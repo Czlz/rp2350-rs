@@ -39,11 +39,11 @@
 
 | Crate | Version | Usage |
 |-------|---------|-------|
-| `eframe` | latest (0.31+) | egui framework (native + wasm runner) |
-| `egui` | latest (0.31+) | Immediate mode GUI core |
-| `egui-wgpu` | latest (0.31+) | wgpu render backend |
-| `egui-winit` | latest (0.31+) | winit window integration |
-| `egui_plot` | latest (0.31+) | Plot widgets (PIO timing) |
+| `eframe` | 0.37 | egui framework (native + wasm runner) |
+| `egui` | 0.37 | Immediate mode GUI core |
+| `egui-wgpu` | 0.37 | wgpu render backend |
+| `egui-winit` | 0.37 | winit window integration |
+| `egui_plot` | 0.37 | Plot widgets (PIO timing) |
 | `winit` | 0.30 | Windowing abstraction |
 | `wgpu` | 24.x | GPU rendering (cross-platform native) |
 | `image` | 0.25 | HSTX screenshot → PNG |
@@ -55,11 +55,11 @@ All egui-family crates use the latest stable release. Version is specified in `[
 
 ```toml
 [workspace.dependencies]
-egui = "0.31"
-eframe = "0.31"
-egui-wgpu = "0.31"
-egui-winit = "0.31"
-egui_plot = "0.31"
+egui = "0.37"
+eframe = "0.37"
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+egui_plot = "0.37"
 ```
 
 ## Plugin FFI / 插件 FFI

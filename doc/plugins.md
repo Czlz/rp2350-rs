@@ -66,7 +66,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Only if device has UI:
-egui = "0.31"
+egui = "0.37"
 
 # Only if device needs logging:
 log = "0.4"

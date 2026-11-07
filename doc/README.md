@@ -12,7 +12,7 @@
 | **Chip** | RP2350 (Raspberry Pi Pico 2) |
 | **Phase 1** | ARM Cortex-M33 dual-core (complete) |
 | **Phase 2** | RISC-V Hazard3 dual-core (future) |
-| **GUI** | egui latest (0.31+) (eframe + wgpu) — Virtual Electronics Lab |
+| **GUI** | egui 0.37 (eframe + wgpu) — Virtual Electronics Lab |
 | **Debug** | GDB RSP Server (TCP :3333), multi-core vCont |
 | **Plugins** | libloading + abi_stable — dynamic .dll/.so/.dylib loading |
 | **Platform** | Windows / Linux / macOS / Web (WASM planned) |
