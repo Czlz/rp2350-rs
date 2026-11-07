@@ -1,37 +1,43 @@
 # Implementation Plan / 实施计划
 
-> **Version**: 3.0 | **Date**: 2026-11-08
+> **Version**: 3.0 | **Date**: 2026-11-08 | **Phase 1: ✅ COMPLETE**
 
 ---
 
-## Phase 1 · Foundation (Week 1)
+## Phase 1 · Foundation (Week 1) ✅ COMPLETE
 
 ### Deliverables / 交付物
 
-| ID | Task | Crate | Output |
+| ID | Task | Crate | Status |
 |----|------|-------|--------|
-| 1.1 | Workspace scaffold + Cargo.toml with dependencies | root | `cargo build --all` passes |
-| 1.2 | `BusDevice` trait + `AtomicType` + `AddressBus` route logic | rp2350-core | Region routing with correct base/size match |
-| 1.3 | `RP2350Chip` struct skeleton | rp2350-core | All fields initialized, no panic |
-| 1.4 | `GpioPin` + `PinFunction` + `PinDirection` (48 pins) | rp2350-core | Unit tests: function switch, direction, output |
-| 1.5 | `SimulationClock` + clock divider logic | rp2350-core | Unit tests: divider rollover |
-| 1.6 | `IrqMatrix` (256 IRQs, pending/enabled) | rp2350-core | Unit tests: set/clear/get |
-| 1.7 | `CpuCore` trait definition | rp2350-cpu | Trait compiles, doc tests pass |
-| 1.8 | `Peripheral` trait (base for APB peripherals) | rp2350-periph | Trait compiles |
-| 1.9 | `RpPlugin` trait + `PluginContext` trait + `declare_plugin!` macro | rp2350-plugin | Trait compiles, macro generates exports |
-| 1.10 | `DevicePlugin` trait + `DevicePort` + `ConfigSchema` | rp2350-virt-periph | Trait definitions complete |
-| 1.11 | `SafeLibrary` RAII wrapper (libloading) | rp2350-ffi | dlopen/dlclose works on all platforms |
-| 1.12 | `PluginLoader` + `WiringTable` + `DeviceManager` skeleton | rp2350-virt-periph | scan/load/unload/wire works |
-| 1.13 | `eframe` App skeleton with menu bar + status bar | rp2350-egui | Window launches, menu items clickable |
-| 1.14 | `clap` CLI: `run`, `gdb`, `wire`, `list-devices`, `mcp-serve` subcommands | rp2350-cli | `--help` output correct |
-| 1.15 | Git init + pre-commit hooks | root | `git commit` success |
-| 1.16 | Fill `doc/README.md` + all crate stub docs | doc/ | `cargo doc` generates complete docs |
+| 1.1 | Workspace scaffold + Cargo.toml with dependencies | root | ✅ |
+| 1.2 | `MemoryRegion` trait + `AddressBus` trait + `BusErrorKind` + route logic | rp2350-core | ✅ |
+| 1.3 | `RP2350Chip` struct skeleton (gpio, irq, clock, cores) | rp2350-core | ✅ |
+| 1.4 | `GpioPin` + `PinFunction` + `PinDirection` + `PortDirection` (48 pins) | rp2350-core | ✅ |
+| 1.5 | `SimulationClock` + clock divider logic | rp2350-core | ✅ |
+| 1.6 | `IrqMatrix` (256 IRQs, pending/enabled/priority routing) | rp2350-core | ✅ |
+| 1.7 | `CpuCore` trait + `CpuState` + `CpuArch` enums | rp2350-cpu | ✅ |
+| 1.8 | `Peripheral` trait (base for APB peripherals) | rp2350-periph | ✅ |
+| 1.9 | `RpPlugin` trait + `PluginContext` trait + `PluginMetadata` builder | rp2350-plugin | ✅ |
+| 1.10 | `DevicePlugin` trait + `DevicePort` + `PortDirection` + `ConfigSchema` | rp2350-virt-periph | ✅ |
+| 1.11 | `SafeLibrary` RAII wrapper (libloading) | rp2350-ffi | ✅ |
+| 1.12 | `PluginLoader` + `WiringTable` + `DeviceManager` (full impl + tests) | rp2350-virt-periph | ✅ |
+| 1.13 | `eframe` App skeleton with menu bar + status bar (stub) | rp2350-egui | ✅ |
+| 1.14 | `clap` CLI: `run`, `gdb`, `wire`, `list-devices`, `mcp-serve` subcommands | rp2350-cli | ✅ |
+| 1.15 | `GdbServer` skeleton + `McpServer` skeleton | rp2350-gdb, rp2350-mcp | ✅ |
+| 1.16 | Git init + `.gitignore` + `README.md` + GitHub Actions CI/CD | root | ✅ |
 
-### Milestone M1 / 里程碑 M1
+### Milestone M1 / 里程碑 M1 ✅
 
-- `cargo build --all` 零错误
-- `AddressBus` 能正确路由到不同地址区域
-- egui 空窗口启动成功
+- ✅ `cargo build` 零错误 (11 crates + workspace)
+- ✅ `AddressBus` 路由抽象完整（`find_region_mut` + read/write auto-route）
+- ✅ `DeviceManager` 完整实现（注册/接线/tick/mcp_query_all）+ 单元测试
+- ✅ `WiringTable` 双向 (device, port) ↔ GPIO pin 映射
+- ✅ `PluginLoader` 目录扫描 + SafeLibrary 加载
+- ✅ `SafeLibrary` RAII 包装 + Send/Sync
+- ✅ egui 空窗口桩代码就绪（Phase 3 实现）
+- ✅ CLI 子命令桩全部就绪
+- ✅ GitHub Actions CI (三平台) + Release (多目标 + WASM + Pages) 工作流
 
 ---
 

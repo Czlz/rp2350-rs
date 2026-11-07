@@ -108,6 +108,7 @@ plugin-led = ["rp2350-plugin-led"]
 plugin-tfcard = ["rp2350-plugin-tfcard"]
 plugin-uart = ["rp2350-plugin-uart-terminal"]
 wasm = ["eframe/wasm_bindgen", "egui-wgpu/webgl"]
+```
 
 ---
 

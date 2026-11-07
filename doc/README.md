@@ -35,17 +35,16 @@ rp2350-rs/
 ├── Cargo.toml                    # workspace root
 ├── crates/
 │   ├── rp2350-core/              # chip topology, address bus, clock tree, IRQ matrix
-│   ├── rp2350-cpu/               # CPU abstraction traits
-│   ├── rp2350-arm/               # Cortex-M33 implementation
-│   ├── rp2350-riscv/             # RISC-V Hazard3 (Phase 2)
-│   ├── rp2350-periph/            # built-in silicon peripherals (PIO, HSTX, DMA, XIP, ...)
-│   ├── rp2350-virt-periph/       # Virtual Device Manager (DevicePlugin trait, PluginLoader, WiringTable)
-│   ├── rp2350-plugin/            # plugin base trait (RpPlugin, PluginContext, declare_plugin!)
+│   ├── rp2350-cpu/               # CPU abstraction traits (CpuCore, CpuState, CpuArch)
+│   ├── rp2350-arm/               # Cortex-M33 core implementation (registers, stub)
+│   ├── rp2350-periph/            # built-in silicon peripherals (Peripheral trait)
+│   ├── rp2350-virt-periph/       # Virtual Device Manager (DevicePlugin, PluginLoader, WiringTable, DeviceManager)
+│   ├── rp2350-plugin/            # plugin base trait (RpPlugin, PluginContext, PluginMetadata)
 │   ├── rp2350-ffi/               # FFI safety wrapper (SafeLibrary — libloading RAII)
-│   ├── rp2350-gdb/               # GDB RSP Server
-│   ├── rp2350-egui/              # egui GUI (Virtual Lab + HSTX display + panels)
-│   ├── rp2350-cli/               # CLI entry point
-│   └── rp2350-mcp/               # MCP Server (AgentFuse integration)
+│   ├── rp2350-gdb/               # GDB RSP Server (stub)
+│   ├── rp2350-egui/              # egui GUI (Virtual Lab + canvas + panels — stub)
+│   ├── rp2350-cli/               # CLI entry point (clap run/gdb/wire/list-devices/mcp-serve)
+│   └── rp2350-mcp/               # MCP Server (AgentFuse integration — stub)
 ├── plugins/                      # ★ all virtual devices as independent plugins
 │   ├── led/                      # first-party: LED
 │   ├── tfcard/                   # first-party: TF Card (SPI + SDIO)
@@ -56,7 +55,9 @@ rp2350-rs/
 │   ├── third-party/              # ★ third-party plugin directory
 │   └── user-guide.md             # plugin development guide
 ├── tests/
-└── doc/
+├── doc/
+└── .github/
+    └── workflows/                # CI (ci.yml) + Release (release.yml)
 ```
 
 ---

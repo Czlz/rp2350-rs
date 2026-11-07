@@ -15,6 +15,12 @@
 │  │          │   Wire Connect)  │ HSTX Mem)  │                │  │
 │  └──────────┴──────────────────┴────────────┴────────────────┘  │
 ├─────────────────────────────────────────────────────────────────┤
+│                   rp2350-cli (CLI Entry Point)                    │
+│  run | gdb | mcp-serve | screenshot | wire | list-devices       │
+├───────────────────────┬─────────────────────────────────────────┤
+│   rp2350-gdb (GDB)    │     rp2350-mcp (AgentFuse MCP Server)   │
+│   server  protocol    │     server  query_all  configure        │
+├───────────────────────┴─────────────────────────────────────────┤
 │                   rp2350-virt-periph (DeviceManager)            │
 │  PluginLoader │ WiringTable │ DeviceRegistry │ MCP Query API   │
 │  (libloading) │ (pin↔port)  │ (Vec<Device>)  │ (JSON-RPC)      │
@@ -25,12 +31,6 @@
 │  │RpPlugin  │RpPlugin  │RpPlugin       │RpPlugin  │RpPlugin  │ │
 │  │DevicePlg │DevicePlg │DevicePlg      │DevicePlg │DevicePlg │ │
 │  └──────────┴──────────┴───────────────┴──────────┴──────────┘ │
-├─────────────────────────────────────────────────────────────────┤
-│                        rp2350-cli (CLI)                          │
-│  run | gdb | mcp-serve | screenshot | wire | list-devices       │
-├─────────────────────────────────────────────────────────────────┤
-│                        rp2350-gdb (GDB RSP)                      │
-│  server | connection | protocol | arm_target                    │
 ├─────────────────────────────────────────────────────────────────┤
 │                     RP2350Chip (rp2350-core)                      │
 │  ┌─────────┬──────────┬──────────┬──────────┬────────────────┐  │
@@ -45,6 +45,9 @@
 │  PIO HSTX DMA UART SPI I2C PWM ADC GPIO SIO CLOCKS              │
 │  TIMER WATCHDOG USB QMI XIP_CTRL ...                            │
 ├─────────────────────────────────────────────────────────────────┤
+│  rp2350-cpu (CPU abstraction)     rp2350-arm (Cortex-M33 impl)  │
+│  CpuCore CpuState CpuArch         registers stub                │
+├─────────────────────────────────────────────────────────────────┤
 │  rp2350-plugin (base trait)        rp2350-ffi (SafeLibrary)     │
 │  RpPlugin PluginContext            RAII libloading wrapper       │
 └─────────────────────────────────────────────────────────────────┘
@@ -54,45 +57,35 @@
 
 ## 2. Core Trait System / 核心 Trait 体系
 
-### 2.1 BusDevice — 总线设备
+### 2.1 MemoryRegion + AddressBus — 总线设备
 
-The fundamental abstraction for all memory-mapped components.
-所有内存映射设备的基础抽象。
+The fundamental abstraction for all memory-mapped components. Two-tier: `MemoryRegion` for individual regions, `AddressBus` for the address routing layer.
+所有内存映射设备的基础抽象。两层架构：`MemoryRegion` 用于单个区域，`AddressBus` 用于地址路由层。
 
 ```rust
-/// A device that can be attached to the address bus.
-/// 可挂载到地址总线上的设备。
-pub trait BusDevice: Send + Sync {
-    /// Human-readable device name (for debug logging).
-    /// 设备名称（调试日志用）。
+/// A single memory-mapped region (RP2350 datasheet address range).
+/// 单个内存映射区域。
+pub trait MemoryRegion: Send + Sync {
     fn name(&self) -> &str;
+    fn base_address(&self) -> u32;
+    fn size(&self) -> usize;
+    fn contains(&self, addr: u32) -> bool;
+    fn read_u8(&mut self, addr: u32, cycles: &mut u64) -> BusResult<u8>;
+    fn write_u8(&mut self, addr: u32, value: u8, cycles: &mut u64) -> BusResult<()>;
+    // Optional: override for wider access
+    fn read_u16(&mut self, addr: u32, cycles: &mut u64) -> BusResult<u16> { ... }
+    fn read_u32(&mut self, addr: u32, cycles: &mut u64) -> BusResult<u32> { ... }
+    fn write_u16(&mut self, addr: u32, value: u16, cycles: &mut u64) -> BusResult<()> { ... }
+    fn write_u32(&mut self, addr: u32, value: u32, cycles: &mut u64) -> BusResult<()> { ... }
+}
 
-    /// 32-bit word read.
-    fn read_u32(&self, offset: u32) -> u32;
-    /// 16-bit halfword read.
-    fn read_u16(&self, offset: u32) -> u16;
-    /// 8-bit byte read.
-    fn read_u8(&self, offset: u32) -> u8;
-
-    /// 32-bit word write.
-    fn write_u32(&mut self, offset: u32, value: u32);
-    /// 16-bit halfword write.
-    fn write_u16(&mut self, offset: u32, value: u16);
-    /// 8-bit byte write.
-    fn write_u8(&mut self, offset: u32, value: u8);
-
-    /// Atomic write (XOR/SET/CLEAR — APB atomic alias region).
-    /// 原子写入（XOR/SET/CLEAR —— APB 原子别名区域）。
-    fn write_atomic(&mut self, offset: u32, value: u32, atomic_type: AtomicType);
-
-    /// Returns true for byte-addressable memory (BOOTRAM, SRAM).
-    /// Used to decide read-modify-write vs replicate-across-word behavior.
-    /// 是否为字节可寻址内存。
-    fn byte_addressable(&self) -> bool { false }
-
-    /// Peripheral tick — called every clk_peri cycle.
-    /// 外设时钟 tick —— 每个 clk_peri 周期调用。
-    fn tick(&mut self, _cycles: u64) {}
+/// The central address bus that routes accesses to the correct region.
+/// 中央地址总线，将内存访问路由到正确区域。
+pub trait AddressBus: Send + Sync {
+    fn register_region(&mut self, region: Box<dyn MemoryRegion>) -> BusResult<()>;
+    fn unregister_region(&mut self, name: &str);
+    fn find_region_mut(&mut self, addr: Address) -> Option<&mut dyn MemoryRegion>;
+    // read_u8/u16/u32, write_u8/u16/u32 with auto-route + default impls
 }
 ```
 
@@ -100,40 +93,24 @@ pub trait BusDevice: Send + Sync {
 
 ```rust
 pub trait CpuCore: Send + Sync {
-    /// Execute one instruction cycle.
-    /// 执行一个指令周期。
-    fn step(&mut self, chip: &mut RP2350Chip) -> StepResult;
-
-    /// Full reset.
-    fn reset(&mut self);
-
-    /// Program counter.
+    fn cpu_id(&self) -> CpuId;
+    fn arch(&self) -> CpuArch;
+    fn init(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError>;
+    fn run_cycles(&mut self, bus: &mut dyn AddressBus, cycles: CycleCount) -> (CycleCount, CpuState);
+    fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError>;
+    fn signal_interrupt(&mut self, irq: IrqNumber);
+    fn servicing_irq(&self) -> Option<IrqNumber>;
     fn pc(&self) -> u32;
-    fn set_pc(&mut self, pc: u32);
-
-    /// Stack pointer.
-    fn sp(&self) -> u32;
-    fn set_sp(&mut self, sp: u32);
-
-    /// Read/write general register.
-    fn reg(&self, index: usize) -> u32;
-    fn set_reg(&mut self, index: usize, value: u32);
-
-    /// NVIC interface.
-    fn nvic_set_pending(&mut self, irq: u32);
-    fn nvic_clear_pending(&mut self, irq: u32);
-    fn nvic_get_priority(&self, irq: u32) -> u8;
-
-    /// Core identification.
-    fn core_index(&self) -> usize;
-    fn architecture(&self) -> CoreArch;
+    fn read_register(&self, index: u8) -> u32;
+    fn write_register(&mut self, index: u8, value: u32);
+    fn reset(&mut self);
+    fn description(&self) -> String;
 }
-```
 
 ### 2.3 RpPlugin — 基础插件契约
 
-Defined in `rp2350-plugin` crate. All plugins implement this.
-定义在 `rp2350-plugin` crate，所有插件均实现。
+Defined in `rp2350-plugin` crate. All plugins implement this. Zero GUI dependency.
+定义在 `rp2350-plugin` crate，所有插件均实现。零 GUI 依赖。
 
 ```rust
 pub trait RpPlugin: Send + Sync {
@@ -141,40 +118,51 @@ pub trait RpPlugin: Send + Sync {
     fn init(&mut self, ctx: &mut dyn PluginContext) -> Result<(), PluginError>;
     fn tick(&mut self, ctx: &mut dyn PluginContext, cycles: u64);
     fn shutdown(&mut self);
-
-    fn as_bus_device(&mut self) -> Option<&mut dyn BusDevice> { None }
-    fn irq_triggered(&mut self, irq_num: u32) {}
     fn state_snapshot(&self) -> serde_json::Value { json!({}) }
 }
 ```
 
-### 2.4 DevicePlugin — 设备插件契约
+### 2.4 PluginContext — 插件上下文 (dyn-safe)
+
+```rust
+pub trait PluginContext: Send {
+    fn log(&self, level: LogLevel, message: &str);
+    fn gpio_read(&self, pin: u8) -> bool;
+    fn gpio_write(&mut self, pin: u8, level: bool);
+    fn gpio_set_direction(&mut self, pin: u8, direction: PinDirection);
+    fn schedule_callback(&mut self, cycles: u64, tag: &str);
+    // Internal: erased service access (use PluginContextExt for typed access)
+    fn get_service_erased(&self) -> Option<&dyn Any>;
+}
+
+pub trait PluginContextExt: PluginContext {
+    fn get_service<T: Any>(&self) -> Option<&T>;
+}
+impl<T: PluginContext + ?Sized> PluginContextExt for T {}
+```
+
+### 2.5 DevicePlugin — 设备插件契约
 
 Defined in `rp2350-virt-periph` crate. Extends `RpPlugin` with GPIO ports, optional config, optional GUI.
 定义在 `rp2350-virt-periph` crate。扩展 `RpPlugin`，增加 GPIO 端口、可选配置、可选 GUI。
 
 ```rust
 pub trait DevicePlugin: RpPlugin {
-    // GPIO ports (required)
     fn ports(&self) -> &[DevicePort];
     fn ports_mut(&mut self) -> &mut [DevicePort];
     fn on_gpio_change(&mut self, port_index: usize, level: bool);
-
-    // Config (optional, JSON-based, no GUI dependency)
     fn config_schema(&self) -> Option<ConfigSchema> { None }
     fn apply_config(&mut self, config: &serde_json::Value) -> Result<(), ConfigError> { Ok(()) }
-    fn current_config(&self) -> Option<serde_json::Value> { None }
-
-    // GUI (optional, never called in headless mode)
     fn has_ui(&self) -> bool { false }
+    #[cfg(feature = "gui")]
     fn render_ui(&mut self, ui: &mut egui::Ui) {}
-
-    // Headless/MCP state query (required)
-    fn state_snapshot(&self) -> serde_json::Value;
 }
 ```
 
-### 2.5 Trait Hierarchy / Trait 层次
+> **Note**: `state_snapshot()` is inherited from `RpPlugin` — no duplicate definition. `DevicePlugin` does **not** redefine it, avoiding trait ambiguity.
+> **注意**: `state_snapshot()` 从 `RpPlugin` 继承，无重复定义。`DevicePlugin` **不**重新定义它，避免 trait 歧义。
+
+### 2.6 Trait Hierarchy / Trait 层次
 
 ```
 RpPlugin (rp2350-plugin)

@@ -1,0 +1,18 @@
+[package]
+name = "rp2350-arm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+
+# Internal
+rp2350-core = { workspace = true }
+rp2350-cpu = { workspace = true }

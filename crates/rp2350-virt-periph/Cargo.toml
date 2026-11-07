@@ -1,0 +1,28 @@
+[package]
+name = "rp2350-virt-periph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+
+# egui is optional — only needed when building with GUI
+egui = { workspace = true, optional = true }
+
+# Internal
+rp2350-core = { workspace = true }
+rp2350-plugin = { workspace = true }
+rp2350-ffi = { workspace = true }
+
+[features]
+default = []
+gui = ["dep:egui"]
