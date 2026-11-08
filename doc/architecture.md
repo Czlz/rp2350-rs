@@ -204,23 +204,55 @@ RpPlugin (rp2350-plugin)
 
 ### APB Peripheral Map / APB 外设映射
 
-| Offset | Base | Peripheral |
-|--------|------|------------|
-| 0x00000 | 0x4000_0000 | SYSINFO |
-| 0x04000 | 0x4000_4000 | SYSCFG |
-| 0x08000 | 0x4000_8000 | CLOCKS |
-| 0x10000 | 0x4001_0000 | PSM |
-| 0x14000 | 0x4001_4000 | HSTX_CTRL |
-| 0x18000 | 0x4001_8000 | HSTX_FIFO |
-| 0x20000 | 0x4002_0000 | RESETS |
-| 0x30000 | 0x4003_0000 | PIO0 |
-| 0x34000 | 0x4003_4000 | XIP_CTRL (QSPI) |
-| 0x38000 | 0x4003_8000 | XIP_CTRL |
-| 0x3C000 | 0x4003_C000 | XIP_QMI |
-| 0x40000 | 0x4004_0000 | PIO1 |
-| 0x50000 | 0x4005_0000 | PIO2 |
-| 0xD0000 | 0x400D_0000 | DMA |
-| 0xE0000 | 0x400E_0000 | USB CTRL |
+Stage 4 只建模启动路径需要的外设；基地址已按 RP2350 数据手册核对（见
+`crates/rp2350-periph/src/map.rs`），未建模偏移由 `MmioRouter` 告警一次并读 0。
+
+| Base | Peripheral | Stage 4 |
+|------|------------|---------|
+| 0x4000_0000 | SYSINFO | 未建模 |
+| 0x4001_0000 | CLOCKS | 桩：`CLK_*_SELECTED` 恒读 1 |
+| 0x4002_0000 | RESETS | 桩：`RESET_DONE` 恒读全 1 |
+| 0x4002_8000 | IO_BANK0 | 桩：寄存器存储 |
+| 0x4003_8000 | PADS_BANK0 | 桩：48 个 pad 复位值 0x56 |
+| 0x4004_8000 | XOSC | 桩：`STATUS` 恒为 STABLE\|ENABLED |
+| 0x4005_0000 | PLL_SYS | 桩：`CS.LOCK` 恒为 1 |
+| 0x4005_8000 | PLL_USB | 桩：`CS.LOCK` 恒为 1 |
+| 0x4007_0000 | UART0 (PL011) | 桩：写 `DR` 进入宿主串口缓冲 |
+| 0x400B_0000 | TIMER0 | 桩：共享微秒时基 + 4 个闹钟 |
+| 0x400D_8000 | WATCHDOG | 桩：scratch 存储，`REASON` 读 0 |
+| 0xD000_0000 | SIO | 桩：GPIO 输出/回环、FIFO、自旋锁 |
+| 0xE000_0000 | PPB (Core 0) | 桩：`CPUID`、`VTOR` 存储 |
+
+### MMIO Framework API / MMIO 框架接口
+
+Stage 4 引入通用挂载接口，任何外部 crate（例如独立的 USB 设备控制器）
+只需实现 `MmioDevice` 并用 `mount_device`（或 `MmioRouter::mount`）注册：
+
+```rust
+pub struct MmioWindow { pub base: Address, pub size: usize }
+
+pub trait MmioDevice: Send + Sync {
+    fn name(&self) -> &str;
+    fn window(&self) -> MmioWindow;
+    fn read32(&mut self, offset: u32) -> Option<u32>;   // None = 未建模
+    fn write32(&mut self, offset: u32, value: u32) -> bool; // false = 未建模
+    fn reset(&mut self) {}
+    fn irq_number(&self) -> Option<u16> { None }
+}
+
+pub fn mount_device(
+    bus: &mut dyn AddressBus,
+    device: Box<dyn MmioDevice>,
+) -> BusResult<MmioWindow>;
+```
+
+- 地址窗口：设备在 `window()` 中声明数据手册的固定窗口；`mount_device` 校验
+  4 字节对齐、大小为正且为 4 的倍数后注册到总线，重叠由总线返回 `Overlap`。
+- `MmioRouter`：把一个大跨度（如 1 MB APB）按子设备窗口分发；未映射偏移只
+  告警一次，读返回 0、写被忽略，避免固件因数据中止而停机。
+- `MmioRegion`：`MmioDevice` → `MemoryRegion` 适配层，16/32 位访问按整字
+  原子分发（不会拆成多次字节副作用）。
+- ARM 侧 `CpuId` 等类型从 `rp2350_core` 复用，外部 crate 不需要依赖 CPU 后端。
 
 ---
 

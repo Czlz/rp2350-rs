@@ -1,0 +1,138 @@
+//! Stage-4 boot peripheral set / Stage 4 启动外设集合
+//!
+//! [`BootPeripherals::mount`] installs the APB router, SIO and PPB into a bus,
+//! returning the shared handles the simulation driver needs: the UART0 transmit
+//! sink and the [`Timebase`] used by TIMER0.
+//! [`BootPeripherals::mount`] 将 APB 路由器、SIO 与 PPB 安装到总线，并返回
+//! 仿真驱动所需的共享句柄：UART0 发送缓冲与 TIMER0 使用的 [`Timebase`]。
+
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use rp2350_core::bus::{AddressBus, BusResult};
+use rp2350_core::mmio::{MmioRouter, MmioWindow, mount_device};
+
+use super::clocks::Clocks;
+use super::io_bank0::IoBank0;
+use super::map;
+use super::pads_bank0::PadsBank0;
+use super::pll::Pll;
+use super::ppb::Ppb;
+use super::resets::Resets;
+use super::sio::Sio;
+use super::timer::Timer0;
+use super::uart::{Uart0, UartSink};
+use super::watchdog::Watchdog;
+use super::xosc::Xosc;
+
+/// Default RP2350 system clock in cycles per microsecond (150 MHz)
+/// 默认 RP2350 系统时钟每微秒周期数（150 MHz）
+pub const DEFAULT_CYCLES_PER_US: u32 = 150;
+
+/// Cycle-driven microsecond timebase shared with TIMER0
+/// 与 TIMER0 共享的周期驱动微秒时基
+#[derive(Debug, Clone, Copy)]
+pub struct Timebase {
+    cycles: u64,
+    cycles_per_us: u32,
+}
+
+impl Timebase {
+    /// Create a timebase with the given clock rate / 以给定时钟频率创建时基
+    #[must_use]
+    pub const fn new(cycles_per_us: u32) -> Self {
+        Self {
+            cycles: 0,
+            cycles_per_us,
+        }
+    }
+
+    /// Advance the timebase by executed CPU cycles / 按已执行 CPU 周期推进时基
+    pub fn advance(&mut self, cycles: u64) {
+        self.cycles = self.cycles.saturating_add(cycles);
+    }
+
+    /// Elapsed microseconds / 已经过的微秒数
+    #[must_use]
+    pub fn time_us(&self) -> u64 {
+        match self.cycles_per_us {
+            0 => 0,
+            rate => self.cycles / u64::from(rate),
+        }
+    }
+
+    /// Total elapsed cycles / 已经过的总周期数
+    #[must_use]
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
+}
+
+/// Handles for the peripherals mounted by [`BootPeripherals::mount`]
+/// [`BootPeripherals::mount`] 挂载的外设句柄
+pub struct BootPeripherals {
+    uart0: Arc<Mutex<UartSink>>,
+    timebase: Arc<Mutex<Timebase>>,
+}
+
+impl BootPeripherals {
+    /// Mount the Stage-4 boot peripherals on `bus` / 在 `bus` 上挂载 Stage 4 启动外设
+    ///
+    /// APB devices are installed into one router covering
+    /// [`map::APB_BASE`]..[`map::APB_SIZE`]; SIO and PPB get standalone window
+    /// regions. Offsets inside APB that no device models are absorbed by the
+    /// router with a one-shot warning, which keeps boot firmware running.
+    /// APB 设备安装到覆盖 [`map::APB_BASE`]..[`map::APB_SIZE`] 的路由器中；
+    /// SIO 与 PPB 使用独立窗口区域。APB 中无设备建模的偏移由路由器吸收并只
+    /// 警告一次，从而保持启动固件继续运行。
+    ///
+    /// # Errors
+    /// Returns a bus error if a window is invalid or overlaps a region already
+    /// registered on `bus`.
+    /// 窗口非法或与 `bus` 已注册区域重叠时返回总线错误。
+    pub fn mount(bus: &mut dyn AddressBus) -> BusResult<Self> {
+        let uart0 = Arc::new(Mutex::new(UartSink::default()));
+        let timebase = Arc::new(Mutex::new(Timebase::new(DEFAULT_CYCLES_PER_US)));
+
+        let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
+        apb.mount(Box::new(Clocks::new()))?;
+        apb.mount(Box::new(Resets::new()))?;
+        apb.mount(Box::new(IoBank0::new()))?;
+        apb.mount(Box::new(PadsBank0::new()))?;
+        apb.mount(Box::new(Xosc::new()))?;
+        apb.mount(Box::new(Pll::sys()))?;
+        apb.mount(Box::new(Pll::usb()))?;
+        apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
+        apb.mount(Box::new(Timer0::new(Arc::clone(&timebase))))?;
+        apb.mount(Box::new(Watchdog::new()))?;
+        bus.register_region(Box::new(apb))?;
+
+        mount_device(bus, Box::new(Sio::new()))?;
+        mount_device(bus, Box::new(Ppb::new()))?;
+
+        Ok(Self { uart0, timebase })
+    }
+
+    /// Advance the shared timebase / 推进共享时基
+    pub fn advance(&self, cycles: u64) {
+        self.timebase.lock().advance(cycles);
+    }
+
+    /// Elapsed microseconds since boot / 自启动以来的微秒数
+    #[must_use]
+    pub fn time_us(&self) -> u64 {
+        self.timebase.lock().time_us()
+    }
+
+    /// Drain buffered UART0 transmit bytes / 取出 UART0 已缓冲的发送字节
+    #[must_use]
+    pub fn take_uart_output(&self) -> Vec<u8> {
+        self.uart0.lock().take()
+    }
+
+    /// Number of bytes waiting in the UART0 sink / UART0 缓冲中等待的字节数
+    #[must_use]
+    pub fn uart_pending(&self) -> usize {
+        self.uart0.lock().len()
+    }
+}

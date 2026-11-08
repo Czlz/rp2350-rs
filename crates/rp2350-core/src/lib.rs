@@ -17,20 +17,26 @@ pub mod chip_family;
 pub mod clock;
 pub mod error;
 pub mod firmware;
+pub mod flash;
 pub mod gpio;
 pub mod irq;
 pub mod memory;
+pub mod mmio;
 pub mod types;
 pub mod uf2;
 
-pub use bus::{AddressBus, BusResult, MemoryRegion};
+pub use bus::{AccessWidth, AddressBus, BusResult, MemoryRegion};
 pub use chip::RP2350Chip;
 pub use chip_family::{ChipCapabilities, ChipFamily, ChipInfo, RP2040Chip};
 pub use clock::SimulationClock;
 pub use error::{BusErrorKind, CoreError};
 pub use firmware::{FirmwareImage, FirmwareSegment};
+pub use flash::{FLASH_XIP_BASE, FLASH_XIP_SIZE, FlashRegion};
 pub use gpio::{GpioPin, PinDirection, PinFunction};
 pub use irq::IrqMatrix;
 pub use memory::{RamRegion, SimpleBus};
-pub use types::{Address, CycleCount, GpioNumber, IrqNumber, PinNumber};
+pub use mmio::{
+    MMIO_REGISTER_SIZE, MmioDevice, MmioRegion, MmioRouter, MmioWindow, RegisterFile, mount_device,
+};
+pub use types::{Address, CpuId, CycleCount, GpioNumber, IrqNumber, PinNumber};
 pub use uf2::{Uf2Arch, Uf2Block, Uf2Family, Uf2Image, Uf2LoadReport, Uf2Region};

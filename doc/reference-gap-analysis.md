@@ -235,11 +235,24 @@ Deliverables:
 - ARM direct-boot from `0x1000_0000`; CLI `run --file <uf2> --arch arm`.
 - Boot trace: PC sampling, unhandled-MMIO log, UART0 TX echo.
 
-Acceptance: the target UF2 starts executing from `0x1000_015A`, survives
-`set_sys_clock_khz`, and reports a stable halt reason instead of hanging.
-Known limitation: UART0 output is empty on the stock image (USB REPL only).
+Acceptance (measured 2026-11-08): the ARM core boots from the flash vector table
+through a 4 KB BootROM stub (`SP = 0x2008_2000`, `PC = 0x1000_015A`), programs
+`SCB->VTOR` (`0xE000_ED08`) and enters the C runtime at `0x1000_0166`. A synthetic
+UF2 that writes UART0 `DR` through the MMIO path yields host-visible `Hi\n`,
+proving Flash XIP → `MmioRouter` → UART0 end to end.
+
+Known limitation: on the stock MicroPython image execution stops inside the C
+runtime because the Thumb-32 `op1 = 0b00` group (data-processing modified
+immediate, `ADD`/`SUB SP` immediate) is not yet implemented by the ARM decoder
+line. UART0 output therefore stays empty for the stock image (USB REPL only).
+
+`MmioDevice` / `mount_device` / `MmioRouter` are the public mounting contract for
+out-of-tree devices; see `doc/architecture.md` §3.
 
 ### Stage 5 — USB CDC device + raw-REPL bridge / USB CDC 与 REPL 桥
+
+> 已拆分给独立的 USB 子任务线（独立 crate，经 `MmioDevice` 挂载），主线不再实现。
+> Owned by an independent USB sub-task line (separate crate mounted via `MmioDevice`).
 
 Deliverables:
 

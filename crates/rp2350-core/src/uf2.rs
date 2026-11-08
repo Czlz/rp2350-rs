@@ -435,7 +435,9 @@ impl Uf2Image {
 
             for (offset, byte) in block.payload.iter().enumerate() {
                 let addr = block.target_addr.wrapping_add(offset as u32);
-                bus.write_u8(addr, *byte, &mut cycles)?;
+                // 加载器走宿主写入通道，因此可以直接编程只读的 Flash 区域。
+                // The loader uses the host write path so it can program read-only flash.
+                bus.load_u8(addr, *byte, &mut cycles)?;
             }
 
             written += 1;

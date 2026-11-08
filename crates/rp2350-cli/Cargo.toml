@@ -16,7 +16,9 @@ tokio = { workspace = true }
 
 # Internal
 rp2350-core = { workspace = true }
+rp2350-cpu = { workspace = true }
 rp2350-arm = { workspace = true }
+rp2350-riscv = { workspace = true }
 rp2350-periph = { workspace = true }
 rp2350-virt-periph = { workspace = true }
 rp2350-gdb = { workspace = true }

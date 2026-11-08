@@ -8,6 +8,11 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `rp2350-core`: `FlashRegion` XIP window (`0x1000_0000`, 16 MB) — guest writes return `AccessDenied`, host loaders use the new `MemoryRegion::load_u8` / `AddressBus::load_u8` path
+- `rp2350-core`: generic MMIO framework (`MmioWindow`, `MmioDevice`, `MmioRegion`, `MmioRouter`, `RegisterFile`, `mount_device`) with fixed datasheet windows, overlap rejection and one-shot warnings for unmodelled offsets; 16/32-bit accesses dispatch as single register operations
+- `rp2350-periph`: Stage-4 boot stubs — RESETS, CLOCKS, XOSC, PLL_SYS/USB, WATCHDOG, TIMER0, SIO, IO_BANK0, PADS_BANK0, UART0 and PPB, wired through `BootPeripherals::mount` with a shared microsecond `Timebase` and a host-visible `UartSink`
+- `rp2350-cli`: `run --file <uf2|elf> [--arch arm|riscv] [--max-cycles N] [--trace-steps N]` — builds the Stage-4 bus (BootROM stub, XIP flash, SRAM, APB), boots ARM from `0x1000_0000`, prints a boot trace, drains UART0 output and reports the halt reason
+- `rp2350-arm`: Thumb-16 decoder groups remapped to the ARMv8-M table (shift-immediate, MOV/CMP/ADD/SUB immediate, ALU/high-register, literal, register-offset, word/byte/halfword immediates, SP-relative), added `CBZ`/`CBNZ`/`POP`/`SETEND`/`CPS`/`BKPT`/`IT`, and fixed PC-relative branch/literal offsets for the pre-advanced PC
 - `rp2350-core`: UF2 container loader (`uf2` module) — parses 512-byte blocks, decodes RP2040/RP2350 family IDs, routes blocks to the flash XIP or SRAM window via `AddressBus`, and rejects duplicate block numbers, bad magics, oversized payloads and unmapped targets
 - `rp2350-core`: flat RAM-backed `SimpleBus`/`RamRegion`/`RomRegion` test bus used by boot and loader tests
 - `rp2350-core`: `FirmwareImage` ELF loader for the boot path

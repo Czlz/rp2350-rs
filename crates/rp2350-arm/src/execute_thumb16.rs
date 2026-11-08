@@ -216,75 +216,152 @@ pub fn execute_thumb16(
 
     match instr_type {
         0b00000 => {
-            // Shift by immediate: LSLS, LSRS, ASRS
-            // 立即数移位：LSLS、LSRS、ASRS
-            let op = (opcode >> 11) & 0x3;
+            // LSLS Rd, Rm, #imm5 / 逻辑左移立即数
             let imm5 = ((opcode >> 6) & 0x1F) as u32;
             let rm = ((opcode >> 3) & 0x7) as usize;
             let rd = (opcode & 0x7) as usize;
+            let result = lsl_c(regs.r[rm], imm5, regs);
+            regs.r[rd] = result;
+            regs.set_nz_flags(result);
+        }
+        0b00001 => {
+            // LSRS Rd, Rm, #imm5 (imm5 == 0 encodes 32) / 逻辑右移立即数
+            let imm5 = ((opcode >> 6) & 0x1F) as u32;
+            let rm = ((opcode >> 3) & 0x7) as usize;
+            let rd = (opcode & 0x7) as usize;
+            let shift = if imm5 == 0 { 32 } else { imm5 };
+            let result = lsr_c(regs.r[rm], shift, regs);
+            regs.r[rd] = result;
+            regs.set_nz_flags(result);
+        }
+        0b00010 => {
+            // ASRS Rd, Rm, #imm5 (imm5 == 0 encodes 32) / 算术右移立即数
+            let imm5 = ((opcode >> 6) & 0x1F) as u32;
+            let rm = ((opcode >> 3) & 0x7) as usize;
+            let rd = (opcode & 0x7) as usize;
+            let shift = if imm5 == 0 { 32 } else { imm5 };
+            let result = asr_c(regs.r[rm], shift, regs);
+            regs.r[rd] = result;
+            regs.set_nz_flags(result);
+        }
+        0b00011 => {
+            // ADDS/SUBS (register) and ADDS/SUBS (3-bit immediate)
+            // 寄存器或 3 位立即数加减
+            let immediate = (opcode >> 10) & 0x1 != 0;
+            let subtract = (opcode >> 9) & 0x1 != 0;
+            let rn = ((opcode >> 3) & 0x7) as usize;
+            let rd = (opcode & 0x7) as usize;
+            let operand = if immediate {
+                ((opcode >> 6) & 0x7) as u32
+            } else {
+                regs.r[((opcode >> 6) & 0x7) as usize]
+            };
+            let result = if subtract {
+                regs.r[rn].wrapping_sub(operand)
+            } else {
+                regs.r[rn].wrapping_add(operand)
+            };
+            regs.r[rd] = result;
+            regs.set_nz_flags(result);
+        }
+        0b00100 => {
+            // MOVS Rd, #imm8 / 立即数移动到 Rd
+            let rd = ((opcode >> 8) & 0x7) as usize;
+            let imm8 = (opcode & 0xFF) as u32;
+            regs.r[rd] = imm8;
+            regs.set_nz_flags(imm8);
+        }
+        0b00101 => {
+            // CMP Rn, #imm8 / 立即数比较
+            let rn = ((opcode >> 8) & 0x7) as usize;
+            let imm8 = (opcode & 0xFF) as u32;
+            let value = regs.r[rn];
+            let (result, _overflow) = value.overflowing_sub(imm8);
+            let c = value >= imm8;
+            let v = ((value ^ imm8) & (value ^ result) & 0x8000_0000) != 0;
+            regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
+        }
+        0b00110 => {
+            // ADDS Rd, #imm8 / 立即数加法
+            let rd = ((opcode >> 8) & 0x7) as usize;
+            let imm8 = (opcode & 0xFF) as u32;
+            let value = regs.r[rd];
+            let (result, carry) = value.overflowing_add(imm8);
+            let v = ((value ^ imm8) & !(value ^ result) & 0x8000_0000) != 0;
+            regs.r[rd] = result;
+            regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, carry, v);
+        }
+        0b00111 => {
+            // SUBS Rd, #imm8 / 立即数减法
+            let rd = ((opcode >> 8) & 0x7) as usize;
+            let imm8 = (opcode & 0xFF) as u32;
+            let value = regs.r[rd];
+            let (result, _overflow) = value.overflowing_sub(imm8);
+            let c = value >= imm8;
+            let v = ((value ^ imm8) & (value ^ result) & 0x8000_0000) != 0;
+            regs.r[rd] = result;
+            regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
+        }
+        0b01000 if (opcode >> 10) & 0x1 != 0 => {
+            // ADD/CMP/MOV high registers, BX and BLX
+            // 高寄存器 ADD/CMP/MOV，以及 BX 与 BLX
+            let op = (opcode >> 8) & 0x3;
+            let h1 = ((opcode >> 7) & 0x1) != 0;
+            let rs_or_rm = ((opcode >> 3) & 0xF) as usize;
+            let rd = ((opcode & 0x7) as usize) | if h1 { 8 } else { 0 };
             match op {
                 0b00 => {
-                    // LSLS Rd, Rm, #imm5 / 逻辑左移
-                    let result = lsl_c(regs.r[rm], imm5, regs);
-                    regs.r[rd] = result;
-                    regs.set_nz_flags(result);
+                    // ADD Rd, Rm (high regs) / 加法（高寄存器）
+                    let result = regs.read(rd as u8).wrapping_add(regs.read(rs_or_rm as u8));
+                    if h1 && rd == 15 {
+                        regs.pc = result & !1u32;
+                        return Ok(StepResult::BranchTaken);
+                    }
+                    regs.write(rd as u8, result);
                 }
-                _ => {
-                    // LSRS or ASRS / 逻辑或算术右移
-                    let shift = if imm5 == 0 { 32 } else { imm5 };
-                    let result = if op == 0b01 {
-                        lsr_c(regs.r[rm], shift, regs)
-                    } else {
-                        asr_c(regs.r[rm], shift, regs)
-                    };
-                    regs.r[rd] = result;
-                    regs.set_nz_flags(result);
-                }
-            }
-        }
-        0b00001..=0b00011 => {
-            // ADD/SUB/CMP/MOV immediate (3-bit register, 8-bit immediate)
-            // ADD/SUB/CMP/MOV 立即数（3 位寄存器，8 位立即数）
-            let op = (opcode >> 11) & 0x3;
-            let rd_or_rn = ((opcode >> 8) & 0x7) as usize;
-            let imm8 = (opcode & 0xFF) as u32;
-            match op {
                 0b01 => {
-                    // MOVS Rd, #imm8 / 移动到 Rd
-                    regs.r[rd_or_rn] = imm8;
-                    regs.set_nz_flags(imm8);
+                    // CMP Rn, Rm (high regs) / 比较（高寄存器）
+                    let rn = regs.read(rd as u8);
+                    let rm = regs.read(rs_or_rm as u8);
+                    let (result, _overflow) = rn.overflowing_sub(rm);
+                    let c = rn >= rm;
+                    let v = ((rn ^ rm) & (rn ^ result) & 0x8000_0000) != 0;
+                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
                 }
                 0b10 => {
-                    // CMP Rn, #imm8 / 比较
-                    let rn = regs.r[rd_or_rn];
-                    let (result, _overflow) = rn.overflowing_sub(imm8);
-                    let c = rn >= imm8;
-                    let v = ((rn ^ imm8) & (rn ^ result) & 0x8000_0000) != 0;
-                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
+                    // MOV Rd, Rm (high regs) / 移动（高寄存器）
+                    let value = regs.read(rs_or_rm as u8);
+                    // MOV to PC = branch / 写入 PC 即分支
+                    if rd == 15 {
+                        regs.pc = value & !1u32;
+                        return Ok(StepResult::BranchTaken);
+                    }
+                    regs.write(rd as u8, value);
                 }
                 0b11 => {
-                    // ADDS Rd, #imm8 / 加法
-                    let rn = regs.r[rd_or_rn];
-                    let (result, overflow) = rn.overflowing_add(imm8);
-                    let c = overflow;
-                    let v = ((rn ^ imm8) & !(rn ^ result) & 0x8000_0000) == 0
-                        && ((rn ^ imm8) & 0x8000_0000) != 0;
-                    regs.r[rd_or_rn] = result;
-                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
-                }
-                0b00 => {
-                    // SUBS Rd, #imm8 / 减法
-                    let rn = regs.r[rd_or_rn];
-                    let (result, _overflow) = rn.overflowing_sub(imm8);
-                    let c = rn >= imm8;
-                    let v = ((rn ^ imm8) & (rn ^ result) & 0x8000_0000) != 0;
-                    regs.r[rd_or_rn] = result;
-                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
+                    // BX Rm or BLX Rm / 分支并交换或带链接分支并交换
+                    let target = regs.read(rs_or_rm as u8);
+                    if h1 {
+                        // BLX Rm: LR = 下一条指令的地址（PC 已由取指推进）。
+                        // BLX Rm: LR = address of the next instruction (PC already advanced).
+                        regs.lr = regs.pc | 1;
+                    }
+                    if target & 0x1 == 0 {
+                        // Not Thumb target → ARM mode (not supported by M33)
+                        // 非 Thumb 目标 → ARM 模式（M33 不支持）
+                        regs.xpsr |= 0x200_0000; // UsageFault: INVSTATE
+                        return Err(CoreError::BusError {
+                            addr: target,
+                            kind: rp2350_core::error::BusErrorKind::NoDevice,
+                        });
+                    }
+                    regs.pc = target & !1u32;
+                    return Ok(StepResult::BranchTaken);
                 }
                 _ => unreachable!(),
             }
         }
-        0b00100 => {
+        0b01000 => {
             // Data processing register (two-operand): ANDS, EORS, LSLS, LSRS,
             // ASRS, ADCS, SBCS, RORS, TST, RSBS, CMP, CMN, ORRS, MULS, BICS, MVNS
             // 数据处理寄存器（双操作数）
@@ -413,97 +490,10 @@ pub fn execute_thumb16(
                 _ => unreachable!(),
             }
         }
-        0b00101 => {
-            // ADD/CMP/MOV high registers: ADD, CMP, MOV, BX, BLX
-            // ADD/CMP/MOV 高寄存器：ADD、CMP、MOV、BX、BLX
-            let op = (opcode >> 8) & 0x3;
-            let h1 = ((opcode >> 7) & 0x1) != 0;
-            let h2 = ((opcode >> 6) & 0x1) != 0;
-            let rs_or_rm = ((opcode >> 3) & 0xF) as usize | if h2 { 8 } else { 0 };
-            let rd = ((opcode & 0x7) as usize) | if h1 { 8 } else { 0 };
-            match op {
-                0b00 => {
-                    // ADD Rd, Rm (high regs) / 加法（高寄存器）
-                    let result = regs.r[rd].wrapping_add(regs.r[rs_or_rm]);
-                    if h1 && rd == 15 {
-                        // ADD PC, Rm → branch to aligned address
-                        // ADD PC, Rm → 跳转到对齐地址
-                        regs.pc = result & !1u32;
-                        return Ok(StepResult::BranchTaken);
-                    }
-                    regs.r[rd] = result;
-                }
-                0b01 => {
-                    // CMP Rn, Rm (high regs) / 比较（高寄存器）
-                    let rn = regs.r[rd];
-                    let rm = regs.r[rs_or_rm];
-                    let (result, _overflow) = rn.overflowing_sub(rm);
-                    let c = rn >= rm;
-                    let v = ((rn ^ rm) & (rn ^ result) & 0x8000_0000) != 0;
-                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
-                }
-                0b10 => {
-                    // MOV Rd, Rm (high regs) / 移动（高寄存器）
-                    regs.r[rd] = regs.r[rs_or_rm];
-                    // MOV to PC = branch
-                    if rd == 15 {
-                        regs.pc &= !1u32;
-                        return Ok(StepResult::BranchTaken);
-                    }
-                }
-                0b11 => {
-                    // BX Rm or BLX Rm / 分支并交换或带链接分支并交换
-                    let target = regs.r[rs_or_rm];
-                    if h2 {
-                        // BLX Rm: set LR = next PC, switch to Thumb if needed
-                        // BLX Rm：设置 LR = 下一条 PC，根据需要切换到 Thumb
-                        regs.lr = (regs.pc - 2) | 1;
-                    }
-                    if target & 0x1 == 0 {
-                        // Not Thumb target → ARM mode (not supported by M33)
-                        // 非 Thumb 目标 → ARM 模式（M33 不支持）
-                        regs.xpsr |= 0x200_0000; // UsageFault: INVSTATE
-                        return Err(CoreError::BusError {
-                            addr: target,
-                            kind: rp2350_core::error::BusErrorKind::NoDevice,
-                        });
-                    }
-                    regs.pc = target & !1u32;
-                    return Ok(StepResult::BranchTaken);
-                }
-                _ => unreachable!(),
-            }
-        }
-        0b00110 => {
-            // MOV Rd, #imm8
-            let rd = ((opcode >> 8) & 0x7) as usize;
-            let imm8 = (opcode & 0xFF) as u32;
-            regs.r[rd] = imm8;
-            regs.set_nz_flags(imm8);
-        }
-        0b00111 => {
-            // ADD/SUB immediate (3-bit register)
-            // ADD/SUB 立即数（3 位寄存器）
-            let op = (opcode >> 9) & 0x1;
-            let rn = ((opcode >> 6) & 0x7) as usize;
-            let rd = ((opcode >> 3) & 0x7) as usize;
-            let imm3 = (opcode & 0x7) as u32;
-            if op == 0 {
-                // ADDS Rd, Rn, #imm3 / 加法
-                let result = regs.r[rn].wrapping_add(imm3);
-                regs.r[rd] = result;
-                regs.set_nz_flags(result);
-            } else {
-                // SUBS Rd, Rn, #imm3 / 减法
-                let result = regs.r[rn].wrapping_sub(imm3);
-                regs.r[rd] = result;
-                regs.set_nz_flags(result);
-            }
-        }
-        0b01000 => {
-            // Load/store register offset: STR, STRH, STRB, LDRSB, LDR, LDRH, LDRB, LDRSH
-            // 加载/存储寄存器偏移
-            let op_a = (opcode >> 10) & 0x3;
+        0b01010 => {
+            // Load/store register offset: STR, STRH, STRB, LDRSB
+            // 加载/存储寄存器偏移：STR、STRH、STRB、LDRSB
+            let op_a = (opcode >> 9) & 0x3;
             let ro = ((opcode >> 6) & 0x7) as usize;
             let rb = ((opcode >> 3) & 0x7) as usize;
             let rd = (opcode & 0x7) as usize;
@@ -533,10 +523,10 @@ pub fn execute_thumb16(
                 _ => unreachable!(),
             }
         }
-        0b01001 => {
+        0b01011 => {
             // Load/store register offset (continued): LDR, LDRH, LDRB, LDRSH
             // 加载/存储寄存器偏移（续）
-            let op_b = (opcode >> 10) & 0x3;
+            let op_b = (opcode >> 9) & 0x3;
             let ro = ((opcode >> 6) & 0x7) as usize;
             let rb = ((opcode >> 3) & 0x7) as usize;
             let rd = (opcode & 0x7) as usize;
@@ -566,7 +556,7 @@ pub fn execute_thumb16(
                 _ => unreachable!(),
             }
         }
-        0b01010 => {
+        0b10000..=0b10001 => {
             // Load/store immediate offset: STRH, LDRH
             // 加载/存储立即数偏移：STRH、LDRH
             let op = (opcode >> 11) & 0x1;
@@ -583,7 +573,7 @@ pub fn execute_thumb16(
             }
             *cycles += 1;
         }
-        0b01011 => {
+        0b10010..=0b10011 => {
             // Load/store SP-relative: STR, LDR
             // SP 相对加载/存储
             let op = (opcode >> 11) & 0x1;
@@ -599,16 +589,16 @@ pub fn execute_thumb16(
             }
             *cycles += 1;
         }
-        0b01100 => {
+        0b01001 => {
             // LDR Rd, [PC, #imm8*4] — literal load
             // LDR Rd, [PC, #imm8*4] — 文字池加载
             let rd = ((opcode >> 8) & 0x7) as usize;
             let imm8 = (opcode & 0xFF) as u32;
-            let addr = (regs.pc & !0x3u32).wrapping_add(imm8 << 2);
+            let addr = (regs.pc.wrapping_add(2) & !0x3u32).wrapping_add(imm8 << 2);
             regs.r[rd] = bus.read_u32(addr, cycles)?;
             *cycles += 1;
         }
-        0b01101 => {
+        0b01100..=0b01101 => {
             // Load/store immediate offset: STR, LDR
             // 加载/存储立即数偏移：STR、LDR
             let op = (opcode >> 11) & 0x1;
@@ -625,7 +615,7 @@ pub fn execute_thumb16(
             }
             *cycles += 1;
         }
-        0b01110 => {
+        0b01110..=0b01111 => {
             // Load/store immediate offset: STRB, LDRB
             // 加载/存储立即数偏移：STRB、LDRB
             let op = (opcode >> 11) & 0x1;
@@ -642,68 +632,11 @@ pub fn execute_thumb16(
             }
             *cycles += 1;
         }
-        0b01111 => {
-            // Load/store multiple: STMIA, LDMIA
-            // 多加载/存储
-            let op = (opcode >> 11) & 0x1;
-            let rb = ((opcode >> 8) & 0x7) as usize;
-            let reg_list = (opcode & 0xFF) as u16;
-            let mut addr = regs.r[rb];
-            if reg_list == 0 {
-                return Ok(StepResult::Undefined);
-            }
-            for i in 0..8u16 {
-                if (reg_list >> i) & 1 != 0 {
-                    if op == 0 {
-                        // STMIA Rb!, {reg_list}: store and increment after
-                        // STMIA Rb!, {reg_list}：存储后递增
-                        bus.write_u32(addr, regs.r[i as usize], cycles)?;
-                        *cycles += 1;
-                    } else {
-                        // LDMIA Rb!, {reg_list}: load and increment after
-                        // LDMIA Rb!, {reg_list}：加载后递增
-                        let val = bus.read_u32(addr, cycles)?;
-                        regs.r[i as usize] = val;
-                        *cycles += 1;
-                    }
-                    addr = addr.wrapping_add(4);
-                }
-            }
-            // Update base register if not in reg_list (write-back)
-            // 如果不在 reg_list 中，更新基址寄存器（写回）
-            if (reg_list >> rb) & 1 == 0 || op == 1 {
-                regs.r[rb] = addr;
-            }
-        }
-        0b10000..=0b10011 => {
-            // Unconditional branch: B, conditional branch: B<cond>
-            // 无条件分支：B，条件分支：B<cond>
-            let cond_bits = (opcode >> 8) & 0xF;
-            if cond_bits == 0xE {
-                // B (unconditional) / 无条件
-                let offset = sign_extend(((opcode & 0x7FF) as u32) << 1, 12);
-                regs.pc = regs.pc.wrapping_add(offset);
-                return Ok(StepResult::BranchTaken);
-            } else if cond_bits != 0xF {
-                // B<cond> (conditional) / 有条件
-                let cond = Condition::from_bits(cond_bits as u8);
-                if cond.evaluate(regs) {
-                    let offset = sign_extend(((opcode & 0xFF) as u32) << 1, 9);
-                    regs.pc = regs.pc.wrapping_add(offset);
-                    return Ok(StepResult::BranchTaken);
-                }
-            }
-            // 0xF: SVC instruction / SVC 指令
-            if cond_bits == 0xF {
-                let imm8 = (opcode & 0xFF) as u8;
-                return Ok(StepResult::SvCall(imm8));
-            }
-        }
         0b10100 => {
             // ADR Rd, label / 地址生成
             let rd = ((opcode >> 8) & 0x7) as usize;
             let imm8 = (opcode & 0xFF) as u32;
-            regs.r[rd] = (regs.pc & !0x3u32).wrapping_add(imm8 << 2);
+            regs.r[rd] = (regs.pc.wrapping_add(2) & !0x3u32).wrapping_add(imm8 << 2);
         }
         0b10101 => {
             // ADD Rd, SP, #imm8*4
@@ -712,13 +645,13 @@ pub fn execute_thumb16(
             regs.r[rd] = regs.sp.wrapping_add(imm8 << 2);
         }
         0b10110 => {
-            // Miscellaneous: ADD/SUB SP, PUSH, POP, SETEND, CPS, BKPT, IT, etc.
-            // 杂项：ADD/SUB SP、PUSH、POP、SETEND、CPS、BKPT、IT 等
-            let op_a = (opcode >> 7) & 0x1F;
-            let op_b = (opcode >> 5) & 0x7;
-            match (op_a, op_b) {
+            // Miscellaneous 16-bit instructions in the 0xB0xx-0xB7xx range:
+            // ADD/SUB SP, CBZ, PUSH, SETEND, CPS.
+            // 0xB0xx-0xB7xx 范围内的杂项 16 位指令：ADD/SUB SP、CBZ、PUSH、SETEND、CPS。
+            match opcode >> 8 {
                 // ADD SP, #imm7*4 or SUB SP, #imm7*4
-                (_, _) if (opcode >> 7) == 0b10110_000 => {
+                // 加/减 SP 立即数
+                0xB0 => {
                     let op = (opcode >> 7) & 0x1;
                     let imm7 = ((opcode & 0x7F) as u32) << 2;
                     if op == 0 {
@@ -727,35 +660,109 @@ pub fn execute_thumb16(
                         regs.sp = regs.sp.wrapping_sub(imm7);
                     }
                 }
-                // SETEND (deprecated in ARMv8-M, treated as NOP)
-                (0b10110_010, _) => {
-                    // SETEND not supported → NOP
+                // CBZ Rn, label (bit9 supplies the high bit of the 7-bit immediate)
+                // CBZ Rn, label（bit9 是 7 位立即数的高位）
+                0xB1 | 0xB3 => {
+                    let i = ((opcode >> 9) & 0x1) as u32;
+                    let imm5 = ((opcode >> 3) & 0x1F) as u32;
+                    let rn = (opcode & 0x7) as usize;
+                    let offset = sign_extend((i << 6) | (imm5 << 1), 7);
+                    if regs.r[rn] == 0 {
+                        regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
+                        return Ok(StepResult::BranchTaken);
+                    }
                 }
-                // CPSID, CPSIE
-                (0b10110_011, _) => {
-                    let enable = (opcode >> 4) & 0x1 == 0;
-                    let affect_fault = (opcode & 0x1) != 0;
-                    if affect_fault {
-                        if enable {
-                            regs.faultmask &= !1;
-                        } else {
-                            regs.faultmask |= 1;
+                // PUSH {reg_list, LR?}
+                // PUSH {reg_list, LR?}
+                0xB4 | 0xB5 => {
+                    let m = ((opcode >> 8) & 0x1) != 0;
+                    let reg_list = (opcode & 0xFF) as u16;
+                    let count = reg_list.count_ones() + u32::from(m);
+                    regs.sp = regs.sp.wrapping_sub(count * 4);
+                    let mut addr = regs.sp;
+                    for i in 0..8u16 {
+                        if (reg_list >> i) & 1 != 0 {
+                            bus.write_u32(addr, regs.r[i as usize], cycles)?;
+                            *cycles += 1;
+                            addr = addr.wrapping_add(4);
                         }
-                    } else {
-                        if enable {
+                    }
+                    if m {
+                        bus.write_u32(addr, regs.lr, cycles)?;
+                        *cycles += 1;
+                    }
+                }
+                // SETEND (deprecated, NOP) and CPS for PRIMASK/FAULTMASK
+                // SETEND（已废弃，视为 NOP）以及用于 PRIMASK/FAULTMASK 的 CPS
+                0xB6 => match opcode {
+                    0xB650 => {}
+                    o if (o & 0xFFF0) == 0xB660 || (o & 0xFFF0) == 0xB670 => {
+                        let enable = (opcode >> 4) & 0x1 == 0;
+                        if (opcode & 0x1) != 0 {
+                            if enable {
+                                regs.faultmask &= !1;
+                            } else {
+                                regs.faultmask |= 1;
+                            }
+                        } else if enable {
                             regs.primask &= !1;
                         } else {
                             regs.primask |= 1;
                         }
                     }
+                    _ => return Ok(StepResult::Undefined),
+                },
+                _ => return Ok(StepResult::Undefined),
+            }
+        }
+        0b10111 => {
+            // Miscellaneous 16-bit instructions in the 0xB8xx-0xBFFF range:
+            // CBNZ, POP, BKPT, IT.
+            // 0xB8xx-0xBFFF 范围内的杂项 16 位指令：CBNZ、POP、BKPT、IT。
+            match opcode >> 8 {
+                // CBNZ Rn, label
+                // CBNZ Rn, label
+                0xB9 | 0xBB => {
+                    let i = ((opcode >> 9) & 0x1) as u32;
+                    let imm5 = ((opcode >> 3) & 0x1F) as u32;
+                    let rn = (opcode & 0x7) as usize;
+                    let offset = sign_extend((i << 6) | (imm5 << 1), 7);
+                    if regs.r[rn] != 0 {
+                        regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
+                        return Ok(StepResult::BranchTaken);
+                    }
                 }
-                // BKPT
-                (0b10111_110, _) => {
-                    let imm8 = (opcode & 0xFF) as u8;
-                    return Ok(StepResult::Breakpoint(imm8));
+                // POP {reg_list, PC?}
+                // POP {reg_list, PC?}
+                0xBC | 0xBD => {
+                    let m = ((opcode >> 8) & 0x1) != 0;
+                    let reg_list = (opcode & 0xFF) as u16;
+                    let mut addr = regs.sp;
+                    for i in 0..8u16 {
+                        if (reg_list >> i) & 1 != 0 {
+                            regs.r[i as usize] = bus.read_u32(addr, cycles)?;
+                            *cycles += 1;
+                            addr = addr.wrapping_add(4);
+                        }
+                    }
+                    if m {
+                        let val = bus.read_u32(addr, cycles)?;
+                        *cycles += 1;
+                        regs.pc = val & !1u32;
+                    }
+                    regs.sp = regs
+                        .sp
+                        .wrapping_add((reg_list.count_ones() + u32::from(m)) * 4);
+                    if m {
+                        return Ok(StepResult::BranchTaken);
+                    }
                 }
+                // BKPT #imm8
+                // BKPT #imm8
+                0xBE => return Ok(StepResult::Breakpoint((opcode & 0xFF) as u8)),
                 // IT
-                (0b10111_111, _) => {
+                // IT 指令
+                0xBF => {
                     let firstcond = ((opcode >> 4) & 0xF) as u8;
                     let mask = (opcode & 0xF) as u8;
                     if firstcond == 0xF || (firstcond == 0xE && mask != 0) {
@@ -763,63 +770,7 @@ pub fn execute_thumb16(
                     }
                     it.execute_it(firstcond, mask);
                 }
-                // CBZ / CBNZ
-                _ if (opcode >> 11) == 0b10111 => {
-                    let op = (opcode >> 11) & 0x1;
-                    let i = ((opcode >> 9) & 0x1) as u32;
-                    let imm5 = ((opcode >> 3) & 0x1F) as u32;
-                    let rn = (opcode & 0x7) as usize;
-                    let imm = (i << 6) | (imm5 << 1);
-                    let offset = sign_extend(imm, 7);
-                    if (op == 0 && regs.r[rn] == 0) || (op == 1 && regs.r[rn] != 0) {
-                        regs.pc = regs.pc.wrapping_add(offset);
-                        return Ok(StepResult::BranchTaken);
-                    }
-                }
-                // PUSH / POP
-                _ => {
-                    let op = (opcode >> 11) & 0x1;
-                    let m = ((opcode >> 8) & 0x1) != 0; // LR for PUSH, PC for POP
-                    let reg_list = (opcode & 0xFF) as u16;
-                    if op == 0 {
-                        // PUSH {reg_list, LR?}
-                        let count = reg_list.count_ones() + if m { 1 } else { 0 };
-                        regs.sp = regs.sp.wrapping_sub(count * 4);
-                        let mut addr = regs.sp;
-                        for i in 0..8u16 {
-                            if (reg_list >> i) & 1 != 0 {
-                                bus.write_u32(addr, regs.r[i as usize], cycles)?;
-                                *cycles += 1;
-                                addr = addr.wrapping_add(4);
-                            }
-                        }
-                        if m {
-                            bus.write_u32(addr, regs.lr, cycles)?;
-                            *cycles += 1;
-                        }
-                    } else {
-                        // POP {reg_list, PC?}
-                        let mut addr = regs.sp;
-                        for i in 0..8u16 {
-                            if (reg_list >> i) & 1 != 0 {
-                                regs.r[i as usize] = bus.read_u32(addr, cycles)?;
-                                *cycles += 1;
-                                addr = addr.wrapping_add(4);
-                            }
-                        }
-                        if m {
-                            let val = bus.read_u32(addr, cycles)?;
-                            *cycles += 1;
-                            regs.pc = val & !1u32;
-                        }
-                        regs.sp = regs
-                            .sp
-                            .wrapping_add((reg_list.count_ones() + if m { 1 } else { 0 }) * 4);
-                        if m {
-                            return Ok(StepResult::BranchTaken);
-                        }
-                    }
-                }
+                _ => return Ok(StepResult::Undefined),
             }
         }
         0b11000 => {
@@ -851,21 +802,23 @@ pub fn execute_thumb16(
             regs.r[rb] = addr;
         }
         0b11010..=0b11011 => {
-            // B<cond> (conditional branch, short)
-            // B<cond>（条件分支，短）
-            let cond = Condition::from_bits(((opcode >> 8) & 0xF) as u8);
-            if cond != Condition::Al {
-                if cond.evaluate(regs) {
-                    let offset = sign_extend(((opcode & 0xFF) as u32) << 1, 9);
-                    regs.pc = regs.pc.wrapping_add(offset);
-                    return Ok(StepResult::BranchTaken);
-                }
+            // B<cond> (conditional branch) or SVC (cond == 0xF)
+            // 条件分支 B<cond>，或 cond == 0xF 时的 SVC
+            let cond_bits = ((opcode >> 8) & 0xF) as u8;
+            if cond_bits == 0xF {
+                return Ok(StepResult::SvCall((opcode & 0xFF) as u8));
+            }
+            let cond = Condition::from_bits(cond_bits);
+            if cond != Condition::Al && cond.evaluate(regs) {
+                let offset = sign_extend(((opcode & 0xFF) as u32) << 1, 9);
+                regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
+                return Ok(StepResult::BranchTaken);
             }
         }
         0b11100 => {
             // B (unconditional branch) / 无条件分支
             let offset = sign_extend(((opcode & 0x7FF) as u32) << 1, 12);
-            regs.pc = regs.pc.wrapping_add(offset);
+            regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
             return Ok(StepResult::BranchTaken);
         }
         0b11101..=0b11111 => {
@@ -900,5 +853,56 @@ mod tests {
     fn step_result_equality() {
         assert_eq!(StepResult::Ok, StepResult::Ok);
         assert_ne!(StepResult::Ok, StepResult::Undefined);
+    }
+
+    #[test]
+    fn short_branch_uses_instruction_address_plus_four() {
+        // B -13 at 0x1000_0164 must land on 0x1000_014E.
+        // 0x1000_0164 处的 B -13 必须跳到 0x1000_014E。
+        let mut regs = CortexM33Registers::new();
+        regs.pc = 0x1000_0166; // 取指后已推进 2 字节 / fetcher already advanced by 2
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let mut cycles = 0;
+        let result = execute_thumb16(
+            0xE7F3,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(result, StepResult::BranchTaken);
+        assert_eq!(regs.pc, 0x1000_014E);
+    }
+
+    #[test]
+    fn cbz_uses_instruction_address_plus_four() {
+        // CBZ r0, +2 at 0x1000_0160 must land on 0x1000_0166.
+        // 0x1000_0160 处的 CBZ r0, +2 必须跳到 0x1000_0166。
+        let mut regs = CortexM33Registers::new();
+        regs.pc = 0x1000_0162;
+        regs.r[0] = 0;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let mut cycles = 0;
+        let result = execute_thumb16(
+            0xB108,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(result, StepResult::BranchTaken);
+        assert_eq!(regs.pc, 0x1000_0166);
     }
 }

@@ -101,6 +101,22 @@ pub trait MemoryRegion: Send + Sync {
         self.write_u16(addr, (value & 0xFFFF) as u16, cycles)?;
         self.write_u16(addr + 2, ((value >> 16) & 0xFFFF) as u16, cycles)
     }
+
+    /// Host-side byte write that bypasses guest write protection
+    /// 宿主侧字节写入，绕过客户机写保护
+    ///
+    /// Firmware loaders and debuggers use this entry point to program ROM-like
+    /// regions (for example flash) that reject guest writes. The default
+    /// implementation forwards to [`Self::write_u8`].
+    /// 固件加载器和调试器通过此入口写入 ROM 类区域（例如 Flash），这类区域
+    /// 拒绝客户机写入。默认实现转发到 [`Self::write_u8`]。
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
+    fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
+        self.write_u8(addr, value, cycles)
+    }
 }
 
 /// The central address bus that routes memory accesses to the correct region
@@ -201,5 +217,26 @@ pub trait AddressBus: Send + Sync {
                 kind: BusErrorKind::NoDevice,
             })?
             .write_u32(addr, value, cycles)
+    }
+
+    /// Host-side byte write (loader and debugger path)
+    /// 宿主侧字节写入（加载器与调试器路径）
+    ///
+    /// Unlike [`Self::write_u8`], this entry point asks the region to accept the
+    /// write even when it normally rejects guest writes. Firmware loaders use it
+    /// to program flash.
+    /// 与 [`Self::write_u8`] 不同，此入口会让区域接受写入，即使该区域通常拒绝
+    /// 客户机写入。固件加载器用它写入 Flash。
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
+        self.find_region_mut(addr)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            })?
+            .load_u8(addr, value, cycles)
     }
 }

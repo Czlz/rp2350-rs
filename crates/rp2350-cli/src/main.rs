@@ -7,6 +7,8 @@
 
 use clap::{Parser, Subcommand};
 
+mod run;
+
 /// RP2350 Emulator — cycle-accurate ARM/RISC-V simulator
 /// RP2350 模拟器 — 精确周期 ARM/RISC-V 仿真器
 #[derive(Parser, Debug)]
@@ -29,9 +31,21 @@ struct Cli {
 enum Commands {
     /// Run the emulator with the given firmware / 使用给定固件运行模拟器
     Run {
-        /// Firmware file (ELF or HEX) / 固件文件（ELF 或 HEX）
+        /// Firmware file (UF2 or ELF) / 固件文件（UF2 或 ELF）
         #[arg(short, long)]
         file: String,
+
+        /// CPU architecture override / CPU 架构覆盖
+        #[arg(long, value_enum)]
+        arch: Option<run::ArchArg>,
+
+        /// Instruction budget before stopping / 停止前的指令预算
+        #[arg(long, default_value_t = 20_000_000)]
+        max_cycles: u64,
+
+        /// Number of boot-trace steps to print / 打印的启动轨迹步数
+        #[arg(long, default_value_t = 16)]
+        trace_steps: usize,
     },
 
     /// Start GDB server / 启动 GDB 服务器
@@ -81,9 +95,22 @@ fn main() {
     }
 
     match cli.command {
-        Commands::Run { file } => {
-            log::info!("Running firmware: {file} (stub)");
-            log::info!("Run mode not yet implemented (Phase 3+)");
+        Commands::Run {
+            file,
+            arch,
+            max_cycles,
+            trace_steps,
+        } => {
+            let options = run::RunOptions {
+                file: file.into(),
+                arch,
+                max_cycles,
+                trace_steps,
+            };
+            if let Err(error) = run::run(&options) {
+                log::error!("run failed / 运行失败: {error:#}");
+                std::process::exit(1);
+            }
         }
         Commands::Gdb { file, port } => {
             log::info!("Starting GDB server on port {port} for firmware: {file} (stub)");

@@ -137,11 +137,13 @@ impl FirmwareImage {
         for segment in &self.segments {
             for (offset, byte) in segment.data.iter().enumerate() {
                 let addr = segment.address.wrapping_add(offset as u32);
-                bus.write_u8(addr, *byte, &mut cycles)?;
+                // 加载器走宿主写入通道，因此可以直接编程只读的 Flash 区域。
+                // The loader uses the host write path so it can program read-only flash.
+                bus.load_u8(addr, *byte, &mut cycles)?;
             }
             for offset in segment.data.len()..segment.mem_size {
                 let addr = segment.address.wrapping_add(offset as u32);
-                bus.write_u8(addr, 0, &mut cycles)?;
+                bus.load_u8(addr, 0, &mut cycles)?;
             }
         }
         Ok(())

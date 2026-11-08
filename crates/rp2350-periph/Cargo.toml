@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 bitflags = { workspace = true }
 bytemuck = { workspace = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 smallvec = { workspace = true }
 
 # Internal
