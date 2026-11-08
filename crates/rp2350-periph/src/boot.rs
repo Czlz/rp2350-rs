@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use rp2350_core::bus::{AddressBus, BusResult};
 use rp2350_core::mmio::{MmioRouter, MmioWindow, mount_device};
 
+use super::bootram::BootRam;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
 use super::io_bank0::IoBank0;
@@ -121,6 +122,7 @@ impl BootPeripherals {
         apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
         apb.mount(Box::new(timer.clone()))?;
         apb.mount(Box::new(Watchdog::new()))?;
+        apb.mount(Box::new(BootRam::new()))?;
         bus.register_region(Box::new(apb))?;
 
         // TICKS 位于 APB 路由器跨度之上，独立挂载；写 CYCLES 会推进共享时基。

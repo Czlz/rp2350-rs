@@ -19,6 +19,7 @@
 #![allow(clippy::doc_markdown, clippy::unnecessary_literal_bound)]
 
 pub mod boot;
+pub mod bootram;
 pub mod clocks;
 pub mod cycle;
 pub mod io_bank0;

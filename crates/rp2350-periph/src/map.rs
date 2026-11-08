@@ -52,6 +52,12 @@ pub const WATCHDOG_BASE: Address = 0x400D_8000;
 /// TICKS 位于路由器建模的 1 MB APB 跨度之上，因此作为独立设备窗口挂载。
 pub const TICKS_BASE: Address = 0x4010_8000;
 
+/// BOOTRAM base / BOOTRAM 基地址
+///
+/// The boot ROM scratch RAM and the boot locks share one 4 KB window.
+/// boot ROM 暂存 RAM 与 boot 锁共用同一个 4 KB 窗口。
+pub const BOOTRAM_BASE: Address = 0x400E_0000;
+
 /// SIO base / SIO 基地址
 pub const SIO_BASE: Address = 0xD000_0000;
 
