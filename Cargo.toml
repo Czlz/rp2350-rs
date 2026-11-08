@@ -4,6 +4,7 @@ members = [
     "crates/rp2350-core",
     "crates/rp2350-cpu",
     "crates/rp2350-arm",
+    "crates/rp2350-riscv",
     "crates/rp2350-periph",
     "crates/rp2350-virt-periph",
     "crates/rp2350-plugin",
@@ -61,6 +62,7 @@ wee_alloc = "0.4"
 rp2350-core = { path = "crates/rp2350-core" }
 rp2350-cpu = { path = "crates/rp2350-cpu" }
 rp2350-arm = { path = "crates/rp2350-arm" }
+rp2350-riscv = { path = "crates/rp2350-riscv" }
 rp2350-periph = { path = "crates/rp2350-periph" }
 rp2350-virt-periph = { path = "crates/rp2350-virt-periph" }
 rp2350-plugin = { path = "crates/rp2350-plugin" }

@@ -3391,6 +3391,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rp2350-riscv"
+version = "0.1.0"
+dependencies = [
+ "rp2350-core",
+ "rp2350-cpu",
+]
+
+[[package]]
 name = "rp2350-virt-periph"
 version = "0.1.0"
 dependencies = [
