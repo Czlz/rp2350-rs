@@ -1,6 +1,7 @@
 //! RP2350 chip topology — connects CPU cores, address bus, peripherals, GPIO
 //! RP2350 芯片拓扑 — 连接 CPU 核心、地址总线、外设和 GPIO
 
+use super::chip_family::{ChipCapabilities, ChipFamily, ChipInfo};
 use super::clock::SimulationClock;
 use super::gpio::GpioPin;
 use super::irq::IrqMatrix;
@@ -63,6 +64,16 @@ impl Default for RP2350Chip {
     }
 }
 
+impl ChipInfo for RP2350Chip {
+    fn family(&self) -> ChipFamily {
+        ChipFamily::Rp2350
+    }
+
+    fn capabilities(&self) -> ChipCapabilities {
+        ChipCapabilities::rp2350()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +95,12 @@ mod tests {
         let mut chip = RP2350Chip::new();
         assert!(chip.gpio_mut(48).is_none());
         assert!(chip.gpio_mut(0).is_some());
+    }
+
+    #[test]
+    fn chip_reports_rp2350_capabilities() {
+        let chip = RP2350Chip::new();
+        assert_eq!(chip.family(), ChipFamily::Rp2350);
+        assert_eq!(chip.capabilities().sram_bytes, 520 * 1024);
     }
 }

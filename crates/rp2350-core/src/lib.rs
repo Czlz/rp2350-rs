@@ -13,6 +13,7 @@
 
 pub mod bus;
 pub mod chip;
+pub mod chip_family;
 pub mod clock;
 pub mod error;
 pub mod firmware;
@@ -24,6 +25,7 @@ pub mod uf2;
 
 pub use bus::{AddressBus, BusResult, MemoryRegion};
 pub use chip::RP2350Chip;
+pub use chip_family::{ChipCapabilities, ChipFamily, ChipInfo, RP2040Chip};
 pub use clock::SimulationClock;
 pub use error::{BusErrorKind, CoreError};
 pub use firmware::{FirmwareImage, FirmwareSegment};

@@ -45,8 +45,8 @@
 │  PIO HSTX DMA UART SPI I2C PWM ADC GPIO SIO CLOCKS              │
 │  TIMER WATCHDOG USB QMI XIP_CTRL ...                            │
 ├─────────────────────────────────────────────────────────────────┤
-│  rp2350-cpu (CPU abstraction)     rp2350-arm (Cortex-M33 impl)  │
-│  CpuCore CpuState CpuArch         registers stub                │
+│  rp2350-cpu (CPU abstraction)   rp2350-arm / rp2350-riscv impls  │
+│  CpuCore CpuState CpuArch       Cortex-M33 | Hazard3 RV32IMAC    │
 ├─────────────────────────────────────────────────────────────────┤
 │  rp2350-plugin (base trait)        rp2350-ffi (SafeLibrary)     │
 │  RpPlugin PluginContext            RAII libloading wrapper       │
@@ -106,6 +106,12 @@ pub trait CpuCore: Send + Sync {
     fn reset(&mut self);
     fn description(&self) -> String;
 }
+```
+
+#### Chip identification / 芯片识别
+
+`rp2350-core::chip_family` provides `ChipFamily`, `ChipCapabilities` and the `ChipInfo` trait. `RP2350Chip` reports the RP2350 capability set (520 KB SRAM, 16 MB XIP window, Hazard3 available). `RP2040Chip` is a constructible, identifiable stub: `boot`, `step` and memory access all return `CoreError::UnsupportedChip` so callers see an explicit error instead of fabricated behaviour.
+`rp2350-core::chip_family` 提供 `ChipFamily`、`ChipCapabilities` 与 `ChipInfo` trait。`RP2350Chip` 报告 RP2350 的能力集（520 KB SRAM、16 MB XIP 窗口、可用 Hazard3）。`RP2040Chip` 是可构造、可识别的桩：`boot`、`step` 与内存访问均返回 `CoreError::UnsupportedChip`，让调用方看到明确错误而不是伪造行为。
 
 ### 2.3 RpPlugin — 基础插件契约
 
