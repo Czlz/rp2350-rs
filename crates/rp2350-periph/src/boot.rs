@@ -17,6 +17,7 @@ use rp2350_core::bus::{AddressBus, BusResult};
 use rp2350_core::mmio::{MmioRouter, MmioWindow, mount_device};
 
 use super::clocks::Clocks;
+use super::cycle::CycleSink;
 use super::io_bank0::IoBank0;
 use super::irq::IrqAssert;
 use super::map;
@@ -25,6 +26,7 @@ use super::pll::Pll;
 use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
 use super::resets::Resets;
 use super::sio::Sio;
+use super::ticks::Ticks;
 use super::timer::Timer0;
 use super::uart::{Uart0, UartSink};
 use super::watchdog::Watchdog;
@@ -77,7 +79,7 @@ impl Timebase {
 /// [`BootPeripherals::mount`] 挂载的外设句柄
 pub struct BootPeripherals {
     uart0: Arc<Mutex<UartSink>>,
-    timebase: Arc<Mutex<Timebase>>,
+    cycles: CycleSink,
     timer: Timer0,
     sio: Sio,
     irq: IrqAssert,
@@ -102,6 +104,7 @@ impl BootPeripherals {
     pub fn mount(bus: &mut dyn AddressBus) -> BusResult<Self> {
         let uart0 = Arc::new(Mutex::new(UartSink::default()));
         let timebase = Arc::new(Mutex::new(Timebase::new(DEFAULT_CYCLES_PER_US)));
+        let cycles = CycleSink::new(Arc::clone(&timebase));
         let irq = IrqAssert::new();
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
@@ -120,12 +123,16 @@ impl BootPeripherals {
         apb.mount(Box::new(Watchdog::new()))?;
         bus.register_region(Box::new(apb))?;
 
+        // TICKS 位于 APB 路由器跨度之上，独立挂载；写 CYCLES 会推进共享时基。
+        // TICKS sits above the APB router span, so it is mounted standalone;
+        // writing CYCLES advances the shared time base.
+        mount_device(bus, Box::new(Ticks::new(cycles.clone())))?;
         mount_device(bus, Box::new(sio.clone()))?;
         mount_device(bus, Box::new(Ppb::with_log(Arc::clone(&system_writes))))?;
 
         Ok(Self {
             uart0,
-            timebase,
+            cycles,
             timer,
             sio,
             irq,
@@ -136,7 +143,7 @@ impl BootPeripherals {
     /// Advance the shared timebase and refresh TIMER0 interrupt lines
     /// 推进共享时基并刷新 TIMER0 中断线
     pub fn advance(&self, cycles: u64) {
-        self.timebase.lock().advance(cycles);
+        self.cycles.push(cycles);
         self.timer.refresh();
     }
 
@@ -165,7 +172,7 @@ impl BootPeripherals {
     /// Elapsed microseconds since boot / 自启动以来的微秒数
     #[must_use]
     pub fn time_us(&self) -> u64 {
-        self.timebase.lock().time_us()
+        self.cycles.time_us()
     }
 
     /// Drain buffered UART0 transmit bytes / 取出 UART0 已缓冲的发送字节

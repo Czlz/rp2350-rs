@@ -45,6 +45,13 @@ pub const TIMER0_BASE: Address = 0x400B_0000;
 /// WATCHDOG base / WATCHDOG 基地址
 pub const WATCHDOG_BASE: Address = 0x400D_8000;
 
+/// TICKS tick generator base / TICKS 滴答发生器基地址
+///
+/// TICKS sits above the 1 MB APB span modelled by the router, so it is mounted
+/// as a standalone device window.
+/// TICKS 位于路由器建模的 1 MB APB 跨度之上，因此作为独立设备窗口挂载。
+pub const TICKS_BASE: Address = 0x4010_8000;
+
 /// SIO base / SIO 基地址
 pub const SIO_BASE: Address = 0xD000_0000;
 

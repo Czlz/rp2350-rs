@@ -20,6 +20,7 @@
 
 pub mod boot;
 pub mod clocks;
+pub mod cycle;
 pub mod io_bank0;
 pub mod irq;
 pub mod map;
@@ -28,6 +29,7 @@ pub mod pll;
 pub mod ppb;
 pub mod resets;
 pub mod sio;
+pub mod ticks;
 pub mod timer;
 pub mod traits;
 pub mod uart;
@@ -35,6 +37,7 @@ pub mod watchdog;
 pub mod xosc;
 
 pub use boot::{BootPeripherals, Timebase};
+pub use cycle::CycleSink;
 pub use irq::IrqAssert;
 pub use traits::Peripheral;
 pub use uart::UartSink;
