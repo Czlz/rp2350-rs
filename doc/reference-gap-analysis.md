@@ -244,7 +244,11 @@ proving Flash XIP → `MmioRouter` → UART0 end to end.
 Known limitation: on the stock MicroPython image execution stops inside the C
 runtime because the Thumb-32 `op1 = 0b00` group (data-processing modified
 immediate, `ADD`/`SUB SP` immediate) is not yet implemented by the ARM decoder
-line. UART0 output therefore stays empty for the stock image (USB REPL only).
+line. Measured trace: `mov.w r0, #0xD000_0000` is skipped, so the SIO `CPUID`
+read returns the boot-stub mirror and the stub takes its core-1 re-entry path;
+`sub.w sp, sp, #256` is skipped as well, leaving `SP` at the top of SRAM, so
+`blx r0` faults at `0x2008_2000`. UART0 output therefore stays empty for the
+stock image (USB REPL only).
 
 `MmioDevice` / `mount_device` / `MmioRouter` are the public mounting contract for
 out-of-tree devices; see `doc/architecture.md` §3.
