@@ -21,6 +21,7 @@
 pub mod boot;
 pub mod clocks;
 pub mod io_bank0;
+pub mod irq;
 pub mod map;
 pub mod pads_bank0;
 pub mod pll;
@@ -34,6 +35,7 @@ pub mod watchdog;
 pub mod xosc;
 
 pub use boot::{BootPeripherals, Timebase};
+pub use irq::IrqAssert;
 pub use traits::Peripheral;
 pub use uart::UartSink;
 

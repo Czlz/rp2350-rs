@@ -100,6 +100,8 @@ pub trait CpuCore: Send + Sync {
     fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError>;
     fn signal_interrupt(&mut self, irq: IrqNumber);
     fn servicing_irq(&self) -> Option<IrqNumber>;
+    fn system_write(&mut self, addr: u32, value: u32);
+    fn system_read(&mut self, addr: u32) -> Option<u32>;
     fn pc(&self) -> u32;
     fn read_register(&self, index: u8) -> u32;
     fn write_register(&mut self, index: u8, value: u32);
@@ -197,8 +199,9 @@ RpPlugin (rp2350-plugin)
 | XIP PSRAM | 0x1100_0000 | 0x11FF_FFFF | 16MB | PSRAM XIP alias |
 | SRAM0-9 | 0x2000_0000 | 0x2008_1FFF | 520KB | Internal SRAM |
 | APB | 0x4000_0000 | 0x4FFF_FFFF | 256MB | Peripherals |
-| USB DPRAM | 0x5010_0000 | 0x5010_3FFF | 16KB | USB Controller RAM |
-| SIO | 0xD000_0000 | 0xD000_01FF | 512B | Single-cycle IO |
+| USB DPRAM | 0x5010_0000 | 0x5010_0FFF | 4KB | USB Controller RAM |
+| USBCTRL REGS | 0x5011_0000 | 0x5011_0FFF | 4KB | USB SIE control/status |
+| SIO | 0xD000_0000 | 0xD000_0FFF | 4KB | Single-cycle IO |
 | PPB0 | 0xE000_0000 | 0xE00F_FFFF | 1MB | Private Peripheral Bus (Core 0) |
 | PPB1 | 0xE100_0000 | 0xE10F_FFFF | 1MB | Private Peripheral Bus (Core 1) |
 
@@ -254,6 +257,37 @@ pub fn mount_device(
   原子分发（不会拆成多次字节副作用）。
 - ARM 侧 `CpuId` 等类型从 `rp2350_core` 复用，外部 crate 不需要依赖 CPU 后端。
 
+### Interrupt Number Map / 中断号映射
+
+中断号取自 pico-sdk `intctrl.h`（RP2350），也是 `crates/rp2350-periph/src/map.rs`
+中 `*_IRQ` 常量的来源。外部 IRQ `n` 的异常号为 `16 + n`，向量位于
+`VTOR + (16 + n) * 4`。
+
+| IRQ | Peripheral | IRQ | Peripheral |
+|-----|------------|-----|------------|
+| 0..3 | TIMER0_IRQ_0..3 | 21 | IO_IRQ_BANK0 |
+| 10..13 | DMA_IRQ_0..3 | 25 | SIO_IRQ_FIFO |
+| **14** | **USBCTRL_IRQ** | 26 | SIO_IRQ_BELL |
+| 15/16 | PIO0_IRQ_0/1 | 29 | SIO_IRQ_MTIMECMP |
+| 17/18 | PIO1_IRQ_0/1 | 30 | CLOCKS_IRQ |
+| 19/20 | PIO2_IRQ_0/1 | 31/32 | SPI0_IRQ / SPI1_IRQ |
+| 33 | UART0_IRQ | 34 | UART1_IRQ |
+
+### Interrupt Wiring / 中断接线
+
+中断线不插桩到指令执行路径，而由驱动在两个位置搬运状态：
+
+1. **NVIC/SysTick/VTOR 写回放**：PPB 桩把落在 `0xE000_ED08`（VTOR）、
+   `0xE000_E010..=0xE000_E01F`（SysTick）与 `0xE000_E100..=0xE000_E4FF`
+   （NVIC）的写记录到共享日志；驱动调用 `CpuCore::system_write` 回放到核。
+2. **外设中断线轮询**：外设把断言状态写入共享 `IrqAssert`（64 位掩码），
+   驱动读取 `BootPeripherals::irq_mask()` 并对每条断言的线调用
+   `CpuCore::signal_interrupt`。
+
+核侧在每次 `step` 后检查 `PRIMASK` 与 NVIC 的使能/挂起/活跃状态，满足条件
+即按 `16 + irq` 进入异常。活跃中断不会被再次选中，避免同一电平在异常返回
+前自我抢占。
+
 ---
 
 ## 4. Execution Loop / 执行循环
@@ -297,8 +331,9 @@ CPU ld/st → RP2350Chip::read_u32(addr)
     ├── 0x1100_0000-0x11FF_FFFF → XIP → QMI → Psram.read()
     ├── 0x2000_0000-0x2008_1FFF → SRAM
     ├── 0x4000_0000-0x4FFF_FFFF → APB peripherals
-    ├── 0x5010_0000-0x5010_3FFF → USB DPRAM
-    ├── 0xD000_0000-0xD000_01FF → SIO
+    ├── 0x5010_0000-0x5010_0FFF → USB DPRAM (4 KB)
+    ├── 0x5011_0000-0x5011_0FFF → USBCTRL REGS (4 KB)
+    ├── 0xD000_0000-0xD000_0FFF → SIO
     └── 0xE000_0000-0xE10F_FFFF → PPB (per-core)
 ```
 

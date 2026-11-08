@@ -63,6 +63,15 @@ pub const PPB_WINDOW_SIZE: usize = 0x0010_0000;
 /// TIMER0 alarm 0 interrupt line / TIMER0 闹钟 0 中断线
 pub const TIMER0_IRQ_0: u16 = 0;
 
+/// USBCTRL interrupt line (RP2350 `intctrl.h`) / USBCTRL 中断线（RP2350 `intctrl.h`）
+pub const USBCTRL_IRQ: u16 = 14;
+
+/// SIO inter-core FIFO interrupt line / SIO 核间 FIFO 中断线
+pub const SIO_IRQ_FIFO: u16 = 25;
+
+/// SIO doorbell interrupt line / SIO 门铃中断线
+pub const SIO_IRQ_BELL: u16 = 26;
+
 /// UART0 interrupt line / UART0 中断线
 pub const UART0_IRQ: u16 = 33;
 

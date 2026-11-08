@@ -52,6 +52,13 @@ const SYSTICK_BASE: u32 = 0xE000_E010;
 #[allow(dead_code)]
 const NVIC_BASE: u32 = 0xE000_E100;
 
+/// `SCB_VTOR` absolute address / `SCB_VTOR` 绝对地址
+const SCB_VTOR: u32 = 0xE000_ED08;
+
+/// First exception number that maps to an external interrupt
+/// 映射到外部中断的第一个异常号
+const FIRST_EXTERNAL_EXCEPTION: u32 = 16;
+
 /// Address of the initial stack pointer in the boot vector table
 /// 启动向量表中初始栈指针的地址
 const BOOT_SP_ADDR: u32 = 0x0000_0000;
@@ -71,12 +78,17 @@ pub struct CortexM33Core {
     nvic: Nvic,
     /// SysTick timer / SysTick 定时器
     systick: SysTick,
+    /// Vector table offset register value / 向量表偏移寄存器值
+    vtor: u32,
     /// IT block state machine / IT 块状态机
     it_state: ITBlockState,
     /// Current execution state / 当前执行状态
     state: CpuState,
     /// Pending IRQ number (if any) / 待处理的中断号（如果有）
     pending_irq: Option<IrqNumber>,
+    /// Active external exception numbers, innermost last
+    /// 活跃的外部异常号栈，最内层位于末尾
+    active_exceptions: Vec<u16>,
     /// Boot vectors cached by `boot` as (initial MSP, reset vector)
     /// 由 `boot` 缓存的启动向量（初始 MSP、复位向量）
     boot_vectors: Option<(u32, u32)>,
@@ -95,9 +107,11 @@ impl CortexM33Core {
             registers: CortexM33Registers::new(),
             nvic: Nvic::new(),
             systick: SysTick::new(),
+            vtor: 0,
             it_state: ITBlockState::new(),
             state: CpuState::Reset,
             pending_irq: None,
+            active_exceptions: Vec::new(),
             boot_vectors: None,
             total_cycles: 0,
         }
@@ -142,8 +156,10 @@ impl CortexM33Core {
         self.registers = CortexM33Registers::new();
         self.nvic = Nvic::new();
         self.systick = SysTick::new();
+        self.vtor = 0;
         self.it_state = ITBlockState::new();
         self.pending_irq = None;
+        self.active_exceptions.clear();
         self.total_cycles = 0;
     }
 
@@ -175,7 +191,6 @@ impl CortexM33Core {
 
     /// Handle SysTick register accesses via bus
     /// 通过总线处理 SysTick 寄存器访问
-    #[allow(dead_code)]
     fn handle_systick_access(
         &mut self,
         offset: u32,
@@ -216,9 +231,28 @@ impl CortexM33Core {
         }
     }
 
+    /// Route a system control space access to the matching inner device
+    /// 将系统控制空间访问路由到对应的内部设备
+    fn route_system_access(&mut self, addr: u32, write: bool, value: u32) -> Option<u32> {
+        if addr == SCB_VTOR {
+            if write {
+                // ARMv8-M：VTOR 低 7 位保留，向量表按 128 字节对齐。
+                // ARMv8-M: VTOR bits[6:0] are reserved; the table is 128-byte aligned.
+                self.vtor = value & !0x7F;
+            }
+            Some(self.vtor)
+        } else if (NVIC_BASE..NVIC_BASE + 0x400).contains(&addr) {
+            self.handle_nvic_access(addr - NVIC_BASE, write, value)
+        } else if (SYSTICK_BASE..SYSTICK_BASE + 0x10).contains(&addr) {
+            let mut cycles = 0u64;
+            self.handle_systick_access(addr - SYSTICK_BASE, write, value, &mut cycles)
+        } else {
+            None
+        }
+    }
+
     /// Handle NVIC register accesses via bus
     /// 通过总线处理 NVIC 寄存器访问
-    #[allow(dead_code)]
     fn handle_nvic_access(&mut self, offset: u32, write: bool, value: u32) -> Option<u32> {
         match offset {
             // ISERn: set-enable, write-1-to-set
@@ -363,17 +397,45 @@ impl CortexM33Core {
         }
 
         if let Some(irq) = self.nvic.find_highest_priority() {
+            // 外部中断 n 对应异常号 16 + n，向量位于 VTOR + (16 + n) * 4。
+            // External interrupt n maps to exception number 16 + n, so its
+            // vector lives at VTOR + (16 + n) * 4.
+            let exception_number = FIRST_EXTERNAL_EXCEPTION + u32::from(irq);
             exceptions::enter_exception(
                 bus,
                 &mut self.registers,
                 &mut self.nvic,
-                irq as u32,
-                0, // Default VTOR = 0
+                exception_number,
+                self.vtor,
                 cycles,
             )?;
+            self.active_exceptions.push(exception_number as u16);
         }
 
         Ok(())
+    }
+
+    /// Perform an exception return for a `BX LR` carrying `EXC_RETURN`
+    /// 对携带 `EXC_RETURN` 的 `BX LR` 执行异常返回
+    fn return_from_exception(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        cycles: &mut u64,
+    ) -> Result<(), CoreError> {
+        let Some(info) = exceptions::decode_exc_return(self.registers.lr) else {
+            return Ok(());
+        };
+        let Some(active) = self.active_exceptions.pop() else {
+            return Ok(());
+        };
+        exceptions::exit_exception(
+            bus,
+            &mut self.registers,
+            &mut self.nvic,
+            &info,
+            u32::from(active),
+            cycles,
+        )
     }
 }
 
@@ -405,7 +467,19 @@ impl CpuCore for CortexM33Core {
 
             let mut step_cycles: u64 = 0;
             match self.step_instruction(bus, &mut step_cycles) {
-                Ok(_) => {
+                Ok(result) => {
+                    if result == StepResult::ExceptionReturn {
+                        if let Err(e) = self.return_from_exception(bus, &mut step_cycles) {
+                            self.state = CpuState::Halted;
+                            log::error!("CPU halted: {e:?}");
+                            break;
+                        }
+                    }
+                    if let Err(e) = self.check_pending_exceptions(bus, &mut step_cycles) {
+                        self.state = CpuState::Halted;
+                        log::error!("CPU halted: {e:?}");
+                        break;
+                    }
                     self.total_cycles += step_cycles;
                     consumed += 1;
                     remaining -= 1;
@@ -428,7 +502,10 @@ impl CpuCore for CortexM33Core {
 
         let mut cycle_count: u64 = 0;
         match self.step_instruction(bus, &mut cycle_count) {
-            Ok(_) => {
+            Ok(result) => {
+                if result == StepResult::ExceptionReturn {
+                    self.return_from_exception(bus, &mut cycle_count)?;
+                }
                 self.check_pending_exceptions(bus, &mut cycle_count)?;
                 self.total_cycles += cycle_count;
                 Ok(self.state)
@@ -442,6 +519,14 @@ impl CpuCore for CortexM33Core {
 
     fn signal_interrupt(&mut self, irq: IrqNumber) {
         self.nvic.set_pending(irq);
+    }
+
+    fn system_write(&mut self, addr: u32, value: u32) {
+        let _ = self.route_system_access(addr, true, value);
+    }
+
+    fn system_read(&mut self, addr: u32) -> Option<u32> {
+        self.route_system_access(addr, false, 0)
     }
 
     fn servicing_irq(&self) -> Option<IrqNumber> {

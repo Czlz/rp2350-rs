@@ -32,12 +32,18 @@ const BOOTROM_STUB_BASE: u32 = 0x0000_0000;
 /// Boot ROM stub size (4 KB) / Boot ROM 桩大小（4 KB）
 const BOOTROM_STUB_SIZE: usize = 0x1000;
 
-/// Number of flash bytes mirrored into the boot stub (SP + reset vector)
-/// 镜像到启动桩的 Flash 字节数（SP 与复位向量）
-const VECTOR_BYTES: usize = 8;
+/// Number of flash bytes mirrored into the boot stub (vectors SP..IRQ51)
+/// 镜像到启动桩的 Flash 字节数（SP 至 IRQ51 向量）
+const VECTOR_BYTES: usize = 0x140;
 
-/// Four-byte UF2 magic prefix / UF2 四字节魔术前缀
+/// Four-byte UF2 magic prefix / UF2 魔术前缀（四字节）
 const UF2_MAGIC: [u8; 4] = [0x55, 0x46, 0x32, 0x0A];
+
+/// Instructions between interrupt polls / 中断轮询间隔（指令数）
+const PUMP_INTERVAL: u64 = 64;
+
+/// Maximum number of logged IRQ deliveries / 记录的中断投递条数上限
+const IRQ_LOG_LIMIT: usize = 8;
 
 /// CPU architecture selection for `run` / `run` 的 CPU 架构选择
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +131,12 @@ pub fn run(options: &RunOptions) -> Result<()> {
         us = outcome.micros,
         pc = outcome.pc
     )?;
+    if !outcome.irqs.is_empty() {
+        writeln!(stdout, "[run] irq deliveries (first {IRQ_LOG_LIMIT}):")?;
+        for line in &outcome.irqs {
+            writeln!(stdout, "{line}")?;
+        }
+    }
     writeln!(stdout, "[run] uart0: {} bytes", outcome.uart.len())?;
     if !outcome.uart.is_empty() {
         writeln!(stdout, "[run] uart0 output:")?;
@@ -147,6 +159,8 @@ struct Outcome {
     micros: u64,
     /// Final program counter / 最终程序计数器
     pc: u32,
+    /// Logged interrupt deliveries / 已记录的中断投递
+    irqs: Vec<String>,
     /// Buffered UART output / 已缓冲的 UART 输出
     uart: Vec<u8>,
 }
@@ -225,6 +239,24 @@ fn prepare_arm_vectors(bus: &mut SimpleBus, elf_entry: Option<u32>) -> Result<(u
     Ok((sp, reset & !1))
 }
 
+/// Replay PPB system writes into the core and deliver asserted interrupt lines
+/// 将 PPB 系统写入回放到核，并投递已断言的中断线
+fn pump(core: &mut dyn CpuCore, peripherals: &BootPeripherals, irq_log: &mut Vec<String>) {
+    for (addr, value) in peripherals.take_system_writes() {
+        core.system_write(addr, value);
+    }
+    let mask = peripherals.irq_mask();
+    for irq in 0..64u16 {
+        if mask & (1u64 << irq) == 0 {
+            continue;
+        }
+        core.signal_interrupt(irq);
+        if irq_log.len() < IRQ_LOG_LIMIT {
+            irq_log.push(format!("[irq] signal {irq} at PC={:#010X}", core.pc()));
+        }
+    }
+}
+
 /// Step the core, printing a short trace and draining UART output
 /// 单步执行核心，打印简短轨迹并抽取 UART 输出
 fn execute(
@@ -237,6 +269,7 @@ fn execute(
     let mut steps = 0u64;
     let mut reason = String::from("instruction budget exhausted / 指令预算耗尽");
     let mut uart = Vec::new();
+    let mut irqs = Vec::new();
 
     for index in 0..options.trace_steps {
         let pc = core.pc();
@@ -247,16 +280,18 @@ fn execute(
             Ok(CpuState::Running) => steps += 1,
             Ok(state) => {
                 reason = format!("core entered state {state:?}");
-                return Ok(finish(peripherals, core, steps, reason, uart));
+                return Ok(finish(peripherals, core, steps, reason, irqs, uart));
             }
             Err(error) => {
                 reason = error.to_string();
-                return Ok(finish(peripherals, core, steps, reason, uart));
+                return Ok(finish(peripherals, core, steps, reason, irqs, uart));
             }
         }
+        pump(core, peripherals, &mut irqs);
     }
 
     let mut advanced = 0u64;
+    let mut pumped = 0u64;
     while steps < options.max_cycles {
         match core.step(bus) {
             Ok(CpuState::Running) => steps += 1,
@@ -269,6 +304,10 @@ fn execute(
                 break;
             }
         }
+        if steps - pumped >= PUMP_INTERVAL {
+            pump(core, peripherals, &mut irqs);
+            pumped = steps;
+        }
         if steps - advanced >= 10_000 {
             peripherals.advance(steps - advanced);
             advanced = steps;
@@ -277,7 +316,7 @@ fn execute(
     }
     peripherals.advance(steps - advanced);
     uart.extend(peripherals.take_uart_output());
-    Ok(finish(peripherals, core, steps, reason, uart))
+    Ok(finish(peripherals, core, steps, reason, irqs, uart))
 }
 
 /// Collect final state and UART output / 收集最终状态与 UART 输出
@@ -286,6 +325,7 @@ fn finish(
     core: &dyn CpuCore,
     steps: u64,
     reason: String,
+    irqs: Vec<String>,
     mut uart: Vec<u8>,
 ) -> Outcome {
     uart.extend(peripherals.take_uart_output());
@@ -294,6 +334,7 @@ fn finish(
         steps,
         micros: peripherals.time_us(),
         pc: core.pc(),
+        irqs,
         uart,
     }
 }

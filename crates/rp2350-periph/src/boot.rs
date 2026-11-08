@@ -2,9 +2,13 @@
 //!
 //! [`BootPeripherals::mount`] installs the APB router, SIO and PPB into a bus,
 //! returning the shared handles the simulation driver needs: the UART0 transmit
-//! sink and the [`Timebase`] used by TIMER0.
+//! sink, the [`Timebase`] used by TIMER0, the [`IrqAssert`] set carrying
+//! asserted interrupt lines and the PPB system-write log that must be replayed
+//! into the core with `CpuCore::system_write`.
 //! [`BootPeripherals::mount`] 将 APB 路由器、SIO 与 PPB 安装到总线，并返回
-//! 仿真驱动所需的共享句柄：UART0 发送缓冲与 TIMER0 使用的 [`Timebase`]。
+//! 仿真驱动所需的共享句柄：UART0 发送缓冲、TIMER0 使用的 [`Timebase`]、携带
+//! 中断线断言状态的 [`IrqAssert`]，以及需要用 `CpuCore::system_write` 回放
+//! 到核中的 PPB 系统写入日志。
 
 use std::sync::Arc;
 
@@ -14,10 +18,11 @@ use rp2350_core::mmio::{MmioRouter, MmioWindow, mount_device};
 
 use super::clocks::Clocks;
 use super::io_bank0::IoBank0;
+use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
 use super::pll::Pll;
-use super::ppb::Ppb;
+use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
 use super::resets::Resets;
 use super::sio::Sio;
 use super::timer::Timer0;
@@ -73,6 +78,10 @@ impl Timebase {
 pub struct BootPeripherals {
     uart0: Arc<Mutex<UartSink>>,
     timebase: Arc<Mutex<Timebase>>,
+    timer: Timer0,
+    sio: Sio,
+    irq: IrqAssert,
+    system_writes: SystemWriteLog,
 }
 
 impl BootPeripherals {
@@ -93,6 +102,10 @@ impl BootPeripherals {
     pub fn mount(bus: &mut dyn AddressBus) -> BusResult<Self> {
         let uart0 = Arc::new(Mutex::new(UartSink::default()));
         let timebase = Arc::new(Mutex::new(Timebase::new(DEFAULT_CYCLES_PER_US)));
+        let irq = IrqAssert::new();
+        let system_writes = new_system_write_log();
+        let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
+        let sio = Sio::new(irq.clone());
 
         let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
         apb.mount(Box::new(Clocks::new()))?;
@@ -103,19 +116,50 @@ impl BootPeripherals {
         apb.mount(Box::new(Pll::sys()))?;
         apb.mount(Box::new(Pll::usb()))?;
         apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
-        apb.mount(Box::new(Timer0::new(Arc::clone(&timebase))))?;
+        apb.mount(Box::new(timer.clone()))?;
         apb.mount(Box::new(Watchdog::new()))?;
         bus.register_region(Box::new(apb))?;
 
-        mount_device(bus, Box::new(Sio::new()))?;
-        mount_device(bus, Box::new(Ppb::new()))?;
+        mount_device(bus, Box::new(sio.clone()))?;
+        mount_device(bus, Box::new(Ppb::with_log(Arc::clone(&system_writes))))?;
 
-        Ok(Self { uart0, timebase })
+        Ok(Self {
+            uart0,
+            timebase,
+            timer,
+            sio,
+            irq,
+            system_writes,
+        })
     }
 
-    /// Advance the shared timebase / 推进共享时基
+    /// Advance the shared timebase and refresh TIMER0 interrupt lines
+    /// 推进共享时基并刷新 TIMER0 中断线
     pub fn advance(&self, cycles: u64) {
         self.timebase.lock().advance(cycles);
+        self.timer.refresh();
+    }
+
+    /// Currently asserted interrupt lines, refreshed for the new time
+    /// 当前断言的中断线，已按新时间刷新
+    #[must_use]
+    pub fn irq_mask(&self) -> u64 {
+        self.timer.refresh();
+        self.irq.mask()
+    }
+
+    /// Drain PPB system-space writes for replay into the core
+    /// 取走待回放到核的 PPB 系统空间写入
+    #[must_use]
+    pub fn take_system_writes(&self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.system_writes.lock())
+    }
+
+    /// Shared SIO handle, used by the core-1 doorbell hook
+    /// 共享的 SIO 句柄，供 core 1 门铃挂钩使用
+    #[must_use]
+    pub fn sio(&self) -> &Sio {
+        &self.sio
     }
 
     /// Elapsed microseconds since boot / 自启动以来的微秒数

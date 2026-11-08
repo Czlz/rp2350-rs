@@ -181,11 +181,13 @@ pub fn enter_exception(
     cycles: &mut u64,
 ) -> Result<(), CoreError> {
     // Save current SP
+    // 保存当前 SP
+    let thread_used_psp = regs.control & 0x2 != 0;
     let sp = if exception_number >= 16 {
         // External interrupt: always use MSP during handler
         // 外部中断：处理程序期间始终使用 MSP
         regs.msp
-    } else if regs.control & 0x2 != 0 {
+    } else if thread_used_psp {
         regs.psp
     } else {
         regs.msp
@@ -214,9 +216,9 @@ pub fn enter_exception(
     // Set up return value in LR (EXC_RETURN)
     // 在 LR 中设置返回值（EXC_RETURN）
     if exception_number >= 16 {
-        // Return to Thread mode, use MSP or PSP depending on original CONTROL
-        // 返回 Thread 模式，使用 MSP 或 PSP 取决于原始 CONTROL
-        if regs.control & 0x2 != 0 {
+        // Return to Thread mode, use MSP or PSP depending on the interrupted context
+        // 返回 Thread 模式，按被打断的上下文选择 MSP 或 PSP
+        if thread_used_psp {
             regs.lr = 0xFFFF_FFED; // Return to Thread, PSP
         } else {
             regs.lr = 0xFFFF_FFF9; // Return to Thread, MSP
@@ -234,8 +236,11 @@ pub fn enter_exception(
     // Mark interrupt as active
     // 标记中断为活跃
     if exception_number >= 16 {
-        nvic.set_active(exception_number as u16);
-        nvic.clear_pending(exception_number as u16);
+        // NVIC 寄存器的位号是 IRQ 号（异常号减去 16）。
+        // NVIC register bit indices are IRQ numbers (exception number minus 16).
+        let irq = exception_number as u16 - 16;
+        nvic.set_active(irq);
+        nvic.clear_pending(irq);
     }
 
     Ok(())
@@ -257,7 +262,7 @@ pub fn exit_exception(
     // Clear active status
     // 清除活跃状态
     if active_exception >= 16 {
-        nvic.clear_active(active_exception as u16);
+        nvic.clear_active(active_exception as u16 - 16);
     }
 
     // Determine which SP to use for unstacking

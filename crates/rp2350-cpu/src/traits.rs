@@ -71,6 +71,25 @@ pub trait CpuCore: Send + Sync {
     /// Get human-readable core description / 获取可读的核心描述
     fn description(&self) -> String;
 
+    /// Write to the architecture's system control space (NVIC, `SysTick`, SCB).
+    /// 写入架构的系统控制空间（NVIC、`SysTick`、SCB）。
+    ///
+    /// Drivers replay bus writes captured from the private peripheral bus here
+    /// so interrupt-enable and priority state reach the emulated core.
+    /// 驱动把从私有外设总线捕获的写操作回放到这里，使中断使能与优先级状态
+    /// 到达被模拟的核心。
+    fn system_write(&mut self, _addr: u32, _value: u32) {}
+
+    /// Read from the architecture's system control space.
+    /// 读取架构的系统控制空间。
+    ///
+    /// Defaults to `None` for cores without a system control space.
+    /// 对于没有系统控制空间的核心，默认返回 `None`。
+    #[must_use]
+    fn system_read(&mut self, _addr: u32) -> Option<u32> {
+        None
+    }
+
     /// Return the current execution state / 返回当前执行状态
     ///
     /// Defaults to [`CpuState::Reset`] for cores that do not track state.

@@ -19,6 +19,21 @@
 - `rp2350-core`: `ChipFamily`, `ChipCapabilities` and `ChipInfo`; `RP2350Chip` reports RP2350 capabilities and `RP2040Chip` is a constructible stub whose operations return `CoreError::UnsupportedChip`
 - `rp2350-riscv`: `Hazard3Core` implementing `CpuCore` for RV32IMAC — base/M/A/C instruction decode, machine-mode CSRs, trap entry/`mret`, Xh3irq-style external interrupts, and picobin boot (magic `0x7188EBF2`)
 - `doc/reference-gap-analysis.md`: upstream capability comparison, verified MicroPython UF2 facts and phased landing plan (Stages 0–6)
+- `rp2350-periph`: `IrqAssert` — shared 64-bit interrupt-line mask that peripherals assert and the driver polls
+- `rp2350-periph`: TIMER0 alarm model — four alarms compared against the shared microsecond `Timebase`, `INTR`/`INTE`/`INTF`/`INTS` semantics and IRQ lines 0..3
+- `rp2350-periph`: SIO FIFO and doorbell model — core-to-core FIFO queues, `FIFO_ST` flags, `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` assertions and `DOORBELL_OUT_SET/CLR` + `IN_SET/CLR`
+- `rp2350-periph`: PPB records NVIC, SysTick and VTOR writes into a shared log for replay into the core
+- `rp2350-cpu`: `CpuCore::system_write` / `CpuCore::system_read` hooks for system control space accesses
+- `rp2350-cli`: interrupt pump — replays PPB writes via `system_write`, delivers asserted lines via `signal_interrupt` and prints `[run] irq deliveries`
+- `doc/architecture.md`: verified IRQ number map (TIMER0 0..3, USBCTRL 14, IO_BANK0 21, SIO 25/26, UART0 33) and interrupt wiring description
+
+### Fixed / 修复
+- `rp2350-arm`: external interrupts used the IRQ number as the exception number and fetched the vector from `VTOR + irq * 4`; they now use exception number `16 + irq`
+- `rp2350-arm`: `SCB_VTOR` writes now reach the core (replayed from the PPB log) and the exception vector fetch uses the programmed offset
+- `rp2350-arm`: NVIC active/pending bits were indexed with the exception number (offset by 16); they now use the IRQ number
+- `rp2350-arm`: `find_highest_priority` skips active interrupts so an asserted level cannot preempt its own handler
+- `rp2350-periph`: SIO register offsets switched from the RP2040 layout to the RP2350 interleaved layout (`GPIO_HI_OUT` 0x014, `OUT_SET` 0x018, `GPIO_OE` 0x030, `OE_SET` 0x038)
+- `doc/architecture.md`: USB DPRAM corrected from 16 KB to 4 KB (`0x5010_0000..0x5010_0FFF`), USBCTRL IRQ documented as 14, SIO window corrected from 512 B to 4 KB (`0xD000_0000..0xD000_0FFF`)
 
 ### Planned / 计划中
 - ARM Cortex-M33 dual-core simulation

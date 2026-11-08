@@ -258,6 +258,11 @@ impl Nvic {
     /// Find the highest-priority pending enabled interrupt
     /// 查找最高优先级的挂起已使能中断
     ///
+    /// Active interrupts are skipped: an interrupt cannot preempt itself, so a
+    /// level still asserted by its peripheral must wait for exception return.
+    /// 活跃中断会被跳过：中断不能抢占自身，因此外设仍保持的电平必须等到
+    /// 异常返回后再处理。
+    ///
     /// Returns `None` if no interrupt is pending and enabled.
     /// 如果没有挂起且已使能的中断，返回 `None`。
     #[must_use]
@@ -266,14 +271,15 @@ impl Nvic {
         let mut best_prio: u8 = 0xFF;
 
         for irq in 0u16..256 {
-            if self.is_enabled(irq) && self.is_pending(irq) {
-                let prio = self.get_priority(irq);
-                // Lower number = higher priority
-                // 数字越小 = 优先级越高
-                if prio < best_prio {
-                    best_prio = prio;
-                    best_irq = Some(irq);
-                }
+            if !self.is_enabled(irq) || !self.is_pending(irq) || self.is_active(irq) {
+                continue;
+            }
+            let prio = self.get_priority(irq);
+            // Lower number = higher priority
+            // 数字越小 = 优先级越高
+            if prio < best_prio {
+                best_prio = prio;
+                best_irq = Some(irq);
             }
         }
 
@@ -339,5 +345,19 @@ mod tests {
         nvic.write_iser(0, 1 << 15);
         nvic.write_stir(15);
         assert!(nvic.is_pending(15));
+    }
+
+    #[test]
+    fn active_interrupt_is_not_selected_again() {
+        let mut nvic = Nvic::new();
+        nvic.write_iser(0, 1 << 3);
+        nvic.set_pending(3);
+        assert_eq!(nvic.find_highest_priority(), Some(3));
+
+        nvic.set_active(3);
+        assert_eq!(nvic.find_highest_priority(), None);
+
+        nvic.clear_active(3);
+        assert_eq!(nvic.find_highest_priority(), Some(3));
     }
 }

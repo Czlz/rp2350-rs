@@ -346,6 +346,11 @@ pub fn execute_thumb16(
                         // BLX Rm: LR = address of the next instruction (PC already advanced).
                         regs.lr = regs.pc | 1;
                     }
+                    if !h1 && crate::exceptions::decode_exc_return(target).is_some() {
+                        // BX LR 携带 EXC_RETURN：交由核执行异常返回序列。
+                        // BX LR carries EXC_RETURN: let the core perform the return sequence.
+                        return Ok(StepResult::ExceptionReturn);
+                    }
                     if target & 0x1 == 0 {
                         // Not Thumb target → ARM mode (not supported by M33)
                         // 非 Thumb 目标 → ARM 模式（M33 不支持）
