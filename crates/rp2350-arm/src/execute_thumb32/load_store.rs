@@ -224,11 +224,14 @@ pub(super) fn execute_single(
 /// Dispatch the `op1 == 0b01`, `op2 == 0b00` group by the ARM ARM bit fields
 /// 按 ARM ARM 位域分派 `op1 == 0b01`、`op2 == 0b00` 组
 ///
-/// Table branch requires second halfword `0xF0xx`; exclusive transfers have
-/// `U == 0`, `P == 0` and `W == 0` with bit 22 set; the remaining
-/// bit-22-set encodings are LDRD/STRD; `P != U` selects LDM/STM.
-/// 表分支要求第二半字为 `0xF0xx`；独占传输满足 `U == 0`、`P == 0`、`W == 0`
-/// 且位 22 置位；其余位 22 置位的编码为 LDRD/STRD；`P != U` 选择 LDM/STM。
+/// Table branch requires second halfword `0xF0xx`; exclusive word transfers
+/// have `U == 0`, `P == 0` and `W == 0` with bit 22 set; the byte, halfword,
+/// doubleword and acquire/release forms use `P == 0`, `U == 1`, `W == 0`; the
+/// remaining bit-22-set encodings are LDRD/STRD; `P != U` selects LDM/STM.
+/// 表分支要求第二半字为 `0xF0xx`；字的独占传输满足 `U == 0`、`P == 0`、
+/// `W == 0` 且位 22 置位；字节、半字、双字与获取/释放形式满足 `P == 0`、
+/// `U == 1`、`W == 0`；其余位 22 置位的编码为 LDRD/STRD；`P != U` 选择
+/// LDM/STM。
 pub(super) fn execute_group(
     instr: u32,
     regs: &mut CortexM33Registers,
@@ -262,6 +265,11 @@ pub(super) fn execute_group(
             } else {
                 multiple::execute_exclusive(instr, regs, bus, cycles)
             }
+        } else if !pre_index && add_offset && !write_back {
+            // ARMv8-M byte/halfword/doubleword exclusives plus acquire/release.
+            // 后索引 LDRD/STRD 必须置位 W，因此 P=0、U=1、W=0 专属
+            // ARMv8-M 的字节/半字/双字独占与获取/释放指令。
+            multiple::execute_acquire_release(instr, regs, bus, cycles)
         } else {
             execute_dual(instr, regs, bus, cycles)
         }

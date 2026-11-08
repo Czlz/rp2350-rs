@@ -2,15 +2,62 @@
 //! Thumb-32 多寄存器加载/存储、独占访问与表分支指令
 //!
 //! Covers LDM/STM (including the `.W` write-back forms used by push/pop),
-//! LDREX/STREX and TBB/TBH within the `op1 == 0b01` encoding group.
+//! the exclusive and load-acquire/store-release instructions, and TBB/TBH
+//! within the `op1 == 0b01` encoding group.
 //! 覆盖 `op1 == 0b01` 编码组内的 LDM/STM（含 push/pop 使用的 `.W` 写回形式）、
-//! LDREX/STREX 与 TBB/TBH。
+//! 独占访问与获取/释放指令，以及 TBB/TBH。
+//!
+//! The exclusive monitor is a per-thread single-core simplification that
+//! records the last exclusive-load address and size. Multi-core visibility and
+//! the ordering guarantees of acquire/release are not modelled; the instructions
+//! are executed as plain loads/stores with the architecturally visible result.
+//! 独占监视器是单核简化实现，按线程记录最近一次独占加载的地址与尺寸。未建模
+//! 多核可见性以及获取/释放的顺序保证；这些指令按普通加载/存储执行，只保留
+//! 架构上可见的数据结果。
+
+use core::cell::Cell;
 
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
 use crate::execute_thumb16::StepResult;
 use crate::registers::CortexM33Registers;
+
+/// Size of an exclusive or acquire/release transfer
+/// 独占或获取/释放传输的尺寸
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferSize {
+    /// Byte transfer / 字节传输
+    Byte,
+    /// Halfword transfer / 半字传输
+    Half,
+    /// Word transfer / 字传输
+    Word,
+    /// Doubleword transfer / 双字传输
+    Double,
+}
+
+thread_local! {
+    /// Address and size currently watched by the exclusive monitor
+    /// 当前被独占监视器监视的地址与尺寸
+    static EXCLUSIVE_MONITOR: Cell<Option<(u32, TransferSize)>> = const { Cell::new(None) };
+}
+
+/// Arm the monitor for an exclusive load
+/// 为独占加载启用监视器
+fn monitor_set(addr: u32, size: TransferSize) {
+    EXCLUSIVE_MONITOR.with(|monitor| monitor.set(Some((addr, size))));
+}
+
+/// Consume the monitor, reporting whether the address and size matched
+/// 消费监视器，返回地址与尺寸是否匹配
+fn monitor_consume(addr: u32, size: TransferSize) -> bool {
+    EXCLUSIVE_MONITOR.with(|monitor| {
+        let hit = monitor.get() == Some((addr, size));
+        monitor.set(None);
+        hit
+    })
+}
 
 /// Execute LDM/STM, `op1 == 0b01`, `op2 == 0b00`, bit 22 clear
 /// 执行 LDM/STM，`op1 == 0b01`，`op2 == 0b00`，位 22 清零
@@ -96,11 +143,12 @@ pub(super) fn execute_register_list(
 /// Execute LDREX/STREX, `op1 == 0b01`, `op2 == 0b00`, bit 22 set, bit 23 clear
 /// 执行 LDREX/STREX，`op1 == 0b01`，`op2 == 0b00`，位 22 置位、位 23 清零
 ///
-/// `imm8` is scaled by four. LDREX loads into `Rt` (bits 15:12); STREX stores
-/// `Rt` and writes the success status 0 into `Rd` (bits 11:8), with `Rd == 15`
-/// discarding the status.
-/// `imm8` 按四倍缩放。LDREX 加载到 `Rt`（位段 15:12）；STREX 存储 `Rt`
-/// 并把成功状态 0 写入 `Rd`（位段 11:8），`Rd == 15` 表示丢弃状态。
+/// `imm8` is scaled by four. LDREX loads into `Rt` (bits 15:12) and arms the
+/// monitor; STREX stores `Rt`, reports success in `Rd` (bits 11:8) and clears
+/// the monitor, with `Rd == 15` discarding the status.
+/// `imm8` 按四倍缩放。LDREX 加载到 `Rt`（位段 15:12）并启用监视器；STREX
+/// 存储 `Rt`，把成功状态写入 `Rd`（位段 11:8）并清除监视器，`Rd == 15`
+/// 表示丢弃状态。
 pub(super) fn execute_exclusive(
     instr: u32,
     regs: &mut CortexM33Registers,
@@ -116,17 +164,161 @@ pub(super) fn execute_exclusive(
     if load {
         let value = bus.read_u32(addr, cycles)?;
         regs.write(rt, value);
+        monitor_set(addr, TransferSize::Word);
     } else {
         let rd = ((instr >> 8) & 0xF) as u8;
-        let value = regs.read(rt);
-        bus.write_u32(addr, value, cycles)?;
+        let success = monitor_consume(addr, TransferSize::Word);
+        if success {
+            bus.write_u32(addr, regs.read(rt), cycles)?;
+        }
         if rd != 15 {
-            regs.write(rd, 0);
+            regs.write(rd, u32::from(!success));
         }
     }
 
     *cycles += 1;
     Ok(StepResult::Ok)
+}
+
+/// Execute load/store exclusive byte/halfword/doubleword and the
+/// load-acquire/store-release family, `op1 == 0b01`, bit 22 set, bit 23 set
+/// 执行字节/半字/双字独占访问与获取/释放指令族，`op1 == 0b01`，位 22 置位、
+/// 位 23 置位
+///
+/// The second halfword bits 7:4 select the operation and bits 3:0 hold either
+/// the status register of an exclusive store or the fixed `1111` marker. This
+/// covers `STREXB/H/D`, `LDREXB/H/D`, `STLEXB/H/D`, `LDAEXB/H/D`, and
+/// `STLB/H`, `LDA/B/H` and the word forms. Immediate offsets do not exist in
+/// this encoding, so the address is simply `Rn`.
+/// 第二半字位段 7:4 选择操作，位段 3:0 或为独占存储的状态寄存器，或为固定
+/// 标记 `1111`。覆盖 `STREXB/H/D`、`LDREXB/H/D`、`STLEXB/H/D`、
+/// `LDAEXB/H/D`，以及 `STLB/H`、`LDA/B/H` 与字形式。该编码没有立即数偏移，
+/// 地址就是 `Rn`。
+pub(super) fn execute_acquire_release(
+    instr: u32,
+    regs: &mut CortexM33Registers,
+    bus: &mut dyn AddressBus,
+    cycles: &mut u64,
+) -> Result<StepResult, CoreError> {
+    let load = (instr >> 20) & 1 != 0;
+    let rn = ((instr >> 16) & 0xF) as u8;
+    let rt = ((instr >> 12) & 0xF) as u8;
+    let low = (instr & 0xF) as u8;
+    let Some((size, exclusive)) = decode_acquire_release((instr >> 4) & 0xF) else {
+        return Ok(StepResult::Undefined);
+    };
+    if rn == 15 || rt == 15 {
+        return Ok(StepResult::Undefined);
+    }
+
+    let double = size == TransferSize::Double;
+    let rt2 = ((instr >> 8) & 0xF) as u8;
+    if double {
+        if rt2 == 15 {
+            return Ok(StepResult::Undefined);
+        }
+    } else if (instr >> 8) & 0xF != 0xF {
+        return Ok(StepResult::Undefined);
+    }
+    // Loads and non-exclusive stores use the fixed 1111 low nibble.
+    // 加载与非独占存储使用固定的低位半字节 1111。
+    if (load || !exclusive) && low != 15 {
+        return Ok(StepResult::Undefined);
+    }
+
+    let addr = regs.read(rn);
+
+    if load {
+        if double {
+            let first = bus.read_u32(addr, cycles)?;
+            let second = bus.read_u32(addr.wrapping_add(4), cycles)?;
+            regs.write(rt, first);
+            regs.write(rt2, second);
+        } else {
+            let value = read_sized(size, bus, addr, cycles)?;
+            regs.write(rt, value);
+        }
+        if exclusive {
+            monitor_set(addr, size);
+        }
+        *cycles += 1;
+        return Ok(StepResult::Ok);
+    }
+
+    let success = if exclusive {
+        monitor_consume(addr, size)
+    } else {
+        true
+    };
+    if success {
+        if double {
+            bus.write_u32(addr, regs.read(rt), cycles)?;
+            bus.write_u32(addr.wrapping_add(4), regs.read(rt2), cycles)?;
+        } else {
+            write_sized(size, bus, addr, regs.read(rt), cycles)?;
+        }
+    }
+    if exclusive && low != 15 {
+        regs.write(low, u32::from(!success));
+    }
+    *cycles += 1;
+    Ok(StepResult::Ok)
+}
+
+/// Map second-halfword bits 7:4 to a transfer size and exclusivity flag
+/// 将第二半字位段 7:4 映射为传输尺寸与是否独占
+fn decode_acquire_release(sub_op: u32) -> Option<(TransferSize, bool)> {
+    Some(match sub_op {
+        // `0x4/0xC`: STREXB/LDREXB and STLEXB/LDAEXB
+        // `0x5/0xD`: STREXH/LDREXH and STLEXH/LDAEXH
+        // `0x7/0xF`: STREXD/LDREXD and STLEXD/LDAEXD
+        // `0x4/0xC`：STREXB/LDREXB 与 STLEXB/LDAEXB
+        // `0x5/0xD`：STREXH/LDREXH 与 STLEXH/LDAEXH
+        // `0x7/0xF`：STREXD/LDREXD 与 STLEXD/LDAEXD
+        0x4 | 0xC => (TransferSize::Byte, true),
+        0x5 | 0xD => (TransferSize::Half, true),
+        0x7 | 0xF => (TransferSize::Double, true),
+        // `0x8-0xA`: STLB/LDAB, STLH/LDAH, STL/LDA (no monitor)
+        // `0x8-0xA`：STLB/LDAB、STLH/LDAH、STL/LDA（无监视器）
+        0x8 => (TransferSize::Byte, false),
+        0x9 => (TransferSize::Half, false),
+        0xA => (TransferSize::Word, false),
+        // `0xE`: STLEX/LDAEX (word)
+        // `0xE`：STLEX/LDAEX（字）
+        0xE => (TransferSize::Word, true),
+        _ => return None,
+    })
+}
+
+/// Read a byte or halfword and widen it to a word
+/// 读取字节或半字并零扩展到字
+fn read_sized(
+    size: TransferSize,
+    bus: &mut dyn AddressBus,
+    addr: u32,
+    cycles: &mut u64,
+) -> Result<u32, CoreError> {
+    Ok(match size {
+        TransferSize::Byte => u32::from(bus.read_u8(addr, cycles)?),
+        TransferSize::Half => u32::from(bus.read_u16(addr, cycles)?),
+        TransferSize::Word | TransferSize::Double => bus.read_u32(addr, cycles)?,
+    })
+}
+
+/// Write the low byte, halfword or word of a register
+/// 写入寄存器的低字节、半字或字
+fn write_sized(
+    size: TransferSize,
+    bus: &mut dyn AddressBus,
+    addr: u32,
+    value: u32,
+    cycles: &mut u64,
+) -> Result<(), CoreError> {
+    match size {
+        TransferSize::Byte => bus.write_u8(addr, value as u8, cycles),
+        TransferSize::Half => bus.write_u16(addr, value as u16, cycles),
+        TransferSize::Word | TransferSize::Double => bus.write_u32(addr, value, cycles),
+    }
 }
 
 /// Execute TT (Test Target), ARMv8-M, second halfword `0xF0xx`

@@ -339,10 +339,115 @@ fn ldrex_loads_and_scales_offset() {
 fn strex_stores_and_reports_success() {
     let mut r = CortexM33Registers::new();
     let mut bus = TestBus::new();
-    r.write(1, 0x2468_ACE0);
     r.write(2, 0x100);
+    // Arm the monitor with the paired LDREX before the STREX.
+    // 先用配对的 LDREX 启用监视器，再执行 STREX。
+    assert_eq!(run(0xE852_1F00, &mut r, &mut bus), StepResult::Ok);
+    r.write(1, 0x2468_ACE0);
     assert_eq!(run(0xE842_1000, &mut r, &mut bus), StepResult::Ok);
     assert_eq!(bus.peek_u32(0x100), 0x2468_ACE0);
+    assert_eq!(r.read(0), 0);
+}
+
+#[test]
+fn strex_without_matching_ldrex_reports_failure() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    bus.poke_u8(0x100, 0xA5);
+    r.write(0, 0x100);
+    // LDREX arms 0x104 as a word, so the byte STREX at 0x100 must fail.
+    // LDREX 监视的是 0x104 的字，因此 0x100 的字节 STREX 必须失败。
+    assert_eq!(run(0xE850_1F04, &mut r, &mut bus), StepResult::Ok);
+    r.write(1, 0x5A);
+    assert_eq!(run(0xE8C0_1F42, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u8(0x100), 0xA5);
+    assert_eq!(r.read(2), 1);
+}
+
+#[test]
+fn strexb_and_strexh_transfer_sized_values() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    bus.poke_u8(0x100, 0xA5);
+    r.write(2, 0x100);
+    assert_eq!(run(0xE8D2_0F4F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(0), 0xA5);
+    r.write(1, 0x5A);
+    assert_eq!(run(0xE8C2_1F43, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u8(0x100), 0x5A);
+    assert_eq!(r.read(3), 0);
+
+    bus.poke_u16(0x100, 0x1234);
+    r.write(2, 0x100);
+    assert_eq!(run(0xE8D2_0F5F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(0), 0x1234);
+    r.write(1, 0xBEEF);
+    assert_eq!(run(0xE8C2_1F53, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u8(0x100), 0xEF);
+    assert_eq!(bus.peek_u8(0x101), 0xBE);
+    assert_eq!(r.read(3), 0);
+}
+
+#[test]
+fn ldrexd_and_strexd_move_two_words() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    bus.poke_u32(0x100, 0x1111_2222);
+    bus.poke_u32(0x104, 0x3333_4444);
+    r.write(2, 0x100);
+    assert_eq!(run(0xE8D2_017F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(0), 0x1111_2222);
+    assert_eq!(r.read(1), 0x3333_4444);
+    assert_eq!(run(0xE8C2_0173, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u32(0x100), 0x1111_2222);
+    assert_eq!(bus.peek_u32(0x104), 0x3333_4444);
+    assert_eq!(r.read(3), 0);
+}
+
+#[test]
+fn stlb_stlh_and_ldab_ldah_access_bytes_and_halfwords() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    r.write(1, 0x100);
+    r.write(2, 0xAB);
+    assert_eq!(run(0xE8C1_2F8F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u8(0x100), 0xAB);
+    r.write(3, 0);
+    assert_eq!(run(0xE8D1_3F8F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(3), 0xAB);
+
+    r.write(2, 0x1234);
+    assert_eq!(run(0xE8C1_2F9F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u8(0x100), 0x34);
+    assert_eq!(bus.peek_u8(0x101), 0x12);
+    r.write(3, 0);
+    assert_eq!(run(0xE8D1_3F9F, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(3), 0x1234);
+}
+
+#[test]
+fn stl_and_lda_access_words() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    r.write(1, 0x100);
+    r.write(2, 0xDEAD_BEEF);
+    assert_eq!(run(0xE8C1_2FAF, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u32(0x100), 0xDEAD_BEEF);
+    r.write(3, 0);
+    assert_eq!(run(0xE8D1_3FAF, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(3), 0xDEAD_BEEF);
+}
+
+#[test]
+fn ldaex_and_stlex_use_the_exclusive_monitor() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    bus.poke_u32(0x100, 0x1234_5678);
+    r.write(1, 0x100);
+    assert_eq!(run(0xE8D1_2FEF, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(2), 0x1234_5678);
+    assert_eq!(run(0xE8C1_2FE0, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u32(0x100), 0x1234_5678);
     assert_eq!(r.read(0), 0);
 }
 
