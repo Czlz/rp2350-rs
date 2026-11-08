@@ -63,4 +63,18 @@ pub enum CoreError {
     /// Chip family or capability is not implemented / 芯片家族或能力尚未实现
     #[error("Unsupported chip capability: {0} / 不支持的芯片能力: {0}")]
     UnsupportedChip(String),
+
+    /// Undefined instruction encountered in strict decode mode
+    /// 严格解码模式下遇到未定义指令
+    #[error(
+        "Undefined instruction at PC {pc:#010X}: opcode {opcode:#010X} ({width} bytes) / 未定义指令 PC {pc:#010X}: opcode {opcode:#010X}（{width} 字节）"
+    )]
+    UndefinedInstruction {
+        /// Program counter of the instruction / 指令所在的程序计数器
+        pc: Address,
+        /// Raw opcode bits / 原始操作码位
+        opcode: u32,
+        /// Instruction width in bytes / 指令宽度（字节）
+        width: u8,
+    },
 }

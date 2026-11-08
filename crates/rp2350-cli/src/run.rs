@@ -67,6 +67,8 @@ pub struct RunOptions {
     pub max_cycles: u64,
     /// Number of steps printed as a boot trace / 作为启动轨迹打印的步数
     pub trace_steps: usize,
+    /// Halt on undefined instructions instead of skipping / 遇到未定义指令即停机
+    pub strict_decode: bool,
 }
 
 /// Build the bus, load firmware and execute until halt or budget exhaustion
@@ -118,6 +120,7 @@ pub fn run(options: &RunOptions) -> Result<()> {
     let (mut core, boot_vectors): (Box<dyn CpuCore>, Option<(u32, u32)>) = match arch {
         ArchArg::Arm => {
             let mut arm = CortexM33Core::new(CpuId::Core0);
+            arm.set_strict_decode(options.strict_decode);
             let vectors = if let Some(entry) = elf_entry {
                 // ELF 映像没有 Flash 向量表，使用标准 SRAM 栈顶与 ELF 入口。
                 // ELF images have no flash vector table; use the SRAM top and ELF entry.

@@ -120,3 +120,96 @@ fn boot_without_vector_table_fails() {
     assert!(core.boot(&mut bus).is_err());
     assert_eq!(core.state, CpuState::Reset);
 }
+
+/// Warning messages captured from the `log` facade for assertions.
+/// 供断言使用的 `log` 告警消息。
+fn captured_warnings() -> &'static std::sync::Mutex<Vec<String>> {
+    static WARNINGS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::OnceLock::new();
+    WARNINGS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Test logger that records warning-level messages.
+/// 记录告警级别消息的测试日志器。
+struct CaptureLogger;
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            captured_warnings()
+                .lock()
+                .unwrap()
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Install the capture logger once per test process.
+/// 每个测试进程只安装一次捕获日志器。
+fn install_capture_logger() {
+    static LOGGER: CaptureLogger = CaptureLogger;
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+}
+
+#[test]
+fn undefined_instruction_default_warns_once_and_continues() {
+    install_capture_logger();
+    captured_warnings().lock().unwrap().clear();
+
+    // Two copies of the undefined opcode 0xB800 at 0x80 and 0x82.
+    // 在 0x80 与 0x82 处放两条相同的未定义指令 0xB800。
+    let mut bus = boot_bus(0x2000_1000, 0x0000_0081);
+    let mut cycles = 0;
+    bus.write_u16(0x0000_0080, 0xB800, &mut cycles).unwrap();
+    bus.write_u16(0x0000_0082, 0xB800, &mut cycles).unwrap();
+
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    core.boot(&mut bus).unwrap();
+
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.registers.pc, 0x0000_0082);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.registers.pc, 0x0000_0084);
+
+    let warnings = captured_warnings().lock().unwrap().clone();
+    let undefined: Vec<&String> = warnings
+        .iter()
+        .filter(|message| message.contains("undefined instruction"))
+        .collect();
+    assert_eq!(undefined.len(), 1, "warnings: {warnings:?}");
+    assert!(undefined[0].contains("0x00000080"));
+    assert!(undefined[0].contains("0x0000B800"));
+    assert!(undefined[0].contains("2 bytes"));
+}
+
+#[test]
+fn undefined_instruction_strict_mode_halts_with_context() {
+    let mut bus = boot_bus(0x2000_1000, 0x0000_0081);
+    let mut cycles = 0;
+    bus.write_u16(0x0000_0080, 0xB800, &mut cycles).unwrap();
+
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    core.set_strict_decode(true);
+    core.boot(&mut bus).unwrap();
+
+    let error = core.step(&mut bus).unwrap_err();
+    match error {
+        CoreError::UndefinedInstruction { pc, opcode, width } => {
+            assert_eq!(pc, 0x0000_0080);
+            assert_eq!(opcode, 0x0000_B800);
+            assert_eq!(width, 2);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(core.state, CpuState::Halted);
+}

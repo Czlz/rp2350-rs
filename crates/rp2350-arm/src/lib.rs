@@ -33,6 +33,8 @@ pub mod systick;
 /// Cortex-M33 register set / Cortex-M33 寄存器组
 pub use registers::CortexM33Registers;
 
+use std::collections::BTreeSet;
+
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 use rp2350_core::types::{CpuId, CycleCount, IrqNumber};
@@ -93,6 +95,12 @@ pub struct CortexM33Core {
     /// Cumulative cycles executed since the last reset
     /// 自上次复位以来累计执行的周期数
     total_cycles: u64,
+    /// Halt instead of skipping when an undefined instruction is executed
+    /// 遇到未定义指令时停机而不是跳过
+    strict_decode: bool,
+    /// Distinct undefined opcodes already reported, keyed by (width, opcode)
+    /// 已报告过的未定义操作码，按（宽度, 操作码）去重
+    undefined_seen: BTreeSet<(u8, u32)>,
 }
 
 impl CortexM33Core {
@@ -113,6 +121,8 @@ impl CortexM33Core {
             boot_vectors: None,
             boot_vtor: 0,
             total_cycles: 0,
+            strict_decode: false,
+            undefined_seen: BTreeSet::new(),
         }
     }
 
@@ -171,6 +181,35 @@ impl CortexM33Core {
         self.apply_boot_vectors();
     }
 
+    /// Select whether undefined instructions halt or are skipped
+    /// 选择未定义指令是停机还是跳过
+    ///
+    /// In strict mode the next undefined instruction makes [`CpuCore::step`]
+    /// return [`CoreError::UndefinedInstruction`] and leaves the core halted.
+    /// The default is to warn once per distinct opcode and skip it.
+    /// 严格模式下，下一条未定义指令会让 [`CpuCore::step`] 返回
+    /// [`CoreError::UndefinedInstruction`] 并使核心停机。默认行为是对每个
+    /// 不同的操作码告警一次后跳过。
+    pub fn set_strict_decode(&mut self, strict: bool) {
+        self.strict_decode = strict;
+    }
+
+    /// Report an undefined instruction, deduplicated by opcode
+    /// 按操作码去重地报告未定义指令
+    fn note_undefined(&mut self, pc: u32, opcode: u32, width: u8) -> Result<(), CoreError> {
+        if self.strict_decode {
+            return Err(CoreError::UndefinedInstruction { pc, opcode, width });
+        }
+        if self.undefined_seen.insert((width, opcode)) {
+            log::warn!(
+                "undefined instruction at PC {pc:#010X}: opcode {opcode:#010X} \
+                 ({width} bytes), skipped / 未定义指令 PC {pc:#010X}: \
+                 opcode {opcode:#010X}（{width} 字节），已跳过"
+            );
+        }
+        Ok(())
+    }
+
     /// Write the program status register (XPSR)
     /// 写入程序状态寄存器（XPSR）
     ///
@@ -194,6 +233,7 @@ impl CortexM33Core {
         self.pending_irq = None;
         self.active_exceptions.clear();
         self.total_cycles = 0;
+        self.undefined_seen.clear();
     }
 
     /// Apply cached boot vectors, entering Running only if they exist
@@ -383,6 +423,10 @@ impl CortexM33Core {
         // Determine if Thumb-16 or Thumb-32
         // 判断是 Thumb-16 还是 Thumb-32
         let instr_type = (hw >> 11) & 0x1F;
+        // Raw opcode and width, retained so undefined instructions can be
+        // reported with enough context / 保留原始操作码与宽度，便于报告未定义指令
+        let mut raw_opcode = u32::from(hw);
+        let mut width = 2u8;
 
         let result = if instr_type >= 0b11101 {
             // Thumb-32: fetch second halfword
@@ -392,6 +436,8 @@ impl CortexM33Core {
             // ARM 体系参考手册约定：第一个半字位于高 16 位，第二个半字位于低 16 位。
             // ARM ARM convention: first halfword in bits[31:16], second in bits[15:0].
             let instr32 = (hw as u32) << 16 | hw2 as u32;
+            raw_opcode = instr32;
+            width = 4;
             self.registers.pc = old_pc.wrapping_add(4);
             execute_thumb32(
                 instr32,
@@ -414,6 +460,10 @@ impl CortexM33Core {
                 cycles,
             )?
         };
+
+        if matches!(result, StepResult::Undefined) {
+            self.note_undefined(old_pc, raw_opcode, width)?;
+        }
 
         Ok(result)
     }

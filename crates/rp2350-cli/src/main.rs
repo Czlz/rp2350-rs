@@ -46,6 +46,11 @@ enum Commands {
         /// Number of boot-trace steps to print / 打印的启动轨迹步数
         #[arg(long, default_value_t = 16)]
         trace_steps: usize,
+
+        /// Halt on undefined instructions instead of skipping them
+        /// 遇到未定义指令时停机而不是跳过
+        #[arg(long)]
+        strict_decode: bool,
     },
 
     /// Start GDB server / 启动 GDB 服务器
@@ -100,12 +105,14 @@ fn main() {
             arch,
             max_cycles,
             trace_steps,
+            strict_decode,
         } => {
             let options = run::RunOptions {
                 file: file.into(),
                 arch,
                 max_cycles,
                 trace_steps,
+                strict_decode,
             };
             if let Err(error) = run::run(&options) {
                 log::error!("run failed / 运行失败: {error:#}");
