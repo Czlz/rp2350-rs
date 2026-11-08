@@ -1,6 +1,15 @@
 //! MCP Server implementation (stub)
 //! MCP 服务器实现（桩）
 
+// MCP 桩代码尚未实现 .await 调用，异步签名和文档标记为未来扩展预留。
+// MCP stub has no .await calls yet; async sigs and doc markup reserved for future.
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::unused_async,
+    clippy::unused_async_trait_impl
+)]
+
 use serde_json::Value;
 
 /// MCP Server for AgentFuse integration

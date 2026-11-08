@@ -57,7 +57,7 @@ impl SafeLibrary {
     /// Look up a symbol by name
     /// 按名称查找符号
     ///
-    /// # Safety / 安全性
+    /// # Safety
     ///
     /// The caller must ensure that the symbol type matches the actual
     /// exported symbol. `libloading` performs no type checking.
@@ -67,7 +67,10 @@ impl SafeLibrary {
     ///
     /// Returns `Err` if the symbol is not found.
     /// 如果符号未找到则返回 `Err`。
-    pub unsafe fn find_symbol<T>(&self, name: &[u8]) -> Result<libloading::Symbol<'_, T>, libloading::Error> {
+    pub unsafe fn find_symbol<T>(
+        &self,
+        name: &[u8],
+    ) -> Result<libloading::Symbol<'_, T>, libloading::Error> {
         // SAFETY: delegated to libloading; caller must ensure T matches the symbol type
         unsafe { self.inner.get::<T>(name) }
     }

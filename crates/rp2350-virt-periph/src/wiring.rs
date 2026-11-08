@@ -1,6 +1,11 @@
 //! `WiringTable` — bidirectional (device, port) ↔ GPIO pin mapping
 //! `WiringTable` — 双向 (设备, 端口) ↔ GPIO 引脚映射
 
+// 接线表文档注释中使用内部标识符来描述数据结构字段映射关系。
+// Wiring table doc comments use internal identifiers to describe data
+// structure field mapping relationships.
+#![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
+
 use serde::{Deserialize, Serialize};
 
 /// A single wiring entry connecting a device port to a GPIO pin
@@ -44,9 +49,7 @@ impl WiringTable {
     pub fn wire(&mut self, device_id: &str, port_name: &str, port_index: usize, gpio_pin: u8) {
         // Remove any existing entry for the same (device, port)
         self.entries.retain(|e| {
-            !(e.device_id == device_id
-                && e.port_name == port_name
-                && e.port_index == port_index)
+            !(e.device_id == device_id && e.port_name == port_name && e.port_index == port_index)
         });
         self.entries.push(WiringEntry {
             device_id: device_id.to_string(),
@@ -59,9 +62,7 @@ impl WiringTable {
     /// Remove a specific wiring connection / 移除特定接线连接
     pub fn unwire(&mut self, device_id: &str, port_name: &str, port_index: usize) {
         self.entries.retain(|e| {
-            !(e.device_id == device_id
-                && e.port_name == port_name
-                && e.port_index == port_index)
+            !(e.device_id == device_id && e.port_name == port_name && e.port_index == port_index)
         });
     }
 
@@ -74,7 +75,10 @@ impl WiringTable {
     /// 查找给定 GPIO 引脚的所有接线条目
     #[must_use]
     pub fn find_by_gpio(&self, gpio_pin: u8) -> Vec<&WiringEntry> {
-        self.entries.iter().filter(|e| e.gpio_pin == gpio_pin).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.gpio_pin == gpio_pin)
+            .collect()
     }
 
     /// Find the GPIO pin for a given device port

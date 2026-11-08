@@ -8,6 +8,9 @@
 //! 支持查询设备状态、配置设备和控制仿真 — 全部无需 GUI。
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// AgentFuse 是外部 AI 平台名称，在文档注释中作为引用出现。
+// AgentFuse is an external AI platform name referenced in documentation.
+#![allow(clippy::doc_markdown)]
 #![warn(missing_docs)]
 
 pub mod server;

@@ -55,7 +55,7 @@ pub enum PinFunction {
 /// Represents a single GPIO pin on the RP2350
 /// 表示 RP2350 上的单个 GPIO 引脚
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::struct_excessive_bools)]
 pub struct GpioPin {
     /// Pin number (0-47) / 引脚号（0-47）
     number: PinNumber,
@@ -146,8 +146,8 @@ impl GpioPin {
         }
     }
 
-    /// Set input level (called by external source, e.g. DeviceManager)
-    /// 设置输入电平（由外部源调用，如 DeviceManager）
+    /// Set input level (called by external source, e.g. `DeviceManager`)
+    /// 设置输入电平（由外部源调用，如 `DeviceManager`）
     pub fn set_input(&mut self, level: bool) {
         self.input_level = level;
     }

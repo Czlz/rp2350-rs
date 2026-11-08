@@ -77,13 +77,14 @@ impl SimulationClock {
         self.total_cycles += cycles;
     }
 
-    /// Read the SysTick counter value (24-bit down-counter)
-    /// 读取 SysTick 计数器值（24 位递减计数器）
+    /// Read the `SysTick` counter value (24-bit down-counter)
+    /// 读取 `SysTick` 计数器值（24 位递减计数器）
     #[must_use]
-    pub fn systick_value(&self, reload: u32, _enable: bool) -> u32 {
-        if !_enable || reload == 0 {
+    pub fn systick_value(&self, reload: u32, enable: bool) -> u32 {
+        if !enable || reload == 0 {
             return 0;
         }
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed = (self.total_cycles % u64::from(reload + 1)) as u32;
         reload - elapsed
     }

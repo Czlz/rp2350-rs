@@ -18,7 +18,7 @@ pub mod manager;
 pub mod wiring;
 
 pub use config::ConfigSchema;
-pub use device::{DevicePort, DevicePlugin};
+pub use device::{DevicePlugin, DevicePort};
 pub use error::DeviceError;
 pub use loader::PluginLoader;
 pub use manager::DeviceManager;

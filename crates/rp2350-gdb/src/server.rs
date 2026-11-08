@@ -1,6 +1,15 @@
 //! GDB RSP Server implementation (stub)
 //! GDB RSP 服务器实现（桩）
 
+// GDB 服务器桩代码尚未实现 .await 调用，异步方法签名为未来扩展预留。
+// GDB server stub has no .await calls yet; async signatures reserved for future.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::unused_async,
+    clippy::unused_async_trait_impl,
+    clippy::module_name_repetitions
+)]
+
 use std::net::SocketAddr;
 
 /// GDB Remote Serial Protocol server

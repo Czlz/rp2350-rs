@@ -63,7 +63,8 @@ impl PluginLoader {
     ///
     /// Returns `Err` if the library cannot be loaded.
     pub fn load(&self, path: &Path) -> Result<SafeLibrary, crate::error::DeviceError> {
-        SafeLibrary::load(path).map_err(|e| crate::error::DeviceError::PluginLoadFailed(e.to_string()))
+        SafeLibrary::load(path)
+            .map_err(|e| crate::error::DeviceError::PluginLoadFailed(e.to_string()))
     }
 
     /// Scan and load all plugins from search paths
@@ -75,13 +76,11 @@ impl PluginLoader {
     pub fn scan_and_load(&self) -> Vec<(PathBuf, SafeLibrary)> {
         self.scan()
             .into_iter()
-            .filter_map(|path| {
-                match SafeLibrary::load(&path) {
-                    Ok(lib) => Some((path, lib)),
-                    Err(e) => {
-                        log::warn!("Failed to load plugin {}: {}", path.display(), e);
-                        None
-                    }
+            .filter_map(|path| match SafeLibrary::load(&path) {
+                Ok(lib) => Some((path, lib)),
+                Err(e) => {
+                    log::warn!("Failed to load plugin {}: {}", path.display(), e);
+                    None
                 }
             })
             .collect()

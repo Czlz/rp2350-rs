@@ -6,7 +6,7 @@
 //! RP2350 支持最多 256 个中断，可路由到两个 Cortex-M33 核心。
 //! 每个中断可被使能、挂起，并可选择性路由到指定核心。
 
-use super::types::{IrqNumber, IRQ_COUNT};
+use super::types::{IRQ_COUNT, IrqNumber};
 
 /// Interrupt routing matrix
 /// 中断路由矩阵
@@ -90,6 +90,7 @@ impl IrqMatrix {
     /// 为指定核心查找最高优先级活跃中断
     #[must_use]
     pub fn find_highest_active(&self) -> Option<IrqNumber> {
+        #[allow(clippy::cast_possible_truncation)]
         (0..IRQ_COUNT as u16)
             .filter(|&irq| self.is_active(irq))
             .min_by_key(|&irq| self.priority[irq as usize])

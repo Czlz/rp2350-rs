@@ -4,7 +4,7 @@
 use super::clock::SimulationClock;
 use super::gpio::GpioPin;
 use super::irq::IrqMatrix;
-use super::types::{PinNumber, GPIO_PIN_COUNT};
+use super::types::{GPIO_PIN_COUNT, PinNumber};
 
 /// The top-level RP2350 chip structure
 /// RP2350 芯片顶层结构
@@ -30,7 +30,10 @@ impl RP2350Chip {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gpio_pins: std::array::from_fn(|i| GpioPin::new(i as PinNumber)),
+            gpio_pins: std::array::from_fn(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                GpioPin::new(i as PinNumber)
+            }),
             irq_matrix: IrqMatrix::new(),
             clock: SimulationClock::new(),
         }
@@ -69,7 +72,10 @@ mod tests {
         let chip = RP2350Chip::new();
         assert_eq!(chip.gpio_pins.len(), GPIO_PIN_COUNT);
         for (i, pin) in chip.gpio_pins.iter().enumerate() {
-            assert_eq!(pin.number(), i as PinNumber);
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                assert_eq!(pin.number(), i as PinNumber);
+            }
         }
     }
 

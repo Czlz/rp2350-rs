@@ -63,7 +63,7 @@ enum Commands {
     /// List all registered devices / 列出所有已注册设备
     ListDevices,
 
-    /// Start MCP server (AgentFuse integration) / 启动 MCP 服务器（AgentFuse 集成）
+    /// Start MCP server (`AgentFuse` integration) / 启动 MCP 服务器（`AgentFuse` 集成）
     McpServe {
         /// MCP listen port / MCP 监听端口
         #[arg(short, long, default_value = "8080")]
@@ -82,30 +82,21 @@ fn main() {
 
     match cli.command {
         Commands::Run { file } => {
-            log::info!("Running firmware: {} (stub)", file);
+            log::info!("Running firmware: {file} (stub)");
             log::info!("Run mode not yet implemented (Phase 3+)");
         }
         Commands::Gdb { file, port } => {
-            log::info!("Starting GDB server on port {} for firmware: {} (stub)", port, file);
+            log::info!("Starting GDB server on port {port} for firmware: {file} (stub)");
             log::info!("GDB server not yet implemented (Phase 7)");
         }
-        Commands::Wire {
-            device,
-            port,
-            gpio,
-        } => {
-            log::info!(
-                "Wiring device '{}' port {} to GPIO {} (stub)",
-                device,
-                port,
-                gpio
-            );
+        Commands::Wire { device, port, gpio } => {
+            log::info!("Wiring device '{device}' port {port} to GPIO {gpio} (stub)");
         }
         Commands::ListDevices => {
             log::info!("No devices registered yet (stub)");
         }
         Commands::McpServe { port } => {
-            log::info!("Starting MCP server on port {} (stub)", port);
+            log::info!("Starting MCP server on port {port} (stub)");
             log::info!("MCP server not yet implemented (Phase 3)");
         }
     }

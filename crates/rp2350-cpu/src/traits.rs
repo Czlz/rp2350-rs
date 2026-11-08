@@ -24,6 +24,10 @@ pub trait CpuCore: Send + Sync {
 
     /// Initialize the core (bootrom, reset vector, SP/PC)
     /// 初始化核心（bootrom、复位向量、SP/PC）
+    ///
+    /// # Errors
+    /// Returns `CoreError` if the bus read/write fails during initialization.
+    /// 如果初始化期间总线读写失败，返回 `CoreError`。
     fn init(&mut self, bus: &mut dyn AddressBus) -> Result<(), rp2350_core::error::CoreError>;
 
     /// Execute `cycles` worth of instructions
@@ -31,11 +35,20 @@ pub trait CpuCore: Send + Sync {
     ///
     /// Returns the actual number of cycles executed and the new CPU state.
     /// 返回实际执行的周期数和新 CPU 状态。
-    fn run_cycles(&mut self, bus: &mut dyn AddressBus, cycles: CycleCount) -> (CycleCount, CpuState);
+    fn run_cycles(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        cycles: CycleCount,
+    ) -> (CycleCount, CpuState);
 
     /// Execute a single instruction (debug step)
     /// 执行单条指令（调试单步）
-    fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, rp2350_core::error::CoreError>;
+    ///
+    /// # Errors
+    /// Returns `CoreError` if instruction execution fails (e.g., `BusError`).
+    /// 如果指令执行失败（如总线错误），返回 `CoreError`。
+    fn step(&mut self, bus: &mut dyn AddressBus)
+    -> Result<CpuState, rp2350_core::error::CoreError>;
 
     /// Signal an interrupt to this core / 向此核心发送中断信号
     fn signal_interrupt(&mut self, irq: IrqNumber);

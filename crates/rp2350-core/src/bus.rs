@@ -35,7 +35,10 @@ pub trait MemoryRegion: Send + Sync {
 
     /// End address (exclusive) / 结束地址（不含）
     fn end(&self) -> Address {
-        self.base() + self.size() as u32
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.base() + self.size() as u32
+        }
     }
 
     /// Check if `addr` falls within this region / 检查地址是否在此区域内
@@ -44,32 +47,56 @@ pub trait MemoryRegion: Send + Sync {
     }
 
     /// Read a single byte / 读取一个字节
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
     fn read_u8(&mut self, addr: Address, _cycles: &mut u64) -> BusResult<u8>;
 
     /// Write a single byte / 写入一个字节
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
     fn write_u8(&mut self, addr: Address, value: u8, _cycles: &mut u64) -> BusResult<()>;
 
     /// Read a 16-bit halfword / 读取 16 位半字
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
     fn read_u16(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u16> {
-        let lo = self.read_u8(addr, cycles)? as u16;
-        let hi = self.read_u8(addr + 1, cycles)? as u16;
+        let lo = u16::from(self.read_u8(addr, cycles)?);
+        let hi = u16::from(self.read_u8(addr + 1, cycles)?);
         Ok(lo | (hi << 8))
     }
 
     /// Write a 16-bit halfword / 写入 16 位半字
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
     fn write_u16(&mut self, addr: Address, value: u16, cycles: &mut u64) -> BusResult<()> {
         self.write_u8(addr, (value & 0xFF) as u8, cycles)?;
         self.write_u8(addr + 1, ((value >> 8) & 0xFF) as u8, cycles)
     }
 
     /// Read a 32-bit word / 读取 32 位字
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
     fn read_u32(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u32> {
-        let lo = self.read_u16(addr, cycles)? as u32;
-        let hi = self.read_u16(addr + 2, cycles)? as u32;
+        let lo = u32::from(self.read_u16(addr, cycles)?);
+        let hi = u32::from(self.read_u16(addr + 2, cycles)?);
         Ok(lo | (hi << 16))
     }
 
     /// Write a 32-bit word / 写入 32 位字
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
     fn write_u32(&mut self, addr: Address, value: u32, cycles: &mut u64) -> BusResult<()> {
         self.write_u16(addr, (value & 0xFFFF) as u16, cycles)?;
         self.write_u16(addr + 2, ((value >> 16) & 0xFFFF) as u16, cycles)
@@ -80,6 +107,10 @@ pub trait MemoryRegion: Send + Sync {
 /// 中央地址总线，将内存访问路由到正确区域
 pub trait AddressBus: Send + Sync {
     /// Register a memory region / 注册一个内存区域
+    ///
+    /// # Errors
+    /// Returns `BusError` if the region overlaps with an existing one.
+    /// 如果区域与已有区域重叠，返回 `BusError`。
     fn register_region(&mut self, region: Box<dyn MemoryRegion>) -> BusResult<()>;
 
     /// Remove a region by name / 按名称移除区域
@@ -89,9 +120,13 @@ pub trait AddressBus: Send + Sync {
     fn find_region_mut(&mut self, addr: Address) -> Option<&mut dyn MemoryRegion>;
 
     /// Read from the bus (auto-routes to correct region) / 从总线读取（自动路由到正确区域）
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
         self.find_region_mut(addr)
-            .ok_or_else(|| CoreError::BusError {
+            .ok_or(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             })?
@@ -99,9 +134,13 @@ pub trait AddressBus: Send + Sync {
     }
 
     /// Read a 16-bit halfword / 读取 16 位半字
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
     fn read_u16(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u16> {
         self.find_region_mut(addr)
-            .ok_or_else(|| CoreError::BusError {
+            .ok_or(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             })?
@@ -109,9 +148,13 @@ pub trait AddressBus: Send + Sync {
     }
 
     /// Read a 32-bit word / 读取 32 位字
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
     fn read_u32(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u32> {
         self.find_region_mut(addr)
-            .ok_or_else(|| CoreError::BusError {
+            .ok_or(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             })?
@@ -119,9 +162,13 @@ pub trait AddressBus: Send + Sync {
     }
 
     /// Write to the bus (auto-routes to correct region) / 写入总线（自动路由到正确区域）
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
     fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
         self.find_region_mut(addr)
-            .ok_or_else(|| CoreError::BusError {
+            .ok_or(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             })?
@@ -129,9 +176,13 @@ pub trait AddressBus: Send + Sync {
     }
 
     /// Write a 16-bit halfword / 写入 16 位半字
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
     fn write_u16(&mut self, addr: Address, value: u16, cycles: &mut u64) -> BusResult<()> {
         self.find_region_mut(addr)
-            .ok_or_else(|| CoreError::BusError {
+            .ok_or(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             })?
@@ -139,9 +190,13 @@ pub trait AddressBus: Send + Sync {
     }
 
     /// Write a 32-bit word / 写入 32 位字
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
     fn write_u32(&mut self, addr: Address, value: u32, cycles: &mut u64) -> BusResult<()> {
         self.find_region_mut(addr)
-            .ok_or_else(|| CoreError::BusError {
+            .ok_or(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             })?

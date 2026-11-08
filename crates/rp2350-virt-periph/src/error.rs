@@ -9,7 +9,9 @@ pub enum ConfigError {
     MissingField(String),
 
     /// A field has an invalid type / 字段类型无效
-    #[error("Invalid type for field {field}: expected {expected}, got {actual} / 字段 {field} 类型无效: 期望 {expected}，实际 {actual}")]
+    #[error(
+        "Invalid type for field {field}: expected {expected}, got {actual} / 字段 {field} 类型无效: 期望 {expected}，实际 {actual}"
+    )]
     InvalidType {
         /// Field name / 字段名
         field: String,

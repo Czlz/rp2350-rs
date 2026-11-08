@@ -1,4 +1,4 @@
-//! rp2350-core — RP2350 SoC topology, address bus, GPIO, IRQ matrix, clock simulation
+//! rp2350-core — RP2350 `SoC` topology, address bus, GPIO, IRQ matrix, clock simulation
 //!
 //! This crate provides the foundational types and simulation infrastructure for the
 //! RP2350 microcontroller. It defines the address space layout, GPIO pin model,

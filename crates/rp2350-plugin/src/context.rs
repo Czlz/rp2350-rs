@@ -57,7 +57,8 @@ pub trait PluginContext: Send {
 pub trait PluginContextExt: PluginContext {
     /// Access a typed service from the host / 从主机访问类型化服务
     fn get_service<T: Any>(&self) -> Option<&T> {
-        self.get_service_erased().and_then(|s| s.downcast_ref::<T>())
+        self.get_service_erased()
+            .and_then(|s| s.downcast_ref::<T>())
     }
 }
 

@@ -4,6 +4,9 @@
 /// ARMv8-M program status register (XPSR) flags
 /// ARMv8-M 程序状态寄存器标志
 pub mod psr {
+    // bitflags! generates structs without doc comments -- suppress missing_docs lint
+    // bitflags! 生成的 struct 不含文档注释 -- 抑制 missing_docs lint
+    #![allow(missing_docs)]
     use bitflags::bitflags;
 
     bitflags! {

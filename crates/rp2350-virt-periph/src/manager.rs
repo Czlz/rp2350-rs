@@ -6,6 +6,15 @@
 //! 拥有插件生命周期、接线表、GPIO 路由、tick 调度和 MCP 查询 API。
 //! 所有设备作为独立插件加载。
 
+// DeviceManager 等类型名称来自项目约定，文档标记反映了这些内部类型名称。
+// DeviceManager and similar type names come from project conventions;
+// doc markup reflects these internal type names.
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::module_name_repetitions
+)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -55,7 +64,11 @@ impl DeviceManager {
 
     /// Register an already-constructed device plugin
     /// 注册已构建的设备插件
-    pub fn register(&mut self, id: DeviceId, device: Box<dyn DevicePlugin>) -> Result<(), DeviceError> {
+    pub fn register(
+        &mut self,
+        id: DeviceId,
+        device: Box<dyn DevicePlugin>,
+    ) -> Result<(), DeviceError> {
         if self.devices.contains_key(&id) {
             return Err(DeviceError::AlreadyExists(id));
         }
@@ -81,7 +94,12 @@ impl DeviceManager {
     }
 
     /// Wire a device port to a GPIO pin / 将设备端口连接到 GPIO 引脚
-    pub fn wire(&mut self, device_id: &str, port_index: usize, gpio_pin: u8) -> Result<(), DeviceError> {
+    pub fn wire(
+        &mut self,
+        device_id: &str,
+        port_index: usize,
+        gpio_pin: u8,
+    ) -> Result<(), DeviceError> {
         let device = self
             .devices
             .get(device_id)
@@ -115,7 +133,8 @@ impl DeviceManager {
                 if entry.port_index < ports.len()
                     && matches!(
                         ports[entry.port_index].direction,
-                        super::device::PortDirection::Input | super::device::PortDirection::Bidirectional
+                        super::device::PortDirection::Input
+                            | super::device::PortDirection::Bidirectional
                     )
                 {
                     if let Some(pin) = gpio_pins.get_mut(entry.gpio_pin as usize) {
@@ -135,7 +154,8 @@ impl DeviceManager {
             for (i, port) in ports.iter().enumerate() {
                 if matches!(
                     port.direction,
-                    super::device::PortDirection::Output | super::device::PortDirection::Bidirectional
+                    super::device::PortDirection::Output
+                        | super::device::PortDirection::Bidirectional
                 ) {
                     if let Some(gpio_pin) = self.wiring.find_by_device_port(device_id, i) {
                         if let Some(pin) = gpio_pins.get_mut(gpio_pin as usize) {
@@ -204,7 +224,7 @@ impl Default for DeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::device::{DevicePort, PortDirection};
+    use crate::device::DevicePort;
     use rp2350_plugin::PluginContext;
     use rp2350_plugin::RpPlugin;
     use rp2350_plugin::error::PluginError;

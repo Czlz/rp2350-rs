@@ -1,6 +1,10 @@
 //! Configuration schema for plugin parameters (JSON Schema-based)
 //! 插件参数的配置模式（基于 JSON Schema）
 
+// ConfigSchema 是项目定义的类型名，文档引用使用内部命名约定。
+// ConfigSchema is a project-defined type name; doc references use internal naming.
+#![allow(clippy::doc_markdown)]
+
 use serde::{Deserialize, Serialize};
 
 use super::error::ConfigError;
