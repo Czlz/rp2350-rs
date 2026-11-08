@@ -9,6 +9,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod cortex_m33;
 pub mod server;
+pub mod target;
 
+pub use cortex_m33::{CortexM33Target, DEFAULT_INSTRUCTION_BUDGET};
 pub use server::GdbServer;
+pub use target::{GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus};

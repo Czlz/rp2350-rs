@@ -16,3 +16,4 @@ log = { workspace = true }
 # Internal
 rp2350-core = { workspace = true }
 rp2350-cpu = { workspace = true }
+rp2350-arm = { workspace = true }
