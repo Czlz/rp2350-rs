@@ -13,6 +13,8 @@ pub enum BusErrorKind {
     Unaligned,
     /// Access denied (e.g. write to read-only region) / 访问被拒绝（如写入只读区域）
     AccessDenied,
+    /// Region overlaps an already mapped region / 区域与已映射区域重叠
+    Overlap,
     /// Device returned an error / 设备返回错误
     DeviceError,
 }
@@ -23,6 +25,7 @@ impl std::fmt::Display for BusErrorKind {
             Self::NoDevice => write!(f, "NoDevice"),
             Self::Unaligned => write!(f, "Unaligned"),
             Self::AccessDenied => write!(f, "AccessDenied"),
+            Self::Overlap => write!(f, "Overlap"),
             Self::DeviceError => write!(f, "DeviceError"),
         }
     }
@@ -52,4 +55,12 @@ pub enum CoreError {
     /// Clock configuration error / 时钟配置错误
     #[error("Clock configuration error: {0} / 时钟配置错误: {0}")]
     ClockError(String),
+
+    /// Firmware image error / 固件映像错误
+    #[error("Firmware error: {0} / 固件错误: {0}")]
+    FirmwareError(String),
+
+    /// Chip family or capability is not implemented / 芯片家族或能力尚未实现
+    #[error("Unsupported chip capability: {0} / 不支持的芯片能力: {0}")]
+    UnsupportedChip(String),
 }

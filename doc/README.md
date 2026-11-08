@@ -92,6 +92,7 @@ cargo doc --no-deps --document-private-items
 |----------|-------------|
 | [architecture.md](architecture.md) | Architecture design, trait system, data flow |
 | [implementation-plan.md](implementation-plan.md) | Phased implementation plan with milestones |
+| [reference-gap-analysis.md](reference-gap-analysis.md) | Upstream gap analysis, UF2/RISC-V/RP2040/USB plan |
 | [dependencies.md](dependencies.md) | Third-party crate inventory, version, usage |
 | [changelog.md](changelog.md) | Version changelog (Keep a Changelog) |
 | [plugins.md](plugins.md) | Plugin directory structure, development guide, reference impls |

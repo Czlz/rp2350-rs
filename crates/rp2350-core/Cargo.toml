@@ -13,4 +13,5 @@ serde = { workspace = true }
 parking_lot = { workspace = true }
 bitflags = { workspace = true }
 bytemuck = { workspace = true }
+elf = { workspace = true }
 log = { workspace = true }
