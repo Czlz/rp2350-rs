@@ -7,17 +7,20 @@
 //! opcode field `op` is bits 26:20.
 //!
 //! Covered groups: data-processing (modified immediate, shifted register,
-//! register), register-offset and 12-bit immediate loads/stores, LDRD/STRD,
-//! multiply/divide (including long multiply), plain-binary immediate,
-//! bitfield, branches (B.W, B&lt;cond&gt;.W, BL, BLX), and miscellaneous system
-//! instructions. DSP/SIMD/FPU encodings remain undefined for now.
+//! register), single data transfers (register offset, 12-bit immediate,
+//! 8-bit pre/post-index and PC-relative literal), LDM/STM, LDRD/STRD,
+//! LDREX/STREX, TBB/TBH, multiply/divide (including long multiply),
+//! plain-binary immediate, bitfield, branches (B.W, B&lt;cond&gt;.W, BL, BLX),
+//! and miscellaneous system instructions. DSP/SIMD/FPU encodings remain
+//! undefined for now.
 //!
 //! 按 ARMv7-M / ARMv8-M 顶层编码层次解码并执行 32 位 Thumb 指令：
 //! 第一个半字位于指令位段 31:16，因此 `op1` 为位段 28:27，主操作码
 //! `op` 为位段 26:20。
 //!
-//! 已覆盖：数据处理（改良立即数、移位寄存器、寄存器）、寄存器偏移与
-//! 12 位立即数加载/存储、LDRD/STRD、乘除法（含长乘法）、纯二进制立即数、
+//! 已覆盖：数据处理（改良立即数、移位寄存器、寄存器）、单字数据传输
+//! （寄存器偏移、12 位立即数、8 位前/后索引与 PC 相对字面量）、LDM/STM、
+//! LDRD/STRD、LDREX/STREX、TBB/TBH、乘除法（含长乘法）、纯二进制立即数、
 //! 位域、分支（B.W、B&lt;cond&gt;.W、BL、BLX）和杂项系统指令。
 //! DSP/SIMD/FPU 编码暂时视为未定义。
 
@@ -43,6 +46,7 @@
 mod branch_misc;
 mod data_processing;
 mod load_store;
+mod multiple;
 mod multiply;
 
 #[cfg(test)]
@@ -91,18 +95,14 @@ pub fn execute_thumb32(
     let second_halfword = instr & 0xFFFF;
 
     let result = match op1 {
-        // 0b01: load/store dual, data-processing (shifted register)
-        // 0b01：加载/存储双字、数据处理（移位寄存器）
+        // 0b01: load/store multiple, dual, exclusive, table branch when
+        // op2 == 0b00; data-processing (shifted register) when op2 == 0b01.
+        // 0b01：op2 == 0b00 时为多寄存器加载/存储、双字、独占访问、表分支；
+        // op2 == 0b01 时为数据处理（移位寄存器）。
         0b01 => {
-            // op2 (bits[26:25]) selects the sub-group: 00 = load/store
-            // dual/exclusive/table, 01 = data-processing (shifted register).
-            // Dual transfers always have bit 22 set and P/U not both clear.
-            // op2（bits[26:25]）选择子组：00 = 加载/存储双字/独占/表分支，
-            // 01 = 数据处理（移位寄存器）。双字传输始终置位 bit 22 且
-            // P/U 不同时清零。
             let op2 = (instr >> 25) & 0x3;
-            if op2 == 0 && (instr >> 22) & 1 == 1 && ((instr >> 23) & 0x3) != 0 {
-                load_store::execute_dual(instr, regs, bus, cycles)?
+            if op2 == 0 {
+                load_store::execute_group(instr, regs, bus, cycles)?
             } else if op2 == 0b01 {
                 data_processing::execute_shifted_register(instr, regs)
             } else {
