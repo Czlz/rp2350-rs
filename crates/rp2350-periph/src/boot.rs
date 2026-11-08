@@ -20,6 +20,7 @@ use super::bootram::BootRam;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
 use super::io_bank0::IoBank0;
+use super::io_qspi::IoQspi;
 use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
@@ -31,6 +32,7 @@ use super::ticks::Ticks;
 use super::timer::Timer0;
 use super::uart::{Uart0, UartSink};
 use super::watchdog::Watchdog;
+use super::xip_qmi::XipQmi;
 use super::xosc::Xosc;
 
 /// Default RP2350 system clock in cycles per microsecond (150 MHz)
@@ -115,6 +117,7 @@ impl BootPeripherals {
         apb.mount(Box::new(Clocks::new()))?;
         apb.mount(Box::new(Resets::new()))?;
         apb.mount(Box::new(IoBank0::new()))?;
+        apb.mount(Box::new(IoQspi::new()))?;
         apb.mount(Box::new(PadsBank0::new()))?;
         apb.mount(Box::new(Xosc::new()))?;
         apb.mount(Box::new(Pll::sys()))?;
@@ -122,6 +125,7 @@ impl BootPeripherals {
         apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
         apb.mount(Box::new(timer.clone()))?;
         apb.mount(Box::new(Watchdog::new()))?;
+        apb.mount(Box::new(XipQmi::new()))?;
         apb.mount(Box::new(BootRam::new()))?;
         bus.register_region(Box::new(apb))?;
 

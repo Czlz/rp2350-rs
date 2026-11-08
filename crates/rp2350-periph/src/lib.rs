@@ -23,6 +23,7 @@ pub mod bootram;
 pub mod clocks;
 pub mod cycle;
 pub mod io_bank0;
+pub mod io_qspi;
 pub mod irq;
 pub mod map;
 pub mod pads_bank0;
@@ -35,6 +36,7 @@ pub mod timer;
 pub mod traits;
 pub mod uart;
 pub mod watchdog;
+pub mod xip_qmi;
 pub mod xosc;
 
 pub use boot::{BootPeripherals, Timebase};

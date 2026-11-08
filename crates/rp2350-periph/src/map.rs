@@ -24,6 +24,9 @@ pub const RESETS_BASE: Address = 0x4002_0000;
 /// IO_BANK0 base / IO_BANK0 基地址
 pub const IO_BANK0_BASE: Address = 0x4002_8000;
 
+/// IO_QSPI base / IO_QSPI 基地址
+pub const IO_QSPI_BASE: Address = 0x4003_0000;
+
 /// PADS_BANK0 base / PADS_BANK0 基地址
 pub const PADS_BANK0_BASE: Address = 0x4003_8000;
 
@@ -41,6 +44,9 @@ pub const UART0_BASE: Address = 0x4007_0000;
 
 /// TIMER0 base / TIMER0 基地址
 pub const TIMER0_BASE: Address = 0x400B_0000;
+
+/// XIP_QMI base / XIP_QMI 基地址
+pub const XIP_QMI_BASE: Address = 0x400D_0000;
 
 /// WATCHDOG base / WATCHDOG 基地址
 pub const WATCHDOG_BASE: Address = 0x400D_8000;
