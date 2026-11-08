@@ -76,6 +76,43 @@
 
 ---
 
+## Phase 2.5 · Multicore (core1) Strategy / 多核（core1）策略
+
+**Decision (adopted option a): single-core execution with a resident core1.**
+**决策（采纳方案 a）：单核执行 + core1 常驻。**
+
+当前阶段不实现第二核心的真实指令调度。core1 被建模为“常驻 WFE”：它不取指、
+不执行，但 SIO 的 FIFO 与门铃（doorbell）语义完整保留，使 core0 的
+launch / FIFO 握手能够正常完成，而不会因为“对端永不消费 FIFO”而永久阻塞。
+
+At this stage the second core is not actually scheduled. core1 is modelled as a
+*resident WFE*: it fetches and executes nothing, but the SIO FIFO and doorbell
+semantics are preserved so core0's launch/FIFO handshakes can complete instead
+of blocking forever on a core1 that never consumes the FIFO.
+
+设计要点 / Design points:
+
+- **SIO FIFO 语义保留**：`FIFO_WR` / `FIFO_RD` / `FIFO_ST` 按真实硬件行为建模
+  （写满、读空、VLD/RDY 位），core1 视为持续的 FIFO 消费者。
+  FIFO register behaviour (full/empty, VLD/RDY) is modelled; core1 acts as a
+  steady FIFO consumer.
+- **门铃保留**：`DOORBELL_OUT_SET` / `DOORBELL_IN_CLR` 等寄存器可读写，保留
+  跨核中断请求语义。
+  Doorbell registers stay readable/writable to preserve cross-core IRQ request
+  semantics.
+- **阻塞检测告警**：若 core0 在 `FIFO_RD` 上连续空转超过阈值（与现有自旋告警
+  同一套窗口机制），打印一次告警，附带 PC、FIFO 状态与累计步数，便于定位
+  “等待 core1 消费但 core1 未建模”的握手死锁。
+  If core0 spins on `FIFO_RD` past a threshold (reusing the existing tight-loop
+  spin detector), emit a single warning with PC, FIFO state and step count, so
+  a core1-consumption deadlock is easy to locate.
+- **后续升级路径**：若固件确实依赖 core1 并行推进（而非仅握手），再引入真正的
+  双核调度（社区方案 b），届时复用同一 SIO 模型。
+  If firmware later depends on true core1 parallelism (not just handshakes),
+  upgrade to real dual-core scheduling (option b) and reuse the same SIO model.
+
+---
+
 ## Phase 3 · Initial Six Virtual Peripherals (Week 3-5) ★
 
 All six devices are built as independent plugins in `plugins/`.
