@@ -1,0 +1,13 @@
+[package]
+name = "rp2350-usb-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Host-side USB enumeration bridge and raw REPL driver for the RP2350 USB device model"
+
+[dependencies]
+rp2350-core = { workspace = true }
+rp2350-usb = { workspace = true }

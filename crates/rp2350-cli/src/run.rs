@@ -9,9 +9,10 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use rp2350_arm::CortexM33Core;
+use rp2350_bootrom::Rp2350Bootrom;
 use rp2350_core::types::CpuId;
 use rp2350_core::{
     AddressBus, FLASH_XIP_BASE, FLASH_XIP_NOCACHE_BASE, FirmwareImage, FlashRegion, RamRegion,
@@ -26,16 +27,6 @@ const SRAM_BASE: u32 = 0x2000_0000;
 
 /// SRAM size (520 KB) / SRAM 大小（520 KB）
 const SRAM_SIZE: usize = 520 * 1024;
-
-/// Boot ROM stub base / Boot ROM 桩基地址
-const BOOTROM_STUB_BASE: u32 = 0x0000_0000;
-
-/// Boot ROM stub size (4 KB) / Boot ROM 桩大小（4 KB）
-const BOOTROM_STUB_SIZE: usize = 0x1000;
-
-/// Number of flash bytes mirrored into the boot stub (vectors SP..IRQ51)
-/// 镜像到启动桩的 Flash 字节数（SP 至 IRQ51 向量）
-const VECTOR_BYTES: usize = 0x140;
 
 /// Four-byte UF2 magic prefix / UF2 魔术前缀（四字节）
 const UF2_MAGIC: [u8; 4] = [0x55, 0x46, 0x32, 0x0A];
@@ -84,20 +75,18 @@ pub fn run(options: &RunOptions) -> Result<()> {
     })?;
 
     let mut bus = SimpleBus::new();
-    // 启动桩保存 Flash 向量表的镜像，使现有 `boot` 契约（从 0x0 取向量）
-    // 无需改动 Arm crate 即可直接启动 Flash 中的映像。
-    // The stub holds a mirror of the flash vector table so the existing `boot`
-    // contract (vectors at 0x0) can start a flash image without touching the Arm crate.
-    bus.register_region(Box::new(RamRegion::new(
-        "bootrom-stub",
-        BOOTROM_STUB_BASE,
-        BOOTROM_STUB_SIZE,
-    )))?;
+    // 0x0000_0000..0x0000_7FFF 是独立的 boot ROM 地址区，与 Flash XIP 无关。
+    // 这里挂载合成镜像与宿主陷阱桩，启动向量改为从 Flash XIP 基地址读取。
+    // 0x0000_0000..0x0000_7FFF is the boot ROM window, separate from flash XIP.
+    // Mount the synthetic image with host trap stubs here; boot vectors are now
+    // read from the flash XIP base instead.
+    let flash = FlashRegion::rp2350_xip();
+    let bootrom = Rp2350Bootrom::new(flash.handle());
+    bootrom.mount(&mut bus)?;
     // XIP 在缓存窗口 0x1000_0000 与非缓存别名 0x1400_0000 暴露同一份 Flash，
     // 两个区域共享底层存储。
     // XIP exposes the same flash through the cached window at 0x1000_0000 and
     // the non-cached alias at 0x1400_0000; both regions share one backing store.
-    let flash = FlashRegion::rp2350_xip();
     let flash_nocache = flash.alias("flash-xip-nocache", FLASH_XIP_NOCACHE_BASE);
     bus.register_region(Box::new(flash))?;
     bus.register_region(Box::new(flash_nocache))?;
@@ -105,22 +94,37 @@ pub fn run(options: &RunOptions) -> Result<()> {
     let peripherals = BootPeripherals::mount(&mut bus)?;
 
     let (arch, elf_entry) = load_image(&bytes, &mut bus, options.arch)?;
-    let vectors = if arch == ArchArg::Arm {
-        Some(prepare_arm_vectors(&mut bus, elf_entry)?)
-    } else {
-        None
-    };
 
-    let mut core: Box<dyn CpuCore> = match arch {
-        ArchArg::Arm => Box::new(CortexM33Core::new(CpuId::Core0)),
-        ArchArg::RiscV => Box::new(Hazard3Core::new(CpuId::Core0)),
+    let (mut core, boot_vectors): (Box<dyn CpuCore>, Option<(u32, u32)>) = match arch {
+        ArchArg::Arm => {
+            let mut arm = CortexM33Core::new(CpuId::Core0);
+            let vectors = if let Some(entry) = elf_entry {
+                // ELF 映像没有 Flash 向量表，使用标准 SRAM 栈顶与 ELF 入口。
+                // ELF images have no flash vector table; use the SRAM top and ELF entry.
+                let sp = SRAM_BASE + SRAM_SIZE as u32;
+                arm.boot_at(sp, entry, FLASH_XIP_BASE);
+                Some((sp, entry & !1))
+            } else {
+                // UF2 的复位向量表位于 Flash XIP 基地址，VTOR 也指向那里。
+                // UF2 reset vectors live at the flash XIP base, and VTOR follows.
+                arm.boot_from(&mut bus, FLASH_XIP_BASE)
+                    .context("core boot failed / 核心启动失败")?;
+                Some((arm.read_register(13), arm.pc()))
+            };
+            (Box::new(arm), vectors)
+        }
+        ArchArg::RiscV => {
+            let mut riscv = Hazard3Core::new(CpuId::Core0);
+            riscv
+                .init(&mut bus)
+                .context("core boot failed / 核心启动失败")?;
+            (Box::new(riscv), None)
+        }
     };
-    core.init(&mut bus)
-        .context("core boot failed / 核心启动失败")?;
 
     let mut stdout = std::io::stdout();
     writeln!(stdout, "[run] core: {}", core.description())?;
-    if let Some((sp, pc)) = vectors {
+    if let Some((sp, pc)) = boot_vectors {
         writeln!(stdout, "[run] boot vectors: SP={sp:#010X} PC={pc:#010X}")?;
     }
     writeln!(
@@ -130,7 +134,15 @@ pub fn run(options: &RunOptions) -> Result<()> {
         core.read_register(13)
     )?;
 
-    let outcome = execute(&mut *core, &mut bus, &peripherals, options, &mut stdout)?;
+    let bootrom = (arch == ArchArg::Arm).then_some(&bootrom);
+    let outcome = execute(
+        &mut *core,
+        &mut bus,
+        &peripherals,
+        options,
+        &mut stdout,
+        bootrom,
+    )?;
     writeln!(stdout, "[run] halt: {}", outcome.reason)?;
     writeln!(
         stdout,
@@ -217,36 +229,6 @@ fn load_image(
     }
 }
 
-/// Populate the boot stub and return the applied (SP, PC) pair
-/// 填充启动桩并返回应用的 (SP, PC)
-fn prepare_arm_vectors(bus: &mut SimpleBus, elf_entry: Option<u32>) -> Result<(u32, u32)> {
-    let mut cycles = 0u64;
-    if let Some(entry) = elf_entry {
-        // ELF 映像没有 Flash 向量表，使用标准 SRAM 栈顶与 ELF 入口。
-        // ELF images have no flash vector table; use the SRAM top and ELF entry.
-        let sp = SRAM_BASE + SRAM_SIZE as u32;
-        bus.write_u32(BOOTROM_STUB_BASE, sp, &mut cycles)?;
-        bus.write_u32(BOOTROM_STUB_BASE + 4, entry | 1, &mut cycles)?;
-        return Ok((sp, entry & !1));
-    }
-
-    let mut vectors = [0u8; VECTOR_BYTES];
-    for (index, slot) in vectors.iter_mut().enumerate() {
-        *slot = bus.read_u8(FLASH_XIP_BASE + index as u32, &mut cycles)?;
-    }
-    if vectors[..8].iter().all(|byte| *byte == 0) {
-        return Err(anyhow!(
-            "flash vector table at {FLASH_XIP_BASE:#010X} is empty / Flash 向量表为空"
-        ));
-    }
-    for (index, byte) in vectors.iter().enumerate() {
-        bus.load_u8(BOOTROM_STUB_BASE + index as u32, *byte, &mut cycles)?;
-    }
-    let sp = u32::from_le_bytes([vectors[0], vectors[1], vectors[2], vectors[3]]);
-    let reset = u32::from_le_bytes([vectors[4], vectors[5], vectors[6], vectors[7]]);
-    Ok((sp, reset & !1))
-}
-
 /// Replay PPB system writes into the core and deliver asserted interrupt lines
 /// 将 PPB 系统写入回放到核，并投递已断言的中断线
 fn pump(core: &mut dyn CpuCore, peripherals: &BootPeripherals, irq_log: &mut Vec<String>) {
@@ -273,6 +255,7 @@ fn execute(
     peripherals: &BootPeripherals,
     options: &RunOptions,
     stdout: &mut dyn Write,
+    bootrom: Option<&Rp2350Bootrom>,
 ) -> Result<Outcome> {
     let mut steps = 0u64;
     let mut reason = String::from("instruction budget exhausted / 指令预算耗尽");
@@ -281,6 +264,20 @@ fn execute(
 
     for index in 0..options.trace_steps {
         let pc = core.pc();
+        if let Some(bootrom) = bootrom {
+            if bootrom.handles(pc) {
+                writeln!(stdout, "[trace] {index:03} PC={pc:#010X} bootrom-trap")?;
+                if let Some(outcome) = bootrom.dispatch(core, bus)? {
+                    steps += 1;
+                    if let Some(halt) = outcome.halt {
+                        reason = format!("bootrom halt: {halt}");
+                        return Ok(finish(peripherals, core, steps, reason, irqs, uart));
+                    }
+                    pump(core, peripherals, &mut irqs);
+                    continue;
+                }
+            }
+        }
         let mut cycles = 0u64;
         let opcode = bus.read_u16(pc, &mut cycles).unwrap_or(0xFFFF);
         writeln!(stdout, "[trace] {index:03} PC={pc:#010X} op={opcode:#06X}")?;
@@ -301,15 +298,30 @@ fn execute(
     let mut advanced = 0u64;
     let mut pumped = 0u64;
     while steps < options.max_cycles {
-        match core.step(bus) {
-            Ok(CpuState::Running) => steps += 1,
-            Ok(state) => {
-                reason = format!("core entered state {state:?}");
-                break;
+        let mut handled = false;
+        if let Some(bootrom) = bootrom {
+            if bootrom.handles(core.pc()) {
+                if let Some(outcome) = bootrom.dispatch(core, bus)? {
+                    steps += 1;
+                    handled = true;
+                    if let Some(halt) = outcome.halt {
+                        reason = format!("bootrom halt: {halt}");
+                        break;
+                    }
+                }
             }
-            Err(error) => {
-                reason = error.to_string();
-                break;
+        }
+        if !handled {
+            match core.step(bus) {
+                Ok(CpuState::Running) => steps += 1,
+                Ok(state) => {
+                    reason = format!("core entered state {state:?}");
+                    break;
+                }
+                Err(error) => {
+                    reason = error.to_string();
+                    break;
+                }
             }
         }
         if steps - pumped >= PUMP_INTERVAL {

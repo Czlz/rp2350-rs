@@ -3276,6 +3276,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rp2350-bootrom"
+version = "0.1.0"
+dependencies = [
+ "rp2350-core",
+ "rp2350-cpu",
+]
+
+[[package]]
 name = "rp2350-cli"
 version = "0.1.0"
 dependencies = [
@@ -3284,11 +3292,14 @@ dependencies = [
  "env_logger",
  "log",
  "rp2350-arm",
+ "rp2350-bootrom",
  "rp2350-core",
+ "rp2350-cpu",
  "rp2350-egui",
  "rp2350-ffi",
  "rp2350-gdb",
  "rp2350-periph",
+ "rp2350-riscv",
  "rp2350-virt-periph",
  "tokio",
 ]
@@ -3326,7 +3337,9 @@ dependencies = [
  "egui-winit",
  "egui_plot",
  "log",
+ "rp2350-arm",
  "rp2350-core",
+ "rp2350-cpu",
  "rp2350-virt-periph",
  "tracing",
  "tracing-subscriber",
@@ -3349,10 +3362,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "rp2350-arm",
  "rp2350-core",
  "rp2350-cpu",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "rp2350-led-plugin"
+version = "0.1.0"
+dependencies = [
+ "rp2350-core",
+ "rp2350-plugin",
+ "rp2350-virt-periph",
+ "serde_json",
 ]
 
 [[package]]
@@ -3376,6 +3400,7 @@ dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
  "log",
+ "parking_lot",
  "rp2350-core",
  "smallvec",
  "thiserror 2.0.21",
@@ -3396,6 +3421,23 @@ version = "0.1.0"
 dependencies = [
  "rp2350-core",
  "rp2350-cpu",
+]
+
+[[package]]
+name = "rp2350-usb"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "rp2350-core",
+ "rp2350-periph",
+]
+
+[[package]]
+name = "rp2350-usb-host"
+version = "0.1.0"
+dependencies = [
+ "rp2350-core",
+ "rp2350-usb",
 ]
 
 [[package]]

@@ -12,11 +12,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod abi;
 pub mod context;
 pub mod error;
 pub mod metadata;
 pub mod traits;
 
+pub use abi::ABI_VERSION;
 pub use context::{BusDevice, PluginContext, PluginContextExt};
 pub use error::PluginError;
 pub use metadata::PluginMetadata;

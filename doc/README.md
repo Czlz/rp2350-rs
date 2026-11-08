@@ -37,6 +37,7 @@ rp2350-rs/
 │   ├── rp2350-core/              # chip topology, address bus, clock tree, IRQ matrix
 │   ├── rp2350-cpu/               # CPU abstraction traits (CpuCore, CpuState, CpuArch)
 │   ├── rp2350-arm/               # Cortex-M33 core implementation (registers, stub)
+│   ├── rp2350-bootrom/           # synthetic boot ROM images + host trap dispatch
 │   ├── rp2350-periph/            # built-in silicon peripherals (Peripheral trait)
 │   ├── rp2350-virt-periph/       # Virtual Device Manager (DevicePlugin, PluginLoader, WiringTable, DeviceManager)
 │   ├── rp2350-plugin/            # plugin base trait (RpPlugin, PluginContext, PluginMetadata)
@@ -72,10 +73,13 @@ cargo build --all-features
 cargo test --all-features
 
 # Run emulator with firmware
-cargo run -p rp2350-cli -- run --file firmware.elf --arch arm --display
+cargo run -q -p rp2350-cli -- run --file firmware.elf --arch arm --display
 
 # Start GDB server only
-cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf
+cargo run -q -p rp2350-cli -- gdb --port 3333 --file firmware.elf
+
+# Example: boot the MicroPython RP2350 UF2
+cargo run -q -p rp2350-cli -- run --file RPI_PICO2-20260824-v1.29.0.uf2 --trace-steps 40
 
 # Quality gates (zero warning)
 cargo fmt --all -- --check

@@ -194,7 +194,7 @@ RpPlugin (rp2350-plugin)
 
 | Region | Start | End | Size | Device |
 |--------|-------|-----|------|--------|
-| BOOTROM | 0x0000_0000 | 0x0000_7FFF | 32KB | BootROM |
+| BOOTROM | 0x0000_0000 | 0x0000_7FFF | 32KB | Synthetic boot ROM (read-only, host trap) |
 | XIP Flash | 0x1000_0000 | 0x10FF_FFFF | 16MB | QSPI Flash XIP (cached) |
 | XIP Flash (no-cache alias) | 0x1400_0000 | 0x14FF_FFFF | 16MB | Same flash bytes, non-cached window |
 | XIP PSRAM | 0x1100_0000 | 0x11FF_FFFF | 16MB | PSRAM XIP alias |
@@ -213,6 +213,13 @@ XIP 别名依据 pico-sdk `addressmap.h`（RP2350）：`XIP_BASE = 0x1000_0000`�
 `0x1100_0000` 属于 XIP_MAIN1（PSRAM/CS1 窗口），**不是** Flash CS0 的镜像，
 因此不映射到 Flash；本实现只补 Flash CS0 的非缓存窗口
 `0x1400_0000..0x1500_0000`。`0x1800_0000` 是维护窗口，暂不建模。
+
+boot ROM 与 Flash 是两个独立地址区：厂商镜像不能随仓库分发，因此
+`0x0000_0000..0x0000_7FFF` 由 `rp2350-bootrom` 提供合成只读镜像（magic 位于
+`0x10`、函数表指针位于 `0x14`、`rom_table_lookup` 指针位于 `0x16`）。表项指向
+`udf` 占位桩，宿主在指令步进前按 PC 拦截并执行等价语义（`rom_table_lookup`、
+Flash 擦写、系统信息、重启等）。ARM 启动从 Flash XIP 基地址 `0x1000_0000`
+读取 SP/PC，并把 VTOR 设为 `0x1000_0000`；`0x0000_0000` 不再镜像 Flash 向量。
 
 ### APB Peripheral Map / APB 外设映射
 
@@ -335,7 +342,7 @@ Multi-core interleaving: core0 → core1 per cycle, configurable ratio.
 ```
 CPU ld/st → RP2350Chip::read_u32(addr)
   → AddressBus::route(addr)
-    ├── 0x0000_0000-0x0000_7FFF → BOOTROM
+    ├── 0x0000_0000-0x0000_7FFF → BOOTROM (synthetic, read-only, host trap)
     ├── 0x1000_0000-0x10FF_FFFF → XIP → QMI → QspiFlash.read()
     ├── 0x1400_0000-0x14FF_FFFF → XIP no-cache alias → same Flash bytes
     ├── 0x1100_0000-0x11FF_FFFF → XIP → QMI → Psram.read()

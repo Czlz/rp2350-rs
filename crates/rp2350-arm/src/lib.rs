@@ -63,10 +63,6 @@ const FIRST_EXTERNAL_EXCEPTION: u32 = 16;
 /// 启动向量表中初始栈指针的地址
 const BOOT_SP_ADDR: u32 = 0x0000_0000;
 
-/// Address of the reset vector in the boot vector table
-/// 启动向量表中复位向量的地址
-const BOOT_PC_ADDR: u32 = 0x0000_0004;
-
 /// Cortex-M33 processor core
 /// Cortex-M33 处理器核心
 pub struct CortexM33Core {
@@ -92,6 +88,8 @@ pub struct CortexM33Core {
     /// Boot vectors cached by `boot` as (initial MSP, reset vector)
     /// 由 `boot` 缓存的启动向量（初始 MSP、复位向量）
     boot_vectors: Option<(u32, u32)>,
+    /// Vector table base cached with the boot vectors / 随启动向量一起缓存的向量表基址
+    boot_vtor: u32,
     /// Cumulative cycles executed since the last reset
     /// 自上次复位以来累计执行的周期数
     total_cycles: u64,
@@ -113,29 +111,64 @@ impl CortexM33Core {
             pending_irq: None,
             active_exceptions: Vec::new(),
             boot_vectors: None,
+            boot_vtor: 0,
             total_cycles: 0,
         }
     }
 
-    /// Load the boot vector table and start execution
-    /// 加载启动向量表并开始执行
+    /// Load the boot vector table at address 0 and start execution
+    /// 从地址 0 加载启动向量表并开始执行
     ///
     /// Reads the initial MSP from 0x0000_0000 and the reset vector from
-    /// 0x0000_0004, caches both, then applies them to the register file. The
-    /// cached values let `CpuCore::reset` restart the core without bus access.
-    /// 从 0x0000_0000 读取初始 MSP、从 0x0000_0004 读取复位向量，缓存后写入
-    /// 寄存器文件。缓存值使得 `CpuCore::reset` 无需总线访问即可重新启动核心。
+    /// 0x0000_0004. Flash-booting systems should call [`Self::boot_from`] with
+    /// the Flash XIP base instead, because the boot ROM lives at address 0.
+    /// 从 0x0000_0000 读取初始 MSP、从 0x0000_0004 读取复位向量。从 Flash 启动
+    /// 的系统应改用 [`Self::boot_from`] 并传入 Flash XIP 基地址，因为地址 0
+    /// 属于 boot ROM。
     ///
     /// # Errors
     /// Returns a bus error if the vector table is not mapped on `bus`.
     /// 若向量表未映射到 `bus`，返回总线错误。
     pub fn boot(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
+        self.boot_from(bus, BOOT_SP_ADDR)
+    }
+
+    /// Load a vector table at `vector_base` and start execution
+    /// 从 `vector_base` 加载向量表并开始执行
+    ///
+    /// On RP2350 the ARM reset vector table lives at the Flash XIP base
+    /// `0x1000_0000`, while `0x0000_0000` is the boot ROM. The table base is
+    /// also programmed into VTOR so exception vectors resolve to flash.
+    /// RP2350 的 ARM 复位向量表位于 Flash XIP 基地址 `0x1000_0000`，而
+    /// `0x0000_0000` 是 boot ROM。表基址同时写入 VTOR，使异常向量指向 Flash。
+    ///
+    /// # Errors
+    /// Returns a bus error if the vector table is not mapped on `bus`.
+    /// 若向量表未映射到 `bus`，返回总线错误。
+    pub fn boot_from(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        vector_base: u32,
+    ) -> Result<(), CoreError> {
         let mut cycles = 0u64;
-        let msp = bus.read_u32(BOOT_SP_ADDR, &mut cycles)?;
-        let reset = bus.read_u32(BOOT_PC_ADDR, &mut cycles)?;
-        self.boot_vectors = Some((msp, reset));
-        self.apply_boot_vectors();
+        let msp = bus.read_u32(vector_base, &mut cycles)?;
+        let reset = bus.read_u32(vector_base + 4, &mut cycles)?;
+        self.boot_at(msp, reset, vector_base);
         Ok(())
+    }
+
+    /// Start execution from explicit vectors and a vector table base
+    /// 使用显式向量与向量表基址开始执行
+    ///
+    /// Images without a flash vector table (ELF builds) pass the SRAM top as
+    /// `msp` and the ELF entry as `reset`. The values are cached so
+    /// `CpuCore::reset` restarts the core without bus access.
+    /// 没有 Flash 向量表的映像（ELF 构建）把 SRAM 栈顶作为 `msp`、ELF 入口作为
+    /// `reset`。数值会被缓存，使 `CpuCore::reset` 无需总线访问即可重新启动核心。
+    pub fn boot_at(&mut self, msp: u32, reset: u32, vector_base: u32) {
+        self.boot_vectors = Some((msp, reset));
+        self.boot_vtor = vector_base;
+        self.apply_boot_vectors();
     }
 
     /// Write the program status register (XPSR)
@@ -171,6 +204,7 @@ impl CortexM33Core {
             self.registers.msp = msp;
             self.registers.sp = msp;
             self.registers.pc = reset & !1;
+            self.vtor = self.boot_vtor;
             self.state = CpuState::Running;
         } else {
             self.state = CpuState::Reset;

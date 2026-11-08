@@ -103,6 +103,22 @@ impl FlashRegion {
         self.read_store().get(offset..end).map(<[u8]>::to_vec)
     }
 
+    /// Create a host-only handle over the same backing store
+    /// 在同一份底层存储上创建宿主专用句柄
+    ///
+    /// Bootrom emulation runs on the host but must erase and program exactly the
+    /// bytes the guest reads through the XIP windows. The handle exposes that
+    /// path without weakening [`MemoryRegion`]'s guest write rejection.
+    /// bootrom 仿真运行在宿主侧，但必须擦除和编程客户机经 XIP 窗口读取的同一份
+    /// 字节。该句柄提供这条路径，同时不削弱 [`MemoryRegion`] 对客户机写入的拒绝。
+    #[must_use]
+    pub fn handle(&self) -> FlashHandle {
+        FlashHandle {
+            base: self.base,
+            data: Arc::clone(&self.data),
+        }
+    }
+
     /// Program bytes through the host-side loader path
     /// 通过宿主侧加载器路径编程字节
     ///
@@ -189,6 +205,117 @@ impl MemoryRegion for FlashRegion {
     }
 }
 
+/// Host-only handle to the flash bytes shared by every XIP window
+/// 由所有 XIP 窗口共享的 Flash 字节的宿主专用句柄
+///
+/// The guest reaches flash only through [`MemoryRegion`], which rejects writes.
+/// Bootrom emulation runs on the host and uses this handle to erase and program
+/// the same backing store that the guest reads.
+/// 客户机只能通过 [`MemoryRegion`] 访问 Flash，而该路径拒绝写入。bootrom 仿真
+/// 运行在宿主侧，通过本句柄擦除和编程客户机读取的同一份底层存储。
+#[derive(Debug, Clone)]
+pub struct FlashHandle {
+    base: Address,
+    data: Arc<RwLock<Vec<u8>>>,
+}
+
+impl FlashHandle {
+    /// Base address of the window this handle was created from
+    /// 创建本句柄时所用窗口的基地址
+    #[must_use]
+    pub fn base(&self) -> Address {
+        self.base
+    }
+
+    /// Capacity of the backing store in bytes / 底层存储容量（字节）
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.read_store().len()
+    }
+
+    /// Read a range of flash bytes / 读取一段 Flash 字节
+    ///
+    /// # Errors
+    /// Returns a bus error if the range leaves the backing store.
+    /// 范围超出底层存储时返回总线错误。
+    pub fn read(&self, addr: Address, len: usize) -> BusResult<Vec<u8>> {
+        let offset = self.offset(addr)?;
+        let end = offset.checked_add(len).ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::DeviceError,
+        })?;
+        self.read_store()
+            .get(offset..end)
+            .map(<[u8]>::to_vec)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::DeviceError,
+            })
+    }
+
+    /// Program a byte range / 编程一段字节
+    ///
+    /// # Errors
+    /// Returns a bus error if the range leaves the backing store.
+    /// 范围超出底层存储时返回总线错误。
+    pub fn write(&self, addr: Address, bytes: &[u8]) -> BusResult<()> {
+        let offset = self.offset(addr)?;
+        let end = offset.checked_add(bytes.len()).ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::DeviceError,
+        })?;
+        let mut data = self.write_store();
+        let slot = data.get_mut(offset..end).ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::DeviceError,
+        })?;
+        slot.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Erase a byte range to the NOR flash erased state (`0xFF`)
+    /// 将一段字节擦除为 NOR Flash 的擦除态（`0xFF`）
+    ///
+    /// # Errors
+    /// Returns a bus error if the range leaves the backing store.
+    /// 范围超出底层存储时返回总线错误。
+    pub fn erase(&self, addr: Address, len: usize) -> BusResult<()> {
+        let offset = self.offset(addr)?;
+        let end = offset.checked_add(len).ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::DeviceError,
+        })?;
+        let mut data = self.write_store();
+        let slot = data.get_mut(offset..end).ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::DeviceError,
+        })?;
+        slot.fill(0xFF);
+        Ok(())
+    }
+
+    /// Translate an in-region address into a buffer offset / 将区域内地址转换为缓冲区偏移
+    fn offset(&self, addr: Address) -> BusResult<usize> {
+        if addr < self.base || addr - self.base >= self.size() as u32 {
+            return Err(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            });
+        }
+        Ok((addr - self.base) as usize)
+    }
+
+    /// Acquire the shared store for reading / 获取共享存储的读锁
+    fn read_store(&self) -> RwLockReadGuard<'_, Vec<u8>> {
+        self.data.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Acquire the shared store for writing / 获取共享存储的写锁
+    fn write_store(&self) -> RwLockWriteGuard<'_, Vec<u8>> {
+        self.data.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +364,33 @@ mod tests {
                 .write_u8(FLASH_XIP_NOCACHE_BASE + 8, 0, &mut cycles)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn handle_programs_every_window_and_erases_to_ff() {
+        let mut flash = FlashRegion::new("flash", FLASH_XIP_BASE, 64);
+        let mut alias = flash.alias("flash-nocache", FLASH_XIP_NOCACHE_BASE);
+        let handle = flash.handle();
+        let mut cycles = 0;
+
+        handle.write(FLASH_XIP_BASE + 4, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            alias
+                .read_u8(FLASH_XIP_NOCACHE_BASE + 4, &mut cycles)
+                .unwrap(),
+            1
+        );
+        handle.erase(FLASH_XIP_BASE + 4, 3).unwrap();
+        assert_eq!(
+            flash.read_u8(FLASH_XIP_BASE + 4, &mut cycles).unwrap(),
+            0xFF
+        );
+        assert_eq!(handle.read(FLASH_XIP_BASE + 4, 3).unwrap(), vec![0xFF; 3]);
+
+        // 越界按 NoDevice 报错，客户机写入仍被拒绝。
+        // Out-of-range reports NoDevice and guest writes stay rejected.
+        assert!(handle.write(FLASH_XIP_BASE + 63, &[1, 2]).is_err());
+        assert!(flash.write_u8(FLASH_XIP_BASE + 4, 0, &mut cycles).is_err());
     }
 
     #[test]

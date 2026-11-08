@@ -16,14 +16,14 @@
 )]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rp2350_core::gpio::GpioPin;
 use rp2350_plugin::PluginContext;
 
 use super::device::DevicePlugin;
 use super::error::DeviceError;
-use super::loader::PluginLoader;
+use super::loader::{LoadedPlugin, PluginLoader};
 use super::wiring::WiringTable;
 
 /// Identifier type for registered devices / 注册设备的标识类型
@@ -36,6 +36,11 @@ struct ManagedDevice {
     plugin: Box<dyn DevicePlugin>,
     /// Source path if loaded from disk / 从磁盘加载时的源路径
     source_path: Option<PathBuf>,
+    /// Library backing a dynamically loaded plugin / 动态加载插件背后的库
+    ///
+    /// Declared after `plugin` so the plugin (and its vtable) drops first.
+    /// 声明在 `plugin` 之后，确保插件（及其 vtable）先于库被释放。
+    library: Option<rp2350_ffi::SafeLibrary>,
 }
 
 /// Device manager — the central hub for all virtual peripheral plugins
@@ -77,6 +82,28 @@ impl DeviceManager {
             ManagedDevice {
                 plugin: device,
                 source_path: None,
+                library: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Load a device plugin from a dynamic library and register it
+    /// 从动态库加载设备插件并注册
+    ///
+    /// The library is kept alive for as long as the device remains registered.
+    /// 只要设备保持注册状态，库就会保持存活。
+    pub fn load_plugin(&mut self, id: DeviceId, path: impl AsRef<Path>) -> Result<(), DeviceError> {
+        if self.devices.contains_key(&id) {
+            return Err(DeviceError::AlreadyExists(id));
+        }
+        let LoadedPlugin { library, plugin } = self.loader.load_device(path.as_ref())?;
+        self.devices.insert(
+            id,
+            ManagedDevice {
+                plugin,
+                source_path: Some(path.as_ref().to_path_buf()),
+                library: Some(library),
             },
         );
         Ok(())
@@ -84,12 +111,12 @@ impl DeviceManager {
 
     /// Remove a registered device / 移除已注册的设备
     pub fn unregister(&mut self, id: &DeviceId) -> Result<(), DeviceError> {
-        self.devices
+        let mut device = self
+            .devices
             .remove(id)
-            .map(|_| {
-                self.wiring.remove_device(id);
-            })
             .ok_or_else(|| DeviceError::NotFound(id.clone()))?;
+        device.plugin.shutdown();
+        self.wiring.remove_device(id);
         Ok(())
     }
 

@@ -4,15 +4,19 @@ members = [
     "crates/rp2350-core",
     "crates/rp2350-cpu",
     "crates/rp2350-arm",
+    "crates/rp2350-bootrom",
     "crates/rp2350-riscv",
     "crates/rp2350-periph",
     "crates/rp2350-virt-periph",
+    "crates/rp2350-usb",
+    "crates/rp2350-usb-host",
     "crates/rp2350-plugin",
     "crates/rp2350-ffi",
     "crates/rp2350-gdb",
     "crates/rp2350-egui",
     "crates/rp2350-cli",
     "crates/rp2350-mcp",
+    "plugins/led",
 ]
 
 [workspace.package]
@@ -62,15 +66,19 @@ wee_alloc = "0.4"
 rp2350-core = { path = "crates/rp2350-core" }
 rp2350-cpu = { path = "crates/rp2350-cpu" }
 rp2350-arm = { path = "crates/rp2350-arm" }
+rp2350-bootrom = { path = "crates/rp2350-bootrom" }
 rp2350-riscv = { path = "crates/rp2350-riscv" }
 rp2350-periph = { path = "crates/rp2350-periph" }
 rp2350-virt-periph = { path = "crates/rp2350-virt-periph" }
+rp2350-usb = { path = "crates/rp2350-usb" }
+rp2350-usb-host = { path = "crates/rp2350-usb-host" }
 rp2350-plugin = { path = "crates/rp2350-plugin" }
 rp2350-ffi = { path = "crates/rp2350-ffi" }
 rp2350-gdb = { path = "crates/rp2350-gdb" }
 rp2350-egui = { path = "crates/rp2350-egui" }
 rp2350-cli = { path = "crates/rp2350-cli" }
 rp2350-mcp = { path = "crates/rp2350-mcp" }
+rp2350-led-plugin = { path = "plugins/led" }
 
 [profile.release]
 opt-level = 3

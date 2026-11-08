@@ -20,6 +20,6 @@ pub mod wiring;
 pub use config::ConfigSchema;
 pub use device::{DevicePlugin, DevicePort};
 pub use error::DeviceError;
-pub use loader::PluginLoader;
+pub use loader::{LoadedPlugin, PluginLoader};
 pub use manager::DeviceManager;
 pub use wiring::{WiringEntry, WiringTable};
