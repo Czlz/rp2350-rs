@@ -239,6 +239,7 @@ Stage 4 只建模启动路径需要的外设；基地址已按 RP2350 数据手�
 | 0x4007_0000 | UART0 (PL011) | 桩：写 `DR` 进入宿主串口缓冲 |
 | 0x400B_0000 | TIMER0 | 桩：共享微秒时基 + 4 个闹钟 |
 | 0x400D_8000 | WATCHDOG | 桩：scratch 存储，`REASON` 读 0 |
+| 0x4010_8000 | TICKS | 6 个滴答通道；使能后写 `CYCLES` 把该周期计入共享时基 |
 | 0xD000_0000 | SIO | 桩：GPIO 输出/回环、FIFO、自旋锁 |
 | 0xE000_0000 | PPB (Core 0) | 桩：`CPUID`、`VTOR` 存储 |
 
@@ -290,6 +291,36 @@ pico-sdk 大量依赖这套别名（`hw_set_bits`/`hw_clear_bits` 会写 `RESETS
 `PLL_*_PWR`、`CLOCKS_*_CTRL`、`XOSC_CTRL`），缺了它这些写会被静默丢弃，固件随后
 在等待对应状态位时死等。`0x4004_A000` 这类地址不是新设备，而是 `XOSC` 的 SET
 别名（`0x4004_8000 + 0x2000`）。
+
+### Stalls and the Shared Cycle Sink / 停顿与共享周期汇
+
+有些寄存器写入在硬件上不是存值，而是让处理器"等一段时间"（可编程延时、握手停顿）。
+这类设备不做忙等空转，而是持有一个 `CycleSink`（`rp2350-periph/src/cycle.rs`），
+把硬件会花费的周期数推入共享 `Timebase`：
+
+- `CycleSink::push(cycles)` 推进共享时基，`TIMER0`、`time_us()` 与上报的仿真时间
+  立即反映这次"停顿"；`BootPeripherals::advance` 也走同一句柄。
+- 句柄可克隆、跨设备复用，后续块直接使用，不需要改 `MmioDevice` trait，也不需要
+  CPU 侧新增"取停顿周期"的接口。
+- 首个使用者是 `TICKS`：通道使能后写 `CYCLES`，整段周期一次性计入时基，随后读
+  `COUNT` 为 0（剩余量已耗尽），忙等循环因此立即通过而仿真时间正确前进。
+
+`TICKS` 通道记录步长 `0x0C`（`CTRL`+0x00 / `CYCLES`+0x04 / `COUNT`+0x08），
+`CTRL.ENABLE` 未置位时写 `CYCLES` 不生效、不推进时间，避免固件初始化阶段
+（先写 `CYCLES`、后置 `ENABLE`）造成虚假的时间跳跃。
+
+### Unmodelled Accesses / 未建模访问清单
+
+以下地址在真实固件运行中落到"读 0 / 写忽略"的兜底路径（每个地址只告警一次）。
+目前不阻塞已跑通的路径，但属于已知缺口：
+
+| 地址范围 | 归属 | 固件行为 |
+|---|---|---|
+| `0x400E_0000`–`0x400E_00FF` | BOOTRAM（bootrom 暂存 RAM 数据区） | 一次性整块 64 字读到 SRAM `0x2000_4684`（守卫字节 `0x2000_5020`），随后 `0x1004_CF2C` 跳入副本执行；是搬运/探测循环，不是外设寄存器扫描 |
+| `0x400E_080C`–`0x400E_0828` | BOOTRAM `BOOTLOCK0..7` | `0x1003_2084` 轮询 `BOOTLOCK7`（读即认领，成功返回 `1<<7`）；当前读 0 导致忙等，是现在的停点 |
+| `0x400D_0000`–`0x400D_0014` | QMI | 软复位路径读时序/格式寄存器 |
+| `0x4004_0004` | PADS_QSPI `GPIO_QSPI_SCLK` | 读 pad 配置 |
+| `0x4004_3008`–`0x4004_3014` | PADS_QSPI 之后 0x3000 的窗口（SVD 未列出） | 读 pad 配置 |
 
 ### Interrupt Number Map / 中断号映射
 
