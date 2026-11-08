@@ -37,6 +37,16 @@ const PUMP_INTERVAL: u64 = 64;
 /// Maximum number of logged IRQ deliveries / 记录的中断投递条数上限
 const IRQ_LOG_LIMIT: usize = 8;
 
+/// Code window treated as one tight loop / 视为同一紧凑循环的代码窗口大小
+const SPIN_WINDOW_BYTES: u32 = 32;
+
+/// Consecutive steps inside one window before a spin warning is printed
+/// 打印自旋告警前，PC 连续停留在同一代码窗口内的步数
+const SPIN_REPORT_STEPS: u64 = 1_000_000;
+
+/// Maximum number of spin warnings per run / 每次运行最多打印的自旋告警条数
+const SPIN_REPORT_LIMIT: usize = 4;
+
 /// CPU architecture selection for `run` / `run` 的 CPU 架构选择
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchArg {
@@ -271,6 +281,9 @@ fn execute(
     let mut reason = String::from("instruction budget exhausted / 指令预算耗尽");
     let mut uart = Vec::new();
     let mut irqs = Vec::new();
+    let mut spin_base = core.pc();
+    let mut spin_steps = 0u64;
+    let mut spin_reports = 0usize;
 
     for index in 0..options.trace_steps {
         let pc = core.pc();
@@ -333,6 +346,30 @@ fn execute(
                     break;
                 }
             }
+        }
+        // 紧凑自旋通常意味着固件在轮询一个永远不变的 MMIO 值（未建模设备静默
+        // 读 0）或执行延时循环，会无声耗尽指令预算。PC 连续停在同一小窗口内
+        // 达到阈值就告警一次，并给出窗口范围以便反汇编定位。
+        // A tight spin usually means the firmware polls a register that never
+        // changes (unmodelled devices read zero) or runs a delay loop, silently
+        // burning the budget. Warn once when the PC stays inside one small window
+        // and print the window so the spin point can be disassembled.
+        let pc = core.pc();
+        if pc.wrapping_sub(spin_base) < SPIN_WINDOW_BYTES {
+            spin_steps += 1;
+            if spin_steps == SPIN_REPORT_STEPS && spin_reports < SPIN_REPORT_LIMIT {
+                spin_reports += 1;
+                writeln!(
+                    stdout,
+                    "[run] tight spin: PC stayed in {:#010X}..{:#010X} for {spin_steps} steps, \
+                     likely polling a value that never changes / 疑似轮询等待",
+                    spin_base,
+                    spin_base + SPIN_WINDOW_BYTES
+                )?;
+            }
+        } else {
+            spin_base = pc;
+            spin_steps = 0;
         }
         if steps - pumped >= PUMP_INTERVAL {
             pump(core, peripherals, &mut irqs);
