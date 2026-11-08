@@ -665,6 +665,22 @@ pub fn execute_thumb16(
                         regs.sp = regs.sp.wrapping_sub(imm7);
                     }
                 }
+                // SXTH / SXTB / UXTH / UXTB (bits[7:6] select the operation)
+                // 符号/零扩展半字与字节（bit[7:6] 选择操作）
+                0xB2 => {
+                    let op = (opcode >> 6) & 0x3;
+                    let rm = ((opcode >> 3) & 0x7) as usize;
+                    let rd = (opcode & 0x7) as usize;
+                    let value = regs.r[rm];
+                    let result = match op {
+                        0 => sign_extend(value & 0xFFFF, 16), // SXTH
+                        1 => sign_extend(value & 0xFF, 8),    // SXTB
+                        2 => value & 0xFFFF,                  // UXTH
+                        _ => value & 0xFF,                    // UXTB
+                    };
+                    regs.r[rd] = result;
+                    regs.set_nz_flags(result);
+                }
                 // CBZ Rn, label (bit9 supplies the high bit of the 7-bit immediate)
                 // CBZ Rn, label（bit9 是 7 位立即数的高位）
                 0xB1 | 0xB3 => {
@@ -736,6 +752,22 @@ pub fn execute_thumb16(
                         regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
                         return Ok(StepResult::BranchTaken);
                     }
+                }
+                // REV / REV16 / REVSH (bits[7:6] select the operation)
+                // 字节反转（bit[7:6] 选择操作）
+                0xBA => {
+                    let op = (opcode >> 6) & 0x3;
+                    let rm = ((opcode >> 3) & 0x7) as usize;
+                    let rd = (opcode & 0x7) as usize;
+                    let value = regs.r[rm];
+                    let result = match op {
+                        0 => value.swap_bytes(),                                             // REV
+                        1 => ((value & 0x00FF_00FF) << 8) | ((value & 0xFF00_FF00) >> 8), // REV16
+                        3 => sign_extend(((value & 0xFF) << 8) | ((value >> 8) & 0xFF), 16), // REVSH
+                        _ => return Ok(StepResult::Undefined),
+                    };
+                    regs.r[rd] = result;
+                    regs.set_nz_flags(result);
                 }
                 // POP {reg_list, PC?}
                 // POP {reg_list, PC?}
@@ -909,5 +941,46 @@ mod tests {
         .unwrap();
         assert_eq!(result, StepResult::BranchTaken);
         assert_eq!(regs.pc, 0x1000_0166);
+    }
+
+    /// Execute one Thumb-16 opcode with `value` in `rm` and return the registers.
+    /// 在 `rm` 中放入 `value` 执行一条 Thumb-16 指令并返回寄存器。
+    fn run16(opcode: u16, rm: usize, value: u32) -> CortexM33Registers {
+        let mut regs = CortexM33Registers::new();
+        regs.r[rm] = value;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let mut cycles = 0;
+        execute_thumb16(
+            opcode,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        regs
+    }
+
+    #[test]
+    fn extend_instructions_sign_and_zero_extend() {
+        // uxtb r0, r4 / sxtb r0, r4 / uxth r0, r4 / sxth r0, r4
+        assert_eq!(run16(0xB2E0, 4, 0x1234_56FF).r[0], 0x0000_00FF);
+        assert_eq!(run16(0xB260, 4, 0x0000_00FF).r[0], 0xFFFF_FFFF);
+        assert_eq!(run16(0xB2A0, 4, 0x1234_5678).r[0], 0x0000_5678);
+        assert_eq!(run16(0xB220, 4, 0x0000_8000).r[0], 0xFFFF_8000);
+    }
+
+    #[test]
+    fn reverse_instructions_reorder_bytes() {
+        // rev r0, r4 / rev16 r0, r4 / revsh r0, r4
+        assert_eq!(run16(0xBA20, 4, 0x1234_5678).r[0], 0x7856_3412);
+        assert_eq!(run16(0xBA60, 4, 0x1234_5678).r[0], 0x3412_7856);
+        assert_eq!(run16(0xBAE0, 4, 0x1234_5678).r[0], 0x0000_7856);
+        assert_eq!(run16(0xBAE0, 4, 0x1234_80FF).r[0], 0xFFFF_FF80);
     }
 }
