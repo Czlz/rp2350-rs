@@ -25,5 +25,8 @@ plugins/**/*.dylib
 # Editor turds
 *.rs.bk
 
+# Handoff files (temporary, session-specific)
+HANDOFF.md
+
 # Cargo lock for libraries (keep for workspace root)
 # Cargo.lock — committed for workspace root only
