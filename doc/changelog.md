@@ -25,9 +25,11 @@
 - `rp2350-periph`: PPB records NVIC, SysTick and VTOR writes into a shared log for replay into the core
 - `rp2350-cpu`: `CpuCore::system_write` / `CpuCore::system_read` hooks for system control space accesses
 - `rp2350-cli`: interrupt pump — replays PPB writes via `system_write`, delivers asserted lines via `signal_interrupt` and prints `[run] irq deliveries`
+- `rp2350-core`: `FlashRegion::alias` — a second read-only XIP window over the same backing store, used for the RP2350 non-cached flash alias at `0x1400_0000..0x14FF_FFFF`
 - `doc/architecture.md`: verified IRQ number map (TIMER0 0..3, USBCTRL 14, IO_BANK0 21, SIO 25/26, UART0 33) and interrupt wiring description
 
 ### Fixed / 修复
+- `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
 - `rp2350-arm`: external interrupts used the IRQ number as the exception number and fetched the vector from `VTOR + irq * 4`; they now use exception number `16 + irq`
 - `rp2350-arm`: `SCB_VTOR` writes now reach the core (replayed from the PPB log) and the exception vector fetch uses the programmed offset
 - `rp2350-arm`: NVIC active/pending bits were indexed with the exception number (offset by 16); they now use the IRQ number

@@ -14,7 +14,8 @@ use clap::ValueEnum;
 use rp2350_arm::CortexM33Core;
 use rp2350_core::types::CpuId;
 use rp2350_core::{
-    AddressBus, FLASH_XIP_BASE, FirmwareImage, FlashRegion, RamRegion, SimpleBus, Uf2Arch, Uf2Image,
+    AddressBus, FLASH_XIP_BASE, FLASH_XIP_NOCACHE_BASE, FirmwareImage, FlashRegion, RamRegion,
+    SimpleBus, Uf2Arch, Uf2Image,
 };
 use rp2350_cpu::{CpuCore, CpuState};
 use rp2350_periph::BootPeripherals;
@@ -92,7 +93,14 @@ pub fn run(options: &RunOptions) -> Result<()> {
         BOOTROM_STUB_BASE,
         BOOTROM_STUB_SIZE,
     )))?;
-    bus.register_region(Box::new(FlashRegion::rp2350_xip()))?;
+    // XIP 在缓存窗口 0x1000_0000 与非缓存别名 0x1400_0000 暴露同一份 Flash，
+    // 两个区域共享底层存储。
+    // XIP exposes the same flash through the cached window at 0x1000_0000 and
+    // the non-cached alias at 0x1400_0000; both regions share one backing store.
+    let flash = FlashRegion::rp2350_xip();
+    let flash_nocache = flash.alias("flash-xip-nocache", FLASH_XIP_NOCACHE_BASE);
+    bus.register_region(Box::new(flash))?;
+    bus.register_region(Box::new(flash_nocache))?;
     bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, SRAM_SIZE)))?;
     let peripherals = BootPeripherals::mount(&mut bus)?;
 

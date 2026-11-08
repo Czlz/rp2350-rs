@@ -195,7 +195,8 @@ RpPlugin (rp2350-plugin)
 | Region | Start | End | Size | Device |
 |--------|-------|-----|------|--------|
 | BOOTROM | 0x0000_0000 | 0x0000_7FFF | 32KB | BootROM |
-| XIP Flash | 0x1000_0000 | 0x10FF_FFFF | 16MB | QSPI Flash XIP |
+| XIP Flash | 0x1000_0000 | 0x10FF_FFFF | 16MB | QSPI Flash XIP (cached) |
+| XIP Flash (no-cache alias) | 0x1400_0000 | 0x14FF_FFFF | 16MB | Same flash bytes, non-cached window |
 | XIP PSRAM | 0x1100_0000 | 0x11FF_FFFF | 16MB | PSRAM XIP alias |
 | SRAM0-9 | 0x2000_0000 | 0x2008_1FFF | 520KB | Internal SRAM |
 | APB | 0x4000_0000 | 0x4FFF_FFFF | 256MB | Peripherals |
@@ -204,6 +205,14 @@ RpPlugin (rp2350-plugin)
 | SIO | 0xD000_0000 | 0xD000_0FFF | 4KB | Single-cycle IO |
 | PPB0 | 0xE000_0000 | 0xE00F_FFFF | 1MB | Private Peripheral Bus (Core 0) |
 | PPB1 | 0xE100_0000 | 0xE10F_FFFF | 1MB | Private Peripheral Bus (Core 1) |
+
+XIP 别名依据 pico-sdk `addressmap.h`（RP2350）：`XIP_BASE = 0x1000_0000`、
+`XIP_END = 0x1400_0000`、`XIP_NOCACHE_NOALLOC_BASE = 0x1400_0000`、
+`XIP_NOCACHE_NOALLOC_END = 0x1800_0000`、`XIP_MAINTENANCE_BASE = 0x1800_0000`。
+缓存区 `0x1000_0000..0x1400_0000` 是四个 16 MB 的 XIP_MAIN 窗口，
+`0x1100_0000` 属于 XIP_MAIN1（PSRAM/CS1 窗口），**不是** Flash CS0 的镜像，
+因此不映射到 Flash；本实现只补 Flash CS0 的非缓存窗口
+`0x1400_0000..0x1500_0000`。`0x1800_0000` 是维护窗口，暂不建模。
 
 ### APB Peripheral Map / APB 外设映射
 
@@ -328,6 +337,7 @@ CPU ld/st → RP2350Chip::read_u32(addr)
   → AddressBus::route(addr)
     ├── 0x0000_0000-0x0000_7FFF → BOOTROM
     ├── 0x1000_0000-0x10FF_FFFF → XIP → QMI → QspiFlash.read()
+    ├── 0x1400_0000-0x14FF_FFFF → XIP no-cache alias → same Flash bytes
     ├── 0x1100_0000-0x11FF_FFFF → XIP → QMI → Psram.read()
     ├── 0x2000_0000-0x2008_1FFF → SRAM
     ├── 0x4000_0000-0x4FFF_FFFF → APB peripherals

@@ -17,9 +17,14 @@
 use super::bus::{BusResult, MemoryRegion};
 use super::error::{BusErrorKind, CoreError};
 use super::types::Address;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Base address of the RP2350 flash XIP window / RP2350 Flash XIP 窗口基地址
 pub const FLASH_XIP_BASE: Address = 0x1000_0000;
+
+/// Base address of the non-cached flash XIP alias (pico-sdk `XIP_NOCACHE_NOALLOC_BASE`)
+/// 非缓存 Flash XIP 别名基地址（pico-sdk `XIP_NOCACHE_NOALLOC_BASE`）
+pub const FLASH_XIP_NOCACHE_BASE: Address = 0x1400_0000;
 
 /// Size of the RP2350 flash XIP window (16 MB) / RP2350 Flash XIP 窗口大小（16 MB）
 pub const FLASH_XIP_SIZE: usize = 16 * 1024 * 1024;
@@ -29,14 +34,15 @@ pub const FLASH_XIP_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// Guest writes return [`BusErrorKind::AccessDenied`]. Flash programming through
 /// the QMI/XIP controller is not modelled in Stage 4; the loader is the only
-/// writer.
+/// writer. Clones and [`FlashRegion::alias`] windows share one backing store.
 /// 客户机写入返回 [`BusErrorKind::AccessDenied`]。Stage 4 不模拟经由 QMI/XIP
-/// 控制器的 Flash 编程，只有加载器可以写入。
+/// 控制器的 Flash 编程，只有加载器可以写入。克隆与 [`FlashRegion::alias`]
+/// 窗口共享同一份底层存储。
 #[derive(Debug, Clone)]
 pub struct FlashRegion {
     name: String,
     base: Address,
-    data: Vec<u8>,
+    data: Arc<RwLock<Vec<u8>>>,
 }
 
 impl FlashRegion {
@@ -49,7 +55,7 @@ impl FlashRegion {
         Self {
             name: name.into(),
             base,
-            data: vec![0; size],
+            data: Arc::new(RwLock::new(vec![0; size])),
         }
     }
 
@@ -59,10 +65,30 @@ impl FlashRegion {
         Self::new("flash-xip", FLASH_XIP_BASE, FLASH_XIP_SIZE)
     }
 
-    /// Borrow the backing bytes / 借用底层字节
+    /// Create another read-only window over the same flash bytes
+    /// 在同一份 Flash 字节上创建另一个只读窗口
+    ///
+    /// RP2350 exposes the flash at `0x1000_0000` (cached) and at the
+    /// `XIP_NOCACHE_NOALLOC_BASE` alias `0x1400_0000` (non-cached). Both windows
+    /// must observe the same programmed content, so the alias shares the backing
+    /// store rather than copying it.
+    /// RP2350 在 `0x1000_0000`（缓存）与 `XIP_NOCACHE_NOALLOC_BASE` 别名
+    /// `0x1400_0000`（非缓存）同时暴露 Flash。两个窗口必须看到相同的已编程
+    /// 内容，因此别名共享底层存储而非复制。
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.data
+    pub fn alias(&self, name: impl Into<String>, base: Address) -> Self {
+        Self {
+            name: name.into(),
+            base,
+            data: Arc::clone(&self.data),
+        }
+    }
+
+    /// Borrow the backing bytes (copied out of the shared store)
+    /// 借用底层字节（从共享存储复制一份）
+    #[must_use]
+    pub fn bytes(&self) -> Vec<u8> {
+        self.read_store().clone()
     }
 
     /// Read a slice of flash bytes without going through the bus
@@ -71,9 +97,10 @@ impl FlashRegion {
     /// Returns `None` when the requested range leaves the region.
     /// 请求范围超出区域时返回 `None`。
     #[must_use]
-    pub fn slice(&self, addr: Address, len: usize) -> Option<&[u8]> {
+    pub fn slice(&self, addr: Address, len: usize) -> Option<Vec<u8>> {
         let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
-        self.data.get(offset..offset.checked_add(len)?)
+        let end = offset.checked_add(len)?;
+        self.read_store().get(offset..end).map(<[u8]>::to_vec)
     }
 
     /// Program bytes through the host-side loader path
@@ -88,7 +115,8 @@ impl FlashRegion {
             addr,
             kind: BusErrorKind::DeviceError,
         })?;
-        let slot = self.data.get_mut(offset..end).ok_or(CoreError::BusError {
+        let mut data = self.write_store();
+        let slot = data.get_mut(offset..end).ok_or(CoreError::BusError {
             addr,
             kind: BusErrorKind::DeviceError,
         })?;
@@ -106,6 +134,16 @@ impl FlashRegion {
         }
         Ok((addr - self.base) as usize)
     }
+
+    /// Acquire the shared store for reading / 获取共享存储的读锁
+    fn read_store(&self) -> RwLockReadGuard<'_, Vec<u8>> {
+        self.data.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Acquire the shared store for writing / 获取共享存储的写锁
+    fn write_store(&mut self) -> RwLockWriteGuard<'_, Vec<u8>> {
+        self.data.write().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl MemoryRegion for FlashRegion {
@@ -118,13 +156,14 @@ impl MemoryRegion for FlashRegion {
     }
 
     fn size(&self) -> usize {
-        self.data.len()
+        self.read_store().len()
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
         *cycles += 1;
         let offset = self.offset(addr)?;
-        self.data.get(offset).copied().ok_or(CoreError::BusError {
+        let data = self.read_store();
+        data.get(offset).copied().ok_or(CoreError::BusError {
             addr,
             kind: BusErrorKind::DeviceError,
         })
@@ -140,7 +179,8 @@ impl MemoryRegion for FlashRegion {
     fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
         *cycles += 1;
         let offset = self.offset(addr)?;
-        let slot = self.data.get_mut(offset).ok_or(CoreError::BusError {
+        let mut data = self.write_store();
+        let slot = data.get_mut(offset).ok_or(CoreError::BusError {
             addr,
             kind: BusErrorKind::DeviceError,
         })?;
@@ -173,8 +213,46 @@ mod tests {
     fn load_bytes_programs_a_range() {
         let mut flash = FlashRegion::new("flash", 0x1000_0000, 64);
         flash.load_bytes(0x1000_0010, &[1, 2, 3]).unwrap();
-        assert_eq!(flash.slice(0x1000_0010, 3), Some(&[1u8, 2, 3][..]));
+        assert_eq!(flash.slice(0x1000_0010, 3), Some(vec![1u8, 2, 3]));
         assert!(flash.load_bytes(0x1000_003F, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn alias_shares_flash_bytes_and_rejects_guest_writes() {
+        let mut flash = FlashRegion::new("flash", FLASH_XIP_BASE, 64);
+        let mut alias = flash.alias("flash-nocache", FLASH_XIP_NOCACHE_BASE);
+        let mut cycles = 0;
+
+        flash
+            .load_u8(FLASH_XIP_BASE + 8, 0x5A, &mut cycles)
+            .unwrap();
+        assert_eq!(
+            alias
+                .read_u8(FLASH_XIP_NOCACHE_BASE + 8, &mut cycles)
+                .unwrap(),
+            0x5A
+        );
+        assert!(
+            alias
+                .write_u8(FLASH_XIP_NOCACHE_BASE + 8, 0, &mut cycles)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bus_serves_flash_through_nocache_alias() {
+        let mut bus = SimpleBus::new();
+        let flash = FlashRegion::new("flash", FLASH_XIP_BASE, 64);
+        let alias = flash.alias("flash-nocache", FLASH_XIP_NOCACHE_BASE);
+        bus.register_region(Box::new(flash)).unwrap();
+        bus.register_region(Box::new(alias)).unwrap();
+
+        let mut cycles = 0;
+        bus.load_u8(FLASH_XIP_BASE, 0x42, &mut cycles).unwrap();
+        assert_eq!(
+            bus.read_u8(FLASH_XIP_NOCACHE_BASE, &mut cycles).unwrap(),
+            0x42
+        );
     }
 
     #[test]
