@@ -26,6 +26,7 @@ pub mod conditions;
 pub mod exceptions;
 pub mod execute_thumb16;
 pub mod execute_thumb32;
+pub mod fpu;
 pub mod nvic;
 pub mod registers;
 pub mod systick;
@@ -56,6 +57,9 @@ const NVIC_BASE: u32 = 0xE000_E100;
 
 /// `SCB_VTOR` absolute address / `SCB_VTOR` 绝对地址
 const SCB_VTOR: u32 = 0xE000_ED08;
+
+/// `SCB_CPACR` absolute address / `SCB_CPACR` 绝对地址
+const SCB_CPACR: u32 = 0xE000_ED88;
 
 /// First exception number that maps to an external interrupt
 /// 映射到外部中断的第一个异常号
@@ -315,6 +319,13 @@ impl CortexM33Core {
                 self.vtor = value & !0x7F;
             }
             Some(self.vtor)
+        } else if addr == SCB_CPACR {
+            if write {
+                // 仅建模 CP10/CP11 字段，其余协处理器键保持为零。
+                // Only the CP10/CP11 fields are modeled; other keys read as zero.
+                self.registers.cpacr = value & fpu::cpacr::CP10_CP11_MASK;
+            }
+            Some(self.registers.cpacr)
         } else if (NVIC_BASE..NVIC_BASE + 0x400).contains(&addr) {
             self.handle_nvic_access(addr - NVIC_BASE, write, value)
         } else if (SYSTICK_BASE..SYSTICK_BASE + 0x10).contains(&addr) {

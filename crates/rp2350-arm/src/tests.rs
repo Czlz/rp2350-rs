@@ -23,6 +23,35 @@ fn new_core_nvic_all_disabled() {
 }
 
 #[test]
+fn cpacr_controls_fpu_access() {
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    assert_eq!(core.system_read(SCB_CPACR), Some(0));
+    assert!(!core.registers.fp_access_enabled());
+
+    core.system_write(SCB_CPACR, 0x00F0_0000);
+    assert_eq!(core.system_read(SCB_CPACR), Some(0x00F0_0000));
+    assert!(core.registers.fp_access_enabled());
+}
+
+#[test]
+fn cpacr_ignores_unmodeled_bits() {
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    core.system_write(SCB_CPACR, 0xFFFF_FFFF);
+    assert_eq!(core.system_read(SCB_CPACR), Some(0x00F0_0000));
+}
+
+#[test]
+fn cpacr_is_cleared_by_reset() {
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    let mut bus = boot_bus(0x2000_1000, 0x0000_0101);
+    core.boot(&mut bus).unwrap();
+    core.system_write(SCB_CPACR, 0x00F0_0000);
+    core.reset();
+    assert_eq!(core.registers.cpacr, 0);
+    assert_eq!(core.registers.fpu.s, [0; 32]);
+}
+
+#[test]
 fn signal_interrupt_sets_pending() {
     let mut core = CortexM33Core::new(CpuId::Core0);
     core.signal_interrupt(42);

@@ -1,6 +1,8 @@
 //! Cortex-M33 register file (R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK)
 //! Cortex-M33 寄存器文件（R0-R15、MSP/PSP、XPSR、CONTROL、PRIMASK、BASEPRI、FAULTMASK）
 
+use crate::fpu::{FpuRegisters, cpacr};
+
 /// ARMv8-M program status register (XPSR) flags
 /// ARMv8-M 程序状态寄存器标志
 pub mod psr {
@@ -52,6 +54,11 @@ pub struct CortexM33Registers {
     pub basepri: u32,
     /// Fault Mask Register / 故障屏蔽寄存器
     pub faultmask: u32,
+    /// Floating-point registers S0-S31, FPSCR and FPEXC
+    /// 浮点寄存器 S0-S31、FPSCR 与 FPEXC
+    pub fpu: FpuRegisters,
+    /// Coprocessor Access Control Register (CPACR) / 协处理器访问控制寄存器
+    pub cpacr: u32,
 }
 
 impl CortexM33Registers {
@@ -71,6 +78,8 @@ impl CortexM33Registers {
             primask: 0,
             basepri: 0,
             faultmask: 0,
+            fpu: FpuRegisters::new(),
+            cpacr: 0,
         }
     }
 
@@ -109,6 +118,23 @@ impl CortexM33Registers {
             self.msp
         }
     }
+
+    /// Report whether CPACR grants access to coprocessor 10/11 (the FPU)
+    /// 报告 CPACR 是否授予协处理器 10/11（即 FPU）访问权限
+    ///
+    /// ARMv8-M requires CP10 and CP11 to hold the same value. `0b01` grants
+    /// privileged-only access and `0b11` grants full access; the emulator
+    /// executes in privileged mode, so both encodings allow FPU instructions.
+    /// A mismatched or `0b00`/`0b10` setting raises NOCP on real hardware.
+    /// ARMv8-M 要求 CP10 与 CP11 取相同值。`0b01` 为仅特权访问、`0b11` 为
+    /// 完全访问；模拟器始终以特权模式执行，因此两种编码都允许 FPU 指令。
+    /// 两者不一致或为 `0b00`/`0b10` 时，真实硬件会产生 NOCP。
+    #[must_use]
+    pub fn fp_access_enabled(&self) -> bool {
+        let cp10 = (self.cpacr >> cpacr::CP10_SHIFT) & 0x3;
+        let cp11 = (self.cpacr >> cpacr::CP11_SHIFT) & 0x3;
+        cp10 == cp11 && matches!(cp10, cpacr::PRIVILEGED | cpacr::FULL)
+    }
 }
 
 impl Default for CortexM33Registers {
@@ -141,5 +167,34 @@ mod tests {
         regs.msp = 0x2000_4000;
         regs.psp = 0x2000_8000;
         assert_eq!(regs.current_sp(), 0x2000_4000);
+    }
+
+    #[test]
+    fn fpu_access_is_disabled_at_reset() {
+        let regs = CortexM33Registers::new();
+        assert!(!regs.fp_access_enabled());
+    }
+
+    #[test]
+    fn fpu_access_accepts_full_and_privileged_encodings() {
+        let mut regs = CortexM33Registers::new();
+        regs.cpacr = 0x00F0_0000;
+        assert!(regs.fp_access_enabled());
+        regs.cpacr = 0x0050_0000;
+        assert!(regs.fp_access_enabled());
+    }
+
+    #[test]
+    fn fpu_access_rejects_mismatched_or_reserved_encodings() {
+        let mut regs = CortexM33Registers::new();
+        // CP10 = full, CP11 = denied / CP10 完全访问、CP11 禁止
+        regs.cpacr = 0x0030_0000;
+        assert!(!regs.fp_access_enabled());
+        // CP10 = full, CP11 = reserved 0b10 / CP10 完全访问、CP11 保留值
+        regs.cpacr = 0x00B0_0000;
+        assert!(!regs.fp_access_enabled());
+        // CP10 = reserved 0b10, CP11 = full / CP10 保留值、CP11 完全访问
+        regs.cpacr = 0x00C0_0000;
+        assert!(!regs.fp_access_enabled());
     }
 }
