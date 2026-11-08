@@ -18,6 +18,21 @@
 //! [`mount_device`]; they never depend on the peripheral collection.
 //! 外部 crate（例如 USB 控制器）只需实现 [`MmioDevice`] 并调用 [`mount_device`]，
 //! 不需要依赖外设集合。
+//!
+//! # Atomic aliases / 原子别名
+//!
+//! RP2350 APB registers are grouped in [`MMIO_BLOCK_SIZE`] blocks: the first
+//! 4 KB holds the registers, and the next three 4 KB windows alias the same
+//! registers with XOR (`+0x1000`), SET (`+0x2000`) and CLR (`+0x3000`)
+//! semantics. [`MmioRouter`] folds those windows into one read-modify-write on
+//! the child device, so devices never see an alias offset. Reads through an
+//! alias return the underlying register value. A child window that would cross
+//! its own or another child's alias span is rejected at mount time.
+//! RP2350 APB 寄存器按 [`MMIO_BLOCK_SIZE`] 分块：首个 4 KB 是寄存器本体，随后
+//! 三个 4 KB 窗口以 XOR（`+0x1000`）、SET（`+0x2000`）、CLR（`+0x3000`）语义
+//! 别名同一批寄存器。[`MmioRouter`] 把这些窗口折叠成对子设备的一次读-改-写，
+//! 设备本身不会看到别名偏移；经别名读回的是底层寄存器当前值。若子窗口会跨越
+//! 自己或其它子设备的别名跨度，挂载时直接报错。
 
 // MMIO 框架涉及地址与寄存器偏移之间的定宽换算，这是内存映射层的固有特性。
 // The MMIO framework converts between addresses and register offsets, which is
@@ -32,6 +47,53 @@ use super::types::Address;
 
 /// Register granularity of an MMIO window in bytes / MMIO 窗口的寄存器粒度（字节）
 pub const MMIO_REGISTER_SIZE: u32 = 4;
+
+/// Alignment of one APB register block including its alias windows
+/// 含别名窗口的 APB 寄存器块对齐
+pub const MMIO_BLOCK_SIZE: u32 = 0x4000;
+
+/// Offset of the XOR alias window inside a block / 块内 XOR 别名窗口偏移
+pub const MMIO_ALIAS_XOR: u32 = 0x1000;
+
+/// Offset of the SET alias window inside a block / 块内 SET 别名窗口偏移
+pub const MMIO_ALIAS_SET: u32 = 0x2000;
+
+/// Offset of the CLR alias window inside a block / 块内 CLR 别名窗口偏移
+pub const MMIO_ALIAS_CLR: u32 = 0x3000;
+
+/// Atomic write alias applied to a register / 施加到寄存器上的原子写别名
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AliasOp {
+    /// `underlying ^= value` / 异或
+    Xor,
+    /// `underlying |= value` / 置位
+    Set,
+    /// `underlying &= !value` / 清位
+    Clr,
+}
+
+impl AliasOp {
+    /// Fold `value` into the current register content / 将 `value` 合成进当前寄存器值
+    fn apply(self, current: u32, value: u32) -> u32 {
+        match self {
+            Self::Xor => current ^ value,
+            Self::Set => current | value,
+            Self::Clr => current & !value,
+        }
+    }
+}
+
+/// One MMIO access resolved to a child device / 解析到某个子设备的一次 MMIO 访问
+struct Resolved {
+    /// Index of the owning child / 拥有该地址的子设备索引
+    index: usize,
+    /// Address handed to the child, alias offset already folded
+    /// 交给子设备的地址，别名偏移已折叠
+    reg_addr: Address,
+    /// Alias operation, `None` for a direct register access
+    /// 别名操作；直接访问寄存器时为 `None`
+    op: Option<AliasOp>,
+}
 
 /// An address window owned by one MMIO device / 单个 MMIO 设备拥有的地址窗口
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,13 +421,16 @@ impl MmioRouter {
     }
 
     /// Mount a child device; its window must lie inside the router window and
-    /// must not overlap an existing child.
-    /// 挂载子设备；其窗口必须位于路由器窗口内且不与已有子设备重叠。
+    /// must not overlap an existing child or any atomic alias span.
+    /// 挂载子设备；其窗口必须位于路由器窗口内，且不与已有子设备或任何原子别名
+    /// 跨度重叠。
     ///
     /// # Errors
-    /// Returns `BusError` with `Overlap` when two windows intersect, or another
-    /// kind when the child window is invalid or not contained.
-    /// 当两个窗口相交时返回 `Overlap`，子窗口非法或超出路由器窗口时返回其他类型。
+    /// Returns `BusError` with `Overlap` when two windows (including alias
+    /// spans) intersect, or `DeviceError` when the child window is invalid,
+    /// not contained, or crosses its own block's alias span.
+    /// 当两个窗口（含别名跨度）相交时返回 `Overlap`；子窗口非法、超出路由器
+    /// 窗口或跨越自己所属块的别名跨度时返回 `DeviceError`。
     pub fn mount(&mut self, device: Box<dyn MmioDevice>) -> BusResult<MmioWindow> {
         let child = device.window();
         child.validate()?;
@@ -375,11 +440,25 @@ impl MmioRouter {
                 kind: BusErrorKind::DeviceError,
             });
         }
-        let overlaps = self
-            .regions
-            .iter()
-            .any(|region| child.base < region.window().end() && region.window().base < child.end());
-        if overlaps {
+        // 寄存器窗口只能占块内前 0x1000 字节，否则会与自己的别名区重叠。
+        // A register window may only use the first 0x1000 bytes of its block,
+        // otherwise it would overlap its own alias windows.
+        let own_alias = alias_span(child.base);
+        if child.base < own_alias.end() && own_alias.base < child.end() {
+            return Err(CoreError::BusError {
+                addr: child.base,
+                kind: BusErrorKind::DeviceError,
+            });
+        }
+        let conflicts = self.regions.iter().any(|region| {
+            let other = region.window();
+            let other_alias = alias_span(other.base);
+            let window_clash = child.base < other.end() && other.base < child.end();
+            let alias_clash = child.base < other_alias.end() && other_alias.base < child.end();
+            let reverse_clash = other.base < own_alias.end() && own_alias.base < other.end();
+            window_clash || alias_clash || reverse_clash
+        });
+        if conflicts {
             return Err(CoreError::BusError {
                 addr: child.base,
                 kind: BusErrorKind::Overlap,
@@ -394,6 +473,44 @@ impl MmioRouter {
         self.regions
             .iter()
             .position(|region| region.window().contains(addr))
+    }
+
+    /// Resolve `addr` to a child, folding the atomic alias windows
+    /// 将地址解析到子设备，并折叠原子别名窗口
+    ///
+    /// Inside each block `+0x1000` is XOR, `+0x2000` is SET and `+0x3000` is
+    /// CLR over the register with the same low 12 bits. Alias reads return the
+    /// underlying value; alias writes are folded into one read-modify-write by
+    /// the caller. The child always receives the folded (non-alias) address.
+    /// 每个块内 `+0x1000` 为 XOR、`+0x2000` 为 SET、`+0x3000` 为 CLR，作用于
+    /// 低 12 位相同的寄存器。别名读返回底层值；别名写由调用方折叠成一次
+    /// 读-改-写。子设备始终只看到折叠后的（非别名）地址。
+    fn resolve(&self, addr: Address) -> Option<Resolved> {
+        if let Some(index) = self.child_index(addr) {
+            return Some(Resolved {
+                index,
+                reg_addr: addr,
+                op: None,
+            });
+        }
+        for (index, region) in self.regions.iter().enumerate() {
+            let block = region.window().base & !(MMIO_BLOCK_SIZE - 1);
+            let (op, alias_base) = match addr.wrapping_sub(block) {
+                MMIO_ALIAS_XOR..MMIO_ALIAS_SET => (AliasOp::Xor, MMIO_ALIAS_XOR),
+                MMIO_ALIAS_SET..MMIO_ALIAS_CLR => (AliasOp::Set, MMIO_ALIAS_SET),
+                MMIO_ALIAS_CLR..MMIO_BLOCK_SIZE => (AliasOp::Clr, MMIO_ALIAS_CLR),
+                _ => continue,
+            };
+            let reg_addr = addr - alias_base;
+            if region.window().contains(reg_addr) {
+                return Some(Resolved {
+                    index,
+                    reg_addr,
+                    op: Some(op),
+                });
+            }
+        }
+        None
     }
 }
 
@@ -411,48 +528,108 @@ impl MemoryRegion for MmioRouter {
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
-        if let Some(index) = self.child_index(addr) {
-            self.regions[index].read_u8(addr, cycles)
-        } else {
-            *cycles += 1;
-            warn_unhandled(&mut self.warned, &self.name, addr);
-            Ok(0)
+        match self.resolve(addr) {
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: None,
+            }) => self.regions[index].read_u8(reg_addr, cycles),
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: Some(_),
+            }) => {
+                let word = self.regions[index].read_u32(reg_addr & !3, cycles)?;
+                Ok((word >> ((reg_addr & 3) * 8)) as u8)
+            }
+            None => {
+                *cycles += 1;
+                warn_unhandled(&mut self.warned, &self.name, addr);
+                Ok(0)
+            }
         }
     }
 
     fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
-        if let Some(index) = self.child_index(addr) {
-            self.regions[index].write_u8(addr, value, cycles)
-        } else {
-            *cycles += 1;
-            warn_unhandled(&mut self.warned, &self.name, addr);
-            Ok(())
+        match self.resolve(addr) {
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: None,
+            }) => self.regions[index].write_u8(reg_addr, value, cycles),
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: Some(op),
+            }) => {
+                let word_addr = reg_addr & !3;
+                let current = self.regions[index].read_u32(word_addr, cycles)?;
+                let updated = op.apply(current, u32::from(value) << ((reg_addr & 3) * 8));
+                self.regions[index].write_u32(word_addr, updated, cycles)
+            }
+            None => {
+                *cycles += 1;
+                warn_unhandled(&mut self.warned, &self.name, addr);
+                Ok(())
+            }
         }
     }
 
     fn read_u16(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u16> {
-        if let Some(index) = self.child_index(addr) {
-            self.regions[index].read_u16(addr, cycles)
-        } else {
-            *cycles += 1;
-            warn_unhandled(&mut self.warned, &self.name, addr);
-            Ok(0)
+        match self.resolve(addr) {
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: None,
+            }) => self.regions[index].read_u16(reg_addr, cycles),
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: Some(_),
+            }) => {
+                let word = self.regions[index].read_u32(reg_addr & !3, cycles)?;
+                Ok((word >> ((reg_addr & 3) * 8)) as u16)
+            }
+            None => {
+                *cycles += 1;
+                warn_unhandled(&mut self.warned, &self.name, addr);
+                Ok(0)
+            }
         }
     }
 
     fn write_u16(&mut self, addr: Address, value: u16, cycles: &mut u64) -> BusResult<()> {
-        if let Some(index) = self.child_index(addr) {
-            self.regions[index].write_u16(addr, value, cycles)
-        } else {
-            *cycles += 1;
-            warn_unhandled(&mut self.warned, &self.name, addr);
-            Ok(())
+        match self.resolve(addr) {
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: None,
+            }) => self.regions[index].write_u16(reg_addr, value, cycles),
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: Some(op),
+            }) => {
+                let word_addr = reg_addr & !3;
+                let current = self.regions[index].read_u32(word_addr, cycles)?;
+                let updated = op.apply(current, u32::from(value) << ((reg_addr & 3) * 8));
+                self.regions[index].write_u32(word_addr, updated, cycles)
+            }
+            None => {
+                *cycles += 1;
+                warn_unhandled(&mut self.warned, &self.name, addr);
+                Ok(())
+            }
         }
     }
 
     fn read_u32(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u32> {
-        if let Some(index) = self.child_index(addr) {
-            self.regions[index].read_u32(addr, cycles)
+        // 别名区读出底层寄存器的当前值。Alias reads return the underlying value.
+        if let Some(Resolved {
+            index, reg_addr, ..
+        }) = self.resolve(addr)
+        {
+            self.regions[index].read_u32(reg_addr, cycles)
         } else {
             *cycles += 1;
             warn_unhandled(&mut self.warned, &self.name, addr);
@@ -461,12 +638,25 @@ impl MemoryRegion for MmioRouter {
     }
 
     fn write_u32(&mut self, addr: Address, value: u32, cycles: &mut u64) -> BusResult<()> {
-        if let Some(index) = self.child_index(addr) {
-            self.regions[index].write_u32(addr, value, cycles)
-        } else {
-            *cycles += 1;
-            warn_unhandled(&mut self.warned, &self.name, addr);
-            Ok(())
+        match self.resolve(addr) {
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: None,
+            }) => self.regions[index].write_u32(reg_addr, value, cycles),
+            Some(Resolved {
+                index,
+                reg_addr,
+                op: Some(op),
+            }) => {
+                let current = self.regions[index].read_u32(reg_addr, cycles)?;
+                self.regions[index].write_u32(reg_addr, op.apply(current, value), cycles)
+            }
+            None => {
+                *cycles += 1;
+                warn_unhandled(&mut self.warned, &self.name, addr);
+                Ok(())
+            }
         }
     }
 }
@@ -489,6 +679,20 @@ pub fn mount_device(
     window.validate()?;
     bus.register_region(Box::new(MmioRegion::new(device)))?;
     Ok(window)
+}
+
+/// Alias span of the block that owns `base` / `base` 所属块的别名跨度
+///
+/// The alias windows cover `block + 0x1000 .. block + 0x4000`, where the block
+/// base is `base` rounded down to [`MMIO_BLOCK_SIZE`].
+/// 别名窗口覆盖 `block + 0x1000 .. block + 0x4000`，块基址为 `base` 向下按
+/// [`MMIO_BLOCK_SIZE`] 对齐后的地址。
+fn alias_span(base: Address) -> MmioWindow {
+    let block = base & !(MMIO_BLOCK_SIZE - 1);
+    MmioWindow::new(
+        block + MMIO_ALIAS_XOR,
+        (MMIO_BLOCK_SIZE - MMIO_ALIAS_XOR) as usize,
+    )
 }
 
 /// Emit one warning per unmodelled address / 对每个未建模地址只警告一次
@@ -539,6 +743,13 @@ mod tests {
     fn dummy() -> Box<dyn MmioDevice> {
         Box::new(Dummy {
             window: MmioWindow::new(0x4000_0000, 0x1000),
+            value: 0,
+        })
+    }
+
+    fn dummy_at(base: u32, size: usize) -> Box<dyn MmioDevice> {
+        Box::new(Dummy {
+            window: MmioWindow::new(base, size),
             value: 0,
         })
     }
@@ -609,5 +820,75 @@ mod tests {
         assert!(MmioWindow::new(0x4000_0000, 2).validate().is_err());
         assert!(MmioWindow::new(0xFFFF_F000, 0x2000).validate().is_err());
         assert!(MmioWindow::new(0x4000_0000, 0x1000).validate().is_ok());
+    }
+
+    #[test]
+    fn alias_writes_fold_into_one_register() {
+        let mut router = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        router.mount(dummy()).unwrap();
+        let mut cycles = 0;
+        router
+            .write_u32(0x4000_0000, 0x0000_000F, &mut cycles)
+            .unwrap();
+        router
+            .write_u32(0x4000_2000, 0x0000_00F0, &mut cycles)
+            .unwrap();
+        assert_eq!(
+            router.read_u32(0x4000_0000, &mut cycles).unwrap(),
+            0x0000_00FF,
+            "SET alias must OR into the register"
+        );
+        router
+            .write_u32(0x4000_3000, 0x0000_000F, &mut cycles)
+            .unwrap();
+        assert_eq!(
+            router.read_u32(0x4000_0000, &mut cycles).unwrap(),
+            0x0000_00F0,
+            "CLR alias must clear bits"
+        );
+        router
+            .write_u32(0x4000_1000, 0x0000_00FF, &mut cycles)
+            .unwrap();
+        assert_eq!(
+            router.read_u32(0x4000_0000, &mut cycles).unwrap(),
+            0x0000_000F,
+            "XOR alias must toggle bits"
+        );
+    }
+
+    #[test]
+    fn alias_reads_return_the_underlying_value() {
+        let mut router = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        router.mount(dummy()).unwrap();
+        let mut cycles = 0;
+        router
+            .write_u32(0x4000_0000, 0xA5A5_5A5A, &mut cycles)
+            .unwrap();
+        assert_eq!(
+            router.read_u32(0x4000_1000, &mut cycles).unwrap(),
+            0xA5A5_5A5A
+        );
+        assert_eq!(
+            router.read_u32(0x4000_2000, &mut cycles).unwrap(),
+            0xA5A5_5A5A
+        );
+        assert_eq!(
+            router.read_u32(0x4000_3000, &mut cycles).unwrap(),
+            0xA5A5_5A5A
+        );
+    }
+
+    #[test]
+    fn alias_spans_reject_conflicting_windows() {
+        let mut router = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        router.mount(dummy()).unwrap();
+        // 落进已挂载设备的别名区。Lands inside a mounted device's alias span.
+        assert!(router.mount(dummy_at(0x4000_2000, 0x1000)).is_err());
+
+        let mut fresh = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        // 跨进自己所在块的别名区。Crosses its own block's alias span.
+        assert!(fresh.mount(dummy_at(0x4000_0800, 0x1000)).is_err());
+        // 只占块内前 4 KB 则合法。Staying inside the first 4 KB is accepted.
+        assert!(fresh.mount(dummy_at(0x4000_0800, 0x800)).is_ok());
     }
 }

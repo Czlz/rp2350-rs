@@ -273,6 +273,24 @@ pub fn mount_device(
   原子分发（不会拆成多次字节副作用）。
 - ARM 侧 `CpuId` 等类型从 `rp2350_core` 复用，外部 crate 不需要依赖 CPU 后端。
 
+### APB Atomic Aliases / APB 原子别名
+
+RP2350 的 APB 寄存器按 4 KB 分块：块内前 4 KB 是寄存器本体，后三个 4 KB 窗口
+对同一批寄存器做原子操作——`+0x1000` 为 XOR、`+0x2000` 为 SET、`+0x3000` 为 CLR。
+`MmioRouter` 统一处理这些窗口，`MmioDevice` 不需要（也不允许）自己实现别名：
+
+- 设备在 `window()` 里只声明本体窗口，且必须落在所属 `0x4000` 块的前 4 KB 内。
+- 别名写折叠成对子设备的一次读-改-写：SET 为 `|=`、CLR 为 `&= !`、XOR 为 `^=`；
+  底层仍走设备自己的 `read32`/`write32`，设备永远看不到别名偏移。
+- 别名读返回底层寄存器的当前值。
+- 挂载时若子窗口会跨越自己或其它子设备的别名跨度，`mount` 返回
+  `Overlap`/`DeviceError`，不会静默共享。
+
+pico-sdk 大量依赖这套别名（`hw_set_bits`/`hw_clear_bits` 会写 `RESETS`、
+`PLL_*_PWR`、`CLOCKS_*_CTRL`、`XOSC_CTRL`），缺了它这些写会被静默丢弃，固件随后
+在等待对应状态位时死等。`0x4004_A000` 这类地址不是新设备，而是 `XOSC` 的 SET
+别名（`0x4004_8000 + 0x2000`）。
+
 ### Interrupt Number Map / 中断号映射
 
 中断号取自 pico-sdk `intctrl.h`（RP2350），也是 `crates/rp2350-periph/src/map.rs`
