@@ -233,7 +233,7 @@ Stage 4 只建模启动路径需要的外设；基地址已按 RP2350 数据手�
 | 0x4002_0000 | RESETS | 桩：`RESET_DONE` 恒读全 1 |
 | 0x4002_8000 | IO_BANK0 | 桩：寄存器存储 |
 | 0x4003_8000 | PADS_BANK0 | 桩：48 个 pad 复位值 0x56 |
-| 0x4004_8000 | XOSC | 桩：`STATUS` 恒为 STABLE\|ENABLED |
+| 0x4004_8000 | XOSC | 桩：`STATUS`（0x04）恒为 STABLE\|ENABLED，`CTRL`（0x00）只写 |
 | 0x4005_0000 | PLL_SYS | 桩：`CS.LOCK` 恒为 1 |
 | 0x4005_8000 | PLL_USB | 桩：`CS.LOCK` 恒为 1 |
 | 0x4007_0000 | UART0 (PL011) | 桩：写 `DR` 进入宿主串口缓冲 |

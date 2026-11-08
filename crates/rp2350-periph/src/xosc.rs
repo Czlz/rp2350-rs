@@ -49,7 +49,12 @@ impl MmioDevice for Xosc {
 
     fn read32(&mut self, offset: u32) -> Option<u32> {
         match offset {
-            0x00 => Some(STATUS_STABLE | STATUS_ENABLED),
+            // XOSC_STATUS 位于 0x04；0x00 是 CTRL，只能写。
+            // 固件轮询的是 STATUS.STABLE，若把状态挂在 CTRL 偏移上会静默读 0 死等。
+            // XOSC_STATUS lives at 0x04; 0x00 is the write-only CTRL register.
+            // Firmware polls STATUS.STABLE, so reporting status at the CTRL offset
+            // silently reads zero and spins forever.
+            0x04 => Some(STATUS_STABLE | STATUS_ENABLED),
             _ => self.regs.read(offset),
         }
     }
@@ -73,6 +78,14 @@ mod tests {
     #[test]
     fn status_reports_stable() {
         let mut xosc = Xosc::new();
-        assert_eq!(xosc.read32(0x00), Some(0x8000_1000));
+        assert_eq!(xosc.read32(0x04), Some(0x8000_1000));
+    }
+
+    #[test]
+    fn ctrl_writes_do_not_leak_into_status() {
+        let mut xosc = Xosc::new();
+        assert!(xosc.write32(0x00, 0x00FA_AA00));
+        assert_eq!(xosc.read32(0x00), Some(0));
+        assert_eq!(xosc.read32(0x04), Some(0x8000_1000));
     }
 }
