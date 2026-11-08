@@ -193,15 +193,17 @@ impl ITBlockState {
 
         self.count -= 1;
         if self.count > 0 {
-            // Shift mask to consume the LSB of the current instruction;
-            // next instruction's condition is then determined by the new LSB.
-            // 右移 mask 消耗当前指令的 LSB；下一条指令的条件由新的 LSB 决定。
-            self.mask >>= 1;
-            if self.mask & 1 != 0 {
-                self.cond = self.base_cond;
+            // 条件位从 bit3 向 bit0 依次对应块内第 2..n 条指令：0 沿用首条件
+            // （T），1 取反（E）；最低位的那个 1 只是终止标记，不对应指令。
+            // Condition bits are consumed from bit3 downwards: 0 keeps the
+            // first condition (T), 1 inverts it (E), and the lowest set bit
+            // only terminates the block.
+            let position = self.mask.trailing_zeros() + u32::from(self.count);
+            self.cond = if (self.mask >> position) & 1 != 0 {
+                Condition::from_bits((self.base_cond as u8) ^ 1)
             } else {
-                self.cond = Condition::from_bits((self.base_cond as u8) ^ 1);
-            }
+                self.base_cond
+            };
         }
 
         current_cond
@@ -365,7 +367,7 @@ mod tests {
     #[test]
     fn it_block_4_instructions() {
         let mut it = ITBlockState::new();
-        let count = it.execute_it(0x0, 0x5); // ITETE eq
+        let count = it.execute_it(0x0, 0xB); // ITETE eq
         assert_eq!(count, 4);
         assert_eq!(it.cond, Condition::Eq);
         assert!(it.in_it_block());
@@ -375,6 +377,21 @@ mod tests {
         assert_eq!(it.advance(), Condition::Ne); // 2nd
         assert_eq!(it.advance(), Condition::Eq); // 3rd
         assert_eq!(it.advance(), Condition::Ne); // 4th
+        assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn it_block_3_instructions_repeats_the_base_condition() {
+        let mut it = ITBlockState::new();
+        let count = it.execute_it(0x0, 0x2); // ITTT eq
+        assert_eq!(count, 3);
+
+        // 0b0010: 两位 T 分别对应第 2、3 条指令，最低位的 1 只是终止标记。
+        // 0b0010: both T bits cover instructions 2 and 3; the lowest 1 only
+        // terminates the block.
+        assert_eq!(it.advance(), Condition::Eq);
+        assert_eq!(it.advance(), Condition::Eq);
+        assert_eq!(it.advance(), Condition::Eq);
         assert!(!it.in_it_block());
     }
 
