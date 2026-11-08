@@ -49,6 +49,35 @@ fn sign_extend(value: u32, bits: u32) -> u32 {
     ((value << shift) as i32 >> shift) as u32
 }
 
+/// Return true for Thumb-16 instructions whose flag updates are unconditional
+/// even inside an IT block: the compare/test family (CMP/TST/CMN).
+/// 返回即使在 IT 块内也“无条件更新标志”的 16 位指令——比较/测试类
+/// （CMP/TST/CMN）。
+///
+/// ARM defines `setflags = !InITBlock()` for the S-implicit 16-bit
+/// arithmetic/data-processing encodings, but CMP/TST/CMN have no non-flag
+/// variant, so they always update APSR.
+/// ARM 规定 S 位隐含的 16 位算术/数据处理编码 `setflags = !InITBlock()`，
+/// 但 CMP/TST/CMN 没有不带标志的变体，因此它们始终更新 APSR。
+fn thumb16_always_writes_flags(opcode: u16) -> bool {
+    match (opcode >> 11) & 0x1F {
+        // CMP (immediate) / CMP 立即数
+        0b00101 => true,
+        0b01000 => {
+            if (opcode >> 10) & 0x1 != 0 {
+                // High-register group: only CMP (op == 0b01) writes flags.
+                // 高寄存器组中只有 CMP（op == 0b01）写标志。
+                (opcode >> 8) & 0x3 == 0b01
+            } else {
+                // Data-processing (register): TST, CMP, CMN.
+                // 数据处理（寄存器）：TST、CMP、CMN。
+                matches!((opcode >> 6) & 0xF, 0x8 | 0xA | 0xB)
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Perform a logical shift left: value << shift, with APSR carry
 /// 执行逻辑左移：value << shift，带 APSR 进位
 fn lsl_c(value: u32, shift: u32, regs: &mut CortexM33Registers) -> u32 {
@@ -202,7 +231,14 @@ pub fn execute_thumb16(
 ) -> Result<StepResult, CoreError> {
     // IT block condition check
     // IT 块条件检查
-    if it.in_it_block() {
+    //
+    // 必须在 advance() 之前记录“本条是否位于 IT 块内”：advance() 会消费最后一个
+    // 槽位，使其后 in_it_block() 立即变为 false。
+    // Capture whether this instruction started inside an IT block before
+    // advance(), because advance() consumes the final slot and clears
+    // in_it_block() right afterwards.
+    let in_it = it.in_it_block();
+    if in_it {
         let cond = it.advance();
         if !cond.evaluate(regs) {
             // Instruction in IT block is not executed
@@ -211,6 +247,20 @@ pub fn execute_thumb16(
             return Ok(StepResult::Ok);
         }
     }
+
+    // 16 位算术/数据处理编码的 S 位是隐含的，ARM 规定 setflags =
+    // !InITBlock()：在 IT 块内执行时不更新标志位。真实固件依赖这一点，例如
+    // strlen 的 `itt eq { ldreq; addeq r0,#4 }` 之后紧跟 `beq`；若 `addeq`
+    // 清掉 Z，循环会提前退出。比较/测试类（CMP/TST/CMN）始终更新标志，故
+    // 不参与快照恢复。
+    // Thumb-16 arithmetic/data-processing encodings carry an implicit S bit and
+    // ARM specifies setflags = !InITBlock(): inside an IT block they leave the
+    // flags unchanged. Real firmware depends on this (strlen's
+    // `itt eq { ldreq; addeq r0,#4 }` is followed by `beq`; clearing Z in
+    // `addeq` would exit the loop early). Compare/test instructions
+    // (CMP/TST/CMN) always update the flags and are excluded from the restore.
+    let saved_flags = regs.xpsr & 0xF000_0000;
+    let suppress_flags = in_it && !thumb16_always_writes_flags(opcode);
 
     let instr_type = (opcode >> 11) & 0x1F; // bits [15:11]
 
@@ -439,16 +489,13 @@ pub fn execute_thumb16(
                     // C flag unchanged for TST
                 }
                 0x9 => {
-                    // RSBS / 反减（0 - Rn）
-                    let (result, _overflow) = 0u32.overflowing_sub(rn_val);
-                    let c = 0 >= rn_val;
+                    // RSBS / 反减（0 - Rm）：Rdn 只是结果寄存器，取反的是源操作数。
+                    // RSBS negates the source register Rm; Rdn only receives the
+                    // result. Negating Rdn is wrong (e.g. NEGS r5, r3 at 0x425D).
+                    let (result, overflow) = 0u32.overflowing_sub(rm_val);
+                    let carry = rm_val == 0; // C = NOT borrow / C 表示无借位
                     regs.r[rdn] = result;
-                    regs.set_apsr_nzcv(
-                        (result & 0x8000_0000) != 0,
-                        result == 0,
-                        c,
-                        (rn_val & 0x8000_0000) != 0,
-                    );
+                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, carry, overflow);
                 }
                 0xA => {
                     // CMP / 比较
@@ -797,12 +844,32 @@ pub fn execute_thumb16(
                 // BKPT #imm8
                 // BKPT #imm8
                 0xBE => return Ok(StepResult::Breakpoint((opcode & 0xFF) as u8)),
-                // IT
-                // IT 指令
+                // HINT / IT
+                // HINT / IT 指令
                 0xBF => {
+                    // 编码按 ARMv8-M 手册：bits[3:0] 为 0 时进入 hint 空间，
+                    // bits[7:4] 为提示编号；只有 bits[3:0] 非 0 才是 IT 块。
+                    // 依据：`IT EQ` 汇编为 0xBF08、`IT NE` 为 0xBF18，
+                    // 而 NOP/YIELD/WFE/WFI/SEV/SEVL 分别是 0xBF00/10/20/30/40/50。
+                    // Per ARMv8-M, bits[3:0] == 0 selects the hint space with
+                    // the hint number in bits[7:4]; only a non-zero mask is IT.
                     let firstcond = ((opcode >> 4) & 0xF) as u8;
                     let mask = (opcode & 0xF) as u8;
-                    if firstcond == 0xF || (firstcond == 0xE && mask != 0) {
+                    if mask == 0 {
+                        return Ok(match firstcond {
+                            // WFE / WFI：显式进入等待状态，不能顺带跳过下一条。
+                            // WFE / WFI: a real wait state, never a silent skip.
+                            0x2 | 0x3 => StepResult::Sleep,
+                            // NOP / YIELD / SEV / SEVL 以及手册保留的 hint 编码
+                            // （0x6..=0xF）均按 NOP 执行。
+                            // NOP / YIELD / SEV / SEVL, plus the reserved hint
+                            // encodings (0x6..=0xF), all execute as NOP.
+                            _ => StepResult::Ok,
+                        });
+                    }
+                    // mask 非 0 才是 IT；AL（0xE）与 NV（0xF）条件非法。
+                    // A non-zero mask selects IT; AL (0xE) and NV (0xF) are illegal.
+                    if firstcond == 0xF || firstcond == 0xE {
                         return Ok(StepResult::Undefined);
                     }
                     it.execute_it(firstcond, mask);
@@ -868,6 +935,13 @@ pub fn execute_thumb16(
         _ => {
             return Ok(StepResult::Undefined);
         }
+    }
+
+    // 恢复 IT 块内不应被更新的标志位（见函数开头的说明）。
+    // Restore the flags that must not be updated inside an IT block (see the
+    // note at the top of this function).
+    if suppress_flags {
+        regs.xpsr = (regs.xpsr & !0xF000_0000) | saved_flags;
     }
 
     *cycles += 1;
@@ -982,5 +1056,206 @@ mod tests {
         assert_eq!(run16(0xBA60, 4, 0x1234_5678).r[0], 0x3412_7856);
         assert_eq!(run16(0xBAE0, 4, 0x1234_5678).r[0], 0x0000_7856);
         assert_eq!(run16(0xBAE0, 4, 0x1234_80FF).r[0], 0xFFFF_FF80);
+    }
+
+    /// Execute one Thumb-16 opcode against shared CPU state.
+    /// 用共享的 CPU 状态执行一条 Thumb-16 指令。
+    fn step16(
+        opcode: u16,
+        regs: &mut CortexM33Registers,
+        bus: &mut rp2350_core::memory::SimpleBus,
+        it: &mut ITBlockState,
+    ) -> StepResult {
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut cycles = 0;
+        execute_thumb16(opcode, regs, bus, &mut nvic, &mut systick, it, &mut cycles).unwrap()
+    }
+
+    #[test]
+    fn sev_hint_does_not_swallow_following_pop() {
+        // 0xBF40 SEV 是 hint，不是 IT MI；后随 pop {r4, pc} 必须执行。
+        // 0xBF40 SEV is a hint, not IT MI; the following pop must execute.
+        let mut regs = CortexM33Registers::new();
+        regs.sp = 0x2000_1000;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        bus.register_region(Box::new(rp2350_core::memory::RamRegion::new(
+            "stack",
+            0x2000_1000,
+            0x10,
+        )))
+        .unwrap();
+        let mut cycles = 0;
+        bus.write_u32(0x2000_1000, 0xAAAA_AAAA, &mut cycles)
+            .unwrap();
+        bus.write_u32(0x2000_1004, 0x1000_0001, &mut cycles)
+            .unwrap();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0xBF40, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert!(!it.in_it_block());
+        assert_eq!(
+            step16(0xBD10, &mut regs, &mut bus, &mut it),
+            StepResult::BranchTaken
+        );
+        assert_eq!(regs.r[4], 0xAAAA_AAAA);
+        assert_eq!(regs.pc, 0x1000_0000);
+        assert_eq!(regs.sp, 0x2000_1008);
+    }
+
+    #[test]
+    fn nop_hint_does_not_skip_next_instruction() {
+        // 0xBF00 NOP 不得被当成 IT EQ：Z=0 时下一条仍要执行。
+        // NOP must not become IT EQ: with Z clear the next instruction still runs.
+        let mut regs = CortexM33Registers::new();
+        regs.set_nz_flags(1); // Z = 0
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0xBF00, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        // movs r0, #1
+        assert_eq!(step16(0x2001, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[0], 1);
+    }
+
+    #[test]
+    fn wfe_and_wfi_hints_return_sleep() {
+        // 0xBF20 WFE / 0xBF30 WFI 必须表达为 Sleep，且不武装 IT 块。
+        // WFE / WFI must surface as Sleep and must not arm an IT block.
+        let mut regs = CortexM33Registers::new();
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(
+            step16(0xBF20, &mut regs, &mut bus, &mut it),
+            StepResult::Sleep
+        );
+        assert_eq!(
+            step16(0xBF30, &mut regs, &mut bus, &mut it),
+            StepResult::Sleep
+        );
+        assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn ite_ne_runs_the_eq_slot_when_z_is_set() {
+        // 复现固件 0x100309EA 处的用法：TST 结果为 0（Z=1）时 ITE NE 的第一槽
+        // 跳过、第二槽（EQ）执行。
+        // Mirrors the firmware at 0x100309EA: with Z set (TST result zero),
+        // ITE NE skips slot 1 and executes slot 2 (EQ).
+        let mut regs = CortexM33Registers::new();
+        regs.r[0] = 0x2000_5024;
+        regs.set_nz_flags(0); // Z = 1, NE false
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0xBF14, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        // movne r0, #1 — skipped
+        assert_eq!(step16(0x2001, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[0], 0x2000_5024);
+        // moveq r0, #0 — executed
+        assert_eq!(step16(0x2000, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[0], 0);
+        assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn negs_negates_the_source_register_not_the_destination() {
+        // 0x425D = NEGS r5, r3：Rdn=5 只是结果寄存器，取反的是 Rm=3。
+        // 固件在 0x100314F4 用它把 RM 基址转成数组下标；若错误地取反 Rdn，
+        // 地址会算出 0x1F40xxxx 这类越界值。
+        // 0x425D is NEGS r5, r3: Rdn=5 only receives the result, Rm=3 is
+        // negated. The firmware relies on this to map a base address to an
+        // array index; negating Rdn instead yields an out-of-range address.
+        let mut regs = CortexM33Registers::new();
+        regs.r[3] = 0xFFFF_8000;
+        regs.r[5] = 0x400B_8000;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0x425D, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[5], 0x0000_8000);
+        assert!(!regs.apsr_z());
+        assert!(!regs.apsr_c());
+    }
+
+    #[test]
+    fn negs_of_zero_sets_carry_and_zero() {
+        // 0 - 0 = 0：C = 1（无借位），Z = 1。
+        // 0 - 0 = 0 sets C (no borrow) and Z.
+        let mut regs = CortexM33Registers::new();
+        regs.r[3] = 0;
+        regs.r[5] = 0x1234_5678;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0x425D, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[5], 0);
+        assert!(regs.apsr_z());
+        assert!(regs.apsr_c());
+    }
+
+    #[test]
+    fn real_it_instruction_still_arms_it_block() {
+        // 0xBF0C = ITE EQ：Z=0 时第一条跳过、第二条（NE）执行。
+        // 0xBF0C ITE EQ with Z clear: skip the EQ slot, execute the NE slot.
+        let mut regs = CortexM33Registers::new();
+        regs.set_nz_flags(1); // Z = 0
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0xBF0C, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert!(it.in_it_block());
+        // movs r0, #7 — EQ false, skipped
+        assert_eq!(step16(0x2007, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[0], 0);
+        // movs r1, #9 — NE true, executed
+        assert_eq!(step16(0x2109, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[1], 9);
+        assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn sixteen_bit_add_inside_it_block_keeps_flags() {
+        // 复现 strlen（0x100397D0）的 `itt eq { ldreq.w; addeq r0,#4 }` 后紧跟
+        // `beq`：IT 块内的 16 位 ADDS 不得清除 Z，否则循环提前退出。
+        // Reproduce strlen's `itt eq { ldreq.w; addeq r0,#4 }` followed by
+        // `beq`: the 16-bit ADDS in an IT slot must not clear Z, or the loop
+        // exits early.
+        let mut regs = CortexM33Registers::new();
+        regs.set_apsr_nzcv(false, true, false, false); // Z = 1
+        regs.r[0] = 0xFFFF_FFFE;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        // itt eq
+        assert_eq!(step16(0xBF04, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        // addeq r0, #4 → r0 = 2, but Z must stay set for the following beq.
+        assert_eq!(step16(0x3004, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[0], 2);
+        assert!(regs.apsr_z(), "IT slot must not update Z");
+    }
+
+    #[test]
+    fn sixteen_bit_add_outside_it_block_sets_flags() {
+        // 同样的 ADDS 在 IT 块外必须照常更新标志（Z 清零）。
+        // The same ADDS outside an IT block must update flags (Z cleared).
+        let mut regs = CortexM33Registers::new();
+        regs.set_apsr_nzcv(false, true, false, false); // Z = 1
+        regs.r[0] = 0xFFFF_FFFE;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(step16(0x3004, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(regs.r[0], 2);
+        assert!(!regs.apsr_z(), "outside IT the ADDS must clear Z");
+    }
+
+    #[test]
+    fn compare_inside_it_block_still_sets_flags() {
+        // CMP 属于无条件写标志的指令，IT 块内仍更新 Z。
+        // CMP always writes flags, so it must update Z even inside an IT block.
+        let mut regs = CortexM33Registers::new();
+        regs.set_apsr_nzcv(false, true, false, false); // Z = 1 so the EQ slot runs
+        regs.r[0] = 5;
+        regs.r[1] = 6;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        // itt eq
+        assert_eq!(step16(0xBF04, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        // cmp r0, r1 (0x4288): 5 != 6 → it must clear Z even inside the block.
+        assert_eq!(step16(0x4288, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert!(!regs.apsr_z(), "CMP must update Z even inside IT");
     }
 }

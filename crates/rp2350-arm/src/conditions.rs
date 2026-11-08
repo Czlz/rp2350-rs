@@ -162,9 +162,12 @@ impl ITBlockState {
         // Determine block length from trailing zeros in mask
         // 从 mask 尾部的零确定块长度
         if mask == 0x0 {
-            // IT (1 instruction block)
-            self.count = 1;
-            self.cond = Condition::from_bits(firstcond);
+            // mask == 0 属于 hint 空间，解码器不会以它为 IT 调用；这里防御性
+            // 地不武装任何块，避免把 NOP/SEV 之类的 hint 当成单指令 IT。
+            // A zero mask is hint space, never IT; defensively arm nothing so a
+            // hint such as NOP/SEV cannot be mistaken for a one-instruction IT.
+            self.count = 0;
+            self.cond = Condition::Al;
         } else {
             // IT{x}{y}{z} — 2, 3, or 4 instructions
             // Number of instructions = 4 - trailing_zeros(mask)
@@ -193,17 +196,17 @@ impl ITBlockState {
 
         self.count -= 1;
         if self.count > 0 {
-            // 条件位从 bit3 向 bit0 依次对应块内第 2..n 条指令：0 沿用首条件
-            // （T），1 取反（E）；最低位的那个 1 只是终止标记，不对应指令。
-            // Condition bits are consumed from bit3 downwards: 0 keeps the
-            // first condition (T), 1 inverts it (E), and the lowest set bit
-            // only terminates the block.
+            // 条件及其反码只差最低位，因此 mask 的对应位直接给出该槽位条件的
+            // bit0，高 3 位沿用 firstcond。若简单按“取反”处理，firstcond 为
+            // 奇条件（NE/LO/PL/VC/LS/LT/LE）时会把第二槽算反：
+            // 实测 `ITE NE` = 0xBF14 的第二槽是 EQ，而 `ITT NE` = 0xBF1C。
+            // A condition and its inverse differ only in bit 0, so the mask bit
+            // supplies that slot's bit 0 directly and the upper bits come from
+            // firstcond. A plain inversion would flip odd conditions (NE/LO/...):
+            // `ITE NE` (0xBF14) has EQ in its second slot, `ITT NE` (0xBF1C) NE.
             let position = self.mask.trailing_zeros() + u32::from(self.count);
-            self.cond = if (self.mask >> position) & 1 != 0 {
-                Condition::from_bits((self.base_cond as u8) ^ 1)
-            } else {
-                self.base_cond
-            };
+            let slot_bit = (self.mask >> position) & 1;
+            self.cond = Condition::from_bits((self.base_cond as u8 & 0xE) | slot_bit);
         }
 
         current_cond
@@ -396,12 +399,31 @@ mod tests {
     }
 
     #[test]
-    fn it_block_1_instruction() {
+    fn it_block_inverts_relative_to_an_odd_base_condition() {
+        // ITE NE（0xBF14）第二槽应为 EQ，而不是继续 NE。
+        // ITE NE (0xBF14) must run its second slot as EQ, not NE.
         let mut it = ITBlockState::new();
-        let count = it.execute_it(0x8, 0x0); // IT hi
-        assert_eq!(count, 1);
-        assert_eq!(it.cond, Condition::Hi);
-        assert_eq!(it.advance(), Condition::Hi);
+        assert_eq!(it.execute_it(0x1, 0x4), 2);
+        assert_eq!(it.advance(), Condition::Ne);
+        assert_eq!(it.advance(), Condition::Eq);
         assert!(!it.in_it_block());
+
+        // ITT NE（0xBF1C）两槽都是 NE。
+        // ITT NE (0xBF1C) keeps NE in both slots.
+        assert_eq!(it.execute_it(0x1, 0xC), 2);
+        assert_eq!(it.advance(), Condition::Ne);
+        assert_eq!(it.advance(), Condition::Ne);
+        assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn zero_mask_does_not_arm_it_block() {
+        // mask == 0 属于 hint 空间，不能武装 IT 块。
+        // A zero mask is hint space and must not arm an IT block.
+        let mut it = ITBlockState::new();
+        let count = it.execute_it(0x8, 0x0);
+        assert_eq!(count, 0);
+        assert!(!it.in_it_block());
+        assert_eq!(it.advance(), Condition::Al);
     }
 }
