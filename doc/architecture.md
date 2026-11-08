@@ -229,7 +229,7 @@ Stage 4 只建模启动路径需要的外设；基地址已按 RP2350 数据手�
 | Base | Peripheral | Stage 4 |
 |------|------------|---------|
 | 0x4000_0000 | SYSINFO | 未建模 |
-| 0x4001_0000 | CLOCKS | 桩：`CLK_*_SELECTED` 恒读 1 |
+| 0x4001_0000 | CLOCKS | 桩：`CLK_*_SELECTED` 由 CTRL 的 `SRC`/`AUXSRC` 推导 |
 | 0x4002_0000 | RESETS | 桩：`RESET_DONE` 恒读全 1 |
 | 0x4002_8000 | IO_BANK0 | 桩：寄存器存储 |
 | 0x4003_8000 | PADS_BANK0 | 桩：48 个 pad 复位值 0x56 |
