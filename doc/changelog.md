@@ -27,6 +27,7 @@
 - `rp2350-core`: `AddressBus` trait, `MemoryRegion` trait, `BusErrorKind`, `CoreError`, `RP2350Chip`, `SimulationClock`, `IrqMatrix` (256 IRQs), `GpioPin` (48 pins), base types
 - `rp2350-cpu`: `CpuCore` trait (dyn-safe, no generic parameter), `CpuState` enum, `CpuArch` enum
 - `rp2350-arm`: `CortexM33Core` stub implementing `CpuCore`, `CortexM33Registers` (R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK)
+- `rp2350-arm`: **Phase 2 core components** — `Condition` enum (15 ARM conditions), `ITBlockState` (1-4 instruction IT blocks), `execute_thumb16` (Thumb-16 decoder with ~90 ops), `execute_thumb32` (Thumb-32 decoder stub), `Nvic` (ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, `find_highest_priority`), `SysTick` (24-bit down counter with reload/interrupt), `ExceptionHandler` (EXC_RETURN decode, stacking/unstacking, vector fetch, exception entry/exit)
 - `rp2350-periph`: `Peripheral` trait (extends `MemoryRegion`), peripheral stubs
 - `rp2350-virt-periph`: `DevicePlugin` trait (extends `RpPlugin`), `DevicePort`, `PortDirection`, `ConfigSchema`, `ConfigError`, `DeviceError`
 - `rp2350-virt-periph`: `DeviceManager` full implementation (register, wire, unwire, tick_all, sync_gpio, mcp_query_all) with unit tests
@@ -43,6 +44,13 @@
 - Project documentation: `doc/README.md`, `doc/architecture.md`, `doc/dependencies.md`, `doc/changelog.md`, `doc/implementation-plan.md`, `doc/plugins.md`, crate-level docs, FFI spec
 - Root `README.md` with features, quick start, crate structure, platform support
 - `.gitignore` (target, IDE, OS artifacts, WASM outputs, plugin binaries)
+- **Quality gate pass**: `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic` zero errors/warnings; `cargo test --all-features` 51/51 pass; `cargo doc --no-deps` zero warnings
+
+### Fixed
+- `conditions::execute_it`: instruction count formula `ctz(mask)+2` → `4-ctz(mask)` per ARM spec
+- `conditions::advance`: mask bit indexing switched to LSB-shift for correct T/E pattern decoding
+- `sysTick::tick`: counter reaching zero now triggers reload + interrupt in same tick cycle
+- `servicing_irq` test: IRQs must be enabled (`write_iser`) before `find_highest_priority` can see them
 
 ### Design Decisions / 设计决策
 - **Dyn-safe traits**: `CpuCore` uses `&mut dyn AddressBus` instead of generic `B` to enable trait objects
@@ -51,3 +59,4 @@
 - **PluginContext::BusDevice**: Minimal bus interface for plugins — full `MemoryRegion` stays in `rp2350-core`
 - **Edition 2024**: All crates use Rust Edition 2024 with `resolver = "3"`
 - **Feature gate `dep:` prefix**: `gui = ["dep:egui"]` for correct workspace feature resolution
+- **Decouple exception handling**: `exceptions.rs` provides free functions (`enter_exception`, `exit_exception`, `decode_exc_return`) called by `CortexM33Core`, not methods on the core struct itself

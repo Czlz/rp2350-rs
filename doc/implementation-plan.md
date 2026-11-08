@@ -1,6 +1,6 @@
 # Implementation Plan / 实施计划
 
-> **Version**: 3.0 | **Date**: 2026-11-08 | **Phase 1: ✅ COMPLETE**
+> **Version**: 3.0 | **Date**: 2026-11-08 | **Phase 1: ✅ COMPLETE** | **Phase 2: 🔄 IN PROGRESS**
 
 ---
 
@@ -41,23 +41,32 @@
 
 ---
 
-## Phase 2 · ARM Cortex-M33 Basic (Week 2-3)
+## Phase 2 · ARM Cortex-M33 Basic (Week 2-3) 🔄 IN PROGRESS
 
 ### Deliverables / 交付物
 
-| ID | Task | Output |
-|----|------|--------|
-| 2.1 | `CortexM33Registers`: R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK | registers.rs |
-| 2.2 | Thumb-16 decoder + executor (~90 instructions) | execute_thumb16.rs |
-| 2.3 | Thumb-32 basic decoder (~60 ALU + Load/Store, no DSP/FPU) | execute_thumb32.rs |
-| 2.4 | Condition flags (NZCVQ) + IT block execution | conditions.rs |
-| 2.5 | NVIC: ISER/ICER/ISPR/ICPR/IPR/STIR, priority grouping | nvic.rs |
-| 2.6 | Exception entry/exit (stacking/unstacking, EXC_RETURN) | exceptions.rs |
-| 2.7 | SysTick timer + PPB base registers (SCB, VTOR) | systick.rs + ppb.rs |
-| 2.8 | `CortexM33Core` impl of `CpuCore` trait | core.rs |
-| 2.9 | BOOTROM load + reset vector fetch + SP/PC init | chip boot sequence |
-| 2.10 | egui register viewer panel (R0-R15 table) | registers.rs panel |
-| 2.11 | `GdbTarget` trait + `ArmGdbTarget` stub | gdb target.rs |
+| ID | Task | Output | Status |
+|----|------|--------|--------|
+| 2.1 | `CortexM33Registers`: R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK | registers.rs | ✅ |
+| 2.2 | Thumb-16 decoder + executor (~90 instructions) | execute_thumb16.rs | ✅ |
+| 2.3 | Thumb-32 basic decoder (~60 ALU + Load/Store, no DSP/FPU) | execute_thumb32.rs | 🔄 stub |
+| 2.4 | Condition flags (NZCVQ) + IT block execution | conditions.rs | ✅ |
+| 2.5 | NVIC: ISER/ICER/ISPR/ICPR/IPR/STIR, priority grouping | nvic.rs | ✅ |
+| 2.6 | Exception entry/exit (stacking/unstacking, EXC_RETURN) | exceptions.rs | ✅ |
+| 2.7 | SysTick timer + PPB base registers (SCB, VTOR) | systick.rs | ✅ |
+| 2.8 | `CortexM33Core` impl of `CpuCore` trait | core.rs (lib.rs) | ✅ |
+| 2.9 | BOOTROM load + reset vector fetch + SP/PC init | chip boot sequence | ⬜ |
+| 2.10 | egui register viewer panel (R0-R15 table) | registers.rs panel | ⬜ |
+| 2.11 | `GdbTarget` trait + `ArmGdbTarget` stub | gdb target.rs | ⬜ |
+
+### Quality Gate (Current) / 质量门禁（当前）
+
+| Gate | Status |
+|------|--------|
+| `cargo fmt --all -- --check` | ✅ |
+| `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic` | ✅ zero errors/warnings |
+| `cargo test --all-features` | ✅ 51/51 pass |
+| `cargo doc --no-deps` | ✅ zero warnings |
 
 ### Milestone M2 / 里程碑 M2
 
