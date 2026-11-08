@@ -70,4 +70,31 @@ pub trait CpuCore: Send + Sync {
 
     /// Get human-readable core description / 获取可读的核心描述
     fn description(&self) -> String;
+
+    /// Return the current execution state / 返回当前执行状态
+    ///
+    /// Defaults to [`CpuState::Reset`] for cores that do not track state.
+    /// 对于不跟踪状态的核心，默认返回 [`CpuState::Reset`]。
+    #[must_use]
+    fn state(&self) -> CpuState {
+        CpuState::Reset
+    }
+
+    /// Read the program status register (XPSR) / 读取程序状态寄存器（XPSR）
+    ///
+    /// Defaults to `0` for cores without an XPSR (e.g. RISC-V).
+    /// 对于没有 XPSR 的核心（例如 RISC-V），默认返回 `0`。
+    #[must_use]
+    fn xpsr(&self) -> u32 {
+        0
+    }
+
+    /// Return cumulative cycles executed since reset / 返回自复位以来累计执行的周期数
+    ///
+    /// Defaults to `0` for cores that do not track cycle counts.
+    /// 对于不跟踪周期计数的核心，默认返回 `0`。
+    #[must_use]
+    fn total_cycles(&self) -> CycleCount {
+        0
+    }
 }
