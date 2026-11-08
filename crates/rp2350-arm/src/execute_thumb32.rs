@@ -1,13 +1,25 @@
 //! Thumb-32 instruction decoder and executor
 //! Thumb-32 指令解码器和执行器
 //!
-//! Decodes and executes Thumb-32 (32-bit) instructions. Currently covers
-//! the most common instructions: BL, MOVW, MOVT, ADDW, SUBW, LDR/STR
-//! with 12-bit offset, and some data processing modified immediate.
-//! Full DSP/FPU support is deferred to a later phase.
-//! 解码并执行 Thumb-32（32 位）指令。当前覆盖最常见的指令：
-//! BL、MOVW、MOVT、ADDW、SUBW、LDR/STR（12 位偏移）和一些修改立即数
-//! 数据处理。完整的 DSP/FPU 支持延后到后续阶段。
+//! Decodes and executes 32-bit Thumb instructions following the ARMv7-M /
+//! ARMv8-M top-level encoding hierarchy: the first halfword occupies
+//! instruction bits 31:16, so `op1` is bits 28:27 and the primary
+//! opcode field `op` is bits 26:20.
+//!
+//! Covered groups: data-processing (modified immediate, shifted register,
+//! register), register-offset and 12-bit immediate loads/stores, LDRD/STRD,
+//! multiply/divide (including long multiply), plain-binary immediate,
+//! bitfield, branches (B.W, B&lt;cond&gt;.W, BL, BLX), and miscellaneous system
+//! instructions. DSP/SIMD/FPU encodings remain undefined for now.
+//!
+//! 按 ARMv7-M / ARMv8-M 顶层编码层次解码并执行 32 位 Thumb 指令：
+//! 第一个半字位于指令位段 31:16，因此 `op1` 为位段 28:27，主操作码
+//! `op` 为位段 26:20。
+//!
+//! 已覆盖：数据处理（改良立即数、移位寄存器、寄存器）、寄存器偏移与
+//! 12 位立即数加载/存储、LDRD/STRD、乘除法（含长乘法）、纯二进制立即数、
+//! 位域、分支（B.W、B&lt;cond&gt;.W、BL、BLX）和杂项系统指令。
+//! DSP/SIMD/FPU 编码暂时视为未定义。
 
 // 指令解码器涉及大量位操作和类型转换，这是 ARM 指令集仿真的固有特性。
 // Instruction decoders involve extensive bit manipulation and casts,
@@ -15,6 +27,7 @@
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::too_many_lines,
     clippy::missing_errors_doc,
@@ -26,6 +39,16 @@
     clippy::unnecessary_cast,
     clippy::collapsible_if
 )]
+
+mod branch_misc;
+mod data_processing;
+mod load_store;
+mod multiply;
+
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
 
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
@@ -39,10 +62,11 @@ use super::systick::SysTick;
 /// Decode and execute one Thumb-32 instruction (32-bit)
 /// 解码并执行一条 Thumb-32 指令（32 位）
 ///
-/// Thumb-32 instructions are identified by opcode\[15:11\] = 11101, 11110, or 11111.
-/// The full 32-bit instruction is formed by joining two 16-bit halfwords.
-/// Thumb-32 指令通过 opcode\[15:11\] = 11101、11110 或 11111 识别。
-/// 完整的 32 位指令由两个 16 位半字连接而成。
+/// The 32-bit instruction word follows the ARM ARM layout with the first
+/// halfword in bits 31:16. Decoding is layered exactly as in the reference
+/// manual: `op1 = bits 28:27`, `op = bits 26:20`.
+/// 32 位指令字遵循 ARM ARM 布局，第一个半字位于位段 31:16。解码层次与
+/// 参考手册一致：`op1 = bits 28:27`，`op = bits 26:20`。
 pub fn execute_thumb32(
     instr: u32,
     regs: &mut CortexM33Registers,
@@ -62,177 +86,215 @@ pub fn execute_thumb32(
         }
     }
 
-    let op1 = (instr >> 27) & 0x3; // bits [28:27]
-    let op = (instr >> 20) & 0x7F; // bits [26:20]
-    let s = (instr >> 20) & 0x1; // S flag (set flags)
+    let op1 = (instr >> 27) & 0x3;
+    let op = (instr >> 20) & 0x7F;
+    let second_halfword = instr & 0xFFFF;
 
-    match (op1, op) {
-        // BL (Branch with Link)
-        (0b10 | 0b11, 0b0111101 | 0b0111111) => {
-            let s_bit = (instr >> 26) & 0x1;
-            let imm10 = (instr >> 16) & 0x3FF;
-            let j1 = (instr >> 13) & 0x1;
-            let j2 = (instr >> 11) & 0x1;
-            let imm11 = instr & 0x7FF;
-
-            if s_bit == 0 {
-                // BL (not BLX)
-                let s = (instr >> 26) & 0x1;
-                let i1 = !(j1 ^ s) & 1;
-                let i2 = !(j2 ^ s) & 1;
-                let offset = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
-                let mut offset_32 = offset;
-                // Sign-extend to 32 bits
-                if offset_32 & 0x0100_0000 != 0 {
-                    offset_32 |= 0xFE00_0000;
-                }
-                regs.lr = (regs.pc - 2) | 1; // Return address
-                regs.pc = regs.pc.wrapping_add(offset_32);
-                return Ok(StepResult::BranchTaken);
-            }
-        }
-
-        // Data processing (modified immediate) — MOVW, MOVT, ADDW, SUBW
-        (0b10, 0b0000000..=0b0001111) => {
-            let rn = ((instr >> 16) & 0xF) as usize;
-            let rd = ((instr >> 8) & 0xF) as usize;
-            let i = (instr >> 26) & 0x1;
-            let imm3 = ((instr >> 12) & 0x7) as u32;
-            let imm8 = (instr & 0xFF) as u32;
-            let imm = (i << 11) | (imm3 << 8) | imm8;
-
-            match (instr >> 21) & 0xF {
-                0b0000 if rn == 0xF => {
-                    // MOVW Rd, #imm16 / 移动到 Rd 低 16 位（零扩展）
-                    regs.r[rd] = imm & 0xFFFF;
-                }
-                0b0100 if rn == 0xF => {
-                    // MOVT Rd, #imm16 / 移动到 Rd 高 16 位
-                    regs.r[rd] = (regs.r[rd] & 0xFFFF) | ((imm & 0xFFFF) << 16);
-                }
-                _ if (instr >> 23) & 0x1 == 0 => {
-                    // ADDW Rd, Rn, #imm12 / 加法宽立即数
-                    let result = regs.r[rn].wrapping_add(imm);
-                    regs.r[rd] = result;
-                }
-                _ => {
-                    // SUBW Rd, Rn, #imm12 / 减法宽立即数
-                    let result = regs.r[rn].wrapping_sub(imm);
-                    regs.r[rd] = result;
-                }
-            }
-        }
-
-        // Data processing (register) with 4 registers
-        (0b10, 0b0101100 | 0b0101101) => {
-            let rn = ((instr >> 16) & 0xF) as usize;
-            let rd = ((instr >> 8) & 0xF) as usize;
-            let rm = ((instr >> 0) & 0xF) as usize;
-            let ra = ((instr >> 12) & 0xF) as usize;
-            let op2 = (instr >> 4) & 0xF; // [7:4]
-
-            match op2 {
-                // MLA: Rd = Ra + Rn * Rm
-                0b0000 => {
-                    let result = regs.r[ra].wrapping_add(regs.r[rn].wrapping_mul(regs.r[rm]));
-                    regs.r[rd] = result;
-                    if s != 0 {
-                        regs.set_nz_flags(result);
-                    }
-                }
-                // MLS: Rd = Ra - Rn * Rm
-                0b0001 => {
-                    let result = regs.r[ra].wrapping_sub(regs.r[rn].wrapping_mul(regs.r[rm]));
-                    regs.r[rd] = result;
-                    if s != 0 {
-                        regs.set_nz_flags(result);
-                    }
-                }
-                _ => return Ok(StepResult::Undefined),
-            }
-        }
-
-        // Load/store word/byte (immediate, 12-bit offset)
-        (0b10, 0b0011000..=0b0011011) => {
-            let rn = ((instr >> 16) & 0xF) as usize;
-            let rt = ((instr >> 12) & 0xF) as usize;
-            let imm12 = instr & 0xFFF;
-            let op_type = (instr >> 20) & 0xF;
-
-            // Determine pre-index vs post-index
-            let p = (instr >> 24) & 0x1 == 1; // Pre-indexed (use offset before access)
-            let u = (instr >> 23) & 0x1 == 1; // Add offset (+ vs -)
-            let w = (instr >> 21) & 0x1 == 1; // Write-back
-
-            let offset = if u { imm12 } else { 0u32.wrapping_sub(imm12) };
-            let addr = if p {
-                regs.r[rn].wrapping_add(offset)
+    let result = match op1 {
+        // 0b01: load/store dual, data-processing (shifted register)
+        // 0b01：加载/存储双字、数据处理（移位寄存器）
+        0b01 => {
+            // op2 (bits[26:25]) selects the sub-group: 00 = load/store
+            // dual/exclusive/table, 01 = data-processing (shifted register).
+            // Dual transfers always have bit 22 set and P/U not both clear.
+            // op2（bits[26:25]）选择子组：00 = 加载/存储双字/独占/表分支，
+            // 01 = 数据处理（移位寄存器）。双字传输始终置位 bit 22 且
+            // P/U 不同时清零。
+            let op2 = (instr >> 25) & 0x3;
+            if op2 == 0 && (instr >> 22) & 1 == 1 && ((instr >> 23) & 0x3) != 0 {
+                load_store::execute_dual(instr, regs, bus, cycles)?
+            } else if op2 == 0b01 {
+                data_processing::execute_shifted_register(instr, regs)
             } else {
-                regs.r[rn]
-            };
-
-            match op_type {
-                // STRB, LDRB
-                0b1000 => {
-                    // STRB (immediate)
-                    bus.write_u8(addr, regs.r[rt] as u8, cycles)?;
-                    if w {
-                        regs.r[rn] = regs.r[rn].wrapping_add(offset);
-                    }
-                }
-                0b1001 => {
-                    // LDRB (immediate)
-                    regs.r[rt] = bus.read_u8(addr, cycles)? as u32;
-                    if w {
-                        regs.r[rn] = regs.r[rn].wrapping_add(offset);
-                    }
-                }
-                // STRH, LDRH
-                0b1010 => {
-                    // STRH (immediate)
-                    bus.write_u16(addr, regs.r[rt] as u16, cycles)?;
-                    if w {
-                        regs.r[rn] = regs.r[rn].wrapping_add(offset);
-                    }
-                }
-                0b1011 => {
-                    // LDRH (immediate)
-                    regs.r[rt] = bus.read_u16(addr, cycles)? as u32;
-                    if w {
-                        regs.r[rn] = regs.r[rn].wrapping_add(offset);
-                    }
-                }
-                // STR, LDR
-                0b1100 => {
-                    // STR (immediate)
-                    bus.write_u32(addr, regs.r[rt], cycles)?;
-                    if w {
-                        regs.r[rn] = regs.r[rn].wrapping_add(offset);
-                    }
-                }
-                0b1101 => {
-                    // LDR (immediate)
-                    let val = bus.read_u32(addr, cycles)?;
-                    regs.r[rt] = val;
-                    if w {
-                        regs.r[rn] = regs.r[rn].wrapping_add(offset);
-                    }
-                    if rt == 15 {
-                        regs.pc &= !1u32;
-                        return Ok(StepResult::BranchTaken);
-                    }
-                }
-                _ => return Ok(StepResult::Undefined),
+                StepResult::Undefined
             }
-            *cycles += 1;
         }
-
-        // Undefined/unhandled 32-bit instruction
-        _ => {
-            return Ok(StepResult::Undefined);
+        // 0b10: branch/misc when second halfword bit 15 is set; otherwise
+        // bit 25 selects data-processing (modified immediate) when clear
+        // and plain-binary immediate or bitfield when set.
+        // 0b10：第二半字位 15 置位时为分支/杂项；否则位 25 清零表示
+        // 数据处理（改良立即数），置位表示纯二进制立即数或位域。
+        0b10 => {
+            if second_halfword & 0x8000 != 0 {
+                branch_misc::execute_branch_or_misc(instr, regs)
+            } else if (instr >> 25) & 1 == 0 {
+                data_processing::execute_modified_immediate(instr, regs)
+            } else if matches!(op, 0x20..=0x2F | 0x60..=0x6F) {
+                branch_misc::execute_plain_immediate(instr, regs)
+            } else if matches!(op, 0x34 | 0x36 | 0x3C) {
+                branch_misc::execute_bitfield(instr, regs)
+            } else {
+                StepResult::Undefined
+            }
         }
-    }
+        // 0b11: load/store single, data-processing (register), multiply/divide
+        // 0b11：单字加载/存储、数据处理（寄存器）、乘法/除法
+        0b11 => {
+            if op < 0x20 {
+                load_store::execute_single(instr, regs, bus, cycles)?
+            } else if op < 0x30 {
+                data_processing::execute_register_shifted_or_misc(instr, regs)
+            } else if op <= 0x3F {
+                multiply::execute(instr, regs)
+            } else {
+                StepResult::Undefined
+            }
+        }
+        _ => StepResult::Undefined,
+    };
 
     *cycles += 1;
-    Ok(StepResult::Ok)
+    Ok(result)
+}
+
+/// Shift types used by the Thumb-32 data-processing encodings
+/// Thumb-32 数据处理编码使用的移位类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShiftType {
+    /// Logical shift left / 逻辑左移
+    Lsl,
+    /// Logical shift right / 逻辑右移
+    Lsr,
+    /// Arithmetic shift right / 算术右移
+    Asr,
+    /// Rotate right / 循环右移
+    Ror,
+}
+
+impl ShiftType {
+    /// Decode the two-bit shift type field
+    /// 解码两位移位类型字段
+    fn from_bits(bits: u32) -> Self {
+        match bits & 0x3 {
+            0 => Self::Lsl,
+            1 => Self::Lsr,
+            2 => Self::Asr,
+            _ => Self::Ror,
+        }
+    }
+}
+
+/// Sign-extend a value from `bits` bits to 32 bits
+/// 将 `bits` 位宽的值符号扩展到 32 位
+fn sign_extend(value: u32, bits: u32) -> u32 {
+    if bits == 0 || bits >= 32 {
+        return value;
+    }
+    let mask = (1u32 << bits) - 1;
+    let sign = 1u32 << (bits - 1);
+    let truncated = value & mask;
+    if truncated & sign != 0 {
+        truncated | !mask
+    } else {
+        truncated
+    }
+}
+
+/// Shift a value by an immediate-encoded amount, returning the carry-out
+/// 按立即数编码的移位量移位，并返回移出位
+///
+/// Immediate encodings use `amount == 0` to mean 32 for LSR/ASR and RRX for
+/// ROR. LSL with amount 0 leaves the value and carry unchanged.
+/// 立即数编码中 LSR/ASR 的移位量为 0 表示 32，ROR 的 0 表示 RRX；
+/// LSL 的 0 表示不移位且进位不变。
+fn shift_immediate(value: u32, amount: u32, ty: ShiftType, carry_in: bool) -> (u32, bool) {
+    match ty {
+        ShiftType::Lsl => {
+            if amount == 0 {
+                (value, carry_in)
+            } else if amount < 32 {
+                (value << amount, (value >> (32 - amount)) & 1 != 0)
+            } else if amount == 32 {
+                (0, value & 1 != 0)
+            } else {
+                (0, false)
+            }
+        }
+        ShiftType::Lsr => {
+            let amount = if amount == 0 { 32 } else { amount };
+            match amount {
+                1..=31 => (value >> amount, (value >> (amount - 1)) & 1 != 0),
+                32 => (0, value >> 31 != 0),
+                _ => (0, false),
+            }
+        }
+        ShiftType::Asr => {
+            let amount = if amount == 0 { 32 } else { amount };
+            if amount < 32 {
+                (
+                    ((value as i32) >> amount) as u32,
+                    (value >> (amount - 1)) & 1 != 0,
+                )
+            } else {
+                let filled = if value >> 31 != 0 { 0xFFFF_FFFF } else { 0 };
+                (filled, value >> 31 != 0)
+            }
+        }
+        ShiftType::Ror => {
+            if amount == 0 {
+                // RRX: 33-bit rotate right through carry
+                // RRX：经进位标志的 33 位循环右移
+                let result = (u32::from(carry_in) << 31) | (value >> 1);
+                (result, value & 1 != 0)
+            } else {
+                let rotation = amount % 32;
+                if rotation == 0 {
+                    (value, value >> 31 != 0)
+                } else {
+                    let result = value.rotate_right(rotation);
+                    (result, result >> 31 != 0)
+                }
+            }
+        }
+    }
+}
+
+/// Shift a value by a register-encoded amount, returning the carry-out
+/// 按寄存器编码的移位量移位，并返回移出位
+///
+/// Register-encoded shifts treat an amount of 0 as "no shift" for every shift
+/// type (unlike immediate encodings, `ROR #0` here is not RRX).
+/// 寄存器编码移位对任意类型都以 0 表示不移位（与立即数不同，此处 ROR 0 不是 RRX）。
+fn shift_register(value: u32, amount: u32, ty: ShiftType, carry_in: bool) -> (u32, bool) {
+    if amount == 0 {
+        (value, carry_in)
+    } else {
+        shift_immediate(value, amount, ty, carry_in)
+    }
+}
+
+/// Add two operands with carry-in, returning result, carry and overflow
+/// 带进位的加法，返回结果、进位与溢出
+fn add_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
+    let wide = u64::from(a) + u64::from(b) + u64::from(carry_in);
+    let result = wide as u32;
+    let carry = wide > u64::from(u32::MAX);
+    let overflow = ((a ^ result) & (b ^ result) & 0x8000_0000) != 0;
+    (result, carry, overflow)
+}
+
+/// Subtract two operands with borrow, returning result, carry and overflow
+/// 带借位的减法，返回结果、进位与溢出
+///
+/// `carry_in` follows the ARM convention: C == 1 means no borrow.
+/// `carry_in` 遵循 ARM 约定：C 为 1 表示无借位。
+fn sub_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
+    let borrow = if carry_in { 0i64 } else { 1i64 };
+    let wide = i64::from(a) - i64::from(b) - borrow;
+    let result = wide as u32;
+    let carry = wide >= 0;
+    let overflow = ((a ^ b) & (a ^ result) & 0x8000_0000) != 0;
+    (result, carry, overflow)
+}
+
+/// Write NZCV flags for a result that also produces C and V
+/// 为同时产生 C 和 V 的结果写入 NZCV 标志
+fn set_arith_flags(regs: &mut CortexM33Registers, result: u32, carry: bool, overflow: bool) {
+    regs.set_apsr_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+}
+
+/// Write N, Z and C flags for a logical result, preserving V
+/// 为逻辑运算结果写入 N、Z、C 标志，保持 V 不变
+fn set_logic_flags(regs: &mut CortexM33Registers, result: u32, carry: bool) {
+    regs.set_apsr_nzcv(result >> 31 != 0, result == 0, carry, regs.apsr_v());
 }

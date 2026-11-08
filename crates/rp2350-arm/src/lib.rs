@@ -52,6 +52,14 @@ const SYSTICK_BASE: u32 = 0xE000_E010;
 #[allow(dead_code)]
 const NVIC_BASE: u32 = 0xE000_E100;
 
+/// Address of the initial stack pointer in the boot vector table
+/// 启动向量表中初始栈指针的地址
+const BOOT_SP_ADDR: u32 = 0x0000_0000;
+
+/// Address of the reset vector in the boot vector table
+/// 启动向量表中复位向量的地址
+const BOOT_PC_ADDR: u32 = 0x0000_0004;
+
 /// Cortex-M33 processor core
 /// Cortex-M33 处理器核心
 pub struct CortexM33Core {
@@ -69,6 +77,12 @@ pub struct CortexM33Core {
     state: CpuState,
     /// Pending IRQ number (if any) / 待处理的中断号（如果有）
     pending_irq: Option<IrqNumber>,
+    /// Boot vectors cached by `boot` as (initial MSP, reset vector)
+    /// 由 `boot` 缓存的启动向量（初始 MSP、复位向量）
+    boot_vectors: Option<(u32, u32)>,
+    /// Cumulative cycles executed since the last reset
+    /// 自上次复位以来累计执行的周期数
+    total_cycles: u64,
 }
 
 impl CortexM33Core {
@@ -84,6 +98,66 @@ impl CortexM33Core {
             it_state: ITBlockState::new(),
             state: CpuState::Reset,
             pending_irq: None,
+            boot_vectors: None,
+            total_cycles: 0,
+        }
+    }
+
+    /// Load the boot vector table and start execution
+    /// 加载启动向量表并开始执行
+    ///
+    /// Reads the initial MSP from 0x0000_0000 and the reset vector from
+    /// 0x0000_0004, caches both, then applies them to the register file. The
+    /// cached values let `CpuCore::reset` restart the core without bus access.
+    /// 从 0x0000_0000 读取初始 MSP、从 0x0000_0004 读取复位向量，缓存后写入
+    /// 寄存器文件。缓存值使得 `CpuCore::reset` 无需总线访问即可重新启动核心。
+    ///
+    /// # Errors
+    /// Returns a bus error if the vector table is not mapped on `bus`.
+    /// 若向量表未映射到 `bus`，返回总线错误。
+    pub fn boot(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
+        let mut cycles = 0u64;
+        let msp = bus.read_u32(BOOT_SP_ADDR, &mut cycles)?;
+        let reset = bus.read_u32(BOOT_PC_ADDR, &mut cycles)?;
+        self.boot_vectors = Some((msp, reset));
+        self.apply_boot_vectors();
+        Ok(())
+    }
+
+    /// Write the program status register (XPSR)
+    /// 写入程序状态寄存器（XPSR）
+    ///
+    /// Debuggers use this entry point to restore flags and exception state.
+    /// The value is stored verbatim; callers are responsible for keeping the
+    /// Thumb bit (EPSR.T) set for Thumb execution.
+    /// 调试器通过此入口恢复标志位与异常状态。数值按原样写入；调用方需自行
+    /// 保持 Thumb 位（EPSR.T）置位以便执行 Thumb 指令。
+    pub fn write_xpsr(&mut self, value: u32) {
+        self.registers.xpsr = value;
+    }
+
+    /// Clear the register file, NVIC, SysTick and IT state
+    /// 清零寄存器文件、NVIC、SysTick 和 IT 状态
+    fn clear_core_state(&mut self) {
+        self.registers = CortexM33Registers::new();
+        self.nvic = Nvic::new();
+        self.systick = SysTick::new();
+        self.it_state = ITBlockState::new();
+        self.pending_irq = None;
+        self.total_cycles = 0;
+    }
+
+    /// Apply cached boot vectors, entering Running only if they exist
+    /// 应用缓存的启动向量，仅当向量存在时进入运行状态
+    fn apply_boot_vectors(&mut self) {
+        self.clear_core_state();
+        if let Some((msp, reset)) = self.boot_vectors {
+            self.registers.msp = msp;
+            self.registers.sp = msp;
+            self.registers.pc = reset & !1;
+            self.state = CpuState::Running;
+        } else {
+            self.state = CpuState::Reset;
         }
     }
 
@@ -247,7 +321,9 @@ impl CortexM33Core {
             // Thumb-32：获取第二个半字
             self.registers.pc = self.registers.pc.wrapping_add(2);
             let hw2 = self.fetch_halfword(bus, cycles)?;
-            let instr32 = (hw2 as u32) << 16 | hw as u32;
+            // ARM 体系参考手册约定：第一个半字位于高 16 位，第二个半字位于低 16 位。
+            // ARM ARM convention: first halfword in bits[31:16], second in bits[15:0].
+            let instr32 = (hw as u32) << 16 | hw2 as u32;
             self.registers.pc = old_pc.wrapping_add(4);
             execute_thumb32(
                 instr32,
@@ -310,9 +386,8 @@ impl CpuCore for CortexM33Core {
         CpuArch::ArmCortexM33
     }
 
-    fn init(&mut self, _bus: &mut dyn AddressBus) -> Result<(), CoreError> {
-        self.state = CpuState::Running;
-        Ok(())
+    fn init(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
+        self.boot(bus)
     }
 
     fn run_cycles(
@@ -328,8 +403,10 @@ impl CpuCore for CortexM33Core {
                 break;
             }
 
-            match self.step_instruction(bus, &mut 1u64) {
+            let mut step_cycles: u64 = 0;
+            match self.step_instruction(bus, &mut step_cycles) {
                 Ok(_) => {
+                    self.total_cycles += step_cycles;
                     consumed += 1;
                     remaining -= 1;
                 }
@@ -349,10 +426,11 @@ impl CpuCore for CortexM33Core {
             return Ok(self.state);
         }
 
-        let mut cycle_count: u64 = 1;
+        let mut cycle_count: u64 = 0;
         match self.step_instruction(bus, &mut cycle_count) {
             Ok(_) => {
                 self.check_pending_exceptions(bus, &mut cycle_count)?;
+                self.total_cycles += cycle_count;
                 Ok(self.state)
             }
             Err(e) => {
@@ -383,12 +461,9 @@ impl CpuCore for CortexM33Core {
     }
 
     fn reset(&mut self) {
-        self.registers = CortexM33Registers::new();
-        self.nvic = Nvic::new();
-        self.systick = SysTick::new();
-        self.it_state = ITBlockState::new();
-        self.state = CpuState::Reset;
-        self.pending_irq = None;
+        // 重新应用缓存的启动向量；若核心从未 boot 过则保持 Reset 状态。
+        // Re-apply cached boot vectors; stay in Reset if the core never booted.
+        self.apply_boot_vectors();
     }
 
     fn description(&self) -> String {
@@ -399,52 +474,19 @@ impl CpuCore for CortexM33Core {
             self.state
         )
     }
+
+    fn state(&self) -> CpuState {
+        self.state
+    }
+
+    fn xpsr(&self) -> u32 {
+        self.registers.xpsr
+    }
+
+    fn total_cycles(&self) -> CycleCount {
+        self.total_cycles
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_core_is_in_reset() {
-        let core = CortexM33Core::new(CpuId::Core0);
-        assert_eq!(core.cpu_id(), CpuId::Core0);
-        assert_eq!(core.state, CpuState::Reset);
-    }
-
-    #[test]
-    fn new_core_has_systick_disabled() {
-        let core = CortexM33Core::new(CpuId::Core0);
-        assert!(!core.systick.is_enabled());
-    }
-
-    #[test]
-    fn new_core_nvic_all_disabled() {
-        let core = CortexM33Core::new(CpuId::Core0);
-        assert_eq!(core.nvic.find_highest_priority(), None);
-    }
-
-    #[test]
-    fn signal_interrupt_sets_pending() {
-        let mut core = CortexM33Core::new(CpuId::Core0);
-        core.signal_interrupt(42);
-        assert!(core.nvic.is_pending(42));
-    }
-
-    #[test]
-    fn servicing_irq_returns_none_when_none_pending() {
-        let core = CortexM33Core::new(CpuId::Core0);
-        assert_eq!(core.servicing_irq(), None);
-    }
-
-    #[test]
-    fn servicing_irq_finds_highest_priority() {
-        let mut core = CortexM33Core::new(CpuId::Core0);
-        core.nvic.write_iser(0, 1 << 16); // Enable IRQ 16
-        core.nvic.write_iser(1, 1 << 0); // Enable IRQ 32 (bit 0 of ISER[1])
-        core.nvic.set_pending(16);
-        core.nvic.set_pending(32);
-        // Both same priority (0), lowest IRQ number wins
-        assert_eq!(core.servicing_irq(), Some(16));
-    }
-}
+mod tests;
