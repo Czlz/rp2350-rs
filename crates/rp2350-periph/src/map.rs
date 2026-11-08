@@ -51,6 +51,12 @@ pub const XIP_QMI_BASE: Address = 0x400D_0000;
 /// WATCHDOG base / WATCHDOG 基地址
 pub const WATCHDOG_BASE: Address = 0x400D_8000;
 
+/// POWMAN always-on power manager base / POWMAN 常开电源管理器基地址
+///
+/// POWMAN is the first device above the APB span and is mounted standalone.
+/// POWMAN 是 APB 跨度之上的第一个设备，独立挂载。
+pub const POWMAN_BASE: Address = 0x4010_0000;
+
 /// TICKS tick generator base / TICKS 滴答发生器基地址
 ///
 /// TICKS sits above the 1 MB APB span modelled by the router, so it is mounted

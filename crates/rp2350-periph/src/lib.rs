@@ -28,6 +28,7 @@ pub mod irq;
 pub mod map;
 pub mod pads_bank0;
 pub mod pll;
+pub mod powman;
 pub mod ppb;
 pub mod resets;
 pub mod sio;

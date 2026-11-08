@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rp2350_core::bus::{AddressBus, BusResult};
-use rp2350_core::mmio::{MmioRouter, MmioWindow, mount_device};
+use rp2350_core::mmio::{MMIO_BLOCK_SIZE, MmioRouter, MmioWindow, mount_device};
 
 use super::bootram::BootRam;
 use super::clocks::Clocks;
@@ -25,6 +25,7 @@ use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
 use super::pll::Pll;
+use super::powman::Powman;
 use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
 use super::resets::Resets;
 use super::sio::Sio;
@@ -133,6 +134,17 @@ impl BootPeripherals {
         // TICKS sits above the APB router span, so it is mounted standalone;
         // writing CYCLES advances the shared time base.
         mount_device(bus, Box::new(Ticks::new(cycles.clone())))?;
+        // POWMAN 位于 APB 跨度之上，但它的 SET/CLR/XOR 别名仍按 4 KB 块折叠，
+        // 因此用一个窗口覆盖整块的小路由器承载。
+        // POWMAN sits above the APB span, but its SET/CLR/XOR aliases still
+        // fold per 4 KB block, so a small router spanning the whole block hosts
+        // it.
+        let mut aon = MmioRouter::new(
+            "AON",
+            MmioWindow::new(map::POWMAN_BASE, MMIO_BLOCK_SIZE as usize),
+        );
+        aon.mount(Box::new(Powman::new()))?;
+        bus.register_region(Box::new(aon))?;
         mount_device(bus, Box::new(sio.clone()))?;
         mount_device(bus, Box::new(Ppb::with_log(Arc::clone(&system_writes))))?;
 
@@ -191,5 +203,26 @@ impl BootPeripherals {
     #[must_use]
     pub fn uart_pending(&self) -> usize {
         self.uart0.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rp2350_core::bus::AddressBus;
+    use rp2350_core::memory::SimpleBus;
+
+    use super::BootPeripherals;
+
+    #[test]
+    fn powman_set_alias_updates_the_timer_register() {
+        // 0x4010_2088 是 TIMER（0x88）的 SET 别名，写口令后应能直接读回数据位。
+        // 0x4010_2088 is the SET alias of TIMER (0x88); after the password write
+        // the data bits must read back directly.
+        let mut bus = SimpleBus::new();
+        let _peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        bus.write_u32(0x4010_2088, 0x5AFE_0002, &mut cycles)
+            .expect("alias write");
+        assert_eq!(bus.read_u32(0x4010_0088, &mut cycles).expect("read"), 2);
     }
 }
