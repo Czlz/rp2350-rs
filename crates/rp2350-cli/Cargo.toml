@@ -21,6 +21,7 @@ rp2350-arm = { workspace = true }
 rp2350-bootrom = { workspace = true }
 rp2350-riscv = { workspace = true }
 rp2350-periph = { workspace = true }
+rp2350-usb = { workspace = true }
 rp2350-virt-periph = { workspace = true }
 rp2350-gdb = { workspace = true }
 rp2350-egui = { workspace = true }

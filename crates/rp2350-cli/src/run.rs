@@ -92,6 +92,16 @@ pub fn run(options: &RunOptions) -> Result<()> {
     bus.register_region(Box::new(flash_nocache))?;
     bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, SRAM_SIZE)))?;
     let peripherals = BootPeripherals::mount(&mut bus)?;
+    // USBCTRL 挂载后，DPSRAM（0x5010_0000）与寄存器窗口（0x5011_0000，含
+    // XOR/SET/CLR 别名）由控制器建模，固件对 SIE_CTRL（0x5011_004C）的
+    // 读-改-写不再落到 NoDevice。控制器句柄保留到本次运行结束，后续由
+    // perfbench 主机桥驱动。
+    // After mounting USBCTRL, the DPSRAM window at 0x5010_0000 and the register
+    // window at 0x5011_0000 (with XOR/SET/CLR aliases) are modelled, so the
+    // firmware read-modify-write of SIE_CTRL (0x5011_004C) no longer hits
+    // NoDevice. The controller stays alive for the whole run and is driven by
+    // the perfbench host bridge in a later stage.
+    let _usb = rp2350_usb::mount(&mut bus).context("USB mount failed / USB 挂载失败")?;
 
     let (arch, elf_entry) = load_image(&bytes, &mut bus, options.arch)?;
 

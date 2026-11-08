@@ -3300,6 +3300,7 @@ dependencies = [
  "rp2350-gdb",
  "rp2350-periph",
  "rp2350-riscv",
+ "rp2350-usb",
  "rp2350-virt-periph",
  "tokio",
 ]
