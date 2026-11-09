@@ -56,8 +56,23 @@ const STUB_BASE: u32 = 0x80;
 const TABLE_OFFSET: usize = 0x7C00;
 /// Offset of the flash device-info word / Flash 设备信息字的偏移
 const DEVINFO_OFFSET: usize = 0x7D00;
+/// Offset of the 32-bit pointer literal that locates the device-info word
+/// 指向设备信息字的 32 位指针字面量的偏移
+///
+/// `rom_data_lookup` returns a pointer to this literal, not the word itself:
+/// `flash_devinfo_ptr()` dereferences it once to reach `DEVINFO_OFFSET`.
+/// `rom_data_lookup` 返回的是指向该字面量的指针，而非字本身：
+/// `flash_devinfo_ptr()` 对它解引用一次才得到 `DEVINFO_OFFSET` 处的 16 位字。
+const DEVINFO_PTR_OFFSET: usize = 0x7D04;
 /// Flash device info: CS0 = 16 MB, CS1 absent / Flash 设备信息：CS0 = 16 MB，无 CS1
-const DEVINFO_VALUE: u32 = 0x0000_C000;
+///
+/// pico-sdk `hardware/flash.h` encodes sizes as `4096 << code` with
+/// `FLASH_DEVINFO_SIZE_MAX == 0xC` (16 MB); `OTP_DATA_FLASH_DEVINFO_CS0_SIZE_BITS`
+/// occupies bits 11:8, so the word is `0x0C00`.
+/// pico-sdk `hardware/flash.h` 以 `4096 << code` 编码容量，`FLASH_DEVINFO_SIZE_MAX`
+/// 即 `0xC`（16 MB）；`OTP_DATA_FLASH_DEVINFO_CS0_SIZE_BITS` 位于 bits 11:8，
+/// 因此该字应为 `0x0C00`。
+const DEVINFO_VALUE: u16 = 0x0C00;
 
 /// Trap identifier of the `rom_table_lookup` stub / `rom_table_lookup` 占位桩的陷阱标识
 const TRAP_LOOKUP: u16 = 0;
@@ -265,9 +280,13 @@ fn build_image() -> Vec<u8> {
         let pointer = (trap.stub() as u16) | 1;
         table.push_func(trap.tag(), pointer, pointer);
     }
-    table.push_data(code(b'F', b'D'), DEVINFO_OFFSET as u16);
+    table.push_data(code(b'F', b'D'), DEVINFO_PTR_OFFSET as u16);
     image.write_slice(TABLE_OFFSET, &table.finish());
-    image.write_u32(DEVINFO_OFFSET, DEVINFO_VALUE);
+    // 与真实 ROM 相同的两级间接：表项指向字面量，字面量再指向 16 位信息字。
+    // Same two-level indirection as the real ROM: the entry points at the
+    // literal, the literal points at the 16-bit info word.
+    image.write_u32(DEVINFO_PTR_OFFSET, DEVINFO_OFFSET as u32);
+    image.write_u16(DEVINFO_OFFSET, DEVINFO_VALUE);
     image.finish()
 }
 
@@ -330,7 +349,7 @@ impl Rp2350TrapHandler {
                 SYS_INFO_CHIP_INFO => words.extend_from_slice(&[0, 0, 0]),
                 SYS_INFO_CRITICAL => words.push(0),
                 SYS_INFO_CPU_INFO => words.push(CPU_INFO_WORD),
-                SYS_INFO_FLASH_DEV_INFO => words.push(DEVINFO_VALUE),
+                SYS_INFO_FLASH_DEV_INFO => words.push(u32::from(DEVINFO_VALUE)),
                 SYS_INFO_BOOT_RANDOM => words.extend_from_slice(&self.boot_random),
                 SYS_INFO_NONCE => words.extend_from_slice(&[0, 0]),
                 SYS_INFO_BOOT_INFO => words.extend_from_slice(&[BOOT_WORD, 0, 0, 0]),
@@ -433,11 +452,23 @@ mod tests {
         }
         assert_eq!(
             table::lookup(table, code(b'F', b'D'), flags::DATA),
-            Some(DEVINFO_OFFSET as u16)
+            Some(DEVINFO_PTR_OFFSET as u16)
         );
+        // 第一级：表项指向的 32 位字面量给出信息字地址。
+        // First level: the 32-bit literal named by the entry holds the word address.
         assert_eq!(
             u32::from_le_bytes(
-                image[DEVINFO_OFFSET..DEVINFO_OFFSET + 4]
+                image[DEVINFO_PTR_OFFSET..DEVINFO_PTR_OFFSET + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            DEVINFO_OFFSET as u32
+        );
+        // 第二级：信息字本身为 CS0 = 16 MB（code 0xC 位于 bits 11:8）。
+        // Second level: the info word itself is CS0 = 16 MB (code 0xC at bits 11:8).
+        assert_eq!(
+            u16::from_le_bytes(
+                image[DEVINFO_OFFSET..DEVINFO_OFFSET + 2]
                     .try_into()
                     .unwrap()
             ),
