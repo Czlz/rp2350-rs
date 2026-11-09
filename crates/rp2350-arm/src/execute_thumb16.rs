@@ -734,7 +734,12 @@ pub fn execute_thumb16(
                     let i = ((opcode >> 9) & 0x1) as u32;
                     let imm5 = ((opcode >> 3) & 0x1F) as u32;
                     let rn = (opcode & 0x7) as usize;
-                    let offset = sign_extend((i << 6) | (imm5 << 1), 7);
+                    // CBZ/CBNZ 的偏移是 0..=126 的前向无符号值（iiiiii0），
+                    // 不能按 7 位有符号数扩展，否则偏移 >= 64 字节时会反向跳。
+                    // The CBZ/CBNZ offset is a forward unsigned 0..=126 value
+                    // (iiiiii0); sign-extending it makes every offset >= 64
+                    // bytes branch backwards.
+                    let offset = (i << 6) | (imm5 << 1);
                     if regs.r[rn] == 0 {
                         regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
                         return Ok(StepResult::BranchTaken);
@@ -794,7 +799,9 @@ pub fn execute_thumb16(
                     let i = ((opcode >> 9) & 0x1) as u32;
                     let imm5 = ((opcode >> 3) & 0x1F) as u32;
                     let rn = (opcode & 0x7) as usize;
-                    let offset = sign_extend((i << 6) | (imm5 << 1), 7);
+                    // 与 CBZ 相同：7 位偏移是前向无符号值，不做符号扩展。
+                    // Same as CBZ: the 7-bit offset is forward unsigned.
+                    let offset = (i << 6) | (imm5 << 1);
                     if regs.r[rn] != 0 {
                         regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
                         return Ok(StepResult::BranchTaken);
@@ -1015,6 +1022,60 @@ mod tests {
         .unwrap();
         assert_eq!(result, StepResult::BranchTaken);
         assert_eq!(regs.pc, 0x1000_0166);
+    }
+
+    #[test]
+    fn cbz_large_offset_is_forward_unsigned() {
+        // 0xB3C8 = CBZ r0, +0x72：偏移 >= 64 字节时仍是前向跳转，
+        // 不能被当成 7 位有符号数反向跳到 0x1000_014E。
+        // 0xB3C8 = CBZ r0, +0x72: offsets >= 64 bytes are still forward, so
+        // this must not be sign-extended into a backwards branch.
+        let mut regs = CortexM33Registers::new();
+        regs.pc = 0x1000_0162;
+        regs.r[0] = 0;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let mut cycles = 0;
+        let result = execute_thumb16(
+            0xB3C8,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(result, StepResult::BranchTaken);
+        assert_eq!(regs.pc, 0x1000_01D6);
+    }
+
+    #[test]
+    fn cbnz_large_offset_is_forward_unsigned() {
+        // 0xBBC8 = CBNZ r0, +0x72，与 CBZ 共用同一偏移编码规则。
+        // 0xBBC8 = CBNZ r0, +0x72, sharing CBZ's offset encoding.
+        let mut regs = CortexM33Registers::new();
+        regs.pc = 0x1000_0162;
+        regs.r[0] = 1;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let mut cycles = 0;
+        let result = execute_thumb16(
+            0xBBC8,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(result, StepResult::BranchTaken);
+        assert_eq!(regs.pc, 0x1000_01D6);
     }
 
     /// Execute one Thumb-16 opcode with `value` in `rm` and return the registers.
