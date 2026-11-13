@@ -3301,6 +3301,7 @@ dependencies = [
  "rp2350-periph",
  "rp2350-riscv",
  "rp2350-usb",
+ "rp2350-usb-host",
  "rp2350-virt-periph",
  "tokio",
 ]
