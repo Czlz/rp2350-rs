@@ -306,26 +306,38 @@ impl Rp2350TrapHandler {
     }
 
     /// Erase `count` bytes rounded up to `block_size` / 按 `block_size` 上取整擦除 `count` 字节
-    fn range_erase(&self, addr: u32, count: u32, block_size: u32) -> Result<(), CoreError> {
+    ///
+    /// The ROM API takes a flash offset, not an XIP address: `flash_range_erase`
+    /// callers pass e.g. `0x0010_0000` for the second megabyte. Translate it to
+    /// the backing store by adding the XIP base before erasing.
+    /// ROM API 接受的是 Flash 偏移而非 XIP 地址：`flash_range_erase` 调用者会为
+    /// 第二个 MB 传入例如 `0x0010_0000`。擦除前要加上 XIP 基地址，换算到共享
+    /// 存储地址。
+    fn range_erase(&self, offset: u32, count: u32, block_size: u32) -> Result<(), CoreError> {
         let block = block_size.max(1);
         let span = count.div_ceil(block).saturating_mul(block);
-        self.flash.erase(addr, span as usize)
+        self.flash
+            .erase(self.flash.base().wrapping_add(offset), span as usize)
     }
 
     /// Program `count` bytes copied from guest memory / 编程从客户机内存复制的 `count` 字节
+    ///
+    /// Like [`Self::range_erase`], `offset` is relative to the start of flash.
+    /// 与 [`Self::range_erase`] 相同，`offset` 相对于 Flash 起始地址。
     fn range_program(
         &self,
-        addr: u32,
+        offset: u32,
         source: u32,
         count: u32,
         bus: &mut dyn AddressBus,
         cycles: &mut u64,
     ) -> Result<(), CoreError> {
         let mut bytes = Vec::with_capacity(count as usize);
-        for offset in 0..count {
-            bytes.push(bus.read_u8(source.wrapping_add(offset), cycles)?);
+        for byte_offset in 0..count {
+            bytes.push(bus.read_u8(source.wrapping_add(byte_offset), cycles)?);
         }
-        self.flash.write(addr, &bytes)
+        self.flash
+            .write(self.flash.base().wrapping_add(offset), &bytes)
     }
 
     /// Answer `rom_get_sys_info(buffer, capacity, flags)`
@@ -539,7 +551,7 @@ mod tests {
             .invoke(
                 TrapCall {
                     id: TrapId(Trap::RangeProgram.id()),
-                    args: [FLASH_XIP_BASE, SRAM_BASE, 4, 0],
+                    args: [0, SRAM_BASE, 4, 0],
                 },
                 &mut bus,
                 &mut cycles,
@@ -554,12 +566,55 @@ mod tests {
             .invoke(
                 TrapCall {
                     id: TrapId(Trap::RangeErase.id()),
-                    args: [FLASH_XIP_BASE, 4, 4, 0xD8],
+                    args: [0, 4, 4, 0xD8],
                 },
                 &mut bus,
                 &mut cycles,
             )
             .unwrap();
         assert_eq!(handle.read(FLASH_XIP_BASE, 4).unwrap(), vec![0xFF; 4]);
+    }
+
+    #[test]
+    fn flash_api_offsets_are_relative_to_the_xip_base() {
+        // pico-sdk `flash_range_erase`/`flash_range_program` take offsets, so
+        // offset 0x1000 must land at FLASH_XIP_BASE + 0x1000, not 0x1000.
+        // pico-sdk 的擦写 API 接受偏移，因此 0x1000 必须落在 XIP 基地址 + 0x1000。
+        let flash = FlashRegion::rp2350_xip();
+        let handle = flash.handle();
+        let handler = Rp2350TrapHandler {
+            image: Arc::new(build_image()),
+            flash: handle.clone(),
+            boot_random: [0; 4],
+        };
+        let mut bus = SimpleBus::new();
+        bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, 0x100)))
+            .unwrap();
+        let mut cycles = 0u64;
+        bus.write_u8(SRAM_BASE, 0x5A, &mut cycles).unwrap();
+
+        handler
+            .invoke(
+                TrapCall {
+                    id: TrapId(Trap::RangeProgram.id()),
+                    args: [0x1000, SRAM_BASE, 1, 0],
+                },
+                &mut bus,
+                &mut cycles,
+            )
+            .unwrap();
+        assert_eq!(handle.read(FLASH_XIP_BASE + 0x1000, 1).unwrap(), vec![0x5A]);
+
+        handler
+            .invoke(
+                TrapCall {
+                    id: TrapId(Trap::RangeErase.id()),
+                    args: [0x1000, 1, 1, 0x20],
+                },
+                &mut bus,
+                &mut cycles,
+            )
+            .unwrap();
+        assert_eq!(handle.read(FLASH_XIP_BASE + 0x1000, 1).unwrap(), vec![0xFF]);
     }
 }
