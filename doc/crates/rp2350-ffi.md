@@ -48,17 +48,22 @@ pub enum FfiError {
 
 ```rust
 use rp2350_ffi::SafeLibrary;
+use rp2350_plugin::abi::{SYMBOL_DEVICE_CREATE, SYMBOL_IS_DEVICE, SYMBOL_VERSION};
 
-// Load a plugin library
-let lib = SafeLibrary::new("plugins/led.dll")?;
+// Load a plugin library / 加载插件库
+let lib = SafeLibrary::load("target/release/rp2350_led_plugin.dll")?;
 
 // Look up exported symbols (unsafe: requires correct type)
-// SAFETY: rp2350_plugin_create is a well-known symbol with guaranteed signature
-let create_fn: Symbol<fn() -> *mut dyn RpPlugin> =
-    unsafe { lib.get_symbol(b"rp2350_plugin_create")? };
-let plugin = unsafe { Box::from_raw(create_fn()) };
+// SAFETY: the three ABI symbols have guaranteed signatures
+// SAFETY: 三个 ABI 符号具有保证的签名
+let version = unsafe { lib.find_symbol::<fn() -> u32>(SYMBOL_VERSION.as_bytes())? };
+let is_device = unsafe { lib.find_symbol::<fn() -> u32>(SYMBOL_IS_DEVICE.as_bytes())? };
+let create =
+    unsafe { lib.find_symbol::<fn() -> *mut dyn DevicePlugin>(SYMBOL_DEVICE_CREATE.as_bytes())? };
+let plugin = unsafe { Box::from_raw(create()) };
 
 // Library automatically closed when `lib` drops (RAII)
+// `lib` drop 时库自动关闭（RAII）
 ```
 
 ---
@@ -69,8 +74,9 @@ let plugin = unsafe { Box::from_raw(create_fn()) };
 
 | Symbol | Signature | Purpose |
 |--------|-----------|---------|
-| `rp2350_plugin_create` | `fn() -> *mut dyn RpPlugin` | Create plugin instance |
 | `rp2350_plugin_version` | `fn() -> u32` | ABI version check |
+| `rp2350_plugin_is_device` | `fn() -> u32` | `1` = DevicePlugin |
+| `rp2350_device_plugin_create` | `fn() -> *mut dyn DevicePlugin` | Create device plugin instance（无 destroy 导出，宿主 `Box` 回收 / no destroy export, host reclaims via `Box`） |
 
 ### ABI Version / ABI 版本
 

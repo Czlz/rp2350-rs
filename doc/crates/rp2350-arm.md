@@ -15,7 +15,7 @@
 | `registers` | `CortexM33Registers`, PSR flags, CONTROL register |
 | `conditions` | `Condition` (15 codes), `ITBlockState` (1-4 instruction blocks) |
 | `execute_thumb16` | Thumb-16 decoder + executor (~90 instructions) |
-| `execute_thumb32` | Thumb-32 decoder + executor stub |
+| `execute_thumb32` | Thumb-32 decoder + executor (60+ ALU / Load-Store / system instructions) |
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
@@ -292,11 +292,16 @@ pub enum StepResult {
 - **Load/Store**: `LDR`, `STR`, `LDRH`, `STRH`, `LDRB`, `STRB`, `LDMIA`, `STMIA`, `PUSH`, `POP`
 - **Miscellaneous**: `NOP`, `BKPT`, `SVC`, `CPS`, `IT`, `CBZ`, `CBNZ`, `REV`
 
-## Thumb-32 Decoder (stub) / Thumb-32 解码器（桩）
+## Thumb-32 Decoder / Thumb-32 解码器
 
-Currently a stub that returns `Halted(UndefinedInstruction)`.
-Full implementation (60+ ALU + Load/Store instructions) planned for Phase 2 completion.
-当前为桩代码，返回 `Halted(UndefinedInstruction)`。完整实现计划于 Phase 2 完成。
+The Thumb-32 decoder is fully implemented (see `execute_thumb32`): 60+ ALU,
+load/store and miscellaneous system instructions, plus the FPU and
+coprocessor chapters below. DSP/SIMD encodings (e.g. `SMLA*`, `USADA8`) are
+still treated as undefined instructions, exactly as documented in the
+`execute_thumb32` module header.
+Thumb-32 解码器已完整实现（见 `execute_thumb32`）：60+ 条 ALU、Load/Store
+与杂项系统指令，以及下文的 FPU 与协处理器章节。DSP/SIMD 编码（如 `SMLA*`、
+`USADA8`）仍按未定义指令处理，与 `execute_thumb32` 模块头的说明一致。
 
 ---
 

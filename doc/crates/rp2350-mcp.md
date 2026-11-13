@@ -1,6 +1,8 @@
 # rp2350-mcp — MCP Server (AgentFuse) / MCP 服务器
 
-> **Crate**: `rp2350-mcp` | **Path**: `crates/rp2350-mcp` | **Status**: ✅ Skeleton (Phase 1)
+> **Crate**: `rp2350-mcp` | **Path**: `crates/rp2350-mcp` | **Status**: ⚠️ Stub — `McpServer`（`new`/`start`/`stop`/`query_all`/`configure`）存在但为桩；HTTP/JSON-RPC 传输与真实设备查询未实现。以下 API 规格为目标设计，正文未验证部分见文末标注。
+>
+> **Status** (EN): `McpServer` exists as a stub (`server.rs`): `start()` only flips a flag and logs, `query_all()` returns `{"status": "stub", "devices": {}}`. The HTTP/JSON-RPC transport and delegation to `DeviceManager::mcp_query_all` are planned (Phase 3); the specs below are the target design.
 
 ---
 

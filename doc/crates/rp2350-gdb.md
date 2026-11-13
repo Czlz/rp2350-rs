@@ -2,6 +2,18 @@
 
 > GDB Remote Serial Protocol (RSP) Server for multi-core ARM Cortex-M33 debugging.
 > 用于多核 ARM Cortex-M33 调试的 GDB 远程串行协议（RSP）服务器。
+>
+> **Status**: `GdbTarget` trait（`target.rs`）与 `CortexM33Target<B>` 适配器
+> （`cortex_m33.rs`，含 `DEFAULT_INSTRUCTION_BUDGET = 1_000_000`）已实现；
+> `GdbServer`（`server.rs`）仍为桩——`start()` 仅置标志并打日志，RSP/TCP
+> 传输未实现。下文 trait 清单是已实现的目标契约；`GdbServer` 字段规格为规划。
+>
+> **Status** (EN): the `GdbTarget` trait (`target.rs`) and the
+> `CortexM33Target<B>` adapter (`cortex_m33.rs`, with
+> `DEFAULT_INSTRUCTION_BUDGET = 1_000_000`) are implemented; `GdbServer`
+> (`server.rs`) is still a stub — `start()` only sets a flag and logs, and the
+> RSP/TCP transport is not implemented. The trait listing below is the
+> implemented contract; the `GdbServer` field specs are planned.
 
 ---
 

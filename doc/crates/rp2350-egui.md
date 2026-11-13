@@ -2,6 +2,15 @@
 
 > egui GUI crate: Virtual Electronics Lab, HSTX video display, register/memory viewers, debug controls.
 > egui GUI crate：虚拟电子实验室、HSTX 视频显示、寄存器/内存查看器、调试控制。
+>
+> **Status**: 骨架 — 实际仅实现 `EmuApp`（`app.rs`）、寄存器面板（`panels.rs` 的
+> `RegisterPanel`/`RegisterSnapshot`）与 `canvas` 模块；下文的 HSTX 视频面板、
+> 虚拟实验室画布、内存/PIO/GPIO/终端/调试器面板等均为目标设计，尚未实现。
+>
+> **Status** (EN): skeleton — `EmuApp` (`app.rs`), the register panel
+> (`panels.rs`: `RegisterPanel`, `RegisterSnapshot`) and the `canvas` module are
+> implemented; the HSTX panel, virtual-lab canvas and the memory/PIO/GPIO/
+> terminal/debugger panels below are target designs, not yet implemented.
 
 ---
 
@@ -10,68 +19,56 @@
 ```
 rp2350-egui/
 └── src/
-    ├── lib.rs              # module declarations
-    ├── app.rs              # Rp2350EmuApp — eframe::App implementation
-    ├── panels/
-    │   ├── mod.rs
-    │   ├── lab.rs          # Virtual Lab canvas (drag + wire connect)
-    │   ├── hstx_view.rs    # HSTX video output panel
-    │   ├── registers.rs    # Register viewer (R0-R15, NVIC, FPU)
-    │   ├── memory.rs       # Memory hex viewer
-    │   ├── pio_view.rs     # PIO instruction memory + SM state
-    │   ├── gpio_view.rs    # GPIO pin monitor (48 pins)
-    │   ├── terminal.rs     # Virtual UART terminal
-    │   └── debugger.rs     # Debug control panel (breakpoints, step, trace)
-    ├── canvas/
-    │   ├── mod.rs
-    │   ├── chip_view.rs    # RP2350 chip package view with draggable pins
-    │   ├── pin_widget.rs   # Draggable pin component
-    │   ├── device_widget.rs# Virtual peripheral device component
-    │   ├── wire.rs         # Bezier curve wire rendering
-    │   └── drag_drop.rs    # Drag-and-drop from peripheral palette
-    ├── theme.rs            # egui visual theme configuration
-    └── icons.rs            # Embedded SVG/PNG icon resources
+    ├── lib.rs            # module declarations + re-export EmuApp
+    ├── app.rs            # EmuApp — eframe::App implementation (已落地 / landed)
+    ├── panels.rs         # RegisterPanel / RegisterSnapshot / XpsrFlags (已落地 / landed)
+    ├── canvas.rs         # Virtual Lab canvas — Phase 3 stub（桩）
+    └── main.rs           # binary entry / 二进制入口
+
+Planned target layout (Phase 3, not yet created / 规划中的目标结构，尚未创建):
+    panels/{lab, hstx_view, registers→已并入 panels.rs, memory, pio_view,
+            gpio_view, terminal, debugger}.rs
+    canvas/{chip_view, pin_widget, device_widget, wire, drag_drop}.rs
+    theme.rs, icons.rs
 ```
 
 ---
 
 ## Main App Structure / 主应用结构
 
+**已落地 / Landed** (`app.rs`)：
+
 ```rust
-pub struct Rp2350EmuApp {
-    /// Shared emulator instance.
-    pub chip: Arc<Mutex<RP2350Chip>>,
-
-    /// GDB server handle (for status display).
-    pub gdb_server: Option<Arc<GdbServerHandle>>,
-
-    /// Plugin host.
-    pub plugin_host: Arc<Mutex<PluginHost>>,
-
-    // --- Panel states ---
-    pub left_panel: LeftPanel,
-    pub canvas: VirtualLabCanvas,
-    pub right_panel: RightPanel,
-    pub terminal: TerminalPanel,
-    pub status_bar: StatusBar,
-
-    // --- Execution control ---
-    pub running: bool,
-    pub step_mode: StepMode,
-    pub speed_multiplier: f64,
-    pub cycle_budget: u64,
+/// The main egui application / 主 egui 应用程序
+pub struct EmuApp {
+    /// Window title / 窗口标题
+    title: String,
+    /// Inspected core (trait object keeps the UI core-agnostic)
+    /// 被检视的核心（trait 对象使 UI 与具体核心解耦）
+    core: Box<dyn CpuCore>,
 }
 
-impl Rp2350EmuApp {
-    pub fn new(chip: RP2350Chip) -> Self;
-    pub fn set_gdb_server(&mut self, server: GdbServerHandle);
-    pub fn load_plugin(&mut self, path: &Path) -> Result<(), PluginError>;
+impl EmuApp {
+    /// Create an application for the given core / 为指定核心创建应用
+    pub fn new(core: Box<dyn CpuCore>) -> Self;
+    /// Create an application preloaded with sample Cortex-M33 state
+    /// 创建一个预载 Cortex-M33 示例状态的应用
+    pub fn sample() -> Self;
+    /// Run the application with a native window
+    /// 以原生窗口运行应用
+    pub fn run(self) -> Result<(), eframe::Error>;
+}
 
-    /// Render one frame.
-    fn render_menu(&mut self, ctx: &egui::Context);
-    fn tick_simulator(&mut self, multiplier: f64);
+impl eframe::App for EmuApp {
+    /// One CentralPanel + RegisterPanel::new(core).show(ui)
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame);
 }
 ```
+
+**目标设计 / Target design（规划中 / planned，Phase 3）**：扩展为
+`chip: Arc<Mutex<RP2350Chip>>` + `gdb_server` 句柄 + `plugin_host` + 左侧外设/
+插件面板、中央 `VirtualLabCanvas`、右侧寄存器/HSTX 面板、底部 UART 终端与
+状态栏，以及 `render_menu()` / `tick_simulator(multiplier)` 执行控制。
 
 ---
 
