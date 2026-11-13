@@ -73,6 +73,23 @@ pub mod cpacr {
     pub const CP11_SHIFT: u32 = 22;
     /// Mask covering both CP10 and CP11 / 覆盖 CP10 与 CP11 的掩码
     pub const CP10_CP11_MASK: u32 = 0x00F0_0000;
+    /// Mask covering CP0-CP7 / 覆盖 CP0-CP7 的掩码
+    ///
+    /// CP0-CP7 occupy bits 15:0 (two bits each). In particular CP4 lives in
+    /// bits 9:8, so a `0x0000_00FF` mask would cover only CP0-CP3 and drop
+    /// the DCP key written by pico-sdk.
+    /// CP0-CP7 占用 bits 15:0（每个两位）。特别是 CP4 位于 bits 9:8，
+    /// 因此 `0x0000_00FF` 掩码只覆盖 CP0-CP3，会丢掉 pico-sdk 写入的
+    /// DCP 键。
+    pub const CP0_CP7_MASK: u32 = 0x0000_FFFF;
+    /// Mask covering every CPACR field modeled by the core
+    /// 核心建模的全部 CPACR 字段掩码
+    ///
+    /// CP0-CP7 are stored because the GPIO coprocessor (CP0) and the
+    /// double-precision coprocessor (CP4) use them; CP10-CP11 gate the FPU.
+    /// CP0-CP7 需要保存，因为 GPIO 协处理器（CP0）与双精度协处理器（CP4）
+    /// 使用这些字段；CP10-CP11 控制 FPU。
+    pub const MODELED_MASK: u32 = CP0_CP7_MASK | CP10_CP11_MASK;
     /// Access denied — using the coprocessor raises NOCP
     /// 禁止访问 —— 使用协处理器会产生 NOCP
     pub const DENIED: u32 = 0b00;

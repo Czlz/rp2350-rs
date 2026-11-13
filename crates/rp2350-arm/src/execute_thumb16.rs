@@ -201,8 +201,8 @@ pub enum StepResult {
     /// WFI/WFE — enter sleep state
     /// WFI/WFE — 进入睡眠状态
     Sleep,
-    /// Exception return (BX LR with EXC_RETURN value)
-    /// 异常返回（带 EXC_RETURN 值的 BX LR）
+    /// Exception return (any PC write carrying an EXC_RETURN value)
+    /// 异常返回（任意写 PC 的指令携带 EXC_RETURN 值）
     ExceptionReturn,
     /// Undefined instruction
     /// 未定义指令
@@ -395,13 +395,12 @@ pub fn execute_thumb16(
                         // BLX Rm: LR = 下一条指令的地址（PC 已由取指推进）。
                         // BLX Rm: LR = address of the next instruction (PC already advanced).
                         regs.lr = regs.pc | 1;
-                    }
-                    if !h1 && crate::exceptions::decode_exc_return(target).is_some() {
-                        // BX LR 携带 EXC_RETURN：交由核执行异常返回序列。
-                        // BX LR carries EXC_RETURN: let the core perform the return sequence.
+                    } else if crate::exceptions::write_pc(regs, target) {
+                        // BX 携带 EXC_RETURN：交由核执行异常返回序列。
+                        // BX carries EXC_RETURN: let the core perform the return sequence.
                         return Ok(StepResult::ExceptionReturn);
                     }
-                    if target & 0x1 == 0 {
+                    if target & 0x1 == 0 && crate::exceptions::decode_exc_return(target).is_none() {
                         // Not Thumb target → ARM mode (not supported by M33)
                         // 非 Thumb 目标 → ARM 模式（M33 不支持）
                         regs.xpsr |= 0x200_0000; // UsageFault: INVSTATE
@@ -706,11 +705,14 @@ pub fn execute_thumb16(
                 0xB0 => {
                     let op = (opcode >> 7) & 0x1;
                     let imm7 = ((opcode & 0x7F) as u32) << 2;
-                    if op == 0 {
-                        regs.sp = regs.sp.wrapping_add(imm7);
+                    let value = if op == 0 {
+                        regs.sp.wrapping_add(imm7)
                     } else {
-                        regs.sp = regs.sp.wrapping_sub(imm7);
-                    }
+                        regs.sp.wrapping_sub(imm7)
+                    };
+                    // 走 write(13) 以便同步 MSP/PSP 影子寄存器。
+                    // Route through write(13) to keep the MSP/PSP bank in sync.
+                    regs.write(13, value);
                 }
                 // SXTH / SXTB / UXTH / UXTB (bits[7:6] select the operation)
                 // 符号/零扩展半字与字节（bit[7:6] 选择操作）
@@ -751,7 +753,7 @@ pub fn execute_thumb16(
                     let m = ((opcode >> 8) & 0x1) != 0;
                     let reg_list = (opcode & 0xFF) as u16;
                     let count = reg_list.count_ones() + u32::from(m);
-                    regs.sp = regs.sp.wrapping_sub(count * 4);
+                    regs.write(13, regs.sp.wrapping_sub(count * 4));
                     let mut addr = regs.sp;
                     for i in 0..8u16 {
                         if (reg_list >> i) & 1 != 0 {
@@ -836,14 +838,24 @@ pub fn execute_thumb16(
                             addr = addr.wrapping_add(4);
                         }
                     }
+                    let mut exception_return = false;
                     if m {
                         let val = bus.read_u32(addr, cycles)?;
                         *cycles += 1;
-                        regs.pc = val & !1u32;
+                        // POP {..., PC} uses LoadWritePC: an EXC_RETURN value
+                        // must trigger the exception return sequence.
+                        // POP {..., PC} 使用 LoadWritePC：EXC_RETURN 值必须
+                        // 触发异常返回序列，而不是被当作普通跳转地址。
+                        exception_return = crate::exceptions::write_pc(regs, val);
                     }
-                    regs.sp = regs
-                        .sp
-                        .wrapping_add((reg_list.count_ones() + u32::from(m)) * 4);
+                    regs.write(
+                        13,
+                        regs.sp
+                            .wrapping_add((reg_list.count_ones() + u32::from(m)) * 4),
+                    );
+                    if exception_return {
+                        return Ok(StepResult::ExceptionReturn);
+                    }
                     if m {
                         return Ok(StepResult::BranchTaken);
                     }

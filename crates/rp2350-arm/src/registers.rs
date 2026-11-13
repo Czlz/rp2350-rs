@@ -59,6 +59,9 @@ pub struct CortexM33Registers {
     pub fpu: FpuRegisters,
     /// Coprocessor Access Control Register (CPACR) / 协处理器访问控制寄存器
     pub cpacr: u32,
+    /// A synchronous UsageFault is pending from the instruction just executed
+    /// 刚执行的指令已引发待处理的同步用法故障
+    pub(crate) pending_usage_fault: bool,
 }
 
 impl CortexM33Registers {
@@ -80,6 +83,7 @@ impl CortexM33Registers {
             faultmask: 0,
             fpu: FpuRegisters::new(),
             cpacr: 0,
+            pending_usage_fault: false,
         }
     }
 
@@ -101,10 +105,33 @@ impl CortexM33Registers {
     pub fn write(&mut self, index: u8, value: u32) {
         match index {
             0..=12 => self.r[index as usize] = value,
-            13 => self.sp = value,
+            13 => {
+                self.sp = value;
+                self.sync_stack_bank();
+            }
             14 => self.lr = value,
             15 => self.pc = value,
             _ => {}
+        }
+    }
+
+    /// Mirror `SP` into the active bank (`MSP` or `PSP`)
+    /// 把 `SP` 同步回当前栈寄存器组（`MSP` 或 `PSP`）
+    ///
+    /// On real Cortex-M hardware `R13` *is* the selected bank register, not a
+    /// separate value. Instructions such as `push`/`pop`/`add sp` used to update
+    /// only `sp`, so exception return unstacked from a stale `msp` and restored
+    /// a bogus PC/SP (the real `MicroPython` firmware ended up reading at the
+    /// SRAM top, `0x2008_2000`).
+    /// 真实 Cortex-M 中 `R13` 就是被选中的栈寄存器，并非独立数值。此前
+    /// `push`/`pop`/`add sp` 只更新 `sp`，异常返回便从过时的 `msp` 出栈，
+    /// 恢复出错误的 PC/SP（真实 MicroPython 固件最终读到 SRAM 顶端
+    /// `0x2008_2000` 而越界）。
+    pub fn sync_stack_bank(&mut self) {
+        if self.control & 0x2 != 0 {
+            self.psp = self.sp;
+        } else {
+            self.msp = self.sp;
         }
     }
 
@@ -119,21 +146,61 @@ impl CortexM33Registers {
         }
     }
 
-    /// Report whether CPACR grants access to coprocessor 10/11 (the FPU)
-    /// 报告 CPACR 是否授予协处理器 10/11（即 FPU）访问权限
+    /// Report whether CPACR grants access to the FPv5-SP unit (CP10)
+    /// 报告 CPACR 是否授予 FPv5-SP 单元（CP10）访问权限
     ///
-    /// ARMv8-M requires CP10 and CP11 to hold the same value. `0b01` grants
-    /// privileged-only access and `0b11` grants full access; the emulator
-    /// executes in privileged mode, so both encodings allow FPU instructions.
-    /// A mismatched or `0b00`/`0b10` setting raises NOCP on real hardware.
-    /// ARMv8-M 要求 CP10 与 CP11 取相同值。`0b01` 为仅特权访问、`0b11` 为
-    /// 完全访问；模拟器始终以特权模式执行，因此两种编码都允许 FPU 指令。
-    /// 两者不一致或为 `0b00`/`0b10` 时，真实硬件会产生 NOCP。
+    /// FPv5-SP access is governed by `CPACR.CP10`. `0b01` grants privileged-only
+    /// access and `0b11` grants full access; the emulator always executes in
+    /// privileged mode, so both encodings allow FPU instructions. `0b00` and
+    /// the reserved `0b10` encoding raise NOCP.
+    ///
+    /// `CPACR.CP11` is not consulted: it gates double-precision arithmetic,
+    /// which FPv5-SP does not implement. Real RP2350 firmware (MicroPython)
+    /// leaves CP11 at `0b00` while running VFP instructions, so requiring it
+    /// here would reject every FPU access on the target.
+    /// FPv5-SP 的访问权限由 `CPACR.CP10` 决定。`0b01` 为仅特权访问、`0b11`
+    /// 为完全访问；模拟器始终以特权模式执行，因此两种编码都允许 FPU 指令。
+    /// `0b00` 与保留值 `0b10` 产生 NOCP。
+    ///
+    /// 此处不检查 `CPACR.CP11`：它控制双精度算术，而 FPv5-SP 不实现双精度。
+    /// 真实 RP2350 固件（MicroPython）在运行 VFP 指令时把 CP11 保持为
+    /// `0b00`，若这里要求 CP11，目标上的所有浮点访问都会被拒绝。
     #[must_use]
     pub fn fp_access_enabled(&self) -> bool {
-        let cp10 = (self.cpacr >> cpacr::CP10_SHIFT) & 0x3;
-        let cp11 = (self.cpacr >> cpacr::CP11_SHIFT) & 0x3;
-        cp10 == cp11 && matches!(cp10, cpacr::PRIVILEGED | cpacr::FULL)
+        self.cp_access_enabled(10)
+    }
+
+    /// Report whether CPACR grants access to coprocessor `cp`
+    /// 报告 CPACR 是否授予协处理器 `cp` 访问权限
+    ///
+    /// Each coprocessor has a two-bit CPACR field at bits `2*cp+1:2*cp`.
+    /// As with [`Self::fp_access_enabled`], `0b01` (privileged-only) and
+    /// `0b11` (full) are accepted because the emulator always executes in
+    /// privileged mode; `0b00` and the reserved `0b10` raise NOCP.
+    /// 每个协处理器在 CPACR 的 `2*cp+1:2*cp` 位段有一个两位字段。与
+    /// [`Self::fp_access_enabled`] 一致，`0b01`（仅特权）与 `0b11`（完全）
+    /// 都视为允许，因为模拟器始终以特权模式执行；`0b00` 与保留值 `0b10`
+    /// 会产生 NOCP。
+    #[must_use]
+    pub fn cp_access_enabled(&self, cp: u8) -> bool {
+        if cp >= 16 {
+            return false;
+        }
+        let shift = u32::from(cp) * 2;
+        let field = (self.cpacr >> shift) & 0x3;
+        matches!(field, cpacr::PRIVILEGED | cpacr::FULL)
+    }
+
+    /// Mark a synchronous UsageFault as pending for the current instruction
+    /// 将当前指令标记为引发待处理的同步用法故障
+    pub(crate) fn raise_usage_fault(&mut self) {
+        self.pending_usage_fault = true;
+    }
+
+    /// Take and clear the pending synchronous UsageFault flag
+    /// 取出并清除待处理的同步用法故障标志
+    pub(crate) fn take_usage_fault(&mut self) -> bool {
+        core::mem::take(&mut self.pending_usage_fault)
     }
 }
 
@@ -185,16 +252,45 @@ mod tests {
     }
 
     #[test]
-    fn fpu_access_rejects_mismatched_or_reserved_encodings() {
+    fn fpu_access_ignores_cp11_because_fpv5_sp_is_governed_by_cp10() {
         let mut regs = CortexM33Registers::new();
-        // CP10 = full, CP11 = denied / CP10 完全访问、CP11 禁止
+        // 实测 MicroPython RP2350 固件写入 CPACR = 0x00300303（CP10 全开、CP11 为 0），
+        // 且其 VFP 指令在真实硬件上可执行。
+        // Observed MicroPython RP2350 firmware writes CPACR = 0x00300303
+        // (CP10 full, CP11 denied) and still executes VFP instructions.
         regs.cpacr = 0x0030_0000;
+        assert!(regs.fp_access_enabled());
+    }
+
+    #[test]
+    fn fpu_access_rejects_denied_and_reserved_cp10_encodings() {
+        let mut regs = CortexM33Registers::new();
+        // CP10 = denied / CP10 禁止
+        regs.cpacr = 0x0000_0000;
         assert!(!regs.fp_access_enabled());
-        // CP10 = full, CP11 = reserved 0b10 / CP10 完全访问、CP11 保留值
-        regs.cpacr = 0x00B0_0000;
+        // CP10 = reserved 0b10 / CP10 保留值 0b10
+        regs.cpacr = 0x0020_0000;
         assert!(!regs.fp_access_enabled());
-        // CP10 = reserved 0b10, CP11 = full / CP10 保留值、CP11 完全访问
-        regs.cpacr = 0x00C0_0000;
-        assert!(!regs.fp_access_enabled());
+    }
+
+    #[test]
+    fn cp_access_reads_each_two_bit_field() {
+        let mut regs = CortexM33Registers::new();
+        regs.cpacr = 0x0030_0303;
+        assert!(regs.cp_access_enabled(0));
+        assert!(regs.cp_access_enabled(4));
+        assert!(regs.cp_access_enabled(10));
+        assert!(!regs.cp_access_enabled(1));
+        assert!(!regs.cp_access_enabled(7));
+        assert!(!regs.cp_access_enabled(16));
+    }
+
+    #[test]
+    fn cp_access_accepts_privileged_only_and_rejects_reserved() {
+        let mut regs = CortexM33Registers::new();
+        regs.cpacr = 0b01 << 2; // CP1 privileged-only / CP1 仅特权
+        assert!(regs.cp_access_enabled(1));
+        regs.cpacr = 0b10 << 2; // CP1 reserved / CP1 保留值
+        assert!(!regs.cp_access_enabled(1));
     }
 }

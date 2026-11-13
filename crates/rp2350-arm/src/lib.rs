@@ -61,6 +61,9 @@ const SCB_VTOR: u32 = 0xE000_ED08;
 /// `SCB_CPACR` absolute address / `SCB_CPACR` 绝对地址
 const SCB_CPACR: u32 = 0xE000_ED88;
 
+/// `SCB_CFSR` absolute address / `SCB_CFSR` 绝对地址
+const SCB_CFSR: u32 = 0xE000_ED28;
+
 /// First exception number that maps to an external interrupt
 /// 映射到外部中断的第一个异常号
 const FIRST_EXTERNAL_EXCEPTION: u32 = 16;
@@ -82,6 +85,8 @@ pub struct CortexM33Core {
     systick: SysTick,
     /// Vector table offset register value / 向量表偏移寄存器值
     vtor: u32,
+    /// Configurable Fault Status Register (SCB->CFSR) / 可配置故障状态寄存器
+    cfsr: u32,
     /// IT block state machine / IT 块状态机
     it_state: ITBlockState,
     /// Current execution state / 当前执行状态
@@ -105,6 +110,9 @@ pub struct CortexM33Core {
     /// Distinct undefined opcodes already reported, keyed by (width, opcode)
     /// 已报告过的未定义操作码，按（宽度, 操作码）去重
     undefined_seen: BTreeSet<(u8, u32)>,
+    /// Whether the unmodeled lazy FP stacking condition has been reported
+    /// 是否已报告过未建模的惰性浮点压栈条件
+    fp_stack_warned: bool,
 }
 
 impl CortexM33Core {
@@ -118,6 +126,7 @@ impl CortexM33Core {
             nvic: Nvic::new(),
             systick: SysTick::new(),
             vtor: 0,
+            cfsr: 0,
             it_state: ITBlockState::new(),
             state: CpuState::Reset,
             pending_irq: None,
@@ -127,6 +136,7 @@ impl CortexM33Core {
             total_cycles: 0,
             strict_decode: false,
             undefined_seen: BTreeSet::new(),
+            fp_stack_warned: false,
         }
     }
 
@@ -233,11 +243,13 @@ impl CortexM33Core {
         self.nvic = Nvic::new();
         self.systick = SysTick::new();
         self.vtor = 0;
+        self.cfsr = 0;
         self.it_state = ITBlockState::new();
         self.pending_irq = None;
         self.active_exceptions.clear();
         self.total_cycles = 0;
         self.undefined_seen.clear();
+        self.fp_stack_warned = false;
     }
 
     /// Apply cached boot vectors, entering Running only if they exist
@@ -249,6 +261,14 @@ impl CortexM33Core {
             self.registers.sp = msp;
             self.registers.pc = reset & !1;
             self.vtor = self.boot_vtor;
+            // The RP2350 boot ROM enables CP10/CP11 (the FPU) before handing
+            // control to an Arm image. This emulator enters directly at the
+            // image entry point, so it must reproduce that post-ROM state;
+            // a power-on register file still starts with CPACR cleared.
+            // RP2350 boot ROM 在把控制权交给 Arm 映像前已使能 CP10/CP11（FPU）。
+            // 本模拟器直接从映像入口开始执行，因此需要复现这一 post-ROM 状态；
+            // 上电寄存器文件本身仍以 CPACR 清零启动。
+            self.registers.cpacr = fpu::cpacr::CP10_CP11_MASK;
             self.state = CpuState::Running;
         } else {
             self.state = CpuState::Reset;
@@ -321,11 +341,20 @@ impl CortexM33Core {
             Some(self.vtor)
         } else if addr == SCB_CPACR {
             if write {
-                // 仅建模 CP10/CP11 字段，其余协处理器键保持为零。
-                // Only the CP10/CP11 fields are modeled; other keys read as zero.
-                self.registers.cpacr = value & fpu::cpacr::CP10_CP11_MASK;
+                // 建模 CP0-CP7（GPIOC/DCP）与 CP10-CP11（FPU）字段，
+                // 其余协处理器键保持为零。
+                // Model CP0-CP7 (GPIOC/DCP) and CP10-CP11 (FPU) fields;
+                // the remaining coprocessor keys read as zero.
+                self.registers.cpacr = value & fpu::cpacr::MODELED_MASK;
             }
             Some(self.registers.cpacr)
+        } else if addr == SCB_CFSR {
+            if write {
+                // 简化为直接读写；真实 CFSR 为写 1 清零。
+                // Modeled as a plain read/write; the real CFSR is write-one-to-clear.
+                self.cfsr = value;
+            }
+            Some(self.cfsr)
         } else if (NVIC_BASE..NVIC_BASE + 0x400).contains(&addr) {
             self.handle_nvic_access(addr - NVIC_BASE, write, value)
         } else if (SYSTICK_BASE..SYSTICK_BASE + 0x10).contains(&addr) {
@@ -420,6 +449,11 @@ impl CortexM33Core {
         bus: &mut dyn AddressBus,
         cycles: &mut u64,
     ) -> Result<StepResult, CoreError> {
+        // Refresh the diagnostic program counter before each instruction so a
+        // memory watchpoint can attribute stores to their instruction.
+        // 每条指令前刷新诊断用的程序计数器，使内存监视点能把存储归因于具体指令。
+        rp2350_core::watch::set_pc(self.registers.pc);
+
         // SysTick tick (1 cycle per instruction fetch)
         // SysTick 计时（每条指令获取 1 个周期）
         if self.systick.tick(1) {
@@ -472,6 +506,32 @@ impl CortexM33Core {
             )?
         };
 
+        // 同步用法故障（当前仅 NOCP）：设置 CFSR 并立即进入 UsageFault。
+        // Synchronous UsageFault (currently only NOCP): set CFSR and enter
+        // the UsageFault handler immediately with a standard stack frame.
+        if self.registers.take_usage_fault() {
+            self.cfsr |= exceptions::CFSR_UFSR_NOCP;
+            let in_handler = !self.active_exceptions.is_empty();
+            let thread_psp = self.registers.control & 0x2 != 0;
+            exceptions::enter_exception(
+                bus,
+                &mut self.registers,
+                &mut self.nvic,
+                u32::from(exceptions::EXC_USAGE_FAULT),
+                self.vtor,
+                cycles,
+            )?;
+            if !in_handler {
+                // 系统异常默认写入 0xFFFF_FFF1；从 Thread 模式进入时按
+                // MSP/PSP 选择正确的 EXC_RETURN。
+                // System exceptions default to 0xFFFF_FFF1; entering from
+                // Thread mode selects the MSP/PSP-specific EXC_RETURN.
+                self.registers.lr = if thread_psp { 0xFFFF_FFFD } else { 0xFFFF_FFF9 };
+            }
+            self.active_exceptions.push(exceptions::EXC_USAGE_FAULT);
+            return Ok(StepResult::Ok);
+        }
+
         if matches!(result, StepResult::Undefined) {
             self.note_undefined(old_pc, raw_opcode, width)?;
         }
@@ -489,6 +549,25 @@ impl CortexM33Core {
         // Only check if PRIMASK is 0 / 仅在 PRIMASK 为 0 时检查
         if self.registers.primask & 1 != 0 {
             return Ok(());
+        }
+
+        // 惰性浮点压栈未建模（FPCCR/LSPACT/FPCAR）。若中断到来时浮点单元
+        // 已激活，真实硬件会按 FPCCR 压入 26 字扩展帧或推迟保存 S0-S15/FPSCR；
+        // 本模拟器始终只压标准 8 字帧。此处显式报告一次未支持，不假装已保存
+        // 浮点上下文（完整处理留待 Stage 5）。
+        // Lazy FP stacking is unmodeled (FPCCR/LSPACT/FPCAR). If an interrupt
+        // arrives while the FPU is active, real hardware stacks the 26-word
+        // extended frame (or defers it). This emulator stacks only the standard
+        // 8-word frame, so it reports the unsupported condition once instead
+        // of pretending FP context was preserved (full handling is Stage 5).
+        if self.registers.fpu.fpexc & fpu::fpexc::EN != 0 && !self.fp_stack_warned {
+            self.fp_stack_warned = true;
+            log::warn!(
+                "exception entry with live FP context: lazy FP stacking \
+                 (LSPACT/FPCAR/FPCCR) is not modeled; S0-S15 and FPSCR are not stacked / \
+                 异常进入时浮点上下文活跃：未建模惰性压栈（LSPACT/FPCAR/FPCCR），\
+                 S0-S15 与 FPSCR 不会被压栈"
+            );
         }
 
         if let Some(irq) = self.nvic.find_highest_priority() {
@@ -599,9 +678,15 @@ impl CpuCore for CortexM33Core {
         match self.step_instruction(bus, &mut cycle_count) {
             Ok(result) => {
                 if result == StepResult::ExceptionReturn {
-                    self.return_from_exception(bus, &mut cycle_count)?;
+                    if let Err(e) = self.return_from_exception(bus, &mut cycle_count) {
+                        self.state = CpuState::Halted;
+                        return Err(e);
+                    }
                 }
-                self.check_pending_exceptions(bus, &mut cycle_count)?;
+                if let Err(e) = self.check_pending_exceptions(bus, &mut cycle_count) {
+                    self.state = CpuState::Halted;
+                    return Err(e);
+                }
                 self.total_cycles += cycle_count;
                 Ok(self.state)
             }

@@ -44,7 +44,9 @@
 )]
 
 mod branch_misc;
+mod coproc;
 mod data_processing;
+mod fpu;
 mod load_store;
 mod multiple;
 mod multiply;
@@ -88,6 +90,28 @@ pub fn execute_thumb32(
             *cycles += 1;
             return Ok(StepResult::Ok);
         }
+    }
+
+    // FPU (VFPv5-SP) data movement: extension-register transfers occupy
+    // encodings that the integer decoder leaves undefined, so they are
+    // decoded first. Non-FPU encodings return None and fall through.
+    // FPU（VFPv5-SP）数据搬移：扩展寄存器传输占用整数解码器视为未定义的
+    // 编码空间，因此先解码。非 FPU 编码返回 None 并继续常规解码。
+    if let Some(result) = fpu::try_execute(instr, regs, bus, cycles)? {
+        *cycles += 1;
+        return Ok(result);
+    }
+
+    // GPIO coprocessor (CP0) and double-precision coprocessor (CP4) transfers
+    // also occupy coprocessor encoding space left undefined by the integer
+    // decoder. They run after the FPU so the shared `0xEC` space is resolved
+    // in favour of the VFP `VMOV` encoding first.
+    // GPIO 协处理器（CP0）与双精度协处理器（CP4）传输同样位于整数解码器
+    // 视为未定义的协处理器编码空间。它们在 FPU 之后解码，使共享的 `0xEC`
+    // 空间优先解析为 VFP `VMOV` 编码。
+    if let Some(result) = coproc::try_execute(instr, regs, bus, cycles)? {
+        *cycles += 1;
+        return Ok(result);
     }
 
     let op1 = (instr >> 27) & 0x3;

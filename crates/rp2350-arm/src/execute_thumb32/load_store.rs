@@ -100,8 +100,13 @@ fn access(
             Width::Word => bus.read_u32(addr, cycles)?,
         };
         if rt == 15 {
-            regs.pc = value & !1;
-            Ok(StepResult::BranchTaken)
+            // LDR 写 PC 使用 LoadWritePC：EXC_RETURN 触发异常返回。
+            // LDR to PC uses LoadWritePC: EXC_RETURN triggers a return.
+            if crate::exceptions::write_pc(regs, value) {
+                Ok(StepResult::ExceptionReturn)
+            } else {
+                Ok(StepResult::BranchTaken)
+            }
         } else {
             regs.write(rt, value);
             Ok(StepResult::Ok)

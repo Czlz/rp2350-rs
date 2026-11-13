@@ -33,6 +33,12 @@ pub const EXCEPTION_STACK_FRAME_SIZE: u32 = 32;
 /// 带浮点上下文的异常帧（26 字 / 104 字节）
 pub const EXCEPTION_STACK_FRAME_EXTENDED_SIZE: u32 = 104;
 
+/// CFSR.UFSR.NOCP: coprocessor access denied (bit 19 of CFSR)
+/// CFSR.UFSR.NOCP：协处理器访问被拒绝（CFSR 位 19）
+pub const CFSR_UFSR_NOCP: u32 = 1 << 19;
+
+/// Exception number for UsageFault / 用法故障的异常号
+pub const EXC_USAGE_FAULT: u16 = 6;
 /// Exception number for SVCall / SVCall 的异常号
 pub const EXC_SVCALL: u16 = 11;
 /// Exception number for PendSV / PendSV 的异常号
@@ -74,6 +80,38 @@ pub fn decode_exc_return(lr: u32) -> Option<ExcReturnInfo> {
         to_non_secure: (lr & 0x1) != 0,
         has_fp: (lr & 0x10) != 0,
     })
+}
+
+/// Apply `BXWritePC` / `LoadWritePC` semantics to a value written to PC
+/// 对写入 PC 的值应用 `BXWritePC` / `LoadWritePC` 语义
+///
+/// ARMv8-M requires every PC write through `BX`, `BLX`, `POP`, `LDM` and `LDR`
+/// to check for an EXC_RETURN value; only `ALUWritePC` (MOV/ADD to PC) is a
+/// plain branch. A `POP {..., pc}` that restores `0xFFFF_FFF9` is therefore an
+/// exception return, not a branch to `0xFFFF_FFF8` — masking bit 0 first is
+/// exactly how such firmware used to run off into a bus fault.
+/// ARMv8-M 要求通过 `BX`、`BLX`、`POP`、`LDM`、`LDR` 写 PC 时都检查
+/// EXC_RETURN；只有 `ALUWritePC`（MOV/ADD 写 PC）是普通分支。因此
+/// `POP {..., pc}` 恢复 `0xFFFF_FFF9` 是异常返回，而非跳转到 `0xFFFF_FFF8`；
+/// 先清 bit 0 正是这类固件跑飞并触发总线错误的原因。
+///
+/// The EXC_RETURN value is carried in `regs.lr` so the core's private
+/// `return_from_exception` step can decode it; exception
+/// unstacking restores LR from the stack frame afterwards.
+/// EXC_RETURN 值通过 `regs.lr` 传递，供异常返回流程解码；随后出栈会用栈帧
+/// 中的 LR 覆盖它。
+///
+/// Returns `true` when the caller must raise `StepResult::ExceptionReturn`.
+/// 返回 `true` 表示调用方须返回 `StepResult::ExceptionReturn`。
+#[must_use]
+pub fn write_pc(regs: &mut CortexM33Registers, value: u32) -> bool {
+    if decode_exc_return(value).is_some() {
+        regs.lr = value;
+        true
+    } else {
+        regs.pc = value & !1u32;
+        false
+    }
 }
 
 /// Push a standard exception stack frame onto the stack
@@ -335,5 +373,37 @@ mod tests {
     #[test]
     fn exception_stack_frame_size_is_correct() {
         assert_eq!(EXCEPTION_STACK_FRAME_SIZE, 32);
+    }
+
+    #[test]
+    fn write_pc_treats_exc_return_as_an_exception_return() {
+        let mut regs = CortexM33Registers {
+            pc: 0x1000_0100,
+            ..Default::default()
+        };
+        // POP {..., pc} 恢复 0xFFFF_FFF9：不能把 bit 0 清成 0xFFFF_FFF8
+        // 后当成普通跳转目标，否则 CPU 会跳出 Flash 触发总线错误。
+        // A POP restoring 0xFFFF_FFF9 must not mask bit 0 into a branch to
+        // 0xFFFF_FFF8; that would leave flash and raise a bus error.
+        assert!(write_pc(&mut regs, 0xFFFF_FFF9));
+        assert_eq!(
+            regs.pc, 0x1000_0100,
+            "PC must stay until unstacking / 出栈前 PC 不变"
+        );
+        assert_eq!(regs.lr, 0xFFFF_FFF9);
+    }
+
+    #[test]
+    fn write_pc_branches_for_ordinary_addresses() {
+        let mut regs = CortexM33Registers {
+            lr: 0x1234_5678,
+            ..Default::default()
+        };
+        assert!(!write_pc(&mut regs, 0x1000_0123));
+        assert_eq!(
+            regs.pc, 0x1000_0122,
+            "Thumb bit is cleared / Thumb 位应清除"
+        );
+        assert_eq!(regs.lr, 0x1234_5678, "LR is untouched / LR 不应被修改");
     }
 }

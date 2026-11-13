@@ -134,7 +134,11 @@ pub(super) fn execute_register_list(
     *cycles += u64::from(count);
 
     if let Some(value) = loaded_pc {
-        regs.pc = value & !1;
+        // LDM/POP.W 写 PC 同样使用 LoadWritePC 语义。
+        // LDM/POP.W writes to PC also use LoadWritePC semantics.
+        if crate::exceptions::write_pc(regs, value) {
+            return Ok(StepResult::ExceptionReturn);
+        }
         return Ok(StepResult::BranchTaken);
     }
     Ok(StepResult::Ok)
