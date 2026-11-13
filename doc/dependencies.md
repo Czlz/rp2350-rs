@@ -125,8 +125,9 @@ wasm = ["eframe/wasm_bindgen", "egui-wgpu/webgl"]
 ### Required exported symbols
 
 ```
-rp2350_plugin_create     → fn() -> *mut dyn RpPlugin
-rp2350_plugin_version    → fn() -> u32  (ABI version = 1)
+rp2350_plugin_version        → fn() -> u32  (ABI version = 1)
+rp2350_plugin_is_device      → fn() -> u32  (1 = DevicePlugin)
+rp2350_device_plugin_create  → fn() -> *mut dyn DevicePlugin
 ```
 
 ### FFI Safety

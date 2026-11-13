@@ -107,6 +107,11 @@ pub trait CpuCore: Send + Sync {
     fn write_register(&mut self, index: u8, value: u32);
     fn reset(&mut self);
     fn description(&self) -> String;
+
+    // 带默认实现的方法（无状态核心可直接用）/ default-implemented methods:
+    fn state(&self) -> CpuState { CpuState::Reset }
+    fn xpsr(&self) -> u32 { 0 }
+    fn total_cycles(&self) -> CycleCount { 0 }
 }
 ```
 
@@ -134,10 +139,10 @@ pub trait RpPlugin: Send + Sync {
 
 ```rust
 pub trait PluginContext: Send {
-    fn log(&self, level: LogLevel, message: &str);
-    fn gpio_read(&self, pin: u8) -> bool;
-    fn gpio_write(&mut self, pin: u8, level: bool);
-    fn gpio_set_direction(&mut self, pin: u8, direction: PinDirection);
+    fn log_info(&self, message: &str);
+    fn log_warn(&self, message: &str);
+    fn log_error(&self, message: &str);
+    fn current_cycles(&self) -> u64;
     fn schedule_callback(&mut self, cycles: u64, tag: &str);
     // Internal: erased service access (use PluginContextExt for typed access)
     fn get_service_erased(&self) -> Option<&dyn Any>;
@@ -148,6 +153,15 @@ pub trait PluginContextExt: PluginContext {
 }
 impl<T: PluginContext + ?Sized> PluginContextExt for T {}
 ```
+
+> GPIO 不经由 `PluginContext`：设备端口的读写由 `DeviceManager::wire` 接线、
+> `DeviceManager::sync_gpio(&mut [GpioPin])` 在每次 tick 后把 Output 端口电平
+> 写回 GPIO 引脚。插件视角的总线设备接口为 `BusDevice { base_address, size }`
+> （`rp2350-plugin::context`）。
+> GPIO does not go through `PluginContext`: device ports are wired via
+> `DeviceManager::wire`, and `DeviceManager::sync_gpio(&mut [GpioPin])` writes
+> Output port levels back to the GPIO pins after each tick. The plugin-side bus
+> device interface is `BusDevice { base_address, size }`.
 
 ### 2.5 DevicePlugin — 设备插件契约
 
@@ -374,7 +388,7 @@ pico-sdk 大量依赖这套别名（`hw_set_bits`/`hw_clear_bits` 会写 `RESETS
 │                                                               │
 │    peripherals.tick(cycles)   // APB peripherals              │
 │    device_manager.tick_all()  // all loaded DevicePlugins     │
-│    device_manager.notify_gpio() // GPIO → device routing      │
+│    device_manager.sync_gpio(&mut pins) // GPIO→device routing │
 │    irq.process_pending()      // interrupt dispatch           │
 │                                                               │
 │    if debug.halt_requested: break                             │
@@ -420,28 +434,40 @@ GpioPin::set_function() → updates pin state
      ├── SIO output → pin.value → GPIO_OUT register
      │
      ▼
-RP2350Chip::notify_gpio_change(pin, level)
+RP2350Chip GPIO 引脚电平（每 tick 由驱动读取）
      │
      ▼
-DeviceManager::notify_gpio_change(pin, level)
+DeviceManager::sync_gpio(&mut [GpioPin])          // 每个 tick 后调用 / called after each tick
      │
-     ├── WiringTable::get_ports(pin) → [(device_name, port_idx), ...]
+     ├── Input → Device（GPIO 输出电平 → 设备输入端口）:
+     │     for entry in wiring.all():                      // WiringTable 全部接线
+     │       device = devices[entry.device_id]
+     │       port   = device.ports()[entry.port_index]
+     │       if port.direction ∈ {Input, Bidirectional}:
+     │           device.on_gpio_change(entry.port_index, gpio_pin.level())
+     │           （插件在自己的实现里更新 port.level —— 主机不直接写端口字段）
+     │           (the plugin updates its own port.level — the host never writes port fields)
      │
-     ├── For each wired port:
-     │     ├── device.ports_mut()[port_idx].current_level = level
-     │     ├── device.on_gpio_change(port_idx, level)
-     │     └── (device drives output if PortDirection::Output)
-     │           └── DeviceManager::device_drives_gpio(device, port, level)
-     │                 └── ctx.gpio_write(pin, level) → RP2350 GPIO_IN
+     ├── Device → Output（设备输出端口 → GPIO 输入电平）:
+     │     for (device_id, device) in devices:
+     │       for (i, port) in device.ports().enumerate():
+     │         if port.direction ∈ {Output, Bidirectional}
+     │            && let Some(gpio) = wiring.find_by_device_port(device_id, i):
+     │              gpio_pin.set_input(port.level)         // 写回 RP2350 GPIO_IN
      │
-     └── egui lab canvas → update pin color + port color + wire color
+     └── GUI 模式：egui 面板读取 GPIO / 端口状态刷新画布（仅可视化）
+         (GUI mode: egui panels read GPIO / port state to refresh the canvas)
 
 Headless/MCP:
-  DeviceManager::mcp_query_device("LED") → {"level": true, "gpio_pin": 25}
-  DeviceManager::mcp_query_all() → all device states aggregate
+  DeviceManager::mcp_query_all() → { "<device_id>": state_snapshot(), ... }
+  （按 id 汇总每个设备的 state_snapshot；`mcp_query_device` 单设备查询为规划项）
+  (aggregates each device's state_snapshot by id; per-device `mcp_query_device` is planned)
 ```
 
 ### 5.3 HSTX Video Pipeline
+
+> ⏳ **规划中（未实现）**：本节是 Phase 5 的目标设计，`rp2350-periph` 目前没有 HSTX 模块。
+> ⏳ **Planned (not implemented)**: this section is the Phase 5 target design; `rp2350-periph` has no HSTX module yet.
 
 ```
 Firmware: DMA → HSTX FIFO write (8 lanes, 32-bit each)
@@ -466,41 +492,41 @@ wgpu swapchain → window present
 
 ```
 Startup:
-  CLI: rp2350 run firmware.elf [--headless] [--mcp-port 9000]
+  插件加载：DeviceManager::load_plugin / PluginLoader::scan_and_load
        │
        ▼
-  DeviceManager::new(plugin_dirs, headless)
+  DeviceManager::new()                    // 无参构造；目录扫描在 PluginLoader
        │
        ▼
-  DeviceManager::scan_and_load()
+  DeviceManager::load_plugin(id, path)   // 按路径逐个加载（内部 PluginLoader::load_device）
        ├── Walk plugins/ directory
        ├── For each .dll/.so/.dylib:
        │     ├── SafeLibrary::new(path)            // dlopen / LoadLibrary
-       │     ├── dlsym("rp2350_plugin_version")    // check ABI
-       │     ├── dlsym("rp2350_plugin_create")     // → Box<dyn RpPlugin>
-       │     ├── dlsym("rp2350_plugin_is_device")  // → if 1, cast to DevicePlugin
-       │     ├── plugin.init(ctx)                  // init with emulator ctx
-       │     └── Register in devices[]             // store LoadedDevice
-       └── Return Vec<PluginLoadResult>
+       │     ├── dlsym("rp2350_plugin_version")    // 必须等于 ABI_VERSION (1)
+       │     ├── dlsym("rp2350_device_plugin_create")     // → Box<dyn DevicePlugin>
+       │     ├── dlsym("rp2350_plugin_is_device")  // → 非 1 拒绝（仅设备插件）
+       │     ├── Box::from_raw(create())           // 实例化 Box<dyn DevicePlugin>
+       │     └── DeviceManager::register(id, plugin) // 存入设备表
+       └── 任一符号缺失/版本不符则返回 DeviceError::PluginLoadFailed
 
-GUI mode:                        Headless/MCP mode:
+（GUI 渲染与 MCP 集成为规划项 / GUI + MCP wiring planned）:
   For each device:                 For each device:
     if has_ui():                     state_snapshot() → JSON
       render_ui() each frame         exposed via MCP JSON-RPC
                                      also --dump-state CLI flag
 
-Runtime (every cycle):
+Runtime (every tick):
   DeviceManager::tick_all(ctx, cycles)
        ├── For each device:
        │     └── device.plugin.tick(ctx, cycles)
        │
-  DeviceManager::notify_gpio_change(pin, level)
+  DeviceManager::sync_gpio(&mut [GpioPin])
        ├── Lookup WiringTable for (device, port) → pin
        ├── Call device.on_gpio_change(port_idx, level)
        └── Update device port state
 
 On shutdown:
-  DeviceManager::unload_all()
+  DeviceManager::unregister(&id)
        ├── For each device: plugin.shutdown()
        └── SafeLibrary::drop()  // RAII: dlclose / FreeLibrary
 ```
