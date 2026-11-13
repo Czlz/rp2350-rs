@@ -44,8 +44,17 @@ pub fn new_system_write_log() -> SystemWriteLog {
 
 /// Is `addr` a system control space register replayed into the core?
 /// `addr` 是否为需要回放到核的系统控制空间寄存器？
+///
+/// `CPACR` must be replayed because it lives in the core, not in the PPB
+/// storage: firmware's `arm_cpu_hw->cpacr |= ...` in `runtime_init` is the only
+/// thing that enables the FPU, and without the replay every VFP instruction
+/// raises UsageFault `NOCP`.
+/// `CPACR` 必须回放，因为它属于核而不是 PPB 存储：固件在 `runtime_init` 里对
+/// `arm_cpu_hw->cpacr |= ...` 的写入是启用 FPU 的唯一动作，不回放的话每条 VFP
+/// 指令都会触发 UsageFault `NOCP`。
 fn is_replayed(addr: u32) -> bool {
     addr == 0xE000_ED08 // SCB_VTOR
+        || addr == 0xE000_ED88 // SCB_CPACR
         || (0xE000_E010..=0xE000_E01F).contains(&addr) // SysTick
         || (0xE000_E100..=0xE000_E4FF).contains(&addr) // NVIC
 }
@@ -150,6 +159,15 @@ mod tests {
         // SCB_VTOR at 0xE000_ED08. SCB_VTOR 位于 0xE000_ED08。
         assert!(ppb.write32(0xED08, 0x1000_0000));
         assert_eq!(log.lock().as_slice(), &[(0xE000_ED08, 0x1000_0000)]);
+    }
+
+    #[test]
+    fn cpacr_writes_are_logged_for_replay() {
+        let log = new_system_write_log();
+        let mut ppb = Ppb::with_log(Arc::clone(&log));
+        // SCB_CPACR at 0xE000_ED88. SCB_CPACR 位于 0xE000_ED88。
+        assert!(ppb.write32(0xED88, 0x00F0_0000));
+        assert_eq!(log.lock().as_slice(), &[(0xE000_ED88, 0x00F0_0000)]);
     }
 
     #[test]
