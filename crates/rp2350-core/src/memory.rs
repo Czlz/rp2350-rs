@@ -104,6 +104,7 @@ impl MemoryRegion for RamRegion {
 
     fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
         *cycles += 1;
+        crate::watch::check_write(addr, u32::from(value));
         if !self.writable {
             return Err(CoreError::BusError {
                 addr,

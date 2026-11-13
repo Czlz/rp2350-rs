@@ -24,6 +24,7 @@ pub mod memory;
 pub mod mmio;
 pub mod types;
 pub mod uf2;
+pub mod watch;
 
 pub use bus::{AccessWidth, AddressBus, BusResult, MemoryRegion};
 pub use chip::RP2350Chip;

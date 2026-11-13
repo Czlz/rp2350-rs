@@ -211,6 +211,7 @@ pub trait AddressBus: Send + Sync {
     /// Returns `BusError` if no device is mapped at the given address.
     /// 如果给定地址没有映射设备，返回 `BusError`。
     fn write_u32(&mut self, addr: Address, value: u32, cycles: &mut u64) -> BusResult<()> {
+        crate::watch::check_write(addr, value);
         self.find_region_mut(addr)
             .ok_or(CoreError::BusError {
                 addr,
