@@ -1,7 +1,9 @@
 # Plugin Development Guide / 插件开发指南
 
 > All virtual devices (first-party and third-party) live in the `plugins/` directory as independent crates.
+> Currently only the reference LED plugin has landed; the others below are planned.
 > 所有虚拟设备（第一方和第三方）作为独立 crate 存放在 `plugins/` 目录。
+> 目前仅参考 LED 插件落地，其余为规划项。
 
 ---
 
@@ -9,141 +11,126 @@
 
 ```
 plugins/
-├── led/                       # LED plugin (first-party)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── tfcard/                    # TF Card plugin — SPI + SDIO (first-party)
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       ├── spi_mode.rs
-│       └── sdio_mode.rs
-├── uart-terminal/             # UART Terminal plugin (first-party)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── debug-probe/               # Debug Probe plugin (first-party)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── psram/                     # PSRAM plugin (first-party)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── qspi-flash/                # QSPI Flash plugin (first-party)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── third-party/               # ★ Third-party plugins directory
-│   └── my-custom-sensor/      # Your custom plugin here
-│       ├── Cargo.toml
-│       └── src/
-│           └── lib.rs
-├── user-guide.md              # This file (also available as doc/plugins.md)
-└── README.md
+├── led/                       # LED plugin (first-party, landed / 已落地)
+│   ├── Cargo.toml             #   cdylib + rlib
+│   ├── src/
+│   │   └── lib.rs
+│   └── tests/
+│       └── dynamic_load.rs    #   loads the built .dll via DeviceManager
+├── tfcard/                    # (planned / 规划中) TF Card — SPI + SDIO
+├── uart-terminal/             # (planned / 规划中) UART Terminal
+├── debug-probe/               # (planned / 规划中) Debug Probe
+├── psram/                     # (planned / 规划中) PSRAM
+├── qspi-flash/                # (planned / 规划中) QSPI Flash
+└── third-party/               # (planned / 规划中) third-party plugins directory
 ```
 
 ---
 
 ## Plugin Cargo.toml Template / 插件 Cargo.toml 模板
 
+Mirrors `plugins/led/Cargo.toml` (workspace member):
+与 `plugins/led/Cargo.toml` 一致（workspace 成员）：
+
 ```toml
 [package]
-name = "rp2350-plugin-led"
-version = "0.1.0"
-edition = "2024"
-description = "Virtual LED plugin for RP2350 emulator"
+name = "rp2350-my-plugin"      # 第一方插件以 rp2350-*-plugin 命名
+version.workspace = true
+edition.workspace = true
 
 [lib]
-crate-type = ["cdylib"]       # ★ must be cdylib (dynamic library)
-name = "led"                  # output: led.dll / libled.so / libled.dylib
+crate-type = ["cdylib", "rlib"]  # cdylib = 可加载插件；rlib = 供主机侧测试
+name = "rp2350_my_plugin"        # output: rp2350_my_plugin.dll / .so / .dylib
 
 [dependencies]
-rp2350-plugin = { path = "../../crates/rp2350-plugin" }
-rp2350-virt-periph = { path = "../../crates/rp2350-virt-periph" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+rp2350-plugin = { workspace = true }        # RpPlugin / PluginContext / ABI_VERSION
+rp2350-virt-periph = { workspace = true }   # DevicePlugin / DevicePort / ConfigSchema
+serde_json = { workspace = true }           # state_snapshot / apply_config
 
-# Only if device has UI:
-egui = "0.37"
-
-# Only if device needs logging:
-log = "0.4"
-
-# Only if device needs disk I/O:
-# anyhow = "1"
+[dev-dependencies]
+rp2350-core = { workspace = true }          # GpioPin, for DeviceManager-driven tests
 ```
+
+> egui 依赖仅在实现 `render_ui()` 且启用 `gui` 特性时才需要；日志无需依赖 `log`
+> crate —— 通过 `PluginContext::log_info/log_warn/log_error` 走主机日志系统。
+> egui is only needed for `render_ui()` with the `gui` feature; logging needs no
+> `log` dependency — go through `PluginContext::log_info/log_warn/log_error`.
 
 ---
 
-## Reference Implementations / 参考实现
+## Reference Implementation / 参考实现：LED Plugin
 
-### 1. LED Plugin — Simplest Device (no config, has UI)
+This is the real `plugins/led/src/lib.rs` (abridged) — the only landed plugin,
+and the template to copy:
+这是真实的 `plugins/led/src/lib.rs`（节选）—— 目前唯一的落地插件，也是模板：
 
 ```rust
 // plugins/led/src/lib.rs
 
-use rp2350_plugin::{declare_plugin, PluginContext, PluginMetadata, PluginError,
-                    DeviceType, RpPlugin};
-use rp2350_virt_periph::{DevicePlugin, DevicePort, PortDirection};
+// 插件 ABI 通过 trait 对象指针跨越动态库边界，依赖同一编译器与 ABI 版本。
+// The plugin ABI passes trait-object pointers across the dynamic library
+// boundary, relying on the same compiler and ABI version.
+#![allow(improper_ctypes_definitions)]
+
+use rp2350_plugin::abi::ABI_VERSION;
+use rp2350_plugin::{PluginContext, PluginError, PluginMetadata, RpPlugin};
+use rp2350_virt_periph::{DevicePlugin, DevicePort};
+
+const PLUGIN_ID: &str = "com.rp2350-rs.led";
 
 pub struct LedPlugin {
     metadata: PluginMetadata,
     ports: Vec<DevicePort>,
     level: bool,
-    color: [f32; 3],
+    transitions: u64,
 }
 
-impl Default for LedPlugin {
-    fn default() -> Self {
+impl LedPlugin {
+    pub fn new() -> Self {
         Self {
-            metadata: PluginMetadata {
-                name: "LED".into(),
-                version: "1.0.0".into(),
-                author: "rp2350-rs team".into(),
-                description: "Single-color LED via GPIO".into(),
-                device_type: DeviceType::Led,
-                icon_base64: String::new(),
-            },
-            ports: vec![
-                DevicePort {
-                    name: "ANODE".into(),
-                    direction: PortDirection::Input,
-                    group: "General".into(),
-                    description: "LED anode (connect to GPIO output)".into(),
-                    current_level: false,
-                    wired: false,
-                    gpio_pin: None,
-                },
-            ],
+            metadata: PluginMetadata::builder()
+                .id(PLUGIN_ID)
+                .name("LED")
+                .version("0.1.0")
+                .description("Reference single-LED virtual device / 参考单 LED 虚拟设备")
+                .author("RP2350-rs Team")
+                .abi_version(ABI_VERSION)
+                .min_host_version("0.1.0")
+                .has_ui(false)
+                .tags(vec!["reference".to_string(), "gpio".to_string()])
+                .build(),
+            ports: vec![DevicePort::input(
+                "LED",
+                "GPIO-driven LED input / GPIO 驱动的 LED 输入",
+            )],
             level: false,
-            color: [1.0, 0.0, 0.0], // red LED
+            transitions: 0,
         }
     }
 }
 
 impl RpPlugin for LedPlugin {
     fn metadata(&self) -> &PluginMetadata { &self.metadata }
+
     fn init(&mut self, _ctx: &mut dyn PluginContext) -> Result<(), PluginError> {
         Ok(())
     }
+
     fn tick(&mut self, _ctx: &mut dyn PluginContext, _cycles: u64) {
-        // LED has no internal state machine — purely driven by GPIO
+        // LED 是纯电平驱动设备，无需随时间推进状态。
+        // An LED is purely level-driven; no time-based state to advance.
     }
-    fn shutdown(&mut self) {}
+
+    fn shutdown(&mut self) {
+        self.level = false;
+        self.ports[0].level = false;
+    }
 
     fn state_snapshot(&self) -> serde_json::Value {
         serde_json::json!({
-            "name": self.metadata.name,
-            "level": self.level,
-            "color": self.color,
-            "ports": self.ports.iter().map(|p| serde_json::json!({
-                "name": p.name,
-                "level": p.current_level,
-                "wired": p.wired,
-                "gpio_pin": p.gpio_pin,
-            })).collect::<Vec<_>>(),
+            "port": "LED",
+            "on": self.level,
+            "transitions": self.transitions,
         })
     }
 }
@@ -153,117 +140,118 @@ impl DevicePlugin for LedPlugin {
     fn ports_mut(&mut self) -> &mut [DevicePort] { &mut self.ports }
 
     fn on_gpio_change(&mut self, port_index: usize, level: bool) {
-        if port_index == 0 {
-            self.level = level;
+        if port_index != 0 {
+            return;
         }
-    }
-
-    fn has_ui(&self) -> bool { true }
-
-    fn render_ui(&mut self, ui: &mut egui::Ui) {
-        let brightness = if self.level { 1.0 } else { 0.15 };
-        let color = egui::Color32::from_rgb(
-            (self.color[0] * brightness * 255.0) as u8,
-            (self.color[1] * brightness * 255.0) as u8,
-            (self.color[2] * brightness * 255.0) as u8,
-        );
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("●")
-                    .color(color)
-                    .size(24.0)
-            );
-            ui.label(&self.metadata.name);
-            if self.level {
-                ui.label("ON");
-            } else {
-                ui.label("OFF");
-            }
-        });
-    }
-
-    fn state_snapshot(&self) -> serde_json::Value {
-        RpPlugin::state_snapshot(self)
+        if self.level != level {
+            self.transitions += 1;
+        }
+        self.level = level;
+        self.ports[0].level = level;
     }
 }
 
-declare_plugin!(LedPlugin);
+// ── ABI exports / ABI 导出（当前无导出宏，手工声明）──
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rp2350_plugin_version() -> u32 {
+    ABI_VERSION
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rp2350_plugin_is_device() -> u32 {
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rp2350_device_plugin_create() -> *mut dyn DevicePlugin {
+    Box::into_raw(Box::new(LedPlugin::new()))
+}
 ```
 
-### 2. TF Card Plugin — Complex Device (dual mode, config, has UI)
+> 没有 destroy 导出：宿主用 `Box::from_raw` 回收实例，`SafeLibrary` RAII 关闭库。
+> No destroy export: the host reclaims the instance via `Box::from_raw`, and
+> `SafeLibrary` RAII closes the library.
+
+---
+
+## Planned Example / 规划示例：TF Card Plugin（dual mode + config）
+
+Shows the patterns a config-bearing device will use — written against the
+**current** API (note: no `declare_plugin!`, no `DeviceType`, no
+`current_config`; `ConfigSchema` is JSON-Schema-shaped):
+展示带配置设备将使用的模式 —— 基于**当前** API 编写（注意：没有
+`declare_plugin!`、没有 `DeviceType`、没有 `current_config`；
+`ConfigSchema` 为 JSON Schema 形态）：
 
 ```rust
-// plugins/tfcard/src/lib.rs
+// plugins/tfcard/src/lib.rs — planned / 规划中
 
-use rp2350_plugin::{declare_plugin, PluginContext, PluginMetadata, PluginError,
-                    DeviceType, RpPlugin, LogLevel};
-use rp2350_virt_periph::{DevicePlugin, DevicePort, PortDirection,
-                          ConfigSchema, ConfigProperty, ConfigPropType, ConfigError};
+use rp2350_plugin::abi::ABI_VERSION;
+use rp2350_plugin::{PluginContext, PluginError, PluginMetadata, RpPlugin};
+use rp2350_virt_periph::{ConfigError, ConfigSchema, DevicePlugin, DevicePort, PortDirection};
 
 pub struct TfCardPlugin {
     metadata: PluginMetadata,
-    ports_spi: Vec<DevicePort>,    // 4 ports
-    ports_sdio: Vec<DevicePort>,   // 6 ports
+    ports_spi: Vec<DevicePort>,    // 4 ports / 4 个端口
+    ports_sdio: Vec<DevicePort>,   // 6 ports / 6 个端口
     mode: TfCardMode,
-    sd_state: SdCardState,
-    // ... full SD state machine ...
+    // ... full SD state machine / 完整 SD 状态机 ...
 }
 
-impl Default for TfCardPlugin {
-    fn default() -> Self {
-        let mut ports_spi = vec![
-            DevicePort { name: "CS".into(),   direction: PortDirection::Input,  group: "SPI".into(),  description: "Chip Select (active low)".into(), current_level: true, wired: false, gpio_pin: None },
-            DevicePort { name: "MOSI".into(), direction: PortDirection::Input,  group: "SPI".into(),  description: "Master Out, Slave In".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "MISO".into(), direction: PortDirection::Output, group: "SPI".into(),  description: "Master In, Slave Out".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "SCK".into(),  direction: PortDirection::Input,  group: "SPI".into(),  description: "Serial Clock".into(), current_level: false, wired: false, gpio_pin: None },
+impl TfCardPlugin {
+    pub fn new() -> Self {
+        let ports_spi = vec![
+            DevicePort::input("CS",   "Chip Select (active low) / 片选（低有效）"),
+            DevicePort::input("MOSI", "Master Out, Slave In"),
+            DevicePort::output("MISO", "Master In, Slave Out"),
+            DevicePort::input("SCK",  "Serial Clock / 串行时钟"),
         ];
         let ports_sdio = vec![
-            DevicePort { name: "CLK".into(),   direction: PortDirection::Input,         group: "SDIO".into(), description: "Clock".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "CMD".into(),   direction: PortDirection::Bidirectional, group: "SDIO".into(), description: "Command/Response".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "DAT0".into(),  direction: PortDirection::Bidirectional, group: "SDIO".into(), description: "Data line 0".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "DAT1".into(),  direction: PortDirection::Bidirectional, group: "SDIO".into(), description: "Data line 1".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "DAT2".into(),  direction: PortDirection::Bidirectional, group: "SDIO".into(), description: "Data line 2".into(), current_level: false, wired: false, gpio_pin: None },
-            DevicePort { name: "DAT3".into(),  direction: PortDirection::Bidirectional, group: "SDIO".into(), description: "Data line 3".into(), current_level: false, wired: false, gpio_pin: None },
+            DevicePort::input("CLK", "Clock / 时钟"),
+            DevicePort::bidirectional("CMD",  "Command/Response / 命令/响应"),
+            DevicePort::bidirectional("DAT0", "Data line 0 / 数据线 0"),
+            DevicePort::bidirectional("DAT1", "Data line 1 / 数据线 1"),
+            DevicePort::bidirectional("DAT2", "Data line 2 / 数据线 2"),
+            DevicePort::bidirectional("DAT3", "Data line 3 / 数据线 3"),
         ];
-
         Self {
-            metadata: PluginMetadata {
-                name: "TF_CARD".into(),
-                version: "1.0.0".into(),
-                author: "rp2350-rs team".into(),
-                description: "Virtual TF/SD card (SPI + SDIO 4-bit)".into(),
-                device_type: DeviceType::TfCard,
-                icon_base64: String::new(),
-            },
+            metadata: PluginMetadata::builder()
+                .id("com.rp2350-rs.tfcard")
+                .name("TF_CARD")
+                .version("0.1.0")
+                .description("Virtual TF/SD card (SPI + SDIO 4-bit) / 虚拟 TF/SD 卡")
+                .author("RP2350-rs Team")
+                .abi_version(ABI_VERSION)
+                .min_host_version("0.1.0")
+                .has_ui(true)
+                .tags(vec!["storage".to_string()])
+                .build(),
             ports_spi,
             ports_sdio,
             mode: TfCardMode::Spi,
-            sd_state: SdCardState::Idle,
-            // ...
         }
     }
 }
 
 impl RpPlugin for TfCardPlugin {
     fn metadata(&self) -> &PluginMetadata { &self.metadata }
+
     fn init(&mut self, ctx: &mut dyn PluginContext) -> Result<(), PluginError> {
-        ctx.log(LogLevel::Info, "TF Card plugin initialized");
+        ctx.log_info("TF Card plugin initialized / TF 卡插件已初始化");
         Ok(())
     }
+
     fn tick(&mut self, _ctx: &mut dyn PluginContext, _cycles: u64) {
-        // SD state machine tick
+        // SD state machine tick / SD 状态机推进
     }
+
     fn shutdown(&mut self) {}
+
     fn state_snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "name": "TF_CARD",
             "mode": self.mode.as_str(),
-            "sd_state": format!("{:?}", self.sd_state),
-            "ports": self.ports().iter().map(|p| serde_json::json!({
-                "name": p.name,
-                "level": p.current_level,
-                "wired": p.wired,
-            })).collect::<Vec<_>>(),
         })
     }
 }
@@ -291,34 +279,22 @@ impl DevicePlugin for TfCardPlugin {
 
     // ── Configuration ──
     fn config_schema(&self) -> Option<ConfigSchema> {
-        Some(ConfigSchema {
-            properties: vec![
-                ConfigProperty {
-                    name: "mode".into(),
-                    description: "Interface mode (SPI or SDIO 4-bit)".into(),
-                    prop_type: ConfigPropType::Enum,
-                    default: Some(serde_json::json!("spi")),
-                    enum_values: Some(vec!["spi".into(), "sdio".into()]),
-                    min: None, max: None,
-                },
-                ConfigProperty {
-                    name: "image_path".into(),
-                    description: "Path to SD card disk image".into(),
-                    prop_type: ConfigPropType::Path,
-                    default: None,
-                    enum_values: None, min: None, max: None,
-                },
-                ConfigProperty {
-                    name: "block_size".into(),
-                    description: "Block size in bytes".into(),
-                    prop_type: ConfigPropType::Integer,
-                    default: Some(serde_json::json!(512)),
-                    enum_values: None,
-                    min: Some(512.0), max: Some(4096.0),
-                },
-            ],
-            required: vec!["image_path".into()],
-        })
+        Some(
+            ConfigSchema::new(
+                "TF Card",
+                "SD card interface settings / SD 卡接口设置",
+            )
+            .with_property(
+                "mode",
+                serde_json::json!({ "type": "string", "enum": ["spi", "sdio"] }),
+                true,
+            )
+            .with_property(
+                "image_path",
+                serde_json::json!({ "type": "string" }),
+                false,
+            ),
+        )
     }
 
     fn apply_config(&mut self, config: &serde_json::Value) -> Result<(), ConfigError> {
@@ -326,72 +302,41 @@ impl DevicePlugin for TfCardPlugin {
             self.mode = match mode {
                 "spi" => TfCardMode::Spi,
                 "sdio" => TfCardMode::Sdio,
-                _ => return Err(ConfigError::InvalidValue("mode".into())),
+                other => {
+                    return Err(ConfigError::InvalidType {
+                        field: "mode".into(),
+                        expected: "\"spi\" | \"sdio\"".into(),
+                        actual: other.to_string(),
+                    })
+                }
             };
-        }
-        if let Some(path) = config.get("image_path").and_then(|v| v.as_str()) {
-            // self.load_image(Path::new(path))
         }
         Ok(())
     }
 
-    fn current_config(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "mode": self.mode.as_str(),
-        }))
-    }
-
-    // ── GUI ──
-    fn has_ui(&self) -> bool { true }
-
-    fn render_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("💾 TF Card");
-        ui.separator();
-        ui.label(format!("Mode: {:?}", self.mode));
-        ui.label(format!("State: {:?}", self.sd_state));
-
-        // Port status
-        ui.collapsing("Ports", |ui| {
-            for port in self.ports() {
-                let icon = if port.current_level { "●" } else { "○" };
-                ui.label(format!("{} {} {}", icon, port.name,
-                    if port.wired { format!("→ GPIO{}", port.gpio_pin.unwrap_or(0)) }
-                    else { "(unwired)".into() }
-                ));
-            }
-        });
-
-        // Mode switch button
-        ui.horizontal(|ui| {
-            if ui.button("SPI Mode").clicked() {
-                self.mode = TfCardMode::Spi;
-            }
-            if ui.button("SDIO Mode").clicked() {
-                self.mode = TfCardMode::Sdio;
-            }
-        });
-    }
-
-    fn state_snapshot(&self) -> serde_json::Value {
-        RpPlugin::state_snapshot(self)
-    }
+    // GUI（可选）：render_ui 仅在 `gui` 特性下存在；无头模式永不调用。
+    // GUI (optional): render_ui only exists with the `gui` feature;
+    // never called in headless mode.
 }
 
-declare_plugin!(TfCardPlugin);
+// 手工 ABI 导出，同 LED 插件 / manual ABI exports, same as the LED plugin
 ```
 
-### 3. Headless-Only Plugin (no GUI)
+---
+
+## Headless-Only Plugin / 纯无头插件（no GUI）
 
 ```rust
-// plugins/my-protocol-analyzer/src/lib.rs
+// plugins/my-protocol-analyzer/src/lib.rs — 例 / example
 // A plugin that only collects data — no UI, no GPIO ports.
 
-use rp2350_plugin::{declare_plugin, PluginContext, PluginMetadata, PluginError, RpPlugin};
-use rp2350_virt_periph::DevicePlugin;
+use rp2350_plugin::abi::ABI_VERSION;
+use rp2350_plugin::{PluginContext, PluginError, PluginMetadata, RpPlugin};
+use rp2350_virt_periph::{DevicePlugin, DevicePort};
 
 pub struct ProtocolAnalyzer {
     metadata: PluginMetadata,
-    packets: Vec<Packet>,
+    packets: usize,
 }
 
 impl RpPlugin for ProtocolAnalyzer {
@@ -399,28 +344,21 @@ impl RpPlugin for ProtocolAnalyzer {
     fn init(&mut self, _ctx: &mut dyn PluginContext) -> Result<(), PluginError> { Ok(()) }
     fn tick(&mut self, _ctx: &mut dyn PluginContext, _cycles: u64) { /* sniff bus */ }
     fn shutdown(&mut self) {}
+
     fn state_snapshot(&self) -> serde_json::Value {
-        serde_json::json!({ "packets": self.packets.len() })
+        serde_json::json!({ "packets": self.packets })
     }
 }
 
 impl DevicePlugin for ProtocolAnalyzer {
+    // No ports → on_gpio_change never called / 无端口 → on_gpio_change 永不调用
     fn ports(&self) -> &[DevicePort] { &[] }
     fn ports_mut(&mut self) -> &mut [DevicePort] { &mut [] }
-
     fn on_gpio_change(&mut self, _port_index: usize, _level: bool) {}
-    // No ports → on_gpio_change never called
-
-    fn has_ui(&self) -> bool { false }  // ★ Headless only
-    // render_ui never called
-    // Works perfectly in MCP mode
-
-    fn state_snapshot(&self) -> serde_json::Value {
-        RpPlugin::state_snapshot(self)
-    }
 }
 
-declare_plugin!(ProtocolAnalyzer);
+// 手工 ABI 导出：is_device 返回 1（它仍是 DevicePlugin）
+// manual ABI exports: is_device returns 1 (it is still a DevicePlugin)
 ```
 
 ---
@@ -428,24 +366,27 @@ declare_plugin!(ProtocolAnalyzer);
 ## Build & Install / 编译与安装
 
 ```bash
-# Build all first-party plugins
-cargo build --release --workspace
-# → target/release/led.dll, tfcard.dll, uart-terminal.dll, ...
-
-# Copy to plugins/ directory (or configure cargo build output dir)
-cp target/release/*.dll plugins/
-
-# Build a single third-party plugin
-cd plugins/third-party/my-plugin
-cargo build --release
-cp target/release/my_plugin.dll ../../plugins/third-party/
-
-# The emulator auto-discovers plugins on startup
-rp2350 run firmware.elf
-# [INFO] Loaded plugin: LED (plugins/led.dll)
-# [INFO] Loaded plugin: TF_CARD (plugins/tfcard.dll)
-# [INFO] Loaded plugin: UART_TERMINAL (plugins/uart-terminal.dll)
+# Build the first-party plugin / 编译第一方插件
+cargo build --release -p rp2350-led-plugin
+# → target/release/rp2350_led_plugin.dll (Windows) / librp2350_led_plugin.so / .dylib
 ```
+
+Loading today / 当前的加载方式（程序化 API）：
+
+```rust
+let mut dm = DeviceManager::new();                       // 默认搜索路径 "plugins"
+dm.load_plugin("led0".to_string(),                       // id → DeviceError::AlreadyExists 重复即报错
+               "target/release/rp2350_led_plugin.dll")?; // 内部走 PluginLoader::load_device
+dm.wire("led0", 0, 25)?;                                 // 端口 0 → GPIO25
+```
+
+- `PluginLoader::scan()` / `scan_and_load()` can enumerate candidate libraries in the
+  search paths, but **device instantiation + auto-registration into the CLI/emulator
+  startup is planned** (CLI `wire` / `list-devices` wiring, P1).
+  `PluginLoader::scan()` / `scan_and_load()` 可枚举搜索路径中的候选库，但
+  **设备实例化 + CLI/模拟器启动时自动注册为规划项**（CLI `wire` / `list-devices` 接线，P1）。
+- Until then, plugins are loaded explicitly (tests, examples, or host code).
+  在此之前，插件通过显式调用加载（测试、示例或主机代码）。
 
 ---
 
@@ -456,50 +397,61 @@ For a plugin to load successfully, it must:
 
 | Requirement | Check |
 |-------------|-------|
-| Export `rp2350_plugin_create` → `*mut dyn RpPlugin` | `declare_plugin!` macro ensures |
-| Export `rp2350_plugin_destroy` → `fn(*mut dyn RpPlugin)` | `declare_plugin!` macro ensures |
+| Export `rp2350_device_plugin_create` → `*mut dyn DevicePlugin` | 手工 `#[unsafe(no_mangle)]` 导出（参考 `plugins/led/src/lib.rs`） |
 | Export `rp2350_plugin_version` → `u32` matching host ABI | Currently version = 1 |
-| Export `rp2350_plugin_is_device` → `u32` (1 = DevicePlugin) | `declare_device_plugin!` macro ensures |
+| Export `rp2350_plugin_is_device` → `u32` (1 = DevicePlugin) | 手工 `#[unsafe(no_mangle)]` 导出 |
+| Crate declares `#![allow(improper_ctypes_definitions)]` | `*mut dyn DevicePlugin` crosses the dylib boundary |
 | Plugin struct is `Send + Sync` | Required by trait bounds |
-| Plugin struct implements `Default` | Required by `declare_plugin!` |
 | Same `RpPlugin` trait definition as host | Must use same `rp2350-plugin` crate version |
 | Same `DevicePlugin` trait definition as host | Must use same `rp2350-virt-periph` crate version |
+
+> 没有 destroy 导出：宿主用 `Box::from_raw` 回收实例，`SafeLibrary` RAII 关闭库。
+> No destroy export: the host reclaims the instance via `Box::from_raw`, and
+> `SafeLibrary` RAII closes the library.
 
 ---
 
 ## Testing Plugins / 测试插件
 
+Real pattern from `plugins/led/src/lib.rs` (in-process, no dylib needed):
+真实模式，来自 `plugins/led/src/lib.rs`（进程内测试，无需动态库）：
+
 ```rust
-// plugins/tfcard/tests/integration_test.rs
-
 #[test]
-fn test_tfcard_spi_init() {
-    let mut dm = DeviceManager::new(vec![PathBuf::from("../../target/release")], true);
-    dm.load_plugin(Path::new("../../target/release/tfcard.dll")).unwrap();
+fn device_manager_drives_led() {
+    let mut manager = DeviceManager::new();
+    manager
+        .register("led0".to_string(), Box::new(LedPlugin::new()))
+        .unwrap();
+    manager.wire("led0", 0, 25).unwrap();
 
-    let snapshot = dm.mcp_query_device("TF_CARD").unwrap();
-    assert_eq!(snapshot["mode"], "spi");
-    assert_eq!(snapshot["sd_state"], "Idle");
-}
+    let mut pins =
+        std::array::from_fn::<GpioPin, 48, _>(|i| GpioPin::new(u8::try_from(i).unwrap()));
+    pins[25].set_direction(PinDirection::Output);
+    pins[25].set_output(true);
+    manager.sync_gpio(&mut pins);
 
-#[test]
-fn test_tfcard_configure_via_mcp() {
-    let mut dm = DeviceManager::new(vec![PathBuf::from("../../target/release")], true);
-    dm.load_plugin(Path::new("../../target/release/tfcard.dll")).unwrap();
-
-    dm.mcp_configure("TF_CARD", &serde_json::json!({"mode": "sdio"})).unwrap();
-
-    let snapshot = dm.mcp_query_device("TF_CARD").unwrap();
-    assert_eq!(snapshot["mode"], "sdio");
+    let query = manager.mcp_query_all();
+    assert_eq!(query["led0"]["on"], true);
+    assert_eq!(query["led0"]["transitions"], 1);
 }
 ```
+
+End-to-end dylib loading is covered by `plugins/led/tests/dynamic_load.rs`.
+端到端动态库加载由 `plugins/led/tests/dynamic_load.rs` 覆盖。
+
+Planned MCP-facing assertions (not yet implemented / 规划中，尚未实现)：
+`mcp_configure` / `mcp_query_device` are planned DeviceManager additions; today
+queries go through `mcp_query_all()`.
+`mcp_configure` / `mcp_query_device` 为规划中的 DeviceManager 能力；目前查询统一走
+`mcp_query_all()`。
 
 ---
 
 ## Best Practices / 最佳实践
 
-1. **Headless-first** — Always test your plugin with `headless: true` first. GUI is optional decoration.
-   **无头优先** — 始终先用 `headless: true` 测试插件。GUI 是可选装饰。
+1. **Headless-first** — develop and test through the headless path (CLI / MCP / in-process tests). GUI is optional decoration.
+   **无头优先** — 通过无头路径（CLI / MCP / 进程内测试）开发和测试。GUI 是可选装饰。
 
 2. **Config via JSON** — Never depend on egui for configuration. `apply_config()` must accept JSON from any source.
    **通过 JSON 配置** — 永远不要依赖 egui 进行配置。`apply_config()` 必须接受来自任何来源的 JSON。

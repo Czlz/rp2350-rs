@@ -13,16 +13,10 @@ Plugins are compiled as shared libraries (`.dll` / `.so` / `.dylib`) and loaded 
 
 ## Required Exports / 必需导出符号
 
-### `rp2350_plugin_create`
-
-```c
-/// Create plugin instance. Returns heap-allocated Box<dyn RpPlugin>.
-/// 创建插件实例。返回堆分配的 Box<dyn RpPlugin>。
-///
-/// The emulator takes ownership and calls `shutdown()` + `drop()` on unload.
-/// 模拟器取得所有权，在卸载时调用 `shutdown()` + `drop()`。
-void* rp2350_plugin_create(void);
-```
+当前无导出宏（规划中）：插件以 `#[unsafe(no_mangle)] pub extern "C"` 手工导出以下三个
+符号，参考实现 `plugins/led/src/lib.rs`。
+There are no export macros yet (planned): a plugin declares the following three symbols
+manually, as the reference implementation `plugins/led/src/lib.rs` does.
 
 ### `rp2350_plugin_version`
 
@@ -33,6 +27,29 @@ void* rp2350_plugin_create(void);
 /// Emulator refuses to load plugins with incompatible versions.
 /// 模拟器拒绝加载不兼容版本的插件。
 uint32_t rp2350_plugin_version(void);
+```
+
+### `rp2350_plugin_is_device`
+
+```c
+/// Returns 1 when the library exports a DevicePlugin
+/// (the only supported plugin kind).
+/// 当库导出 DevicePlugin（当前唯一支持的插件种类）时返回 1。
+uint32_t rp2350_plugin_is_device(void);
+```
+
+### `rp2350_device_plugin_create`
+
+```c
+/// Create device plugin instance. Returns heap-allocated Box<dyn DevicePlugin>.
+/// 创建设备插件实例。返回堆分配的 Box<dyn DevicePlugin>。
+///
+/// There is no destroy export: the host reclaims the pointer with
+/// `Box::from_raw`, and the `SafeLibrary`/`LoadedPlugin` RAII guard closes
+/// the library.
+/// 没有 destroy 导出：宿主用 `Box::from_raw` 回收指针，
+/// `SafeLibrary`/`LoadedPlugin` 的 RAII 守护负责关闭库。
+void* rp2350_device_plugin_create(void);
 ```
 
 ---
@@ -49,6 +66,9 @@ uint32_t rp2350_plugin_version(void);
     "icon": "<base64 encoded 64x64 PNG>"
 }
 ```
+
+> 字段以 `rp2350-plugin::PluginMetadata` 结构体为准（builder 构造）。
+> Actual fields follow the `rp2350-plugin::PluginMetadata` struct (built with its builder).
 
 ---
 

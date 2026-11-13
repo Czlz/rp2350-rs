@@ -1,7 +1,9 @@
 # rp2350-plugin — Public API / 公共 API
 
-> Plugin framework: `RpPlugin` base trait + `DevicePlugin` extended trait.
-> 插件框架：`RpPlugin` 基础 trait + `DevicePlugin` 扩展 trait。
+> Plugin framework: `RpPlugin` base trait + `DevicePlugin` extended trait
+> (defined in `rp2350-virt-periph`).
+> 插件框架：`RpPlugin` 基础 trait + `DevicePlugin` 扩展 trait
+> （定义在 `rp2350-virt-periph`）。
 
 ---
 
@@ -10,14 +12,15 @@
 ```
 rp2350-plugin (crate)
 └── RpPlugin                 ← all plugins implement this (base contract)
-     │                          mandatory: metadata, init, tick, shutdown, state_snapshot
-     │                          optional:  as_bus_device, irq_triggered
+     │                          mandatory: metadata, init, tick, shutdown
+     │                          optional:  as_bus_device, state_snapshot (defaults provided)
      │
      └── DevicePlugin         ← implemented by virtual peripheral plugins
           (defined in rp2350-virt-periph)
-          mandatory:  ports, on_gpio_change, state_snapshot
-          optional:   config_schema, apply_config, current_config
-          optional:   has_ui, render_ui (requires egui)
+          mandatory:  ports, ports_mut, on_gpio_change
+          optional:   config_schema, apply_config, has_ui,
+                      render_ui (only with the `gui` feature)
+          inherited:  state_snapshot (default empty JSON — override recommended)
 ```
 
 ---
@@ -29,7 +32,7 @@ rp2350-plugin (crate)
 | 不关心 GPIO | 必须声明 GPIO 端口 |
 | 不关心 UI | 可选提供 egui 面板 |
 | 不关心配置 schema | 可选暴露 JSON Schema 配置 |
-| 用于纯逻辑插件（如协议分析器、trace 收集器） | 用于虚拟外设插件（LED、TF 卡、PSRAM 等） |
+| 用于纯逻辑插件（如协议分析器、trace 收集器） | 用于虚拟外设插件（LED 等） |
 
 A plugin can implement `RpPlugin` without implementing `DevicePlugin` — such plugins work headless-only and don't appear in the virtual lab canvas.
 插件可以实现 `RpPlugin` 而不实现 `DevicePlugin` —— 此类插件仅支持无头模式，不出现在虚拟实验室画布中。
@@ -39,151 +42,166 @@ A plugin can implement `RpPlugin` without implementing `DevicePlugin` — such p
 ## `RpPlugin` Trait / RpPlugin 基础接口
 
 ```rust
-/// Base plugin contract. All plugins MUST support headless mode.
-/// 基础插件契约。所有插件必须支持无头模式。
+/// The base plugin contract. Every plugin (pure logic or device) implements this.
+/// 基础插件契约。每个插件（纯逻辑或设备）都实现此 trait。
 pub trait RpPlugin: Send + Sync {
-    /// Plugin metadata (name, version, author, description, device type).
-    /// 插件元数据（名称、版本、作者、描述、设备类型）。
+    /// Return plugin metadata for discovery and display.
+    /// 返回插件元数据用于发现和显示。
     fn metadata(&self) -> &PluginMetadata;
 
-    /// Initialize with emulator context.
-    /// 使用模拟器上下文初始化。
-    /// Called once after loading the .dll/.so/.dylib.
+    /// Initialize the plugin with the given host context.
+    /// 使用给定主机上下文初始化插件。
+    /// Called once before any `tick()` calls.
+    /// 在任何 `tick()` 调用之前调用一次。
+    ///
+    /// # Errors / 错误
+    /// Returns `PluginError` if initialization fails. / 初始化失败时返回 `PluginError`。
     fn init(&mut self, ctx: &mut dyn PluginContext) -> Result<(), PluginError>;
 
-    /// Per-cycle tick.
-    /// 每周期 tick。
-    /// `cycles` = number of system clock cycles elapsed since last tick.
+    /// Advance the plugin's internal state by `cycles` simulation cycles.
+    /// 将插件的内部状态推进 `cycles` 个仿真周期。
     fn tick(&mut self, ctx: &mut dyn PluginContext, cycles: u64);
 
-    /// Cleanup before unload.
-    /// 卸载前清理。
+    /// Shut down the plugin and release resources.
+    /// 关闭插件并释放资源。
+    /// Called once at the end of the plugin's lifecycle.
+    /// 在插件生命周期结束时调用一次。
     fn shutdown(&mut self);
 
-    // ── Optional callbacks (all have default no-op) ──
-    // 可选回调（均有默认空实现）
+    // ── Optional callbacks (default impls) ──
+    // 可选回调（有默认实现）
 
-    /// Expose as a memory-mapped BusDevice.
-    /// 暴露为内存映射的 BusDevice。
-    /// Only needed if plugin registers on the APB address bus.
+    /// If this plugin acts as a bus device, return a mutable reference.
+    /// 如果此插件充当总线设备，返回可变引用。
+    /// Default `None` — only memory-mapped peripherals override this.
+    /// 默认 `None` —— 仅内存映射外设覆写。
+    /// (Host-side bus wiring is a planned integration. / 主机侧总线接线为规划项。)
     fn as_bus_device(&mut self) -> Option<&mut dyn BusDevice> { None }
 
-    /// IRQ notification from the chip.
-    fn irq_triggered(&mut self, irq_num: u32) {}
-
-    /// Headless/MCP state query. Must return valid JSON.
-    /// 无头/MCP 状态查询。必须返回有效 JSON。
-    /// Called by MCP tools to inspect plugin state without GUI.
+    /// Return complete plugin state as JSON (for MCP / headless query).
+    /// 返回完整插件状态（JSON，用于 MCP / 无头查询）。
+    /// Default: empty object. Override for meaningful data.
+    /// 默认空对象。覆写以提供有意义的数据。
     fn state_snapshot(&self) -> serde_json::Value { serde_json::json!({}) }
 }
 ```
 
 ### Design principles / 设计原则
 
-1. **Headless-first** — `state_snapshot()` is mandatory in spirit (default empty JSON), ensuring MCP tools can always query plugin state.
-   **无头优先** —— `state_snapshot()` 实质上必须实现，确保 MCP 工具始终可查询插件状态。
+1. **Headless-first** — the trait has zero dependency on egui or any rendering library; all methods must work in headless mode (MCP, CLI, CI).
+   **无头优先** —— trait 零依赖 egui 或任何渲染库；所有方法必须在无头模式（MCP、CLI、CI）下正常工作。
 
-2. **No egui in RpPlugin** — The base trait has zero GUI dependency. A pure-data plugin (e.g., performance counter, protocol analyzer) compiles without egui at all.
-   **RpPlugin 不依赖 egui** —— 基础 trait 零 GUI 依赖。纯数据插件（如性能计数器、协议分析器）编译时完全不引入 egui。
+2. **`state_snapshot()` is the query surface** — default empty JSON, but MCP tools and headless inspection rely on meaningful overrides.
+   **`state_snapshot()` 是查询接口** —— 默认空 JSON，但 MCP 工具和无头检查依赖有意义的覆写。
 
-3. **Optional BusDevice** — Only plugins that need to respond to memory-mapped register accesses need `as_bus_device()`. GPIO-only devices skip it.
-   **可选 BusDevice** —— 仅需响应内存映射寄存器访问的插件才需实现 `as_bus_device()`。纯 GPIO 设备可跳过。
+3. **Optional BusDevice** — only plugins that act as memory-mapped peripherals implement `as_bus_device()`. GPIO-only devices skip it.
+   **可选 BusDevice** —— 仅充当内存映射外设的插件实现 `as_bus_device()`。纯 GPIO 设备可跳过。
 
 ---
 
 ## `PluginContext` Trait / 插件上下文
 
 ```rust
-/// Emulator context provided to plugins.
-/// 提供给插件的模拟器上下文。
-pub trait PluginContext {
-    // ── GPIO operations ──
-    /// Drive an RP2350 GPIO output level.
-    /// 驱动 RP2350 GPIO 输出电平。
-    fn gpio_write(&mut self, pin: u8, level: bool);
+/// Minimal memory-mapped bus device interface (plugin perspective).
+/// 内存映射总线设备的最小接口（插件视角）。
+/// Full `MemoryRegion` capability lives in `rp2350-core` for crate-internal use.
+/// 完整的 `MemoryRegion` 能力在 `rp2350-core` 中供 crate 内部使用。
+pub trait BusDevice: Send {
+    /// The device's base address on the bus / 设备在总线上的基地址
+    fn base_address(&self) -> u32;
+    /// The size of the device's address space / 设备地址空间的大小
+    fn size(&self) -> usize;
+}
 
-    /// Read RP2350 GPIO input level.
-    /// 读取 RP2350 GPIO 输入电平。
-    fn gpio_read(&self, pin: u8) -> bool;
-
-    /// Set RP2350 GPIO pin direction.
-    /// 设置 RP2350 GPIO 引脚方向。
-    fn gpio_set_direction(&mut self, pin: u8, output: bool);
-
-    // ── Address bus ──
-    /// Register a BusDevice at an APB address range.
-    /// 在 APB 地址范围注册 BusDevice。
-    fn register_bus_device(&mut self, base: u32, size: u32, device: Box<dyn BusDevice>);
-
-    /// Read byte from chip address space (any region).
-    /// 从芯片地址空间读取字节（任意区域）。
-    fn mem_read_u8(&self, addr: u32) -> u8;
-
-    /// Write byte to chip address space (any region).
-    /// 向芯片地址空间写入字节（任意区域）。
-    fn mem_write_u8(&mut self, addr: u32, value: u8);
-
-    // ── Interrupts ──
-    /// Trigger an IRQ to the chip.
-    /// 触发中断到芯片。
-    fn trigger_irq(&mut self, irq: u32, core: Option<usize>);
+/// The context provided to a plugin at initialization and during tick.
+/// 插件初始化和 tick 时提供的上下文。
+/// Provides access to the simulation environment without exposing internals.
+/// 提供对仿真环境的访问，但不暴露内部细节。
+pub trait PluginContext: Send {
+    // ── Logging ──
+    /// Log a message through the host's logging system
+    /// (info / warn / error levels).
+    /// 通过主机的日志系统记录消息（info / warn / error 三个级别）。
+    fn log_info(&self, message: &str);
+    fn log_warn(&self, message: &str);
+    fn log_error(&self, message: &str);
 
     // ── Timing ──
-    /// Simulation time in nanoseconds.
-    /// 模拟时间（纳秒）。
-    fn sim_time_ns(&self) -> u64;
+    /// Current simulation time in cycles / 当前仿真时间（周期数）
+    fn current_cycles(&self) -> u64;
 
-    /// System clock frequency in Hz.
-    /// 系统时钟频率（Hz）。
-    fn sys_clk_hz(&self) -> u32;
+    /// Request that the host schedule a callback after `cycles` ticks.
+    /// 请求主机在 `cycles` 个 tick 后调度一个回调。
+    /// (Interface reserved — host-side dispatch is not wired yet.
+    ///  接口已预留 —— 主机侧调度尚未接入。)
+    fn schedule_callback(&mut self, cycles: u64, tag: &str);
 
-    // ── Logging ──
-    /// Log a message (appears in egui log panel or CLI output).
-    /// 记录日志（出现在 egui 日志面板或 CLI 输出）。
-    fn log(&self, level: LogLevel, msg: &str);
+    /// Access a typed service from the host (e.g. an external bus reference).
+    /// 从主机访问一个类型化服务（如外部总线引用）。
+    /// Returns `None` if the service is not available. / 服务不可用时返回 `None`。
+    #[doc(hidden)]
+    fn get_service_erased(&self) -> Option<&dyn Any>;
 }
 
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
+/// Extension trait for typed service access / 类型化服务访问的扩展 trait
+/// (blanket-implemented for every `PluginContext` / 对所有 `PluginContext` 自动实现)
+pub trait PluginContextExt: PluginContext {
+    /// Access a typed service from the host / 从主机访问类型化服务
+    fn get_service<T: Any>(&self) -> Option<&T> {
+        self.get_service_erased().and_then(|s| s.downcast_ref::<T>())
+    }
 }
 ```
 
-### `PluginMetadata`
+### What the context does NOT provide / 上下文不提供的能力
+
+- **No GPIO operations** — GPIO interaction is not part of `PluginContext`. Device plugins declare
+  `DevicePort`s and the host drives them via `DeviceManager::wire` + `DeviceManager::sync_gpio`.
+  GPIO 交互不属于 `PluginContext`：设备插件声明 `DevicePort`，
+  由主机通过 `DeviceManager::wire` + `DeviceManager::sync_gpio` 驱动。
+- **No bus registration** — a plugin exposes a bus device via `RpPlugin::as_bus_device()`;
+  host-side address-bus wiring is a planned integration.
+  总线注册：插件通过 `RpPlugin::as_bus_device()` 暴露总线设备；
+  主机侧地址总线接线为规划项。
+- **No direct memory access** — the current ABI gives plugins no read/write access to chip
+  address space. / 当前 ABI 下插件不能直接读写芯片地址空间。
+
+---
+
+## `PluginMetadata`
 
 ```rust
+/// Plugin metadata exposed to the host for discovery and display.
+/// 暴露给主机的插件元数据，用于发现和显示。
 pub struct PluginMetadata {
-    /// Unique plugin name.
+    /// Unique plugin identifier (e.g. "com.rp2350-rs.led") / 唯一插件标识符
+    pub id: String,
+    /// Human-readable plugin name / 人类可读的插件名称
     pub name: String,
-    /// Semantic version "MAJOR.MINOR.PATCH".
+    /// Plugin version (semver) / 插件版本（语义版本）
     pub version: String,
-    /// Author name / organization.
-    pub author: String,
-    /// Short description (shown in plugin list).
+    /// Brief description / 简短描述
     pub description: String,
-    /// Device type for egui widget palette.
-    pub device_type: DeviceType,
-    /// Icon for virtual lab palette (64x64 PNG, base64-encoded).
-    /// Empty string = use default icon.
-    pub icon_base64: String,
-}
-
-pub enum DeviceType {
-    Led,
-    TfCard,
-    UartTerminal,
-    DebugProbe,
-    Psram,
-    QspiFlash,
-    HstxDisplay,
-    Button,
-    SevenSegment,
-    Custom(String),
+    /// Plugin author / 插件作者
+    pub author: String,
+    /// ABI version this plugin was compiled against / 此插件编译时使用的 ABI 版本
+    pub abi_version: u32,
+    /// Minimum host version required / 最低主机版本要求
+    pub min_host_version: String,
+    /// Whether this plugin has a GUI component / 此插件是否有 GUI 组件
+    pub has_ui: bool,
+    /// Tags for categorization and search / 分类和搜索标签
+    pub tags: Vec<String>,
 }
 ```
+
+Metadata is built with `PluginMetadata::builder()` → `PluginMetadataBuilder`
+(setters `id` / `name` / `version` / `description` / `author` / `abi_version` /
+`min_host_version` / `has_ui` / `tags`, then `build()`).
+There is **no** `DeviceType` enum and no icon field in the current ABI — the egui
+palette currently keys off `DevicePlugin::ports()` and `has_ui()`.
+元数据通过 `PluginMetadata::builder()` 构建。当前 ABI 中**没有** `DeviceType`
+枚举和图标字段；egui 调色板目前依赖 `DevicePlugin::ports()` 与 `has_ui()`。
 
 ---
 
@@ -197,21 +215,27 @@ pub enum DeviceType {
 /// 设备插件 —— 扩展 RpPlugin，增加 GPIO 端口、可选配置和可选 GUI。
 ///
 /// # Headless requirement / 无头要求
-/// All `DevicePlugin` implementations MUST work correctly when `render_ui()` is never called.
-/// GUI is purely a visualization layer; device logic must not depend on it.
-/// 所有 `DevicePlugin` 实现必须在 `render_ui()` 从未被调用时正常工作。
-/// GUI 纯粹是可视化层；设备逻辑不得依赖 GUI。
+/// All device logic must work without `render_ui()` ever being called.
+/// `state_snapshot()` (inherited from `RpPlugin`) is the sole authoritative
+/// interface used by MCP and headless mode.
+/// 所有设备逻辑必须在从不调用 `render_ui()` 的情况下正常工作。
+/// 继承自 `RpPlugin` 的 `state_snapshot()` 是 MCP 和无头模式使用的唯一权威接口。
 pub trait DevicePlugin: RpPlugin {
     // ── GPIO Ports (required) ──
 
-    /// Port definitions for virtual lab canvas wiring.
-    /// 虚拟实验室画布连线的端口定义。
+    /// The list of I/O ports this device exposes.
+    /// 此设备暴露的 I/O 端口列表。
     fn ports(&self) -> &[DevicePort];
+
+    /// Mutable access to the port list (the host updates port levels via this).
+    /// 端口列表的可变访问（主机借此更新端口电平）。
+    fn ports_mut(&mut self) -> &mut [DevicePort];
 
     /// GPIO level change notification.
     /// Called when a wired RP2350 GPIO pin changes level.
     /// `port_index` = index into `self.ports()`.
     /// `level`     = new GPIO level.
+    /// GPIO 电平变化通知。连接的 RP2350 GPIO 引脚电平变化时调用。
     fn on_gpio_change(&mut self, port_index: usize, level: bool);
 
     // ── Configuration (optional, JSON-based, no GUI dependency) ──
@@ -224,160 +248,140 @@ pub trait DevicePlugin: RpPlugin {
     /// Apply configuration from JSON value.
     /// Can be called from CLI, MCP, or GUI config panel.
     /// 从 JSON 值应用配置。可从 CLI、MCP 或 GUI 配置面板调用。
-    fn apply_config(&mut self, config: &serde_json::Value) -> Result<(), ConfigError> {
-        let _ = config;
-        Ok(())
-    }
+    ///
+    /// # Errors / 错误
+    /// Returns `ConfigError` if the configuration is invalid. / 配置无效时返回 `ConfigError`。
+    fn apply_config(&mut self, config: &serde_json::Value) -> Result<(), ConfigError> { ... }
 
-    /// Current configuration as JSON.
-    /// 当前配置（JSON 格式）。
-    fn current_config(&self) -> Option<serde_json::Value> { None }
-
-    // ── GUI (optional, egui-dependent) ──
+    // ── GUI (optional, egui-dependent, `gui` feature only) ──
 
     /// Whether this device has a GUI panel.
-    /// 此设备是否有 GUI 面板。
-    /// - true  → `render_ui()` will be called each frame in GUI mode.
-    /// - false → device is headless-only, no panel shown.
+    /// If `false`, `render_ui()` will never be called.
+    /// 此设备是否有 GUI 面板。为 false 时 `render_ui()` 永远不会被调用。
     fn has_ui(&self) -> bool { false }
 
     /// Render the device's egui panel.
-    /// 渲染设备的 egui 面板。
-    /// Only called when `has_ui()` returns true AND running in GUI mode.
+    /// Only called when `has_ui()` returns true AND the `gui` feature is enabled.
     /// In headless mode this is never called.
-    /// 仅在 `has_ui()` 返回 true 且运行在 GUI 模式时调用。
+    /// 渲染设备的 egui 面板。仅在 `has_ui()` 为 true 且启用 `gui` 特性时调用。
     /// 无头模式下永远不会调用。
+    #[cfg(feature = "gui")]
     fn render_ui(&mut self, ui: &mut egui::Ui) {}
 
-    // ── Headless/MCP state query (required) ──
-
-    /// Full device state as JSON for MCP tools and headless inspection.
-    /// MCP 工具和无头检查用的完整设备状态（JSON）。
-    ///
-    /// Must include at minimum:
-    /// - device name, mode, status
-    /// - all port states (level, direction)
-    /// - any statistics (bytes read/written, etc.)
-    fn state_snapshot(&self) -> serde_json::Value;
+    // state_snapshot() is inherited from RpPlugin (default: empty JSON).
+    // Override it — it is the MCP / headless query interface.
+    // state_snapshot() 继承自 RpPlugin（默认空 JSON）。请覆写它 ——
+    // 它是 MCP / 无头查询接口。
 }
 ```
 
 ### `DevicePort`
 
 ```rust
-/// A connectable port on a virtual device.
-/// 虚拟设备上可连线的端口。
+/// A single I/O port on a virtual device.
+/// 虚拟设备上的单个 I/O 端口。
 pub struct DevicePort {
-    /// Port name (e.g. "CS", "MOSI", "SCK", "CMD").
+    /// Port name (e.g. "MOSI", "SCK", "LED") / 端口名称
     pub name: String,
-    /// Signal direction.
+    /// Signal direction / 信号方向
     pub direction: PortDirection,
-    /// Visual group (e.g. "SPI", "QSPI", "SDIO", "General").
-    pub group: String,
-    /// Description tooltip.
+    /// Current signal level (updated via `ports_mut`) / 当前信号电平（经 `ports_mut` 更新）
+    pub level: bool,
+    /// Port description for UI tooltip / 端口描述（UI 提示用）
     pub description: String,
-    /// Current level (updated by DeviceManager on GPIO change).
-    pub current_level: bool,
-    /// Whether port is currently wired to an RP2350 GPIO pin.
-    pub wired: bool,
-    /// Connected RP2350 GPIO pin (set by DeviceManager).
-    pub gpio_pin: Option<u8>,
 }
 
 pub enum PortDirection {
-    Input,          // Device reads this signal from RP2350 GPIO output
-    Output,         // Device drives this signal onto RP2350 GPIO input
-    Bidirectional,  // Device both reads and drives
+    /// Signal flows into the device from GPIO pin / 信号从 GPIO 引脚流入设备
+    Input,
+    /// Signal flows out of the device to GPIO pin / 信号从设备流出到 GPIO 引脚
+    Output,
+    /// Signal can flow in either direction / 信号可双向流动
+    Bidirectional,
 }
+
+// Constructors / 构造器：
+//   DevicePort::input(name, description)
+//   DevicePort::output(name, description)
+//   DevicePort::bidirectional(name, description)
 ```
+
+> Wiring state (which GPIO pin a port is connected to) lives in the host's
+> `WiringTable`, not on the port itself.
+> 接线状态（端口连接到哪个 GPIO 引脚）保存在主机的 `WiringTable` 中，不在端口上。
 
 ---
 
-## Plugin Export Macros / 插件导出宏
+## Plugin ABI Exports / 插件 ABI 导出
+
+当前**没有**导出宏（`declare_plugin!` / `declare_device_plugin!` 为规划项）：插件以
+`#[unsafe(no_mangle)] pub extern "C"` 手工导出三个 ABI 符号，参考实现
+`plugins/led/src/lib.rs`。
+There are currently **no** export macros (`declare_plugin!` /
+`declare_device_plugin!` are planned): a plugin declares the three ABI symbols
+manually, as the reference implementation `plugins/led/src/lib.rs` does.
 
 ```rust
-/// Declare the required ABI exports for a plugin.
-/// 声明插件必需的 ABI 导出。
-///
-/// # Example
-/// ```
-/// use rp2350_plugin::declare_plugin;
-///
-/// pub struct MyPlugin { /* impl RpPlugin */ }
-///
-/// declare_plugin!(MyPlugin);
-/// ```
-///
-/// # Generated exports / 生成的导出:
-/// - `rp2350_plugin_create() → *mut dyn RpPlugin`
-/// - `rp2350_plugin_version() → u32`  (ABI version)
-#[macro_export]
-macro_rules! declare_plugin {
-    ($plugin_type:ty) => {
-        #[no_mangle]
-        pub extern "C" fn rp2350_plugin_create() -> *mut dyn $crate::RpPlugin {
-            let plugin: $plugin_type = Default::default();
-            Box::into_raw(Box::new(plugin))
-        }
+use rp2350_plugin::abi::ABI_VERSION;
 
-        #[no_mangle]
-        pub extern "C" fn rp2350_plugin_destroy(ptr: *mut dyn $crate::RpPlugin) {
-            if !ptr.is_null() {
-                unsafe {
-                    let _ = Box::from_raw(ptr);
-                }
-            }
-        }
-
-        #[no_mangle]
-        pub extern "C" fn rp2350_plugin_version() -> u32 {
-            1 // ABI version
-        }
-    };
+/// Return the ABI version this plugin was compiled against
+/// 返回此插件编译时使用的 ABI 版本
+#[unsafe(no_mangle)]
+pub extern "C" fn rp2350_plugin_version() -> u32 {
+    ABI_VERSION
 }
 
-/// Declare exports for a DevicePlugin.
-/// 声明 DevicePlugin 的 ABI 导出。
-#[macro_export]
-macro_rules! declare_device_plugin {
-    ($plugin_type:ty) => {
-        declare_plugin!($plugin_type);
+/// Report that this library exports a device plugin
+/// 报告此库导出的是设备插件
+#[unsafe(no_mangle)]
+pub extern "C" fn rp2350_plugin_is_device() -> u32 {
+    1
+}
 
-        #[no_mangle]
-        pub extern "C" fn rp2350_plugin_is_device() -> u32 {
-            1 // signals this is a DevicePlugin, not just RpPlugin
-        }
-    };
+/// Create a boxed device plugin for the host
+/// 为主机创建 boxed 设备插件
+#[unsafe(no_mangle)]
+pub extern "C" fn rp2350_device_plugin_create() -> *mut dyn DevicePlugin {
+    Box::into_raw(Box::new(MyPlugin::new()))
 }
 ```
+
+> 没有 destroy 导出：宿主用 `Box::from_raw` 回收实例，`SafeLibrary` RAII 关闭库。
+> No destroy export: the host reclaims the instance via `Box::from_raw`, and the
+> `SafeLibrary` RAII guard closes the library.
 
 ---
 
 ## Plugin Loading Flow / 插件加载流程
 
 ```
-DeviceManager::scan_and_load()
+DeviceManager::load_plugin(id, path)     // 单个库文件加载（内部走 PluginLoader::load_device）
      │
-     ├── Walk plugins/ directory
-     ├── For each .dll/.so/.dylib:
-     │     ├── SafeLibrary::new(path)     // dlopen/LoadLibrary
-     │     ├── dlsym("rp2350_plugin_version") → check ABI compat
-     │     ├── dlsym("rp2350_plugin_create") → Box<dyn RpPlugin>
-     │     ├── dlsym("rp2350_plugin_is_device") → if 1, cast to DevicePlugin
-     │     ├── plugin.init(ctx)
-     │     └── Store in DeviceManager.devices[]
-     │
-     └── Return Vec<PluginLoadResult>
+     ├── id 已注册 → DeviceError::AlreadyExists
+     ├── PluginLoader::load_device(path)
+     │     ├── SafeLibrary::load(path)                        // dlopen / LoadLibrary
+     │     ├── find_symbol("rp2350_plugin_version") → 必须等于 ABI_VERSION (1)
+     │     ├── find_symbol("rp2350_plugin_is_device") → 非 1 拒绝（仅设备插件）
+     │     ├── find_symbol("rp2350_device_plugin_create") → 调用工厂
+     │     ├── 工厂返回空指针 → DeviceError::PluginLoadFailed
+     │     └── Box::from_raw(create()) → LoadedPlugin { library, plugin }
+     └── ManagedDevice { plugin, source_path, library } 注册进 DeviceManager
+              （库与设备实例一同保持存活，vtable 位于库内）
 
-GUI mode:
-     │
-     ├── For each device where has_ui() == true:
-     │     └── Create egui panel, call render_ui() each frame
+目录扫描（当前仅加载库本体，不实例化设备）：
+     PluginLoader::scan()           → 搜索路径中匹配 .dll / .so / .dylib（默认路径 "plugins"）
+     PluginLoader::scan_and_load()  → Vec<(PathBuf, SafeLibrary)>
+     └── DeviceManager 级别的自动实例化 + 注册接入为规划项
 
-Headless/MCP mode:
-     │
-     ├── Call device.state_snapshot() → aggregate into MCP response
-     └── No egui dependency at all
+卸载：
+     DeviceManager::unregister(id) → shutdown() → 移除接线 →
+     ManagedDevice 连同 SafeLibrary 一起 drop（库在设备注销时才关闭）
+
+GUI mode / GUI 模式：
+     has_ui() == true 的设备 → egui 面板，每帧调用 render_ui()
+
+Headless/MCP mode / 无头与 MCP 模式：
+     state_snapshot() → 由 mcp_query_all() 汇总进 MCP 响应；完全不依赖 egui
 ```
 
 ---
