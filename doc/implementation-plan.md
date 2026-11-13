@@ -1,6 +1,34 @@
 # Implementation Plan / 实施计划
 
-> **Version**: 3.0 | **Date**: 2026-11-08 | **Phase 1: ✅ COMPLETE** | **Phase 2: 🔄 IN PROGRESS**
+> **Version**: 3.1 | **Date**: 2026-11-14 | **Phase 1: ✅ COMPLETE** | **Phase 2: ✅ COMPLETE** | **验收主线 Stages 0–5: ✅ / Stage 6: 🔄**
+
+> **当前验收主线 / Current acceptance mainline**: [reference-gap-analysis.md](reference-gap-analysis.md) 的
+> Stages 0–6 —— 真实 MicroPython `RPI_PICO2-*.uf2` → USB CDC → raw REPL → `perfbench`。
+> Stages 0–5 已落地（含 `rp2350-usb`/`rp2350-usb-host` 两个 crate 与 CLI `repl`/`perfbench`
+> 子命令，超出本计划原始 Phase 1 清单）；Stage 6（perfbench 对比报告）进行中。
+> The acceptance mainline runs through reference-gap-analysis Stages 0–6; stages 0–5
+> have landed (including the `rp2350-usb` / `rp2350-usb-host` crates and the CLI
+> `repl` / `perfbench` subcommands, beyond the original Phase 1 list), and Stage 6
+> (the perfbench comparison report) is in progress.
+
+---
+
+## 固件验证清单 / Firmware Verification Checklist（内核门禁 / core gate）
+
+> **门禁规则 / Gate rule**: 对应内核必须先跑通下列固件，才允许进入下一任务。
+> **Gate rule**: the core owning each firmware must pass its gate command before
+> the next task may start. 参考实现 / reference implementation: `E:\Source\mcu\pico\rp2350js`。
+
+| ID | 固件 / Firmware | 架构 / Core | 验证命令 / Gate command | 状态 / Status |
+|----|-----------------|-------------|--------------------------|---------------|
+| FV-1 | `E:\Source\mcu\pico\python\micropython\RPI_PICO2-RISCV-20260824-v1.29.0.uf2`（MicroPython RISC-V） | Hazard3（`rp2350-riscv`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`；`run --strict-decode` 全程无未定义指令停机 | ⬜ 未通过 / not passed |
+| FV-2 | `E:\Source\mcu\pico\python\micropython\RPI_PICO2-20260824-v1.29.0.uf2`（MicroPython Arm） | Cortex-M33（`rp2350-arm`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`；`perfbench` 至少一个基准出结果（回归项，随每次内核改动复跑） | 🚧 主线已跑通（Stages 0–5），作为回归门禁持续复跑 / mainline passes (Stages 0–5), kept as a recurring regression gate |
+| FV-3 | `E:\Source\mcu\pico\python\circuitpython\adafruit-circuitpython-raspberry_pi_pico2-zh_Latn_pinyin-10.3.1.uf2`（CircuitPython Arm） | Cortex-M33（`rp2350-arm`） | `rp2350 run --file <该文件>` 完成启动（无 strict-decode 停机、有节奏的时钟推进）；目标 `repl` 交互可用 | ⬜ 未通过 / not passed |
+
+> 状态标记 / status markers: ✅ 通过 · 🚧 部分通过 · ⬜ 未通过。通过一条门禁后，
+> 将其状态、日期与验证命令输出摘要记录到 [changelog.md](changelog.md)。
+> After a gate passes, record its status, date and command output summary in
+> [changelog.md](changelog.md).
 
 ---
 
@@ -41,7 +69,7 @@
 
 ---
 
-## Phase 2 · ARM Cortex-M33 Basic (Week 2-3) 🔄 IN PROGRESS
+## Phase 2 · ARM Cortex-M33 Basic (Week 2-3) ✅ COMPLETE
 
 ### Deliverables / 交付物
 
@@ -49,15 +77,15 @@
 |----|------|--------|--------|
 | 2.1 | `CortexM33Registers`: R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK | registers.rs | ✅ |
 | 2.2 | Thumb-16 decoder + executor (~90 instructions) | execute_thumb16.rs | ✅ |
-| 2.3 | Thumb-32 basic decoder (~60 ALU + Load/Store, no DSP/FPU) | execute_thumb32.rs | 🔄 stub |
+| 2.3 | Thumb-32 decoder（~60 ALU + Load/Store；另含 FPv5-SP FPU 与 GPIO(CP0)/DCP(CP4) 协处理器，DSP/SIMD 编码未实现） | execute_thumb32.rs | ✅ |
 | 2.4 | Condition flags (NZCVQ) + IT block execution | conditions.rs | ✅ |
 | 2.5 | NVIC: ISER/ICER/ISPR/ICPR/IPR/STIR, priority grouping | nvic.rs | ✅ |
 | 2.6 | Exception entry/exit (stacking/unstacking, EXC_RETURN) | exceptions.rs | ✅ |
 | 2.7 | SysTick timer + PPB base registers (SCB, VTOR) | systick.rs | ✅ |
 | 2.8 | `CortexM33Core` impl of `CpuCore` trait | core.rs (lib.rs) | ✅ |
-| 2.9 | BOOTROM load + reset vector fetch + SP/PC init | chip boot sequence | ⬜ |
-| 2.10 | egui register viewer panel (R0-R15 table) | registers.rs panel | ⬜ |
-| 2.11 | `GdbTarget` trait + `ArmGdbTarget` stub | gdb target.rs | ⬜ |
+| 2.9 | BOOTROM load + reset vector fetch + SP/PC init | chip boot sequence | ✅（合成 bootrom + `CortexM33Core::boot`） |
+| 2.10 | egui register viewer panel (R0-R15 table) | panels.rs | ✅（可无头渲染测试） |
+| 2.11 | `GdbTarget` trait + Cortex-M33 adapter | gdb target.rs / cortex_m33.rs | ✅（RSP 服务器循环仍为桩 / RSP server loop still stub） |
 
 ### Quality Gate (Current) / 质量门禁（当前）
 
@@ -65,14 +93,14 @@
 |------|--------|
 | `cargo fmt --all -- --check` | ✅ |
 | `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic` | ✅ zero errors/warnings |
-| `cargo test --all-features` | ✅ 51/51 pass |
+| `cargo test --all-features` | ✅ 465/465 pass |
 | `cargo doc --no-deps` | ✅ zero warnings |
 
-### Milestone M2 / 里程碑 M2
+### Milestone M2 / 里程碑 M2 ✅
 
-- BOOTROM 能够执行到固件入口
-- 基础 Thumb-16 指令集可运行 blink 固件
-- egui 寄存器查看器实时刷新
+- ✅ BOOTROM 能够执行到固件入口（合成 bootrom + Stage-4 总线）
+- ✅ 基础 Thumb-16 指令集可运行 blink 固件
+- ✅ egui 寄存器查看器（`panels.rs`，含无头渲染测试）
 
 ---
 
@@ -110,6 +138,10 @@ of blocking forever on a core1 that never consumes the FIFO.
   双核调度（社区方案 b），届时复用同一 SIO 模型。
   If firmware later depends on true core1 parallelism (not just handshakes),
   upgrade to real dual-core scheduling (option b) and reuse the same SIO model.
+
+> **2026-11-14 更新 / Update**: 真双核调度已排入 P1 开发计划（用户决策），升级路径维持本节设计。
+> Real dual-core scheduling is scheduled into the P1 development plan; the upgrade
+> path in this section stays as designed.
 
 ---
 
@@ -294,16 +326,18 @@ Supports both GUI and headless/MCP mode.
 
 ---
 
-## Phase 10 · RISC-V (Future / 远期)
+## Phase 10 · RISC-V (🔄 部分提前完成 / partially landed ahead of schedule)
 
-| ID | Task |
-|----|------|
-| 10.1 | RISC-V Hazard3: RV32IMAC + Zcb + Zba + Zbb + Zbs |
-| 10.2 | RISC-V CSR registers + Machine mode |
-| 10.3 | Xh3irq (platform interrupt controller) |
-| 10.4 | RISC-V GDB Target |
-| 10.5 | Heterogeneous dual-core (ARM + RISC-V) |
-| 10.6 | RISC-V MicroPython boot test |
+> `rp2350-riscv` crate 已实现并被 CLI `run --arch riscv` 使用（原计划远期，2026-11 前提前落地）。
+
+| ID | Task | Status |
+|----|------|--------|
+| 10.1 | RISC-V Hazard3: RV32IMAC + C 压缩指令（Zcb/Zba/Zbb/Zbs 未实现） | ✅ 基础 / ⏳ Z 扩展 |
+| 10.2 | RISC-V CSR registers + Machine mode（trap/`mret`） | ✅ |
+| 10.3 | Xh3irq (platform interrupt controller) | ✅ |
+| 10.4 | RISC-V GDB Target | ⬜ |
+| 10.5 | Heterogeneous dual-core (ARM + RISC-V) | ⬜ |
+| 10.6 | RISC-V MicroPython boot test | ⬜ |
 
 ---
 

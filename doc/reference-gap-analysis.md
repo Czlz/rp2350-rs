@@ -255,8 +255,13 @@ out-of-tree devices; see `doc/architecture.md` §3.
 
 ### Stage 5 — USB CDC device + raw-REPL bridge / USB CDC 与 REPL 桥
 
-> 已拆分给独立的 USB 子任务线（独立 crate，经 `MmioDevice` 挂载），主线不再实现。
-> Owned by an independent USB sub-task line (separate crate mounted via `MmioDevice`).
+> ✅ **已在本仓库落地（2026-11-14 同步）**：`rp2350-usb`（设备控制器模型：DPRAM/寄存器/别名/端点握手/IRQ14）
+> 与 `rp2350-usb-host`（主机桥枚举 + CDC + raw REPL + perfbench），经 `MmioDevice` 挂载；
+> CLI 子命令 `repl` / `perfbench`。原“独立子任务线”注记作废。
+> ✅ **Landed in this repository (synced 2026-11-14)**: the `rp2350-usb` device controller
+> model (DPRAM/regs/aliases/endpoint handshake/IRQ14) and `rp2350-usb-host` (host bridge
+> enumeration + CDC + raw REPL + perfbench), mounted via `MmioDevice`; CLI subcommands
+> `repl` / `perfbench`. The previous "separate sub-task line" note is obsolete.
 
 Deliverables:
 
@@ -340,10 +345,10 @@ written from the documented behavior and validated with unit tests.
 
 ## 8. Documentation Sync Checklist / 文档同步清单
 
-- [ ] `doc/README.md`: link this document.
-- [ ] `doc/architecture.md`: chip family, Flash/XIP, MMIO, USB rows.
-- [ ] `doc/implementation-plan.md`: replace Phase 10 "future" with the staged plan.
+- [x] `doc/README.md`: link this document.
+- [x] `doc/architecture.md`: chip family, Flash/XIP, MMIO, USB rows.
+- [x] `doc/implementation-plan.md`: replace Phase 10 "future" with the staged plan.
 - [ ] `doc/crates/rp2350-core.md`: UF2 loader and RP2040 stub API.
 - [ ] `doc/crates/rp2350-riscv.md`: new crate API and limitations.
-- [ ] `doc/changelog.md`: one entry per stage.
-- [ ] `README.md`: quick-start commands for UF2 loading and RISC-V selection.
+- [x] `doc/changelog.md`: one entry per stage.
+- [x] `README.md`: quick-start commands for UF2 loading and RISC-V selection.

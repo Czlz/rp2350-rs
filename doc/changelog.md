@@ -30,6 +30,13 @@
 - `rp2350-cli`: interrupt pump — replays PPB writes via `system_write`, delivers asserted lines via `signal_interrupt` and prints `[run] irq deliveries`
 - `rp2350-core`: `FlashRegion::alias` — a second read-only XIP window over the same backing store, used for the RP2350 non-cached flash alias at `0x1400_0000..0x14FF_FFFF`
 - `doc/architecture.md`: verified IRQ number map (TIMER0 0..3, USBCTRL 14, IO_BANK0 21, SIO 25/26, UART0 33) and interrupt wiring description
+- `rp2350-arm`: Thumb-32 FPv5-SP data transfers — `VMOV`/`VLDR`/`VSTR`/`VLDM`/`VSTM`/`VPUSH`/`VPOP`/`VMSR`/`VMRS` (d-register view, VFP immediate expansion, PC-relative `VLDR`), plus the GPIO coprocessor CP0 (`MCR`/`MRC`/`MCRR`/`MRRC` with SET/CLR/XOR alias writes) and a side-effect-free double-coprocessor CP4 placeholder
+- `rp2350-arm`: CFSR storage with synchronous NOCP `UsageFault` entry (rewound PC, standard frame, MSP/PSP-aware `EXC_RETURN`), post-boot-ROM CPACR state, and CPACR modeling for CP0–CP7 + CP10–CP11 with FPv5-SP access governed by CP10 alone
+- `rp2350-core`: `watch` module — optional `RP2350_WATCH=START-END` / `RP2350_WATCHV=VALUE` store watchpoint attributing writes to the current PC (hooked into `AddressBus::write_u32` and `RamRegion::write_u8`)
+- `rp2350-core`: `XipMaintenanceRegion` — write-only cache-maintenance window at `0x1800_0000..0x1BFF_FFFF` (writes accepted and discarded, reads return zero)
+- `rp2350-periph`: PPB replays `SCB_CPACR` writes into the core, matching `runtime_init`'s FPU enable
+- `rp2350-usb-host`: `progress_line()` enumeration diagnostics (stage/phase/request/byte counts/queue depth) and a failed-transfer snapshot preserved after errors
+- `rp2350-cli`: `repl` and `perfbench` subcommands — USB CDC raw REPL over a booted MicroPython UF2 (`--exec`, or `bm_*.py` via shared `benchrun.py` with N/M repetitions); `run.rs` refactored into a reusable `Machine` with register snapshots, a bounded `recent_steps` trace, per-batch PPB system-write replay, the XIP maintenance window and SRAM-top exception stack mapping
 
 ### Fixed / 修复
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
@@ -39,6 +46,10 @@
 - `rp2350-arm`: `find_highest_priority` skips active interrupts so an asserted level cannot preempt its own handler
 - `rp2350-periph`: SIO register offsets switched from the RP2040 layout to the RP2350 interleaved layout (`GPIO_HI_OUT` 0x014, `OUT_SET` 0x018, `GPIO_OE` 0x030, `OE_SET` 0x038)
 - `doc/architecture.md`: USB DPRAM corrected from 16 KB to 4 KB (`0x5010_0000..0x5010_0FFF`), USBCTRL IRQ documented as 14, SIO window corrected from 512 B to 4 KB (`0xD000_0000..0xD000_0FFF`)
+- `rp2350-arm`: PC writes now follow BXWritePC/LoadWritePC semantics — `POP {.., pc}`/`LDM`/`LDR`/`BX` carrying an `EXC_RETURN` value trigger the exception return sequence instead of masking bit 0 into a runaway branch
+- `rp2350-arm`: SP updates route through `regs.write(13)` so the MSP/PSP shadow banks stay in sync; exception returns no longer unstack from a stale `msp` (real MicroPython previously restored PC/SP from the SRAM top `0x2008_2000`)
+- `rp2350-bootrom`: `flash_range_erase`/`flash_range_program` arguments are flash-relative offsets and are translated by the XIP base before touching the backing store (offset `0x1000` used to land at absolute address `0x1000`)
+- `rp2350-usb-host`: control IN data stages end only on a short packet or once `wLength` bytes arrive — `BUF_CTRL_LAST` is a device-internal flag invisible to the host, and treating it as the end condition deadlocked 75-byte configuration descriptor fetches
 
 ### Planned / 计划中
 - ARM Cortex-M33 dual-core simulation
