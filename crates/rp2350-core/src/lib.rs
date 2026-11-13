@@ -25,6 +25,7 @@ pub mod mmio;
 pub mod types;
 pub mod uf2;
 pub mod watch;
+pub mod xip_maintenance;
 
 pub use bus::{AccessWidth, AddressBus, BusResult, MemoryRegion};
 pub use chip::RP2350Chip;
@@ -41,3 +42,4 @@ pub use mmio::{
 };
 pub use types::{Address, CpuId, CycleCount, GpioNumber, IrqNumber, PinNumber};
 pub use uf2::{Uf2Arch, Uf2Block, Uf2Family, Uf2Image, Uf2LoadReport, Uf2Region};
+pub use xip_maintenance::{XIP_MAINTENANCE_BASE, XIP_MAINTENANCE_SIZE, XipMaintenanceRegion};
