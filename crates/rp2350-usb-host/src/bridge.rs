@@ -10,6 +10,10 @@ use rp2350_usb::setup::{SetupPacket, request};
 
 use crate::descriptor::{ConfigInfo, DescriptorError, DeviceInfo, parse_config, parse_device};
 
+/// Full-speed control endpoint maximum packet size
+/// 全速控制端点最大包长
+const MAX_CONTROL_PACKET: usize = 64;
+
 /// CDC bulk endpoints discovered during enumeration
 /// 枚举过程中发现的 CDC 批量端点
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +132,9 @@ pub struct UsbHostBridge {
     retry_at: u64,
     deadline: u64,
     last_error: Option<HostError>,
+    /// Transfer snapshot captured before a failure clears it
+    /// 失败清空传输前保存的现场快照
+    failed_transfer: Option<String>,
 }
 
 impl UsbHostBridge {
@@ -150,6 +157,7 @@ impl UsbHostBridge {
             retry_at: 0,
             deadline: 0,
             last_error: None,
+            failed_transfer: None,
         }
     }
 
@@ -169,6 +177,52 @@ impl UsbHostBridge {
     #[must_use]
     pub fn config_info(&self) -> Option<&ConfigInfo> {
         self.config.as_ref()
+    }
+
+    /// Human-readable enumeration snapshot for diagnostics
+    /// 供诊断使用的可读枚举进度快照
+    ///
+    /// A stalled enumeration otherwise reports only the failing request code;
+    /// the stage, phase, bytes transferred and queue depth tell whether the
+    /// guest armed an endpoint at all.
+    /// 卡住的枚举原本只报告失败请求码；阶段、传输阶段、已传字节数与队列
+    /// 深度可以判断客户机是否确实布防了端点。
+    #[must_use]
+    pub fn progress_line(&self) -> String {
+        let stage = match self.stage {
+            Stage::Detached => "detached",
+            Stage::Enumerating => "enumerating",
+            Stage::Configured => "configured",
+            Stage::Failed => "failed",
+        };
+        let transfer = self.transfer.as_ref().map_or_else(
+            || {
+                self.failed_transfer
+                    .clone()
+                    .unwrap_or_else(|| String::from("none"))
+            },
+            |t| {
+                format!(
+                    "kind={:?} phase={:?} req=0x{:02X} w_value=0x{:04X} \
+                     w_length={} received={} sent={}",
+                    t.request.kind,
+                    t.phase,
+                    t.request.setup.b_request,
+                    t.request.setup.w_value,
+                    t.request.setup.w_length,
+                    t.received.len(),
+                    t.sent
+                )
+            },
+        );
+        format!(
+            "stage={stage}, address={}, queued={}, transfer=[{transfer}], \
+             device={}, config={}",
+            self.address,
+            self.queue.len(),
+            self.device.is_some(),
+            self.config.is_some()
+        )
     }
 
     /// Device address assigned by SET_ADDRESS / SET_ADDRESS 分配的设备地址
@@ -340,9 +394,21 @@ impl UsbHostBridge {
                         return HostProgress::Wait(now);
                     };
                     transfer.received.extend_from_slice(packet.bytes());
-                    let wants_more =
-                        usize::from(transfer.request.setup.w_length) > transfer.received.len();
-                    if packet.last || packet.len() < 64 || !wants_more {
+                    // USB 控制传输的 IN 数据阶段只能由「短包」或「收满 wLength」
+                    // 结束；设备侧 BUF_CTRL_LAST 是硬件内部的缓冲标记，真实
+                    // 主机根本看不到它。此前把它当作终止条件，导致 75 字节
+                    // 配置描述符的第一个 64 字节满包就被判为完成，主机随即
+                    // 进入 Status 阶段，而固件仍在等第二个 IN 令牌，双方死锁。
+                    // An IN data stage ends only on a short packet or once
+                    // wLength bytes arrived; BUF_CTRL_LAST is a device-internal
+                    // buffer flag invisible to a real host. Treating it as the
+                    // end condition made the first full 64-byte packet of a
+                    // 75-byte configuration descriptor look complete, so the
+                    // host moved to Status while the device awaited another IN.
+                    let short_packet = packet.len() < MAX_CONTROL_PACKET;
+                    let length_reached =
+                        transfer.received.len() >= usize::from(transfer.request.setup.w_length);
+                    if short_packet || length_reached {
                         transfer.phase = Phase::Status;
                     }
                     self.retry_at = now + self.us_to_cycles(10);
@@ -356,7 +422,7 @@ impl UsbHostBridge {
                 };
                 let remaining =
                     usize::from(transfer.request.setup.w_length).saturating_sub(transfer.sent);
-                let chunk = remaining.min(64);
+                let chunk = remaining.min(MAX_CONTROL_PACKET);
                 if chunk == 0 {
                     None
                 } else {
@@ -504,6 +570,23 @@ impl UsbHostBridge {
     fn fail(&mut self, error: HostError) -> HostProgress {
         self.stage = Stage::Failed;
         self.last_error = Some(error);
+        // 保留清除前的传输现场：失败时 progress_line 仍能显示卡在哪个阶段、
+        // 已收/已发多少字节，否则只剩 "transfer=[none]" 无从定位。
+        // Keep the transfer snapshot before clearing: progress_line then still
+        // shows the stuck phase and byte counts instead of "transfer=[none]".
+        if let Some(t) = self.transfer.as_ref() {
+            self.failed_transfer = Some(format!(
+                "kind={:?} phase={:?} req=0x{:02X} w_value=0x{:04X} \
+                 w_length={} received={} sent={}",
+                t.request.kind,
+                t.phase,
+                t.request.setup.b_request,
+                t.request.setup.w_value,
+                t.request.setup.w_length,
+                t.received.len(),
+                t.sent
+            ));
+        }
         self.transfer = None;
         HostProgress::Failed(error)
     }
