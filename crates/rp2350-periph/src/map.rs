@@ -117,6 +117,37 @@ pub const TRNG_BASE: Address = 0x400F_0000;
 /// SHA-256 accelerator base / SHA-256 加速器基地址
 pub const SHA256_BASE: Address = 0x400F_8000;
 
+/// DMA controller base / DMA 控制器基地址
+///
+/// The 16-channel DMA register block occupies one 4 KB window at
+/// `0x5000_0000`: channels at `+0x000..=0x3FF`, global registers at
+/// `+0x400..=0x7FF` and per-channel debug registers (not modelled) at
+/// `+0x800..=0xBFF`.
+/// 16 通道 DMA 寄存器块占据 `0x5000_0000` 的一个 4 KB 窗口：通道寄存器位于
+/// `+0x000..=0x3FF`，全局寄存器位于 `+0x400..=0x7FF`，通道调试寄存器
+/// （未建模）位于 `+0x800..=0xBFF`。
+pub const DMA_BASE: Address = 0x5000_0000;
+
+/// DMA register window size (4 KB) / DMA 寄存器窗口大小（4 KB）
+pub const DMA_SIZE: usize = 0x1000;
+
+/// DMA interrupt line 0 / DMA 中断线 0
+///
+/// RP2350 routes four DMA interrupt lines (`DMA_IRQ_0..3`); each one can be
+/// enabled per channel through `INTE0..3`.
+/// RP2350 提供四条 DMA 中断线（`DMA_IRQ_0..3`），每条都可按通道通过
+/// `INTE0..3` 使能。
+pub const DMA_IRQ_0: u16 = 10;
+
+/// DMA interrupt line 1 / DMA 中断线 1
+pub const DMA_IRQ_1: u16 = 11;
+
+/// DMA interrupt line 2 / DMA 中断线 2
+pub const DMA_IRQ_2: u16 = 12;
+
+/// DMA interrupt line 3 / DMA 中断线 3
+pub const DMA_IRQ_3: u16 = 13;
+
 /// PIO0 register block base / PIO0 寄存器块基地址
 ///
 /// RP2350 exposes three identical PIO blocks in the AHB peripheral space.

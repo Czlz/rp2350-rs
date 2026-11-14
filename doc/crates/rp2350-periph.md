@@ -298,29 +298,185 @@ impl HstxDecoder {
 
 ## DMA
 
+`BootPeripherals::mount` installs one `Dma` at `0x5000_0000` (`map::DMA_BASE`,
+window `map::DMA_SIZE` = 4 KB). Clones share a single register file, so the
+bus-mounted device and the handles returned by `BootPeripherals::dma()` /
+`dma_mut()` observe the same state.
+`BootPeripherals::mount` 在 `0x5000_0000`（`map::DMA_BASE`，窗口
+`map::DMA_SIZE` = 4 KB）挂载一个 `Dma`。克隆共享同一个寄存器文件，因此总线上
+的设备与 `BootPeripherals::dma()` / `dma_mut()` 返回的句柄看到相同状态。
+
 ```rust
-pub struct DmaController {
-    pub channels: [DmaChannel; 16],
-    pub dreq_states: [bool; DREQ_MAX],
-    pub timer: Option<DmaTimer>,
+pub struct Dma { /* shared register file + IrqAssert */ }
+
+impl Dma {
+    pub fn new(irq: IrqAssert) -> Self;
+    pub fn run(&mut self, bus: &mut dyn AddressBus, max_transfers: u64) -> u64;
+    pub fn set_dreq(&mut self, dreq: u8, asserted: bool);
+    pub fn dreq(&self, dreq: u8) -> Option<bool>;
+    pub fn abort(&mut self, mask: u16);
+    pub fn busy_mask(&self) -> u16;
+    pub fn channel_state(&self, index: usize) -> Option<DmaChannelState>;
 }
 
-pub struct DmaChannel {
+pub struct DmaChannelState {
     pub read_addr: u32,
     pub write_addr: u32,
     pub trans_count: u32,
-    pub ctrl: DmaCtrl,
-    pub ctrl_trig: DmaCtrl,
-    pub active: bool,
-    pub stalled: bool,
+    pub ctrl: u32,
+    pub busy: bool,
+    pub enabled: bool,
     pub chain_to: u8,
+    pub treq_sel: u8,
+    pub ring_size: u8,
+    pub irq_quiet: bool,
 }
+```
 
-impl DmaController {
-    pub fn tick(&mut self, cycles: u64, chip: &mut RP2350Chip);
-    pub fn set_dreq(&mut self, dreq: DREQChannel, asserted: bool);
-    pub fn abort_channel(&mut self, ch: usize);
-}
+### Register map / 寄存器映射
+
+| Offset | Register | Notes / 说明 |
+|--------|----------|--------------|
+| `0x000..=0x3FF` | `CH0..CH15` | 16 channels × `0x40` bytes / 16 通道 × `0x40` 字节 |
+| `+0x00` | `READ_ADDR` | read address / 读地址 |
+| `+0x04` | `WRITE_ADDR` | write address / 写地址 |
+| `+0x08` | `TRANS_COUNT` | remaining count (`[27:0]`) / 剩余计数（`[27:0]`） |
+| `+0x0C` | `CTRL_TRIG` | control + trigger / 控制 + 触发 |
+| `+0x10..=0x3C` | `AL1_*`/`AL2_*`/`AL3_*` | read/write/control aliases; `AL1_TRANS_COUNT_TRIG`, `AL2_WRITE_ADDR_TRIG`, `AL3_READ_ADDR_TRIG` also start the channel on a non-zero write / 读/写/控制别名；上述三个 `*_TRIG` 别名的非零写入同时启动通道 |
+| `0x400` | `INTR` | raw 16-bit status, W1C / 16 位原始状态，写 1 清零 |
+| `0x404`/`0x414`/`0x424`/`0x434` | `INTE0..3` | per-line enable / 每条线的使能 |
+| `0x408`/`0x418`/`0x428`/`0x438` | `INTF0..3` | per-line force / 每条线的强制位 |
+| `0x40C`/`0x41C`/`0x42C`/`0x43C` | `INTS0..3` | `(INTR & INTEn) \| INTFn`, also W1C through `INTR` / 状态，写 `INTR` 同样可清 |
+| `0x440..=0x44C` | `TIMER0..3` | pacing X/Y storage / 节拍 X/Y 存储 |
+| `0x450` | `MULTI_CHAN_TRIGGER` | start the selected channels / 启动选中通道 |
+| `0x454`/`0x458` | `SNIFF_CTRL`/`SNIFF_DATA` | storage only / 仅存储 |
+| `0x460` | `FIFO_LEVELS` | reads 0 / 读 0 |
+| `0x464` | `CHAN_ABORT` | clear `BUSY` on the selected channels / 清除选中通道的 `BUSY` |
+| `0x468` | `N_CHANNELS` | reads 16 / 读 16 |
+
+`CTRL_TRIG` fields follow the RP2350 layout: `EN[0]`, `HIGH_PRIORITY[1]`,
+`DATA_SIZE[3:2]`, `INCR_READ[4]`, `INCR_WRITE[6]`, `RING_SIZE[11:8]`,
+`RING_SEL[12]`, `CHAIN_TO[16:13]`, `TREQ_SEL[22:17]`, `IRQ_QUIET[23]`,
+`BSWAP[24]`, `SNIFF_EN[25]`, `BUSY[26]`, `WRITE_ERROR[29]` (W1C),
+`READ_ERROR[30]` (W1C), `AHB_ERROR[31]`. `BUSY` is read-only; every other
+writable bit is replaced on a `CTRL_TRIG` write. `EN` is retained after
+completion (the SDK clears it explicitly); writing `CTRL_TRIG` with `EN = 0`
+clears both `EN` and `BUSY`.
+`CTRL_TRIG` 位域遵循 RP2350 布局……`BUSY` 只读；其余可写位在写 `CTRL_TRIG`
+时被替换。完成传输后 `EN` 保留（SDK 会显式清除）；写 `EN = 0` 会同时清除
+`EN` 与 `BUSY`。
+
+### Transfer semantics / 传输语义
+
+- Writing `CTRL_TRIG` (or an ALx control alias) with `EN` set and a non-zero
+  value sets `BUSY` when `TRANS_COUNT > 0`; a zero count completes immediately.
+  `AL1_TRANS_COUNT_TRIG` / `AL2_WRITE_ADDR_TRIG` / `AL3_READ_ADDR_TRIG` and
+  `MULTI_CHAN_TRIGGER` also start the selected channels.
+  写 `CTRL_TRIG`（或 ALx 控制别名）且 `EN` 置位、值非零时，若
+  `TRANS_COUNT > 0` 则置 `BUSY`；计数为 0 时立即完成。
+  `AL1_TRANS_COUNT_TRIG` / `AL2_WRITE_ADDR_TRIG` / `AL3_READ_ADDR_TRIG` 与
+  `MULTI_CHAN_TRIGGER` 也会启动选中通道。
+- `Dma::run(bus, max_transfers)` visits channels round-robin and performs one
+  unit per eligible channel step: read `DATA_SIZE` (`0`=byte, `1`=halfword,
+  `2`=word, reserved `3` treated as word) from `READ_ADDR`, write it to
+  `WRITE_ADDR`, then advance `READ_ADDR` if `INCR_READ` and `WRITE_ADDR` if
+  `INCR_WRITE` by the unit width.
+  `Dma::run(bus, max_transfers)` 按轮转顺序访问通道，每个可执行步搬运一个
+  单元：按 `DATA_SIZE`（`0`=字节、`1`=半字、`2`=字，保留值 `3` 按字处理）从
+  `READ_ADDR` 读取并写入 `WRITE_ADDR`；随后按 `INCR_READ`/`INCR_WRITE` 以
+  单元宽度推进地址。
+- `RING_SIZE` is the log2 ring byte count. With a non-zero size, the read side
+  wraps when `RING_SEL = 0` and the write side when `RING_SEL = 1`, using
+  `(addr & !mask) | ((addr + step) & mask)`.
+  `RING_SIZE` 是环字节数的 log2。非零时，`RING_SEL = 0` 环绕读侧、
+  `RING_SEL = 1` 环绕写侧，公式为 `(addr & !mask) | ((addr + step) & mask)`。
+- `TRANS_COUNT` decrements after each unit and saturates at zero; reaching zero
+  clears `BUSY`, sets `INTR[channel]` unless `IRQ_QUIET`, and starts
+  `CHAIN_TO`. The return value of `run` counts attempted units, so a driver can
+  cap DMA work per CPU timeslice.
+  `TRANS_COUNT` 每个单元后递减并在零处饱和；到零时清除 `BUSY`、在未置
+  `IRQ_QUIET` 时置位 `INTR[channel]`，并启动 `CHAIN_TO`。`run` 的返回值是
+  尝试的单元数，驱动可据此限制每个 CPU 时间片内的 DMA 工作量。
+- `CHAN_ABORT` / `Dma::abort(mask)` clears `BUSY` but keeps `EN`, the addresses
+  and the remaining count, matching the datasheet; a new trigger restarts the
+  channel from the current state.
+  `CHAN_ABORT` / `Dma::abort(mask)` 清除 `BUSY`，但保留 `EN`、地址与剩余计数，
+  与数据手册一致；再次触发会从当前状态重启通道。
+- A bus read or write error latches `READ_ERROR` / `WRITE_ERROR`, clears
+  `BUSY` and raises no completion interrupt.
+  总线读/写错误会锁存 `READ_ERROR` / `WRITE_ERROR`、清除 `BUSY`，且不产生
+  完成中断。
+
+### DREQ / DREQ 请求
+
+`TREQ_SEL = 0x3F` (`TREQ_PERMANENT`) always transfers. Every other selector
+samples the host-driven level array; all 64 inputs reset asserted so firmware
+that never programs a DREQ still progresses. `set_dreq(sel, false)` pauses
+channels using that selector and `set_dreq(sel, true)` resumes them on the next
+`run`. Selectors `>= 64` are ignored. The `TIMER0..3` pacing registers are
+stored but do not gate transfers yet.
+`TREQ_SEL = 0x3F`（`TREQ_PERMANENT`）始终可传输。其他选择器采样宿主驱动的
+电平数组；64 个输入复位时均断言，因此未编程 DREQ 的固件仍能推进。
+`set_dreq(sel, false)` 暂停使用该选择器的通道，`set_dreq(sel, true)` 在下一次
+`run` 时恢复。`>= 64` 的选择被忽略。`TIMER0..3` 节拍寄存器仅存储，尚未
+门控传输。
+
+### Chaining and interrupts / 链式与中断
+
+`CHAIN_TO` is a 4-bit target; a target equal to the channel itself disables
+chaining (the hardware reset value). Completion of a channel starts the target,
+including when `IRQ_QUIET` suppresses the interrupt. The four RP2350 DMA lines
+are `map::DMA_IRQ_0..3` = `10..13`. For each line
+`INTSn = (INTR & INTEn) | INTFn`; any non-zero status asserts the shared
+`IrqAssert` bit, so `BootPeripherals::irq_mask()` already contains DMA
+interrupts without extra wiring. `INTR` and `INTSn` are write-one-to-clear;
+`INTEn` / `INTFn` accept the low 16 bits.
+`CHAIN_TO` 是 4 位目标；目标等于通道自身时禁用链式（硬件复位值）。通道完成后
+启动目标通道，即使 `IRQ_QUIET` 抑制了中断。RP2350 的四条 DMA 线为
+`map::DMA_IRQ_0..3` = `10..13`。对每条线
+`INTSn = (INTR & INTEn) | INTFn`；任一非零状态都会断言共享 `IrqAssert` 的
+对应位，因此 `BootPeripherals::irq_mask()` 无需额外接线即可看到 DMA 中断。
+`INTR` 与 `INTSn` 为写 1 清零；`INTEn` / `INTFn` 只接受低 16 位。
+
+### Not modelled / 未建模项
+
+`BSWAP` byte swapping, `SNIFF_EN`/`SNIFF_CTRL`, `HIGH_PRIORITY` arbitration,
+`TRANS_COUNT` transfer modes (`[31:28]`), the reload/working-count split (a
+`TRANS_COUNT` write also replaces the remaining count while a channel is busy),
+the per-channel debug registers at `0x800..=0xBFF`, DMA pacing timers, AHB
+error recovery beyond clearing `BUSY` and the APB SET/CLR/XOR global aliases.
+Reads of unmodelled offsets return zero with a one-shot warning and writes are
+ignored. The DMA device never intercepts CPU bus traffic: transfers happen only
+inside `Dma::run`.
+`BSWAP` 字节交换、`SNIFF_EN`/`SNIFF_CTRL`、`HIGH_PRIORITY` 仲裁、
+`TRANS_COUNT` 传输模式（`[31:28]`）、重载值与工作计数的拆分（写
+`TRANS_COUNT` 会在通道忙碌时直接替换剩余计数）、`0x800..=0xBFF` 的通道调试
+寄存器、DMA 节拍定时器、除清除 `BUSY` 之外的 AHB 错误恢复，以及 APB
+SET/CLR/XOR 全局别名均未建模。未建模偏移读出 0 并只警告一次，写入被忽略。
+DMA 设备不拦截 CPU 总线流量：传输只在 `Dma::run` 内部发生。
+
+### Host driving / 宿主驱动方式
+
+Program the channel through the MMIO window, then pump `run` from the
+simulation loop. `BootPeripherals::advance` intentionally does not execute DMA
+transfers.
+通过 MMIO 窗口编程通道，然后在仿真循环中泵送 `run`。
+`BootPeripherals::advance` 有意不执行 DMA 传输。
+
+```rust
+use rp2350_core::memory::SimpleBus;
+use rp2350_periph::{BootPeripherals, map};
+
+let mut bus = SimpleBus::new();
+let mut peripherals = BootPeripherals::mount(&mut bus)?;
+let mut cycles = 0u64;
+let base = map::DMA_BASE;
+bus.write_u32(base + 0x00, 0x2000_0000, &mut cycles)?; // READ_ADDR
+bus.write_u32(base + 0x04, 0x2000_1000, &mut cycles)?; // WRITE_ADDR
+bus.write_u32(base + 0x08, 64, &mut cycles)?;          // TRANS_COUNT
+bus.write_u32(base + 0x0C, 0x007E_0051, &mut cycles)?; // EN + INCR + permanent DREQ
+let moved = peripherals.dma_mut().run(&mut bus, 64);
+assert_eq!(moved, 64);
 ```
 
 ---

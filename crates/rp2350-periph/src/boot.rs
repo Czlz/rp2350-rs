@@ -21,6 +21,7 @@ use super::adc::Adc;
 use super::bootram::BootRam;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
+use super::dma::Dma;
 use super::io_bank0::IoBank0;
 use super::io_qspi::IoQspi;
 use super::irq::IrqAssert;
@@ -95,6 +96,7 @@ pub struct BootPeripherals {
     cycles: CycleSink,
     timer: Timer0,
     sio: Sio,
+    dma: Dma,
     irq: IrqAssert,
     system_writes: SystemWriteLog,
     core1_release: Arc<AtomicBool>,
@@ -123,6 +125,7 @@ impl BootPeripherals {
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
         let sio = Sio::new(irq.clone());
+        let dma = Dma::new(irq.clone());
         let core1_release = Arc::new(AtomicBool::new(false));
 
         let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
@@ -173,6 +176,10 @@ impl BootPeripherals {
         mount_device(bus, Box::new(Pio::new(0)))?;
         mount_device(bus, Box::new(Pio::new(1)))?;
         mount_device(bus, Box::new(Pio::new(2)))?;
+        // DMA 位于 AHB 空间，与 PIO 块并列；传输由宿主通过 `Dma::run` 驱动。
+        // DMA lives in AHB space next to the PIO blocks; transfers are driven
+        // by the host through `Dma::run`.
+        mount_device(bus, Box::new(dma.clone()))?;
         mount_device(bus, Box::new(sio.clone()))?;
         mount_device(bus, Box::new(Ppb::with_log(Arc::clone(&system_writes))))?;
 
@@ -181,6 +188,7 @@ impl BootPeripherals {
             cycles,
             timer,
             sio,
+            dma,
             irq,
             system_writes,
             core1_release,
@@ -214,6 +222,11 @@ impl BootPeripherals {
 
     /// Advance the shared timebase and refresh TIMER0 interrupt lines
     /// 推进共享时基并刷新 TIMER0 中断线
+    ///
+    /// DMA transfers are deliberately not pumped here: the host decides when
+    /// to call [`Dma::run`] with its own bus handle and cycle budget.
+    /// 这里有意不泵送 DMA 传输：由宿主用自己的总线句柄与周期预算决定何时调用
+    /// [`Dma::run`]。
     pub fn advance(&self, cycles: u64) {
         self.cycles.push(cycles);
         self.timer.refresh();
@@ -239,6 +252,18 @@ impl BootPeripherals {
     #[must_use]
     pub fn sio(&self) -> &Sio {
         &self.sio
+    }
+
+    /// Shared DMA controller handle / 共享的 DMA 控制器句柄
+    #[must_use]
+    pub fn dma(&self) -> &Dma {
+        &self.dma
+    }
+
+    /// Mutable DMA handle used by the host to execute transfers
+    /// 宿主执行传输所用的可变 DMA 句柄
+    pub fn dma_mut(&mut self) -> &mut Dma {
+        &mut self.dma
     }
 
     /// Elapsed microseconds since boot / 自启动以来的微秒数
@@ -396,5 +421,24 @@ mod tests {
                 "PIO{index} SM0 TXFULL"
             );
         }
+    }
+
+    #[test]
+    fn dma_block_is_mounted_and_shared() {
+        // DMA 位于 0x5000_0000；N_CHANNELS 读回 16，句柄与总线设备共享状态。
+        // DMA sits at 0x5000_0000; N_CHANNELS reads 16 and the handle shares
+        // state with the bus-mounted device.
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        assert_eq!(
+            bus.read_u32(map::DMA_BASE + 0x468, &mut cycles)
+                .expect("n channels"),
+            16
+        );
+        assert_eq!(peripherals.dma().channel_state(0).expect("ch0").chain_to, 0);
+        assert_eq!(peripherals.dma().busy_mask(), 0);
     }
 }
