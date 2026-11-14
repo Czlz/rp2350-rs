@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `rp2350-gdb`: `qXfer:features:read:target.xml` — static ARMv8-M register description (`armv8-m.main` + `org.gnu.gdb.arm.m-profile`, validated with `arm-none-eabi-gdb 16.3`), byte-chunked `m`/`l` replies, `qXfer:features:read+` in `qSupported`, and 11 tests
+- `rp2350-cli`: DMA pump in `Machine` — every 64 steps the machine runs up to 16 DMA data units through `Dma::run`, on the same path used by `step`/`trace_step`/boot-ROM traps/GDB single-steps; `dma_transfers()`/`dma_state()` diagnostics, idle fast path, bounded per-batch budget; 7 tests
+- `rp2350-periph`: HSTX model — APB control window (`CSR`, `BIT0..7`, expanders) plus AHB FIFO window (`STAT`, `FIFO`), 8-word FIFO with WOF, RAW/RAW_REPEAT/TMDS/TMDS_REPEAT/NOP command decoding, documented WAIT extension, host `drain_output`/`take_scanline`, underrun accounting and model IRQ 46; 13 tests
 - `rp2350-periph`: RP2350 DMA controller — 16 channels, control blocks, AL1/AL2/AL3 triggers, byte/half/word copies, address increments, RING wrap, CHAIN_TO, DREQ gating, abort, INTR/INTE/INTF/INTS and `BootPeripherals::dma()`; `Dma::run` is library-driven and the CLI pump is deferred; 20 tests
 - `rp2350-gdb`: write watchpoints — RSP `Z2`/`z2` with 1/2/4/8-byte kinds, idempotent insert/remove, `Z3`/`Z4` fallback, `T05watch:<addr>;` stop replies, and CLI `MachineTarget` value-change detection limited to SRAM (snapshot reads do not advance machine cycles)
 - `rp2350-virt-periph`: plugin hot reload — `Fingerprint`/`ReloadReport`, `DeviceManager::reload` (instance-before-library drop order), added/removed/reloaded/failed reporting, and CLI `list-devices --reload`/`--watch`; 20 new tests

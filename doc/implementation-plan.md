@@ -17,10 +17,11 @@
 > | 领域 / Area | 状态 / Status | 已落地 / Landed | 待办 / Remaining |
 > |---|---|---|---|
 > | PIO | 🚧 | 3 blocks × 4 SMs 寄存器块、FIFO、指令存储；状态机执行（9 类指令、autopush/autopull、wrap、stall）；引脚映射、side-set、delay、CLKDIV、FIFO join、DBG_PADOUT/PADOE | DMA 握手、处理器 IRQ 路由、`Pio::tick` 接入主循环 |
-> | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`）、`Z2` 写监视点（SRAM 值变化检测） | 读/访问监视点、多核 `vCont`、`target.xml`、monitor 命令 |
+> | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`）、`Z2` 写监视点（SRAM 值变化检测）、`target.xml`（`qXfer:features:read`） | 读/访问监视点、多核 `vCont`、monitor 命令 |
 > | MCP | ✅ | JSON-RPC 方法层（`initialize`/`tools/list`/`tools/call`）、HTTP 传输、CLI `mcp-serve`、Bearer 鉴权（`--auth-token`/环境变量） | TLS、插件热加载 |
 > | 插件 / Plugins | ✅ | ABI、`DeviceManager::scan_and_load`/`reload`、CLI `list-devices`/`wire`/`--reload`/`--watch`、LED 与 UART Terminal 插件 | GUI 调色板/连线、接线持久化 |
-> | DMA | 🚧 | 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ、abort、IRQ（库级 `Dma::run`） | CLI 主循环 pump、BSWAP/sniff/优先级、定时器 DREQ 节拍 |
+> | DMA | 🚧 | 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ、abort、IRQ（库级 `Dma::run`）、CLI `Machine` 每 64 步泵送 | BSWAP/sniff/优先级、定时器 DREQ 节拍、周期精确仲裁 |
+> | HSTX | 🚧 | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS/NOP 命令、宿主 drain/scanline、下溢 IRQ | DVI/TMDS 时序与编码、引脚/时钟、DMA/PIO 耦合 |
 > | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、单精度算术/比较/转换/VSEL/VRINT、FPCCR/LSPACT 惰性压栈与扩展帧、DSP 并行 SIMD/GE 标志 | 双精度算术、饱和指令、FPSCR 陷阱模型 |
 > | 官方 perfbench | ✅ | `repl --stdio` + 本地 pyboard shim；Arm 与 RISC-V 各 24/24 通过 CPython 真值（[报告](perfbench-report.md)） | 可选：`-a 8` 方差、更大 N/M、外设类基准 |
 > | 双核 / Dual-core | 🚧 | core1 WFE + SIO FIFO 桩；`DualCoreM33` 双核调度脚手架（释放门、交替步进、预算、独立 NVIC，10 测试） | PSM 释放接线、SIO 门铃、CLI 双核模式、GDB 多核 |

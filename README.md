@@ -21,12 +21,13 @@
 - ✅ **合成 bootrom + XIP Flash** — 32 KB 合成 ROM（`rom_table_lookup`/flash 擦写/sysinfo/reboot）、16 MB Flash XIP、非缓存别名与维护窗口
 - ✅ **启动外设桩** — RESETS/CLOCKS/XOSC/PLL/TIMER/SIO/IO_BANK0/PADS/UART0/PPB/BOOTRAM/TICKS/POWMAN/IO_QSPI/XIP_QMI
 - 🚧 **PIO** — 3 blocks × 4 SMs 寄存器块 + 状态机执行（JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET、autopush/autopull、wrap、stall）；PINCTRL 引脚映射、side-set、delay、CLKDIV、FIFO join 已接入；DMA 握手/IRQ 路由/主循环 tick 待补
-- ✅ **GDB RSP** — 协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、总线内存、PC 断点、resume）；watchpoint/多核 `vCont`/`target.xml` 待补
+- ✅ **GDB RSP** — 协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、总线内存、PC 断点、resume、`Z2` 写监视点、`target.xml`）；读/访问监视点与多核 `vCont` 待补
 - ✅ **MCP** — JSON-RPC 方法层 + HTTP/1.1 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权
-- ✅ **插件系统** — libloading 动态加载 `.dll`/`.so`/`.dylib`，目录扫描 + CLI `list-devices`/`wire`，LED 与 UART Terminal 插件
+- ✅ **插件系统** — libloading 动态加载 `.dll`/`.so`/`.dylib`，目录扫描 + `DeviceManager::reload` + CLI `list-devices`/`wire`/`--reload`/`--watch`，LED 与 UART Terminal 插件
 - 🚧 **双核** — core1 常驻 WFE（SIO FIFO/门铃语义保留），`DualCoreM33` 调度脚手架已落地；PSM/SIO/CLI 接线待补
-- 🚧 **DMA** — 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ、abort、IRQ（库级 `Dma::run`；CLI pump 待接）
-- ⏳ **HSTX** 视频输出、**Virtual Electronics Lab**（egui 拖线连线）、**PSRAM** — 规划中
+- 🚧 **DMA** — 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ、abort、IRQ；`Machine` 每 64 步泵送
+- 🚧 **HSTX** — APB 控制 + AHB FIFO、RAW/TMDS 命令、宿主 drain/scanline、下溢 IRQ；完整 DVI/TMDS 时序待补
+- ⏳ **Virtual Electronics Lab**（egui 拖线连线）、**PSRAM** — 规划中
 
 ---
 
