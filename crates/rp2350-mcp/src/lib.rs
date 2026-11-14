@@ -13,6 +13,7 @@
 #![allow(clippy::doc_markdown)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod http;
 pub mod server;
 
@@ -21,4 +22,5 @@ mod http_tests;
 #[cfg(test)]
 mod tests;
 
+pub use auth::{Auth, HttpOptions};
 pub use server::McpServer;

@@ -306,54 +306,96 @@ lists the IDs that were found), or out-of-bounds port index.
 ### `mcp-serve` — MCP server over HTTP / HTTP 上的 MCP 服务器
 
 ```text
-rp2350 mcp-serve [--port 8080]
+rp2350 mcp-serve [--port 8080] [--auth-token <TOKEN>]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
 |---------------|----------------|----------------|
 | `--port` (`-p`) | `8080` | TCP listen port on `0.0.0.0`; `0` picks a free port / `0.0.0.0` 上的 TCP 监听端口；`0` 由系统分配 |
+| `--auth-token` | env `RP2350_MCP_TOKEN` | Bearer token required on `POST /mcp`; empty flag or variable = auth off / `POST /mcp` 要求的 Bearer Token；空标志或空变量 = 关闭鉴权 |
 
-Binds the listener, prints the actual base address (so `--port 0` is usable),
-installs a Ctrl-C handler and then blocks in `rp2350_mcp::http::serve`:
-绑定监听器、打印实际基地址（因此 `--port 0` 可用）、安装 Ctrl-C 处理器，然后
-阻塞在 `rp2350_mcp::http::serve` 中：
+Binds the listener, prints the actual base address and the auth state (never the
+token), installs a Ctrl-C handler and then blocks in
+`rp2350_mcp::http::serve_with_options`:
+绑定监听器、打印实际基地址与鉴权状态（绝不打印 Token）、安装 Ctrl-C 处理器，
+然后阻塞在 `rp2350_mcp::http::serve_with_options` 中：
 
 ```text
 [mcp] listening on http://0.0.0.0:18080/mcp (POST JSON-RPC) / health: http://0.0.0.0:18080/health
+[mcp] auth: enabled
 [mcp] press Ctrl-C to stop / 按 Ctrl-C 停止
 ```
 
 | Endpoint | Method | Behaviour / 行为 |
 |----------|--------|------------------|
-| `/mcp`（别名 `/`） | `POST` | JSON-RPC 报文体 → `McpServer::handle_request`，返回 `application/json` |
-| `/health` | `GET` | `200 {"status":"ok","server":"rp2350-mcp","version":…,"endpoint":"/mcp"}` |
+| `/mcp`（别名 `/`） | `POST` | JSON-RPC 报文体 → `McpServer::handle_request`，返回 `application/json`；启用鉴权时缺少/错误 Token → `401` |
+| `/health` | `GET` | `200 {"status":"ok","server":"rp2350-mcp","version":…,"endpoint":"/mcp","auth":true/false}`，始终开放 |
+
+#### Authentication / 鉴权
+
+- **Token 来源 / token source**：`--auth-token TOKEN` 优先，其次环境变量
+  `RP2350_MCP_TOKEN`；两者都为空（未设置或空字符串）则关闭鉴权。因此
+  `--auth-token ""` 可显式覆盖环境变量。
+  `--auth-token TOKEN` wins over `RP2350_MCP_TOKEN`; absent/empty for both
+  disables auth, so `--auth-token ""` explicitly overrides the environment.
+- **请求 / request**：`POST /mcp`（含 `/` 别名）必须携带
+  `Authorization: Bearer <TOKEN>`；方案名大小写不敏感、Token 精确匹配。
+  缺失或错误时返回 `401 Unauthorized`、`WWW-Authenticate: Bearer` 与
+  `{"error":"unauthorized"}`。比较为常量时间，不泄露匹配前缀。
+  `POST /mcp` (and `/`) requires `Authorization: Bearer <TOKEN>`; the scheme
+  is case-insensitive and the token must match exactly. Missing/wrong
+  credentials yield `401` with `WWW-Authenticate: Bearer` and
+  `{"error":"unauthorized"}`; comparison is constant-time.
+- **开放探活 / open probe**：`GET /health` 永不鉴权，便于容器 liveness 探针；
+  其 JSON 仅报告 `"auth": true/false`，不回显 Token。
+  `GET /health` is never protected; its JSON only reports `"auth"`.
+- **错误方法/路径 / errors**：`GET /mcp` 仍为 `405`、未知路径仍为 `404`，
+  鉴权不改变这些路由语义。
+  `GET /mcp` still returns `405` and unknown paths `404`; auth does not change
+  routing semantics.
+- **无 TLS / no TLS**：Token 与 JSON-RPC 明文传输。远程部署请用 nginx/Caddy 等
+  反向代理终止 TLS 并转发到回环地址；`mcp-serve` 固定绑定 `0.0.0.0`，启用
+  Token 时应限制网络可达范围。不要通过命令行传 Token（会留在 shell 历史/进程
+  列表中），优先用环境变量或仅本机访问。
+  The token crosses cleartext HTTP: terminate TLS in a reverse proxy for remote
+  use and restrict reachability. Prefer the environment variable over
+  `--auth-token`, which can leak through shell history and process listings.
 
 ```powershell
+# 启用鉴权 / auth enabled
+$env:RP2350_MCP_TOKEN = 's3cret'      # 或用 --auth-token s3cret
 rp2350 mcp-serve --port 18080
 # 另一个终端 / another terminal
 Invoke-RestMethod -Uri http://127.0.0.1:18080/health
+try {
+  Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18080/mcp -ContentType 'application/json' `
+    -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+} catch { $_.Exception.Response.StatusCode.value__ }   # 401
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18080/mcp -ContentType 'application/json' `
+  -Headers @{ Authorization = 'Bearer s3cret' } `
   -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18080/mcp -ContentType 'application/json' `
-  -Body '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_devices","arguments":{}}}'
 ```
 
 **Stopping / 停止语义**：`Ctrl-C` 置真内部的 `AtomicBool` 关停标志，accept 循环
 在 20 ms 轮询点返回，`serve` 打印 `[mcp] server stopped` 后进程正常退出（退出码
 0）。没有 `--stop`/管理端点，也不做守护化；测试与嵌入场景可直接调用
-`rp2350_mcp::http::serve(listener, &server, &shutdown)`。
+`rp2350_mcp::http::serve(listener, &server, &shutdown)`（无鉴权）或
+`serve_with_options(..., &options)`。
 `Ctrl-C` sets an internal `AtomicBool`; the accept loop returns on its next 20 ms
 poll, `serve` prints `[mcp] server stopped`, and the process exits with code 0.
 There is no stop endpoint or daemonization; tests and embedders call
-`rp2350_mcp::http::serve(listener, &server, &shutdown)` directly.
+`rp2350_mcp::http::serve(listener, &server, &shutdown)` (no auth) or
+`serve_with_options(..., &options)` directly.
 
 **Scope / 范围**：本子命令**不加载插件**、也不启动仿真，注册表为空，因此
-`list_devices` 返回 `[]`、`query_device` 返回 `-32001`。无 TLS、无鉴权、无 SSE、
-无 keep-alive；请求头上限 8 KiB、报文体上限 1 MiB，非法 JSON 返回 `400`（载荷为
-JSON-RPC `-32700`），未知路径 `404`，错误方法 `405`。
+`list_devices` 返回 `[]`、`query_device` 返回 `-32001`。鉴权仅支持单枚静态
+Bearer Token；无 TLS、无用户/角色/限流、无 SSE、无 keep-alive。请求头上限
+8 KiB、报文体上限 1 MiB，非法 JSON 返回 `400`（载荷为 JSON-RPC `-32700`），
+未知路径 `404`，错误方法 `405`。
 The subcommand loads no plugins and starts no simulation, so the registry is
-empty (`list_devices` → `[]`, `query_device` → `-32001`). No TLS, auth, SSE or
-keep-alive; 8 KiB head and 1 MiB body limits; malformed JSON → `400` carrying a
+empty (`list_devices` → `[]`, `query_device` → `-32001`). Authentication is a
+single static bearer token only: no TLS, users/roles/rate limiting, SSE or
+keep-alive. 8 KiB head and 1 MiB body limits; malformed JSON → `400` carrying a
 JSON-RPC `-32700` payload, unknown paths → `404`, wrong methods → `405`.
 
 ---
@@ -503,4 +545,10 @@ rp2350 wire --plugin-dir target/release --device com.rp2350-rs.led --port 0 --gp
 
 # Serve the MCP JSON-RPC server over HTTP on port 18080
 rp2350 mcp-serve --port 18080
+
+# Same, requiring `Authorization: Bearer s3cret` on POST /mcp (/health stays open)
+$env:RP2350_MCP_TOKEN = 's3cret'; rp2350 mcp-serve --port 18080
+
+# Explicit flag wins over the environment; an empty flag disables auth
+rp2350 mcp-serve --port 18080 --auth-token s3cret
 ```

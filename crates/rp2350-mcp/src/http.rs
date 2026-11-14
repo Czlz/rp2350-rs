@@ -15,6 +15,13 @@
 //! | `POST` | `/mcp` (alias `/`) | JSON-RPC body → [`McpServer::handle_request`] |
 //! | `GET` | `/health` | `200` with a small JSON object / 返回小型 JSON |
 //!
+//! When [`HttpOptions`] carries a bearer token, `POST /mcp` also requires
+//! `Authorization: Bearer <token>` and otherwise answers `401` with
+//! `WWW-Authenticate: Bearer`. `GET /health` stays open for liveness probes.
+//! 当 [`HttpOptions`] 配置了 Bearer Token 时，`POST /mcp` 还要求
+//! `Authorization: Bearer <token>`，否则返回带 `WWW-Authenticate: Bearer` 的
+//! `401`；`GET /health` 保持开放以便探活。
+//!
 //! 传输层不写错误文档，统一维护在 `doc/crates/rp2350-mcp.md`。
 //! Transport error docs live in `doc/crates/rp2350-mcp.md`.
 #![allow(
@@ -34,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::McpServer;
+use crate::auth::{HttpOptions, WWW_AUTHENTICATE};
 
 /// Maximum size of the request head (request line + headers) in bytes
 /// 请求头（请求行 + 头部字段）允许的最大字节数
@@ -72,6 +80,8 @@ pub struct HttpRequest {
     pub path: String,
     /// Declared `Content-Length`, if any / 声明的 `Content-Length`（若存在）
     pub content_length: Option<usize>,
+    /// Raw `Authorization` header value, if any / `Authorization` 头原始值（若存在）
+    pub authorization: Option<String>,
     /// Raw request body / 原始请求体
     pub body: Vec<u8>,
 }
@@ -87,6 +97,9 @@ pub struct HttpResponse {
     pub body: String,
     /// Optional `Allow` header (only set for `405`) / 可选 `Allow` 头（仅 405）
     pub allow: Option<&'static str>,
+    /// Optional `WWW-Authenticate` header (only set for `401`)
+    /// 可选 `WWW-Authenticate` 头（仅 401）
+    pub www_authenticate: Option<&'static str>,
 }
 
 impl HttpResponse {
@@ -98,6 +111,7 @@ impl HttpResponse {
             content_type: JSON_CONTENT_TYPE,
             body: body.into(),
             allow: None,
+            www_authenticate: None,
         }
     }
 
@@ -109,6 +123,7 @@ impl HttpResponse {
             content_type: TEXT_CONTENT_TYPE,
             body: message.into(),
             allow: None,
+            www_authenticate: None,
         }
     }
 
@@ -117,6 +132,15 @@ impl HttpResponse {
     pub fn method_not_allowed(allow: &'static str) -> Self {
         let mut response = Self::error(405, format!("method not allowed, expected {allow}"));
         response.allow = Some(allow);
+        response
+    }
+
+    /// Build the `401` response for a missing or wrong bearer token
+    /// 为缺失或错误的 Bearer Token 构建 `401` 响应
+    #[must_use]
+    pub fn unauthorized() -> Self {
+        let mut response = Self::json(401, r#"{"error":"unauthorized"}"#);
+        response.www_authenticate = Some(WWW_AUTHENTICATE);
         response
     }
 }
@@ -161,9 +185,33 @@ pub fn serve(
     server: &McpServer,
     shutdown: &AtomicBool,
 ) -> std::io::Result<()> {
+    serve_with_options(listener, server, shutdown, &HttpOptions::default())
+}
+
+/// Serve HTTP requests with explicit options / 按显式选项提供 HTTP 服务
+///
+/// Identical to [`serve`] but takes [`HttpOptions`]; when a bearer token is
+/// configured, `POST /mcp` requires `Authorization: Bearer <token>` and
+/// answers `401` otherwise. `GET /health` is never protected.
+/// 与 [`serve`] 相同，但接受 [`HttpOptions`]；配置 Bearer Token 后 `POST /mcp`
+/// 要求 `Authorization: Bearer <token>`，否则返回 `401`。`GET /health`
+/// 永不鉴权。
+pub fn serve_with_options(
+    listener: TcpListener,
+    server: &McpServer,
+    shutdown: &AtomicBool,
+    options: &HttpOptions,
+) -> std::io::Result<()> {
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
-    log::info!("MCP HTTP transport listening on http://{local}{MCP_PATH}");
+    log::info!(
+        "MCP HTTP transport listening on http://{local}{MCP_PATH} (auth: {})",
+        if options.auth_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -176,7 +224,7 @@ pub fn serve(
                 log::debug!("MCP HTTP connection from {peer}");
                 // 单个连接的失败只记录日志，不终止服务。
                 // A single failed connection is logged, never fatal.
-                if let Err(error) = handle_connection(stream, server) {
+                if let Err(error) = handle_connection(stream, server, options) {
                     log::warn!("MCP HTTP connection from {peer} failed: {error}");
                 }
             }
@@ -194,12 +242,28 @@ pub fn serve(
 /// Convenience wrapper for hosts that stop the process instead of the loop.
 /// 供「以结束进程代替停止循环」的宿主使用。
 pub fn serve_blocking(listener: TcpListener, server: &McpServer) -> std::io::Result<()> {
-    serve(listener, server, &AtomicBool::new(false))
+    serve_blocking_with_options(listener, server, &HttpOptions::default())
+}
+
+/// Serve forever with explicit options / 按显式选项永久服务
+///
+/// Convenience wrapper around [`serve_with_options`] without a shutdown flag.
+/// 不带关停标志的 [`serve_with_options`] 便捷包装。
+pub fn serve_blocking_with_options(
+    listener: TcpListener,
+    server: &McpServer,
+    options: &HttpOptions,
+) -> std::io::Result<()> {
+    serve_with_options(listener, server, &AtomicBool::new(false), options)
 }
 
 /// Handle one accepted connection and write one response
 /// 处理一条已接受的连接并写出一个响应
-fn handle_connection(stream: std::net::TcpStream, server: &McpServer) -> std::io::Result<()> {
+fn handle_connection(
+    stream: std::net::TcpStream,
+    server: &McpServer,
+    options: &HttpOptions,
+) -> std::io::Result<()> {
     // accept 得到的 socket 在部分平台会继承非阻塞标志，这里显式恢复阻塞模式。
     // Accepted sockets can inherit the non-blocking flag on some platforms.
     stream.set_nonblocking(false)?;
@@ -208,7 +272,7 @@ fn handle_connection(stream: std::net::TcpStream, server: &McpServer) -> std::io
 
     let mut reader = BufReader::new(stream);
     let response = match read_request(&mut reader) {
-        Ok(request) => handle_http(server, &request),
+        Ok(request) => handle_http_with_options(server, &request, options),
         Err(error) => error.into_response(),
     };
 
@@ -229,6 +293,7 @@ pub(crate) fn read_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, Ht
         method: parsed.method,
         path: parsed.path,
         content_length: parsed.content_length,
+        authorization: parsed.authorization,
         body,
     })
 }
@@ -288,6 +353,8 @@ struct ParsedHead {
     path: String,
     /// Declared `Content-Length` / 声明的 `Content-Length`
     content_length: Option<usize>,
+    /// Raw `Authorization` header / `Authorization` 头原始值
+    authorization: Option<String>,
 }
 
 /// Parse the request line and the headers we care about / 解析请求行与关心的头部
@@ -317,6 +384,7 @@ fn parse_head(head: &str) -> Result<ParsedHead, HttpError> {
     // Query strings do not take part in routing (`/mcp?x=1` == `/mcp`).
     let path = target.split('?').next().unwrap_or(target).to_string();
     let mut content_length = None;
+    let mut authorization = None;
 
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -329,6 +397,8 @@ fn parse_head(head: &str) -> Result<ParsedHead, HttpError> {
                 .parse::<usize>()
                 .map_err(|_| HttpError::new(400, format!("invalid Content-Length: {value}")))?;
             content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(HttpError::new(
                 501,
@@ -341,6 +411,7 @@ fn parse_head(head: &str) -> Result<ParsedHead, HttpError> {
         method: method.to_string(),
         path,
         content_length,
+        authorization,
     })
 }
 
@@ -360,11 +431,30 @@ fn read_body<R: Read>(reader: &mut R, length: usize) -> Result<Vec<u8>, HttpErro
 }
 
 /// Route one parsed request to its handler / 将一条解析后的请求路由到处理器
+///
+/// Uses default [`HttpOptions`] (authentication disabled) / 使用默认
+/// [`HttpOptions`]（关闭鉴权）
 #[must_use]
 pub fn handle_http(server: &McpServer, request: &HttpRequest) -> HttpResponse {
+    handle_http_with_options(server, request, &HttpOptions::default())
+}
+
+/// Route one parsed request with explicit options / 按显式选项路由一条请求
+///
+/// Authentication is evaluated only for `POST /mcp` (and its `/` alias), after
+/// the method check, so wrong methods keep returning `405` and unknown paths
+/// keep returning `404` regardless of the token policy.
+/// 鉴权只在 `POST /mcp`（含 `/` 别名）上、且方法检查之后进行，因此错误方法与
+/// 未知路径仍分别返回 `405`/`404`，不受 Token 策略影响。
+#[must_use]
+pub fn handle_http_with_options(
+    server: &McpServer,
+    request: &HttpRequest,
+    options: &HttpOptions,
+) -> HttpResponse {
     if request.path == HEALTH_PATH {
         return if request.method == "GET" {
-            HttpResponse::json(200, health_body())
+            HttpResponse::json(200, health_body(options.auth_enabled()))
         } else {
             HttpResponse::method_not_allowed("GET")
         };
@@ -372,7 +462,7 @@ pub fn handle_http(server: &McpServer, request: &HttpRequest) -> HttpResponse {
 
     if request.path == MCP_PATH || request.path == "/" {
         return if request.method == "POST" {
-            handle_rpc(server, request)
+            handle_rpc(server, request, options)
         } else {
             HttpResponse::method_not_allowed("POST")
         };
@@ -382,7 +472,14 @@ pub fn handle_http(server: &McpServer, request: &HttpRequest) -> HttpResponse {
 }
 
 /// Handle one JSON-RPC body / 处理一条 JSON-RPC 报文体
-fn handle_rpc(server: &McpServer, request: &HttpRequest) -> HttpResponse {
+fn handle_rpc(server: &McpServer, request: &HttpRequest, options: &HttpOptions) -> HttpResponse {
+    // 鉴权先于报文校验：未授权调用方不应得知报文体要求。
+    // Authentication precedes body validation, so unauthenticated callers learn
+    // nothing about body requirements.
+    if !options.auth.authorize(request.authorization.as_deref()) {
+        return HttpResponse::unauthorized();
+    }
+
     if request.content_length.is_none() {
         return HttpResponse::error(411, "Content-Length is required for POST");
     }
@@ -409,12 +506,15 @@ fn handle_rpc(server: &McpServer, request: &HttpRequest) -> HttpResponse {
 }
 
 /// JSON body of `GET /health` / `GET /health` 的 JSON 响应体
-fn health_body() -> String {
+fn health_body(auth_enabled: bool) -> String {
     serde_json::json!({
         "status": "ok",
         "server": SERVER_NAME,
         "version": env!("CARGO_PKG_VERSION"),
         "endpoint": MCP_PATH,
+        // 仅暴露是否启用鉴权，绝不回显 Token。
+        // Only the auth policy is exposed, never the token itself.
+        "auth": auth_enabled,
     })
     .to_string()
 }
@@ -436,6 +536,11 @@ fn write_response(
         head.push_str(allow);
         head.push_str("\r\n");
     }
+    if let Some(scheme) = response.www_authenticate {
+        head.push_str("WWW-Authenticate: ");
+        head.push_str(scheme);
+        head.push_str("\r\n");
+    }
     head.push_str("\r\n");
 
     stream.write_all(head.as_bytes())?;
@@ -449,6 +554,7 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         202 => "Accepted",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         411 => "Length Required",

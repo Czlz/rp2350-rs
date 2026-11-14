@@ -192,6 +192,11 @@ enum Commands {
         /// MCP listen port / MCP 监听端口
         #[arg(short, long, default_value_t = mcp_serve::DEFAULT_PORT)]
         port: u16,
+
+        /// Bearer token for `POST /mcp` (falls back to `RP2350_MCP_TOKEN`)
+        /// 保护 `POST /mcp` 的 Bearer Token（缺省读取 `RP2350_MCP_TOKEN`）
+        #[arg(long)]
+        auth_token: Option<String>,
     },
 }
 
@@ -292,8 +297,8 @@ fn main() {
                 "list-devices failed / 列出设备失败",
             );
         }
-        Commands::McpServe { port } => {
-            let options = mcp_serve::McpServeOptions { port };
+        Commands::McpServe { port, auth_token } => {
+            let options = mcp_serve::McpServeOptions { port, auth_token };
             finish(mcp_serve::run(&options), "mcp-serve failed / MCP 服务失败");
         }
     }
@@ -331,5 +336,27 @@ mod tests {
         };
         assert!(stdio);
         assert!(exec.is_none());
+    }
+
+    #[test]
+    fn mcp_serve_auth_token_parses_into_options() {
+        let cli = parse(&["mcp-serve", "--port", "0", "--auth-token", "secret"])
+            .expect("parse mcp-serve");
+        let Commands::McpServe { port, auth_token } = cli.command else {
+            panic!("expected the mcp-serve subcommand");
+        };
+        let options = mcp_serve::McpServeOptions { port, auth_token };
+        assert_eq!(options.port, 0);
+        assert_eq!(options.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn mcp_serve_without_auth_token_leaves_it_unset() {
+        let cli = parse(&["mcp-serve"]).expect("parse mcp-serve");
+        let Commands::McpServe { port, auth_token } = cli.command else {
+            panic!("expected the mcp-serve subcommand");
+        };
+        assert_eq!(port, mcp_serve::DEFAULT_PORT);
+        assert!(auth_token.is_none());
     }
 }

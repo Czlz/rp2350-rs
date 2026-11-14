@@ -1,8 +1,8 @@
 # rp2350-mcp — MCP Server (AgentFuse) / MCP 服务器
 
-> **Crate**: `rp2350-mcp` | **Path**: `crates/rp2350-mcp` | **Status**: ✅ 方法层与最小 HTTP/1.1 传输已实现 / method layer + minimal HTTP/1.1 transport implemented — `McpServer::handle_request` 支持 `initialize` / `tools/list` / `tools/call`，并委托 `DeviceManager`；`http::serve` 提供 `POST /mcp` 与 `GET /health`；CLI `mcp-serve` 已接线。
+> **Crate**: `rp2350-mcp` | **Path**: `crates/rp2350-mcp` | **Status**: ✅ 方法层与最小 HTTP/1.1 传输已实现 / method layer + minimal HTTP/1.1 transport implemented — `McpServer::handle_request` 支持 `initialize` / `tools/list` / `tools/call`，并委托 `DeviceManager`；`http::serve` 提供 `POST /mcp` 与 `GET /health`，可通过 [`Auth`] 启用 Bearer Token 鉴权；CLI `mcp-serve` 已接线。
 >
-> **Status** (EN): The JSON-RPC method layer (`src/server.rs`) implements `initialize`, `tools/list`, `tools/call` (`list_devices` / `query_all` / `query_device` / `configure`) over a shared `DeviceManager`. `src/http.rs` adds a minimal blocking HTTP/1.1 transport (`POST /mcp`, `GET /health`), and the CLI `mcp-serve` subcommand drives it.
+> **Status** (EN): The JSON-RPC method layer (`src/server.rs`) implements `initialize`, `tools/list`, `tools/call` (`list_devices` / `query_all` / `query_device` / `configure`) over a shared `DeviceManager`. `src/http.rs` adds a minimal blocking HTTP/1.1 transport (`POST /mcp`, `GET /health`) with optional Bearer-token authentication (`src/auth.rs`), and the CLI `mcp-serve` subcommand drives it.
 
 ---
 
@@ -37,9 +37,9 @@ agent → TCP → http::serve(listener, &server, &shutdown)
 
 | Method | Path | Status | Notes / 说明 |
 |--------|------|--------|--------------|
-| `POST` | `/mcp`（别名 `/`） | `200` / `400` / `202` | JSON-RPC 响应；非法 JSON 用 `400` 承载 `-32700` 载荷；通知返回 `202` 空体 |
-| `GET` | `/health` | `200` | `{status, server, version, endpoint}` |
-| 其他方法 | `/mcp`、`/health` | `405` | 附带 `Allow: POST` / `Allow: GET` |
+| `POST` | `/mcp`（别名 `/`） | `200` / `400` / `202` / `401` | JSON-RPC 响应；非法 JSON 用 `400` 承载 `-32700` 载荷；通知返回 `202` 空体；启用鉴权且凭据缺失/错误时 `401` |
+| `GET` | `/health` | `200` | `{status, server, version, endpoint, auth}`，始终开放 / always open |
+| 其他方法 | `/mcp`、`/health` | `405` | 附带 `Allow: POST` / `Allow: GET`（鉴权不改变该行为） |
 | 其他路径 | — | `404` | 纯文本错误体 / plain-text body |
 
 Headers / 头部：`Content-Type: application/json`、精确的 `Content-Length`、
@@ -59,10 +59,17 @@ use std::sync::atomic::AtomicBool;
 // 阻塞式 accept 循环；shutdown 由其他线程置真后返回（HTTP 服务不需要 tokio）
 // Blocking accept loop; returns once another thread sets `shutdown`.
 pub fn serve(listener: TcpListener, server: &McpServer, shutdown: &AtomicBool) -> std::io::Result<()>;
-// 无停止标志的便捷入口 / convenience entry point without a shutdown flag
+// 带鉴权选项的入口 / entry point with authentication options
+pub fn serve_with_options(listener: TcpListener, server: &McpServer,
+                          shutdown: &AtomicBool, options: &HttpOptions) -> std::io::Result<()>;
+// 无停止标志的便捷入口 / convenience entry points without a shutdown flag
 pub fn serve_blocking(listener: TcpListener, server: &McpServer) -> std::io::Result<()>;
+pub fn serve_blocking_with_options(listener: TcpListener, server: &McpServer,
+                                   options: &HttpOptions) -> std::io::Result<()>;
 // 单请求处理（测试/嵌入用） / single-request handling (tests, embedding)
 pub fn handle_http(server: &McpServer, request: &HttpRequest) -> HttpResponse;
+pub fn handle_http_with_options(server: &McpServer, request: &HttpRequest,
+                                options: &HttpOptions) -> HttpResponse;
 pub(crate) fn read_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, HttpError>;
 ```
 
@@ -75,13 +82,75 @@ requests are serialized through the `DeviceManager` lock, with a 10 s per
 connection I/O timeout.
 
 `HttpRequest` / `HttpResponse` / `HttpError` 为公开类型：请求含
-`method` / `path`（已剥离查询串）/ `content_length` / `body`，响应含
-`status` / `content_type` / `body` / `allow`；`HttpError` 带 `status` 与
-`message`，`into_response()` 直接给出响应。
+`method` / `path`（已剥离查询串）/ `content_length` / `authorization` / `body`，
+响应含 `status` / `content_type` / `body` / `allow` / `www_authenticate`；
+`HttpError` 带 `status` 与 `message`，`into_response()` 直接给出响应。
 `HttpRequest` / `HttpResponse` / `HttpError` are public: requests carry
-`method` / `path` (query stripped) / `content_length` / `body`; responses carry
-`status` / `content_type` / `body` / `allow`; `HttpError` holds `status` and
-`message` and renders itself via `into_response()`.
+`method` / `path` (query stripped) / `content_length` / `authorization` / `body`;
+responses carry `status` / `content_type` / `body` / `allow` /
+`www_authenticate`; `HttpError` holds `status` and `message` and renders itself
+via `into_response()`.
+
+---
+
+## Authentication / 鉴权
+
+Auth is a single static bearer token; there are no users, roles, scopes or
+rate limits. Configure it with [`HttpOptions`] / [`Auth`]:
+鉴权只有一枚静态 Bearer Token，没有用户、角色、作用域或限流。通过
+[`HttpOptions`] / [`Auth`] 配置：
+
+```rust
+use rp2350_mcp::{Auth, HttpOptions};
+
+let disabled = HttpOptions::new();                       // auth: false
+let enabled  = HttpOptions::with_token("s3cret");        // auth: true
+let token = std::env::var("RP2350_MCP_TOKEN").ok();
+let from_env = HttpOptions::with_optional_token(token);
+// 空字符串 / None 均视为关闭鉴权 / both `None` and `""` disable auth
+assert!(!HttpOptions::with_optional_token(Some(String::new())).auth_enabled());
+```
+
+| Case / 情形 | Behaviour / 行为 |
+|-------------|------------------|
+| Token 未配置 | `POST /mcp` 不检查 `Authorization`，行为与旧版一致 / no header required |
+| 缺失 `Authorization` | `401` + `WWW-Authenticate: Bearer` + `{"error":"unauthorized"}` |
+| 方案名大小写变体 | `Bearer` / `bearer` / `BEARER` 均接受；Token 精确匹配 / scheme is case-insensitive, token is exact |
+| Token 错误 / 前缀 / 多余字符 | `401`（不区分「未知 Token」与「错误 Token」） / same `401` for unknown and wrong tokens |
+| `GET /health` | 始终 `200`，响应含 `"auth": true/false`，不回显 Token / always open, reports `auth` only |
+
+比较使用 [`auth::constant_time_eq`]：循环次数取两串最大长度，不在首个不同
+字节处提前返回，因此响应时间不泄露匹配前缀。
+The comparison uses [`auth::constant_time_eq`]: it iterates `max(len(left),
+len(right))` times with no early exit, so timing does not reveal the matched
+prefix. [`Auth`]'s `Debug` output is redacted, so tokens never reach logs or
+startup banners.
+
+`POST /mcp` 的鉴权在方法检查之后、报文校验之前执行，所以 `GET /mcp` 仍是
+`405`、未知路径仍是 `404`、未授权请求也不会暴露 `Content-Length` 要求
+（`411` 仅在通过鉴权后出现）。
+Authentication runs after the method check and before body validation, so
+`GET /mcp` still returns `405`, unknown paths still return `404`, and
+unauthenticated callers never learn the `Content-Length` requirement (`411`
+only appears once authorized).
+
+```powershell
+# 未带 Token → 401 / no token → 401
+curl.exe -i -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" `
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+# 带 Token → 200 / with token → 200
+curl.exe -i -X POST http://127.0.0.1:18080/mcp -H "Authorization: Bearer s3cret" `
+  -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+```
+
+> **No TLS / 无 TLS**：Token 以明文 HTTP 传输，任何能看到流量的中间人都可复用。
+> 生产/远程部署请在前面挂反向代理（nginx/Caddy）终止 TLS 并转发到
+> `127.0.0.1`，或只监听本机回环。CLI 当前固定绑定 `0.0.0.0`，启用 Token 时
+> 请自行限制网络可达范围。
+> The token travels in cleartext HTTP and can be replayed by anyone who can
+> observe the connection. For production or remote use terminate TLS in a
+> reverse proxy (nginx/Caddy) in front of a loopback-bound server. The CLI binds
+> `0.0.0.0`, so restrict network reachability when a token is enabled.
 
 ---
 
@@ -142,6 +211,32 @@ transport is `rp2350_mcp::http::serve`.
 `new(port)` 保留原签名，内部创建空的私有 `DeviceManager`；已有设备的宿主必须使用
 `with_manager`。`start()` / `stop()` 仍是面向异步宿主的标志占位；阻塞式传输由
 `rp2350_mcp::http::serve` 提供。
+
+### Auth types / 鉴权类型
+
+```rust
+pub struct Auth { /* token: Option<String> */ }   // Debug 已脱敏 / redacted Debug
+impl Auth {
+    pub fn disabled() -> Self;                     // accept everything / 全部放行
+    pub fn bearer(token: impl Into<String>) -> Self;
+    pub fn from_optional(token: Option<String>) -> Self;  // None/"" → disabled
+    pub fn is_enabled(&self) -> bool;
+    pub fn authorize(&self, header: Option<&str>) -> bool;
+}
+
+pub struct HttpOptions { pub auth: Auth }
+impl HttpOptions {
+    pub fn new() -> Self;                          // default: auth disabled
+    pub fn with_token(token: impl Into<String>) -> Self;
+    pub fn with_optional_token(token: Option<String>) -> Self;
+    pub fn auth_enabled(&self) -> bool;
+}
+
+pub fn auth::constant_time_eq(left: &str, right: &str) -> bool;
+pub const auth::AUTH_SCHEME: &str = "Bearer";
+pub const auth::WWW_AUTHENTICATE: &str = "Bearer";
+pub const auth::TOKEN_ENV: &str = "RP2350_MCP_TOKEN";
+```
 
 ---
 
@@ -293,8 +388,11 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/mcp -ContentType 'appl
 
 ## Limitations / 限制
 
-- ⬜ 传输范围：无 TLS、无鉴权、无 SSE/流式、无 keep-alive、无分块编码；每连接一条
-  请求后关闭，超时 10 s，请求头 ≤ 8 KiB、报文体 ≤ 1 MiB。
+- ⬜ 传输范围：无 TLS、无 SSE/流式、无 keep-alive、无分块编码；每连接一条
+  请求后关闭，超时 10 s，请求头 ≤ 8 KiB、报文体 ≤ 1 MiB。鉴权仅支持单枚静态
+  Bearer Token（无用户/角色/限流）。
+- ⬜ 无 TLS：Token 与 JSON-RPC 明文传输，远程部署需反向代理终止 TLS。
+  单进程内 Token 比较为常量时间，但网络层没有任何机密性保证。
 - ⬜ 单线程串行：`serve` 在 accept 线程内同步处理连接，每次调用锁住
   `DeviceManager`，未做并发/背压控制。
 - ⬜ 不支持 JSON-RPC batch 数组（会回 `-32600`），也不支持 `Transfer-Encoding`（`501`）。
@@ -305,15 +403,17 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/mcp -ContentType 'appl
 - ⬜ 通知（`notifications/*`）返回 `202` 空体，未更新任何会话状态。
 - ⬜ `tools/call` 结果仅放入 `content[0].text`，未提供 `structuredContent`。
 
-EN: The transport is deliberately minimal: no TLS, auth, SSE, keep-alive or
+EN: The transport is deliberately minimal: no TLS, SSE, keep-alive or
 chunked bodies; one request per connection with a 10 s timeout, 8 KiB head and
-1 MiB body limits. Connections are handled serially on the accept thread, so
-requests share one manager mutex. JSON-RPC batch arrays and
-`Transfer-Encoding` are rejected. There is no hot reload, the CLI server starts
-with an empty registry, and the MCP surface remains a subset (no
-resources/prompts/sampling, no client capability negotiation). Notifications
-are acknowledged with `202` and an empty body; tool payloads are delivered as
-text content only.
+1 MiB body limits. Authentication is a single static bearer token — no users,
+roles or rate limits — and tokens cross the wire in cleartext, so remote
+deployments need a TLS-terminating reverse proxy. Connections are handled
+serially on the accept thread, so requests share one manager mutex. JSON-RPC
+batch arrays and `Transfer-Encoding` are rejected. There is no hot reload, the
+CLI server starts with an empty registry, and the MCP surface remains a subset
+(no resources/prompts/sampling, no client capability negotiation).
+Notifications are acknowledged with `202` and an empty body; tool payloads are
+delivered as text content only.
 
 ---
 
@@ -333,16 +433,23 @@ text content only.
 
 ## Tests / 测试
 
-`src/tests.rs` 覆盖方法层（14 条），`src/http_tests.rs` 覆盖传输（12 条）：
-请求头/报文解析、`413`/`431`/`400`/`505` 上限与错误路径、`initialize` 与
-`tools/call` 往返、`/` 别名、`/health`、坏 JSON（`400` + `-32700`）、
-未知路径 `404` / 方法 `405`、通知 `202`、缺 `Content-Length` `411`。传输测试使用
+`src/tests.rs` 覆盖方法层（14 条），`src/http_tests.rs` 覆盖传输（20 条），
+`src/auth.rs` 覆盖鉴权（7 条）：请求头/报文解析、`413`/`431`/`400`/`505` 上限与
+错误路径、`initialize` 与 `tools/call` 往返、`/` 别名、`/health`（含 `auth`
+字段）、坏 JSON（`400` + `-32700`）、未知路径 `404` / 方法 `405`、通知 `202`、
+缺 `Content-Length` `411`；鉴权覆盖未配置时的开放行为、缺失/错误/前缀/长度
+Token 的 `401`（含 `WWW-Authenticate: Bearer`）、scheme 与头名大小写变体、
+`/health` 开放、常量时间比较（相同/不同/长度不同）。传输测试使用
 `127.0.0.1:0` + 后台线程，`AtomicBool` 关停后 join，全部离线可跑。
-`src/tests.rs` covers the method layer (14 tests); `src/http_tests.rs` covers the
-transport (12 tests): head/body parsing, `413`/`431`/`400`/`505` limits, the
-`initialize` and `tools/call` round trips, the `/` alias, `/health`, malformed
-JSON (`400` + `-32700`), unknown path `404` / wrong method `405`, notifications
-(`202`) and a missing `Content-Length` (`411`). Transport tests bind
+`src/tests.rs` covers the method layer (14 tests), `src/http_tests.rs` the
+transport (20 tests) and `src/auth.rs` authentication (7 tests): head/body
+parsing, `413`/`431`/`400`/`505` limits, the `initialize` and `tools/call`
+round trips, the `/` alias, `/health` (including `auth`), malformed JSON
+(`400` + `-32700`), unknown path `404` / wrong method `405`, notifications
+(`202`) and a missing `Content-Length` (`411`). Auth tests cover the open
+default, `401` for missing/wrong/prefix/length tokens (with
+`WWW-Authenticate: Bearer`), scheme and header-name case variants, the open
+health endpoint, and constant-time comparison. Transport tests bind
 `127.0.0.1:0` on a background thread, stop it via an `AtomicBool` and join.
 
 ---

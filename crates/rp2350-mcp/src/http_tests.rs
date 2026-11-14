@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::HttpOptions;
 use crate::McpServer;
 use crate::http::{self, HttpRequest, MAX_BODY_BYTES, MAX_HEAD_BYTES};
 
@@ -24,13 +25,25 @@ fn spawn_server() -> (
     Arc<AtomicBool>,
     thread::JoinHandle<std::io::Result<()>>,
 ) {
+    spawn_server_with_token(None)
+}
+
+/// Spawn the transport with an optional bearer token / 以可选 Bearer Token 启动传输
+fn spawn_server_with_token(
+    token: Option<&str>,
+) -> (
+    SocketAddr,
+    Arc<AtomicBool>,
+    thread::JoinHandle<std::io::Result<()>>,
+) {
     let listener = listener();
     let addr = listener.local_addr().expect("listener address");
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&shutdown);
+    let options = HttpOptions::with_optional_token(token.map(str::to_string));
     let handle = thread::spawn(move || {
         let server = McpServer::new(addr.port());
-        http::serve(listener, &server, &flag)
+        http::serve_with_options(listener, &server, &flag, &options)
     });
     (addr, shutdown, handle)
 }
@@ -52,6 +65,8 @@ struct RawResponse {
     content_type: String,
     /// `Content-Length` header / `Content-Length` 头
     content_length: Option<usize>,
+    /// `WWW-Authenticate` header / `WWW-Authenticate` 头
+    www_authenticate: Option<String>,
     /// Message body / 报文体
     body: String,
 }
@@ -87,6 +102,7 @@ fn parse_response(raw: &str) -> RawResponse {
 
     let mut content_type = String::new();
     let mut content_length = None;
+    let mut www_authenticate = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -95,6 +111,8 @@ fn parse_response(raw: &str) -> RawResponse {
             content_type = value.trim().to_string();
         } else if name.eq_ignore_ascii_case("content-length") {
             content_length = Some(value.trim().parse::<usize>().expect("content length"));
+        } else if name.eq_ignore_ascii_case("www-authenticate") {
+            www_authenticate = Some(value.trim().to_string());
         }
     }
 
@@ -102,6 +120,7 @@ fn parse_response(raw: &str) -> RawResponse {
         status,
         content_type,
         content_length,
+        www_authenticate,
         body: body.to_string(),
     }
 }
@@ -115,9 +134,24 @@ fn post_mcp(body: &str) -> String {
     )
 }
 
+/// Build a `POST /mcp` request carrying an `Authorization` header
+/// 构造携带 `Authorization` 头的 `POST /mcp`
+fn post_mcp_with_auth(body: &str, authorization: &str) -> String {
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {authorization}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// JSON-RPC `initialize` request body used by the auth tests
+/// 鉴权测试使用的 JSON-RPC `initialize` 报文体
+const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
 #[test]
 fn parses_request_line_headers_and_body() {
     let raw = "POST /mcp?trace=1 HTTP/1.1\r\nHost: localhost\r\n\
+               Authorization: Bearer abc123\r\n\
                Content-Length: 13\r\n\r\n{\"jsonrpc\":2}";
     let mut reader = BufReader::new(Cursor::new(raw.as_bytes()));
     let request: HttpRequest = http::read_request(&mut reader).expect("valid request");
@@ -125,6 +159,7 @@ fn parses_request_line_headers_and_body() {
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/mcp");
     assert_eq!(request.content_length, Some(13));
+    assert_eq!(request.authorization.as_deref(), Some("Bearer abc123"));
     assert_eq!(request.body, br#"{"jsonrpc":2}"#);
 }
 
@@ -243,6 +278,122 @@ fn health_endpoint_returns_json() {
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["server"], "rp2350-mcp");
     assert_eq!(payload["endpoint"], "/mcp");
+    assert_eq!(payload["auth"], false, "auth is disabled without a token");
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn auth_disabled_by_default_accepts_unauthenticated_requests() {
+    let (addr, shutdown, handle) = spawn_server();
+
+    let post = request(addr, &post_mcp(INITIALIZE_BODY));
+    assert_eq!(post.status, 200);
+    assert_eq!(post.www_authenticate, None);
+
+    let health = request(addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(health.status, 200);
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn missing_authorization_returns_401_with_challenge() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    let response = request(addr, &post_mcp(INITIALIZE_BODY));
+    assert_eq!(response.status, 401);
+    assert_eq!(response.content_type, "application/json");
+    assert_eq!(response.www_authenticate.as_deref(), Some("Bearer"));
+    let payload: Value = serde_json::from_str(&response.body).expect("JSON 401 body");
+    assert_eq!(payload["error"], "unauthorized");
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn wrong_token_returns_401() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    let response = request(addr, &post_mcp_with_auth(INITIALIZE_BODY, "Bearer wrong"));
+    assert_eq!(response.status, 401);
+    assert_eq!(response.www_authenticate.as_deref(), Some("Bearer"));
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn token_prefix_and_extra_data_are_rejected() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    for header in ["Bearer secre", "Bearer secret extra", "Bearersecret"] {
+        let response = request(addr, &post_mcp_with_auth(INITIALIZE_BODY, header));
+        assert_eq!(response.status, 401, "header {header:?} must be rejected");
+    }
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn correct_token_returns_200() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    let response = request(addr, &post_mcp_with_auth(INITIALIZE_BODY, "Bearer secret"));
+    assert_eq!(response.status, 200);
+    assert_eq!(response.content_type, "application/json");
+    let payload: Value = serde_json::from_str(&response.body).expect("JSON response");
+    assert_eq!(payload["result"]["serverInfo"]["name"], "rp2350-mcp");
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn bearer_scheme_and_header_name_are_case_insensitive() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    for header in ["bearer secret", "BEARER secret", "BeArEr secret"] {
+        let response = request(addr, &post_mcp_with_auth(INITIALIZE_BODY, header));
+        assert_eq!(response.status, 200, "header {header:?} must be accepted");
+    }
+
+    // 头名本身同样大小写不敏感 / header names are case-insensitive too.
+    let raw = format!(
+        "POST /mcp HTTP/1.1\r\nhost: localhost\r\nauthorization: bEaReR secret\r\n\
+         Content-Length: {}\r\n\r\n{INITIALIZE_BODY}",
+        INITIALIZE_BODY.len()
+    );
+    assert_eq!(request(addr, &raw).status, 200);
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn health_stays_open_and_reports_auth_enabled() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    let response = request(addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.www_authenticate, None);
+    let payload: Value = serde_json::from_str(&response.body).expect("JSON body");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["auth"], true);
+
+    stop(&shutdown, handle);
+}
+
+#[test]
+fn auth_keeps_405_and_404_routes_intact() {
+    let (addr, shutdown, handle) = spawn_server_with_token(Some("secret"));
+
+    let options = request(addr, "OPTIONS /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(options.status, 405);
+    assert!(options.body.contains("POST"));
+
+    let wrong_method = request(addr, "GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(wrong_method.status, 405);
+
+    let unknown = request(addr, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(unknown.status, 404);
 
     stop(&shutdown, handle);
 }
