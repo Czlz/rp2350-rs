@@ -61,6 +61,11 @@ enum Commands {
         /// 遇到未定义指令时停机而不是跳过
         #[arg(long)]
         strict_decode: bool,
+
+        /// Dump memory when the run stops: ADDR:LEN:PATH (repeatable)
+        /// 停止时导出内存：ADDR:LEN:PATH（可重复）
+        #[arg(long = "dump", value_name = "ADDR:LEN:PATH", value_parser = run::MemoryDump::parse)]
+        dump: Vec<run::MemoryDump>,
     },
 
     /// Open the USB CDC raw REPL of a booted firmware
@@ -223,6 +228,7 @@ fn main() {
             max_cycles,
             trace_steps,
             strict_decode,
+            dump,
         } => {
             let options = run::RunOptions {
                 file: file.into(),
@@ -230,6 +236,7 @@ fn main() {
                 max_cycles,
                 trace_steps,
                 strict_decode,
+                dumps: dump,
             };
             finish(run::run(&options), "run failed / 运行失败");
         }

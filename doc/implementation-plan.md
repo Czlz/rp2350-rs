@@ -6,25 +6,29 @@
 > Stages 0–6 —— 真实 MicroPython `RPI_PICO2-*.uf2` → USB CDC → raw REPL → `perfbench`。
 > Stages 0–5 已落地（含 `rp2350-usb`/`rp2350-usb-host` 两个 crate 与 CLI `repl`/`perfbench`
 > 子命令，超出本计划原始 Phase 1 清单）；Stage 6 的官方 `run-perfbench.py` 结果见
-> [perfbench-report.md](perfbench-report.md)。
+> [perfbench-report.md](perfbench-report.md)。另一条端到端验收主线是
+> [gba-bringup-report.md](gba-bringup-report.md)：`emerald.uf2`（pokeemerald-rp2350）
+> 双核运行、HSTX 扫描输出真实游戏画面。
 > The acceptance mainline runs through reference-gap-analysis Stages 0–6; stages 0–5
 > have landed (including the `rp2350-usb` / `rp2350-usb-host` crates and the CLI
 > `repl` / `perfbench` subcommands, beyond the original Phase 1 list), and the Stage 6
 > official `run-perfbench.py` results are in [perfbench-report.md](perfbench-report.md).
+> A second end-to-end mainline is [gba-bringup-report.md](gba-bringup-report.md):
+> `emerald.uf2` (pokeemerald-rp2350) on two cores with HSTX scanout of real game frames.
 
 > **P1 功能进度 / P1 feature progress（2026-11-14）**
 >
 > | 领域 / Area | 状态 / Status | 已落地 / Landed | 待办 / Remaining |
 > |---|---|---|---|
-> | PIO | 🚧 | 3 blocks × 4 SMs 寄存器块、FIFO、指令存储；状态机执行（9 类指令、autopush/autopull、wrap、stall）；引脚映射、side-set、delay、CLKDIV、FIFO join、DBG_PADOUT/PADOE、共享句柄、IRQ 路由、主循环 tick | DMA 握手、PINCTRL FUNCSEL、跨块 IRQ 模式 1/3 |
+> | PIO | 🚧 | 3 blocks × 4 SMs 寄存器块、FIFO、指令存储；状态机执行（9 类指令、autopush/autopull、wrap、stall）；引脚映射、side-set、delay、CLKDIV、FIFO join、DBG_PADOUT/PADOE、共享句柄、IRQ 路由、主循环 tick、DMA DREQ 选择器 0..23 | PINCTRL FUNCSEL、跨块 IRQ 模式 1/3 |
 > | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`）、`Z2` 写监视点（SRAM 值变化检测）、`target.xml`（`qXfer:features:read`） | 读/访问监视点、多核 `vCont`、monitor 命令 |
 > | MCP | ✅ | JSON-RPC 方法层（`initialize`/`tools/list`/`tools/call`）、HTTP 传输、CLI `mcp-serve`、Bearer 鉴权（`--auth-token`/环境变量） | TLS、插件热加载 |
 > | 插件 / Plugins | ✅ | ABI、`DeviceManager::scan_and_load`/`reload`、CLI `list-devices`/`wire`/`--reload`/`--watch`、LED 与 UART Terminal 插件 | GUI 调色板/连线、接线持久化 |
-> | DMA | 🚧 | 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ、abort、IRQ（库级 `Dma::run`）、CLI `Machine` 每 64 步泵送 | BSWAP/sniff/优先级、定时器 DREQ 节拍、周期精确仲裁 |
-> | HSTX | 🚧 | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS/NOP 命令、宿主 drain/scanline、下溢 IRQ | DVI/TMDS 时序与编码、引脚/时钟、DMA/PIO 耦合 |
-> | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、单精度算术/比较/转换/VSEL/VRINT、FPCCR/LSPACT 惰性压栈与扩展帧、DSP 并行 SIMD/GE 标志、饱和/打包（QADD/QSUB/SSAT/USAT/SEL 等） | 双精度算术、FPSCR 陷阱模型、SH*/UH* 与 SMLALD* |
+> | DMA | 🚧 | 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ（含 PIO 0..23 与 `DREQ_HSTX=52`）、abort、IRQ、SET/CLR/XOR 别名、`TRANS_COUNT` 重载语义与 3 通道环形链（42,912 字三圈校验）、CLI `Machine` 每 64 步泵送 | BSWAP/sniff/优先级、定时器 DREQ 节拍、周期精确仲裁 |
+> | HSTX | 🚧 | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS/NOP 命令、像素时钟节拍（256 字行块 = 800 像素周期）、`DREQ_HSTX` FIFO 空间、宿主 drain/scanline、下溢 IRQ | DVI/TMDS 时序与编码、引脚/时钟、PIO 耦合 |
+> | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、单精度算术/比较/转换/VSEL/VRINT、FPCCR/LSPACT 惰性压栈与扩展帧、DSP 并行 SIMD/GE 标志、饱和/打包、折半/双乘/宽乘、`MSPLIM`/`PSPLIM` | 双精度算术、FPSCR 陷阱模型、`SMLALxy` |
 > | 官方 perfbench | ✅ | `repl --stdio` + 本地 pyboard shim；Arm 与 RISC-V 各 24/24 通过 CPython 真值（[报告](perfbench-report.md)） | 可选：`-a 8` 方差、更大 N/M、外设类基准 |
-> | 双核 / Dual-core | 🚧 | core1 WFE + SIO FIFO 桩；`DualCoreM33` 双核调度脚手架（释放门、交替步进、预算、独立 NVIC，10 测试） | PSM 释放接线、SIO 门铃、CLI 双核模式、GDB 多核 |
+> | 双核 / Dual-core | ✅ | 真实 core1 执行：SIO 按核视图与 `{0,0,1,vtor,sp,entry}` 启动握手、PSM `FRCE_OFF.PROC1` 复位/释放、按核 PPB 回放与 IRQ 路由、`Machine` 双核步进；emerald 的 `core1_render` 驱动 HSTX/PPU | GDB 多核 `vCont`、SIO 硬件自旋锁、`LDREX/STREX` 监视器 |
 >
 > 状态标记：✅ 完成（P1 范围） · 🚧 部分完成 · ⏳ 未开始。
 > Status markers: ✅ done for P1 scope · 🚧 partial · ⏳ not started.

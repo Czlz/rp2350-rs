@@ -9,7 +9,20 @@
 //! 仿真驱动所需的共享句柄：UART0 发送缓冲、TIMER0 使用的 [`Timebase`]、携带
 //! 中断线断言状态的 [`IrqAssert`]，以及需要用 `CpuCore::system_write` 回放
 //! 到核中的 PPB 系统写入日志。
+//!
+//! It also owns the resident core-1 boot-ROM peer: [`BootPeripherals::service_core1_peer`]
+//! acknowledges a `PSM` release with a `0` frame, echoes the SDK's
+//! `{0, 0, 1, vtor, sp, entry}` launch stream and then retires, exposing the
+//! vectors through [`BootPeripherals::take_core1_launch`] so a driver can boot a
+//! real core 1. [`BootPeripherals::core1_irq_mask`] is that core's view of the
+//! shared interrupt lines.
+//! 它还持有常驻的 core1 boot ROM 对端：[`BootPeripherals::service_core1_peer`]
+//! 用一帧 `0` 确认 `PSM` 释放，回显 SDK 的 `{0, 0, 1, vtor, sp, entry}` 启动流，
+//! 随后退役并通过 [`BootPeripherals::take_core1_launch`] 暴露启动向量，使驱动器
+//! 能启动真实的 core1。[`BootPeripherals::core1_irq_mask`] 是该核心视角下的共享
+//! 中断线。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,10 +32,12 @@ use rp2350_core::mmio::{MMIO_BLOCK_SIZE, MmioRouter, MmioWindow, mount_device};
 
 use super::adc::Adc;
 use super::bootram::BootRam;
+use super::busctrl::BusCtrl;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
 use super::dma::Dma;
 use super::dreq;
+use super::gpio_pads::GpioPads;
 use super::hstx::Hstx;
 use super::io_bank0::IoBank0;
 use super::io_qspi::IoQspi;
@@ -91,6 +106,47 @@ impl Timebase {
     }
 }
 
+/// Words in the SDK's `multicore_launch_core1_raw` FIFO command stream
+/// SDK `multicore_launch_core1_raw` 的 FIFO 命令流字数
+///
+/// The stream is `{0, 0, 1, vtor, sp, entry}`: two discard words, a protocol
+/// version, then the vector table, stack pointer and entry point.
+/// 命令流为 `{0, 0, 1, vtor, sp, entry}`：两个丢弃字、一个协议版本，随后是向量
+/// 表、栈指针与入口点。
+pub const CORE1_LAUNCH_WORDS: usize = 6;
+
+/// Boot vectors handed to a launcher after the FIFO launch handshake
+/// FIFO 启动握手完成后交给启动器的启动向量
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Core1Launch {
+    /// Vector table base (`VTOR`) / 向量表基址（`VTOR`）
+    pub vtor: u32,
+    /// Initial stack pointer / 初始栈指针
+    pub sp: u32,
+    /// Entry point with the Thumb bit as sent by the SDK / SDK 发送的带 Thumb 位入口
+    pub entry: u32,
+}
+
+/// Resident core-1 boot-ROM peer state / 常驻 core1 boot ROM 对端状态
+///
+/// Until the final `entry` word arrives the peer echoes every launch command,
+/// exactly like the mask ROM's core-1 launch handler. Once launched it stops
+/// touching the FIFO so real core 1 ↔ core 0 messages pass through.
+/// 在最后一个 `entry` 字到达之前，对端会逐字回显启动命令，与掩膜 ROM 的 core1
+/// 启动处理程序一致。启动完成后它不再触碰 FIFO，使真实的 core1 ↔ core0 消息
+/// 直接通过。
+#[derive(Debug, Default)]
+struct Core1Boot {
+    /// Rolling window of the most recent launch words / 最近的启动字滚动窗口
+    window: VecDeque<u32>,
+    /// Launch vectors waiting for the driver / 等待驱动器的启动向量
+    launch: Option<Core1Launch>,
+    /// Whether the echo stub has been retired / 回显桩是否已退役
+    launched: bool,
+    /// Number of completed launches / 已完成的启动次数
+    launches: u64,
+}
+
 /// Handles for the peripherals mounted by [`BootPeripherals::mount`]
 /// [`BootPeripherals::mount`] 挂载的外设句柄
 pub struct BootPeripherals {
@@ -98,12 +154,16 @@ pub struct BootPeripherals {
     cycles: CycleSink,
     timer: Timer0,
     sio: Sio,
+    pads: GpioPads,
     dma: Dma,
     hstx: Hstx,
     pio: [SharedPio; PIO_BLOCKS],
     irq: IrqAssert,
     system_writes: SystemWriteLog,
     core1_release: Arc<AtomicBool>,
+    core1_reset: Arc<AtomicBool>,
+    core1_boot: Arc<Mutex<Core1Boot>>,
+    core1_launch_pending: Arc<AtomicBool>,
 }
 
 impl BootPeripherals {
@@ -128,20 +188,29 @@ impl BootPeripherals {
         let irq = IrqAssert::new();
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
-        let sio = Sio::new(irq.clone());
+        // SIO 的 FIFO / 门铃中断按核投递：core0 用共享 `irq`，core1 用独立掩码。
+        // SIO's FIFO/doorbell lines are per core: core 0 uses the shared `irq`
+        // set and core 1 gets its own mask.
+        let core1_irq = IrqAssert::new();
+        let pads = GpioPads::new();
+        let sio = Sio::with_peer_irq_and_pads(irq.clone(), core1_irq, pads.clone());
         let dma = Dma::new(irq.clone());
         let hstx = Hstx::new(irq.clone());
         let core1_release = Arc::new(AtomicBool::new(false));
+        let core1_reset = Arc::new(AtomicBool::new(false));
+        let core1_boot = Arc::new(Mutex::new(Core1Boot::default()));
+        let core1_launch_pending = Arc::new(AtomicBool::new(false));
 
         let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
         apb.mount(Box::new(Clocks::new()))?;
         apb.mount(Box::new(Resets::new()))?;
-        apb.mount(Box::new(Psm::with_core1_release(Arc::clone(
-            &core1_release,
-        ))))?;
+        apb.mount(Box::new(Psm::with_core1_flags(
+            Arc::clone(&core1_release),
+            Arc::clone(&core1_reset),
+        )))?;
         apb.mount(Box::new(IoBank0::new()))?;
         apb.mount(Box::new(IoQspi::new()))?;
-        apb.mount(Box::new(PadsBank0::new()))?;
+        apb.mount(Box::new(PadsBank0::with_pads(pads.clone())))?;
         apb.mount(Box::new(PadsQspi::new()))?;
         apb.mount(Box::new(Xosc::new()))?;
         apb.mount(Box::new(Pll::sys()))?;
@@ -157,6 +226,7 @@ impl BootPeripherals {
         apb.mount(Box::new(Watchdog::new()))?;
         apb.mount(Box::new(XipQmi::new()))?;
         apb.mount(Box::new(BootRam::new()))?;
+        apb.mount(Box::new(BusCtrl::new()))?;
         apb.mount(Box::new(Rosc::new()))?;
         apb.mount(Box::new(Trng::new()))?;
         apb.mount(Box::new(Sha256::new()))?;
@@ -207,38 +277,147 @@ impl BootPeripherals {
             cycles,
             timer,
             sio,
+            pads,
             dma,
             hstx,
             pio,
             irq,
             system_writes,
             core1_release,
+            core1_reset,
+            core1_boot,
+            core1_launch_pending,
         })
     }
 
-    /// Emulate the resident core-1 peer once per driver pump
-    /// 每次驱动器泵送时模拟常驻 core1 对端
+    /// Emulate the resident core-1 boot ROM once per driver pump
+    /// 每次驱动器泵送时模拟常驻 core1 boot ROM
     ///
-    /// When `PSM_FRCE_OFF.PROC1` is released, the core-1 boot ROM drains its
-    /// mailbox and pushes `0` to core 0. For ordinary FIFO writes the resident
-    /// peer echoes the frame back, which is what the SDK launch and lockout
-    /// handshakes expect. Core-1 code execution itself is not modelled.
-    /// 当 `PSM_FRCE_OFF.PROC1` 释放时，core1 boot ROM 清空信箱并向 core0 压入
-    /// `0`。普通 FIFO 写入由常驻对端回显，这符合 SDK 启动与锁定握手的预期。
-    /// core1 的指令执行本身未建模。
+    /// Two behaviours are modelled. When `PSM_FRCE_OFF.PROC1` is released the
+    /// core-1 boot ROM drains its mailbox and pushes `0` to core 0. While no
+    /// launch has completed it consumes the `{0, 0, 1, vtor, sp, entry}` command
+    /// stream one word at a time and echoes every word back, which is what
+    /// `multicore_launch_core1_raw` and the lockout handshake expect. After the
+    /// final `entry` word the echo stub retires: subsequent FIFO traffic belongs
+    /// to the real core 1 and must not be stolen.
+    /// 建模两种行为。`PSM_FRCE_OFF.PROC1` 释放时，core1 boot ROM 清空信箱并向
+    /// core0 压入 `0`。在完成一次启动之前，它逐字消费
+    /// `{0, 0, 1, vtor, sp, entry}` 命令流并回显每个字，这正是
+    /// `multicore_launch_core1_raw` 与锁定握手所期望的。收到最后一个 `entry`
+    /// 字后回显桩退役：之后的 FIFO 流量属于真实的 core1，不得被窃取。
     pub fn service_core1_peer(&self) {
         if self.core1_release.swap(false, Ordering::AcqRel) {
             let _ = self.sio.take_from_core();
             self.sio.post_to_core(0);
         }
-        for frame in self.sio.take_from_core() {
+        let mut boot = self.core1_boot.lock();
+        if boot.launched {
+            return;
+        }
+        while let Some(frame) = self.sio.pop_from_core() {
             // 排查核间启动/锁定握手时打印收到的字。
             // Log received words when debugging inter-core launch/lockout.
             if std::env::var_os("RP2350_TRACE_CORE1").is_some() {
                 eprintln!("[core1] echo {frame:#010X}");
             }
             self.sio.post_to_core(frame);
+            boot.window.push_back(frame);
+            while boot.window.len() > CORE1_LAUNCH_WORDS {
+                boot.window.pop_front();
+            }
+            if boot.window.len() < CORE1_LAUNCH_WORDS {
+                continue;
+            }
+            let words: Vec<u32> = boot.window.iter().copied().collect();
+            // `{0, 0, 1, ...}` 出现在任意位置都视为一次新的启动请求，与 SDK
+            // 写 0、0、1 后依次等待回显的顺序一致。
+            // A `{0, 0, 1, ...}` window anywhere in the stream starts a new
+            // launch request, matching the SDK's 0, 0, 1 write order.
+            if words[0] != 0 || words[1] != 0 || words[2] != 1 {
+                continue;
+            }
+            boot.launch = Some(Core1Launch {
+                vtor: words[3],
+                sp: words[4],
+                entry: words[5],
+            });
+            boot.launched = true;
+            boot.launches = boot.launches.saturating_add(1);
+            boot.window.clear();
+            self.core1_launch_pending.store(true, Ordering::Release);
+            break;
         }
+    }
+
+    /// Whether a launch is waiting for [`Self::take_core1_launch`]
+    /// 是否有启动信息等待 [`Self::take_core1_launch`] 取走
+    ///
+    /// A cheap relaxed load intended for the per-step fast path.
+    /// 供每步快速路径使用的廉价 relaxed 读取。
+    #[must_use]
+    pub fn core1_launch_pending(&self) -> bool {
+        self.core1_launch_pending.load(Ordering::Relaxed)
+    }
+
+    /// Take the pending core-1 launch vectors / 取走挂起的 core1 启动向量
+    ///
+    /// Returns `None` when no launch has completed or the previous one was
+    /// already consumed. The echo stub stays retired either way.
+    /// 没有完成启动或上一次已被取走时返回 `None`；无论哪种情况回显桩都保持退役。
+    #[must_use]
+    pub fn take_core1_launch(&self) -> Option<Core1Launch> {
+        let mut boot = self.core1_boot.lock();
+        let launch = boot.launch.take();
+        if launch.is_some() {
+            self.core1_launch_pending.store(false, Ordering::Release);
+        }
+        launch
+    }
+
+    /// Number of completed core-1 launches / 已完成的 core1 启动次数
+    #[must_use]
+    pub fn core1_launch_count(&self) -> u64 {
+        self.core1_boot.lock().launches
+    }
+
+    /// Whether the resident boot-ROM echo stub has retired
+    /// 常驻 boot ROM 回显桩是否已退役
+    #[must_use]
+    pub fn core1_launched(&self) -> bool {
+        self.core1_boot.lock().launched
+    }
+
+    /// Consume a latched `PSM_FRCE_OFF.PROC1` hard reset
+    /// 消费锁存的 `PSM_FRCE_OFF.PROC1` 硬复位
+    ///
+    /// The driver discards the core-1 context and calls
+    /// [`Self::reset_core1_boot`] so a later launch replays the echo stub.
+    /// 驱动器据此丢弃 core1 上下文，并调用 [`Self::reset_core1_boot`]，使后续
+    /// 启动重新启用回显桩。
+    #[must_use]
+    pub fn take_core1_reset(&self) -> bool {
+        self.core1_reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a `PSM` hard reset is waiting for [`Self::take_core1_reset`]
+    /// 是否有 `PSM` 硬复位等待 [`Self::take_core1_reset`] 消费
+    ///
+    /// A cheap relaxed load used as the per-step guard so the hot path does not
+    /// perform a read-modify-write atomic on every instruction.
+    /// 作为每步守卫的廉价 relaxed 读取，使热路径不必每条指令都做读写原子操作。
+    #[must_use]
+    pub fn core1_reset_pending(&self) -> bool {
+        self.core1_reset.load(Ordering::Relaxed)
+    }
+
+    /// Forget the launch state and re-arm the boot-ROM echo stub
+    /// 清除启动状态并重新启用 boot ROM 回显桩
+    pub fn reset_core1_boot(&self) {
+        let mut boot = self.core1_boot.lock();
+        boot.window.clear();
+        boot.launch = None;
+        boot.launched = false;
+        self.core1_launch_pending.store(false, Ordering::Release);
     }
 
     /// Advance the shared timebase and refresh TIMER0 interrupt lines
@@ -253,7 +432,9 @@ impl BootPeripherals {
     /// 自己的总线句柄与周期预算决定何时调用 [`Dma::run`]。
     pub fn advance(&self, cycles: u64) {
         self.cycles.push(cycles);
-        self.hstx.advance(cycles);
+        // HSTX is pumped by the host at the DMA batch cadence (see
+        // `Machine::pump_dma_batch`), so it is not advanced here.
+        // HSTX 由宿主按 DMA 批次节拍推进（见 `Machine::pump_dma_batch`），此处不推进。
         self.timer.refresh();
     }
 
@@ -263,6 +444,19 @@ impl BootPeripherals {
     pub fn irq_mask(&self) -> u64 {
         self.timer.refresh();
         self.irq.mask()
+    }
+
+    /// Asserted lines as seen by core 1 / core1 看到的断言线
+    ///
+    /// Every shared line is broadcast, but `SIO_IRQ_FIFO` and `SIO_IRQ_BELL`
+    /// are per-core endpoints: core 0's levels are replaced by core 1's.
+    /// 共享中断线全部广播，但 `SIO_IRQ_FIFO` 与 `SIO_IRQ_BELL` 是按核端点：
+    /// core0 的电平被 core1 的电平替换。
+    #[must_use]
+    pub fn core1_irq_mask(&self) -> u64 {
+        self.timer.refresh();
+        let sio_bits = (1u64 << map::SIO_IRQ_FIFO) | (1u64 << map::SIO_IRQ_BELL);
+        (self.irq.mask() & !sio_bits) | self.sio.core1_irq_mask()
     }
 
     /// Drain PPB system-space writes for replay into the core
@@ -277,6 +471,13 @@ impl BootPeripherals {
     #[must_use]
     pub fn sio(&self) -> &Sio {
         &self.sio
+    }
+
+    /// Shared pad electrical state (pulls and external levels)
+    /// 共享的 pad 电气状态（上下拉与外部电平）
+    #[must_use]
+    pub fn pads(&self) -> &GpioPads {
+        &self.pads
     }
 
     /// Shared DMA controller handle / 共享的 DMA 控制器句柄
@@ -392,27 +593,51 @@ impl BootPeripherals {
     /// Run one DMA pump, refreshing PIO DREQ levels before every unit batch
     /// 执行一次 DMA 泵送，在每个单元批次前刷新 PIO DREQ 电平
     ///
-    /// The PIO levels are republished first, because the FIFO state may have
-    /// changed since the previous pump. Channels paced by a PIO selector
-    /// (`TREQ_SEL` `0..=23`) advance one unit at a time so a FIFO that fills or
-    /// drains inside the batch is noticed; every other channel can consume the
-    /// whole budget in one [`Dma::run`] call. Returns the units attempted.
-    /// 先重新发布 PIO 电平，因为上次泵送后 FIFO 状态可能已改变。由 PIO 选择器
-    /// （`TREQ_SEL` `0..=23`）节拍的通道逐单元推进，从而能发现批次内 FIFO 被填满
-    /// 或排空；其它通道可在一次 [`Dma::run`] 调用中用完整个预算。返回尝试的单元数。
+    /// The PIO and HSTX levels are republished first, because the FIFO state may
+    /// have changed since the previous pump. Two pacing rules keep a batch from
+    /// overrunning a FIFO:
+    ///
+    /// - Channels paced by a PIO selector (`TREQ_SEL` `0..=23`) that are busy
+    ///   advance one unit at a time, since a PIO FIFO can fill inside the batch.
+    /// - When an enabled channel selects `DREQ_HSTX`, the batch budget is capped
+    ///   at the HSTX FIFO's free space, so at most that many words can enter it
+    ///   regardless of how the round-robin cursor interleaves other channels.
+    ///   This keeps the single-call fast path (no per-unit mutex churn) while
+    ///   making an overrun impossible — the same cap would be too coarse for PIO
+    ///   because several 4-deep FIFOs can be targeted by one batch.
+    ///
+    /// Returns the units attempted.
+    /// 先重新发布 PIO 与 HSTX 电平，因为上次泵送后 FIFO 状态可能已改变。两条节拍
+    /// 规则防止批次冲垮 FIFO：
+    ///
+    /// - 忙碌且由 PIO 选择器（`TREQ_SEL` `0..=23`）节拍的通道逐单元推进，因为
+    ///   PIO FIFO 可能在批次内被填满。
+    /// - 当有已使能通道选择 `DREQ_HSTX` 时，批次预算被限制为 HSTX FIFO 的空闲
+    ///   空间，因此无论轮转游标如何穿插其它通道，最多只有这么多字能进入 FIFO。
+    ///   这样既保留单次调用的快路径（不逐单元加锁），又让溢出不可能发生；同样的
+    ///   上限对 PIO 太粗糙，因为一批可能写入多个 4 深度 FIFO。
+    ///
+    /// 返回尝试的单元数。
     pub fn pump_dma(&mut self, bus: &mut dyn AddressBus, max_units: u64) -> u64 {
         let mut total = 0u64;
         while total < max_units {
             self.sync_pio_dreqs();
             self.sync_hstx_dreq();
-            // PIO/HSTX-paced channels need per-unit resynchronisation; other
-            // selectors run the whole remaining budget in one call.
-            // PIO/HSTX 节拍的通道需要逐单元重新同步；其余选择器整批执行。
-            let per_unit = self
+            let pio_paced = self
                 .dma
-                .busy_selects_dreq(dreq::PIO_DREQ_FIRST, dreq::PIO_DREQ_LAST)
-                || self.dma.busy_selects_dreq(dreq::HSTX_DREQ, dreq::HSTX_DREQ);
-            let budget = if per_unit { 1 } else { max_units - total };
+                .busy_selects_dreq(dreq::PIO_DREQ_FIRST, dreq::PIO_DREQ_LAST);
+            let hstx_paced = self
+                .dma
+                .enabled_selects_dreq(dreq::HSTX_DREQ, dreq::HSTX_DREQ);
+            let mut budget = if pio_paced { 1 } else { max_units - total };
+            if hstx_paced {
+                budget = budget.min(u64::from(self.hstx.fifo_room()));
+            }
+            if budget == 0 {
+                // The HSTX FIFO is full: nothing can move until the expander
+                // drains a word. / HSTX FIFO 已满：扩展器腾出空间前无法推进。
+                break;
+            }
             let moved = self.dma.run(bus, budget);
             if moved == 0 {
                 break;
@@ -494,6 +719,112 @@ mod tests {
             bus.read_u32(0xD000_0058, &mut cycles).expect("fifo rd"),
             0x1234_5678
         );
+    }
+
+    /// Push one launch command and verify its echo / 写入一条启动命令并校验回显
+    fn push_command(bus: &mut SimpleBus, peripherals: &BootPeripherals, value: u32) {
+        let mut cycles = 0u64;
+        bus.write_u32(0xD000_0054, value, &mut cycles).expect("wr");
+        peripherals.service_core1_peer();
+        assert_eq!(
+            bus.read_u32(0xD000_0058, &mut cycles).expect("rd"),
+            value,
+            "the boot-ROM peer must echo every launch word"
+        );
+    }
+
+    #[test]
+    fn the_launch_stream_hands_over_the_vectors_and_retires_the_stub() {
+        // `multicore_launch_core1_raw` 写 {0,0,1,vtor,sp,entry}、逐字等待回显，
+        // 之后 FIFO 属于真实 core1，回显桩必须停止。
+        // `multicore_launch_core1_raw` writes {0,0,1,vtor,sp,entry} and waits for
+        // every echo; afterwards the FIFO belongs to the real core 1 and the echo
+        // stub must stop.
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        assert!(!peripherals.core1_launch_pending());
+
+        for word in [0, 0, 1, 0x2000_0000, 0x2008_1000, 0x1000_0C35] {
+            push_command(&mut bus, &peripherals, word);
+        }
+
+        let launch = peripherals.take_core1_launch().expect("launch");
+        assert_eq!(launch.vtor, 0x2000_0000);
+        assert_eq!(launch.sp, 0x2008_1000);
+        assert_eq!(launch.entry, 0x1000_0C35);
+        assert_eq!(peripherals.core1_launch_count(), 1);
+        assert!(peripherals.core1_launched());
+        assert!(!peripherals.core1_launch_pending());
+        assert!(peripherals.take_core1_launch().is_none());
+
+        // 启动后的消息留在 core1 收件箱中，桩不再回显。
+        // Post-launch frames stay in core 1's inbox and are not echoed.
+        let mut cycles = 0u64;
+        bus.write_u32(0xD000_0054, 0xBEEF, &mut cycles).expect("wr");
+        peripherals.service_core1_peer();
+        assert_eq!(
+            bus.read_u32(0xD000_0050, &mut cycles).expect("fifo_st") & 1,
+            0,
+            "the retired stub does not echo / 退役桩不回显"
+        );
+        peripherals
+            .sio()
+            .select_core(rp2350_core::types::CpuId::Core1);
+        assert_eq!(
+            bus.read_u32(0xD000_0058, &mut cycles).expect("fifo rd"),
+            0xBEEF
+        );
+        peripherals
+            .sio()
+            .select_core(rp2350_core::types::CpuId::Core0);
+    }
+
+    #[test]
+    fn a_psm_hard_reset_rearms_the_echo_stub() {
+        // `multicore_reset_core1` 置位后立即清除 PROC1：reset 请求被锁存并可被
+        // 驱动器消费，清除后的 0 确认仍由回显桩提供。
+        // `multicore_reset_core1` sets then clears PROC1: the reset request is
+        // latched for the driver, and the post-reset `0` ack still comes from
+        // the boot-ROM peer.
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        bus.write_u32(0x4001_A004, 0x0100_0000, &mut cycles)
+            .expect("set");
+        assert!(peripherals.take_core1_reset());
+        assert!(!peripherals.take_core1_reset(), "one-shot latch");
+        peripherals.reset_core1_boot();
+        bus.write_u32(0x4001_B004, 0x0100_0000, &mut cycles)
+            .expect("clr");
+        peripherals.service_core1_peer();
+        assert_eq!(
+            bus.read_u32(0xD000_0058, &mut cycles).expect("ack"),
+            0,
+            "boot ROM ack / boot ROM 确认"
+        );
+        assert!(!peripherals.core1_launched());
+    }
+
+    #[test]
+    fn core1_irq_mask_swaps_only_the_sio_endpoints() {
+        // SIO 的两条线按核独立：core0 的收件箱水位不得投递给 core1。
+        // The two SIO lines are per core: core 0's inbox level must not be
+        // delivered to core 1.
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let fifo = 1u64 << crate::map::SIO_IRQ_FIFO;
+        let bell = 1u64 << crate::map::SIO_IRQ_BELL;
+
+        peripherals.sio().post_to_core(0x1234);
+        assert_eq!(peripherals.irq_mask() & fifo, fifo, "core0 endpoint");
+        assert_eq!(peripherals.core1_irq_mask() & (fifo | bell), 0);
+
+        let mut cycles = 0u64;
+        // core0 写一帧 → 只有 core1 的收件箱被填充。
+        // Core 0 writes a frame → only core 1's inbox is filled.
+        bus.write_u32(0xD000_0054, 7, &mut cycles).expect("wr");
+        assert_eq!(peripherals.core1_irq_mask() & fifo, fifo);
+        assert_eq!(peripherals.irq_mask() & fifo, fifo, "echo is not consumed");
     }
 
     #[test]

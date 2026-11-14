@@ -6,10 +6,19 @@
 //! the requested state. This model keeps the force bits as ordinary storage and
 //! derives `DONE` from them, so polling loops make progress instead of spinning
 //! on an unimplemented address.
+//!
+//! `FRCE_OFF.PROC1` additionally drives two latched handshake flags: setting the
+//! bit asks the driver to hard-reset core 1 (dropping any pending launch), and
+//! clearing it asks for the post-reset `0` mailbox acknowledgement the core-1
+//! boot ROM sends. Both are one-shot flags consumed by the simulation driver.
 //! RP2350 PSM 控制哪些外设与处理器核心被强制开启或关闭。固件在软复位期间用
 //! `FRCE_ON` / `FRCE_OFF` 关闭 core1，然后轮询该寄存器直到目标块报告所需状态。
 //! 本模型把强制位实现为普通存储，并由它们推导 `DONE`，使轮询循环能够推进，
 //! 而不是在未实现地址上空转。
+//!
+//! `FRCE_OFF.PROC1` 另外驱动两个锁存式握手标志：置位时请求驱动器硬复位 core1
+//! （丢弃挂起的启动信息），清除时请求 core1 boot ROM 复位后的 `0` 信箱确认。
+//! 两者都是一次性标志，由仿真驱动器消费。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,13 +63,17 @@ enum Block {
 pub struct Psm {
     regs: RegisterFile,
     core1_release: Arc<AtomicBool>,
+    core1_reset: Arc<AtomicBool>,
 }
 
 impl Psm {
     /// Create the block with reset values / 用复位值创建寄存器块
     #[must_use]
     pub fn new() -> Self {
-        Self::with_core1_release(Arc::new(AtomicBool::new(false)))
+        Self::with_core1_flags(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     /// Create the block with a shared core-1 release flag
@@ -72,9 +85,25 @@ impl Psm {
     /// core0 回送 `0`）。
     #[must_use]
     pub fn with_core1_release(flag: Arc<AtomicBool>) -> Self {
+        Self::with_core1_flags(flag, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Create the block with shared core-1 release and reset flags
+    /// 创建寄存器块并共享 core1 释放与复位标志
+    ///
+    /// `release` is latched when `FRCE_OFF.PROC1` is cleared (core 1 leaves hard
+    /// reset) and `reset` when it is set (core 1 is hard-reset and loses any
+    /// pending launch state). The driver consumes `release` to emulate the boot
+    /// ROM's `0` acknowledgement and `reset` to discard the core-1 context.
+    /// 清除 `FRCE_OFF.PROC1` 时锁存 `release`（core1 退出硬复位），置位时锁存
+    /// `reset`（core1 被硬复位并丢弃挂起的启动信息）。驱动器消费 `release` 以
+    /// 模拟 boot ROM 的 `0` 确认，消费 `reset` 以丢弃 core1 上下文。
+    #[must_use]
+    pub fn with_core1_flags(release: Arc<AtomicBool>, reset: Arc<AtomicBool>) -> Self {
         Self {
             regs: RegisterFile::new(map::DEVICE_WINDOW_SIZE),
-            core1_release: flag,
+            core1_release: release,
+            core1_reset: reset,
         }
     }
 
@@ -143,12 +172,22 @@ impl MmioDevice for Psm {
             Some(Block::ForceOn | Block::ForceOff | Block::Watchdog) => {
                 let was_off = self.force_off();
                 let accepted = self.regs.write(offset, value & DOMAIN_MASK);
-                if offset == FRCE_OFF && was_off & PROC1 != 0 && self.force_off() & PROC1 == 0 {
-                    // Clearing `FRCE_OFF.PROC1` releases core 1 from reset. Its
-                    // boot ROM then drains the mailbox and sends `0` to core 0.
-                    // 清除 `FRCE_OFF.PROC1` 会让 core1 退出复位，其 boot ROM
-                    // 随后清空信箱并向 core0 发送 `0`。
-                    self.core1_release.store(true, Ordering::Release);
+                if offset == FRCE_OFF {
+                    let now_off = self.force_off();
+                    if was_off & PROC1 == 0 && now_off & PROC1 != 0 {
+                        // Setting `FRCE_OFF.PROC1` hard-resets core 1: its
+                        // context and any pending launch are dropped.
+                        // 置位 `FRCE_OFF.PROC1` 会硬复位 core1：上下文与挂起的
+                        // 启动信息全部丢弃。
+                        self.core1_reset.store(true, Ordering::Release);
+                    }
+                    if was_off & PROC1 != 0 && now_off & PROC1 == 0 {
+                        // Clearing `FRCE_OFF.PROC1` releases core 1 from reset. Its
+                        // boot ROM then drains the mailbox and sends `0` to core 0.
+                        // 清除 `FRCE_OFF.PROC1` 会让 core1 退出复位，其 boot ROM
+                        // 随后清空信箱并向 core0 发送 `0`。
+                        self.core1_release.store(true, Ordering::Release);
+                    }
                 }
                 accepted
             }
@@ -207,6 +246,30 @@ mod tests {
             flag.load(Ordering::Acquire),
             "flag stays latched until taken"
         );
+    }
+
+    #[test]
+    fn forcing_proc1_off_latches_a_core1_reset() {
+        // 置位 `FRCE_OFF.PROC1` 必须锁存硬复位请求，清除时不得重复锁存。
+        // Setting `FRCE_OFF.PROC1` must latch a hard-reset request, and clearing
+        // it must not latch another one.
+        let release = Arc::new(AtomicBool::new(false));
+        let reset = Arc::new(AtomicBool::new(false));
+        let mut psm = Psm::with_core1_flags(Arc::clone(&release), Arc::clone(&reset));
+
+        psm.write32(FRCE_OFF, PROC1);
+        assert!(reset.swap(false, Ordering::Acquire), "reset latched");
+        assert!(!release.load(Ordering::Acquire));
+
+        psm.write32(FRCE_OFF, PROC1);
+        assert!(
+            !reset.load(Ordering::Acquire),
+            "no second latch while the bit stays set / 位保持置位时不重复锁存"
+        );
+
+        psm.write32(FRCE_OFF, 0);
+        assert!(release.load(Ordering::Acquire), "release latched");
+        assert!(!reset.load(Ordering::Acquire));
     }
 
     #[test]

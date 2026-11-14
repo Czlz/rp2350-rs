@@ -5,9 +5,9 @@ use rp2350_core::memory::SimpleBus;
 
 use crate::boot::BootPeripherals;
 use crate::hstx::{
-    CMD_NOP, CMD_OPCODE_SHIFT, CMD_RAW, CMD_RAW_REPEAT, CMD_WAIT, CSR_EN, CSR_EXPAND_EN,
-    FIFO_DEPTH, FIFO_STAT_EMPTY, FIFO_STAT_FULL, FIFO_STAT_LEVEL_MASK, FIFO_STAT_WOF, Hstx,
-    IRQ_UNDERRUN, IRQ_UNKNOWN_COMMAND,
+    CMD_NOP, CMD_OPCODE_SHIFT, CMD_RAW, CMD_RAW_REPEAT, CMD_TMDS, CMD_TMDS_REPEAT, CMD_WAIT,
+    CSR_EN, CSR_EXPAND_EN, FIFO_DEPTH, FIFO_STAT_EMPTY, FIFO_STAT_FULL, FIFO_STAT_LEVEL_MASK,
+    FIFO_STAT_WOF, Hstx, IRQ_UNDERRUN, IRQ_UNKNOWN_COMMAND,
 };
 use crate::irq::IrqAssert;
 use crate::map;
@@ -114,7 +114,9 @@ fn raw_command_emits_the_requested_number_of_words() {
     for word in [0x11, 0x22, 0x33] {
         assert!(hstx.push_data(word));
     }
-    hstx.advance(4);
+    // Each RAW word occupies one pixel period (2 clk_sys at CLKDIV=1).
+    // CLKDIV=1 时每个 RAW 字占一个像素周期（2 个 clk_sys）。
+    hstx.advance(8);
     assert_eq!(hstx.drain_output(), [0x11, 0x22, 0x33]);
     assert_eq!(hstx.fifo_level(), 0);
     assert_eq!(hstx.output_level(), 0);
@@ -155,7 +157,9 @@ fn fifo_underrun_counts_and_asserts_the_shared_irq() {
     assert!(hstx.push_command(CMD_RAW | 4));
     assert!(hstx.push_data(1));
     assert!(hstx.push_data(2));
-    hstx.advance(3);
+    // Word 1 fills t=0..2, word 2 fills t=2..4; the starve is visible once the
+    // budget reaches t=4. / 第 1 字占 0..2、第 2 字占 2..4，预算到 4 才可见断流。
+    hstx.advance(4);
 
     assert_eq!(hstx.output_underrun(), 1);
     assert_eq!(hstx.output_level(), 2);
@@ -168,7 +172,7 @@ fn fifo_underrun_counts_and_asserts_the_shared_irq() {
 
     assert!(hstx.push_data(3));
     assert!(hstx.push_data(4));
-    hstx.advance(2);
+    hstx.advance(4);
     assert_eq!(hstx.drain_output(), [1, 2, 3, 4]);
     assert_eq!(hstx.output_underrun(), 1);
 }
@@ -253,7 +257,7 @@ fn reset_clears_fifos_irq_and_counters() {
     write_ctrl(&hstx, 0x34, IRQ_UNDERRUN);
     assert!(hstx.push_command(CMD_RAW | 4));
     assert!(hstx.push_data(1));
-    hstx.advance(2);
+    hstx.advance(3);
     assert_eq!(hstx.output_underrun(), 1);
     assert_ne!(irq.mask() & (1 << map::HSTX_IRQ), 0);
 
@@ -263,6 +267,139 @@ fn reset_clears_fifos_irq_and_counters() {
     assert_eq!(hstx.output_level(), 0);
     assert_eq!(hstx.output_underrun(), 0);
     assert_eq!(irq.mask() & (1 << map::HSTX_IRQ), 0);
+}
+
+#[test]
+fn tmds_data_words_follow_the_pixel_clock() {
+    let mut hstx = new_hstx();
+    // CLKDIV = 5 → pixel clock = clk_hstx/5 = clk_sys/10; ENC_SHIFT = 16 bits
+    // → 2 pixels per FIFO word → 20 clk_sys per word.
+    // CLKDIV = 5：像素时钟 = clk_hstx/5 = clk_sys/10；ENC_SHIFT = 16 位
+    // → 每字 2 像素 → 每字 20 个 clk_sys。
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, (2 << 24) | (16 << 16));
+    assert!(hstx.push_command(CMD_TMDS | 4));
+    assert!(hstx.push_data(0xA1));
+    assert!(hstx.push_data(0xB2));
+
+    hstx.advance(19);
+    assert_eq!(hstx.output_level(), 1, "first word covers t=0..20");
+    hstx.advance(2);
+    assert_eq!(hstx.output_level(), 2, "second word covers t=20..40");
+    assert_eq!(hstx.drain_output(), [0xA1, 0xB2]);
+    assert_eq!(hstx.output_underrun(), 0);
+}
+
+/// The firmware's 256-word active scanline block / 固件的 256 字有效扫描行块
+fn scanline_block() -> Vec<u32> {
+    let mut block = vec![0u32; 256];
+    block[0] = CMD_RAW_REPEAT | 0x10;
+    block[1] = 0x1111_1111;
+    block[2] = CMD_NOP;
+    block[3] = CMD_RAW_REPEAT | 0x60;
+    block[4] = 0x2222_2222;
+    block[5] = CMD_NOP;
+    block[6] = CMD_RAW_REPEAT | 0x30;
+    block[7] = 0x3333_3333;
+    block[8] = CMD_TMDS_REPEAT | 0x50;
+    block[9] = 0;
+    block[10] = CMD_TMDS | 0x1E0;
+    for (index, word) in block.iter_mut().enumerate().take(251).skip(11) {
+        *word = index as u32 | 0x0100_0000;
+    }
+    block[251] = CMD_TMDS_REPEAT | 0x4C;
+    block[252] = 0;
+    block[253] = CMD_TMDS | 4;
+    block[254] = 0;
+    block[255] = 0;
+    block
+}
+
+#[test]
+fn a_scanline_block_streams_for_800_pixel_periods() {
+    let mut hstx = new_hstx();
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, (2 << 24) | (16 << 16) | (1 << 8));
+    let block = scanline_block();
+
+    for lap in 0..3 {
+        let start = hstx.output_words();
+        let mut fed = 0usize;
+        let mut used = 0u64;
+        while used < 8000 {
+            while fed < block.len() && hstx.fifo_level() < FIFO_DEPTH as u8 {
+                assert!(hstx.push_command(block[fed]), "lap {lap} push {fed}");
+                fed += 1;
+            }
+            hstx.advance(1);
+            used += 1;
+        }
+        assert_eq!(fed, block.len(), "lap {lap} feeds the whole block");
+        assert_eq!(
+            hstx.output_words() - start,
+            block.len() as u64,
+            "lap {lap} pops the whole block"
+        );
+        let _ = hstx.drain_output();
+    }
+
+    assert_eq!(
+        hstx.unknown_commands(),
+        0,
+        "command/data phase stays aligned"
+    );
+    assert_eq!(hstx.output_underrun(), 0, "the FIFO never runs dry");
+}
+
+#[test]
+fn a_dma_burst_cannot_overrun_the_hstx_fifo() {
+    // The HSTX FIFO is 8 words deep, so a 64-unit pump must stop at 8 and never
+    // set WOF: the budget is capped at the FIFO's free space, and the words that
+    // would not fit stay pending in the channel.
+    // HSTX FIFO 只有 8 字深，因此 64 单元的泵送必须停在 8 且不置 WOF：预算被限制
+    // 为 FIFO 空闲空间，放不下的字留在通道里。
+    use crate::dma::{CTRL_DATA_SIZE_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_TREQ_SEL_SHIFT};
+    use rp2350_core::memory::RamRegion;
+
+    const RAM_BASE: u32 = 0x2000_0000;
+    const SOURCE_WORDS: u32 = 64;
+
+    let mut bus = SimpleBus::new();
+    bus.register_region(Box::new(RamRegion::new("sram", RAM_BASE, 0x1000)))
+        .expect("ram");
+    let mut peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+    let mut cycles = 0u64;
+    for index in 0..SOURCE_WORDS {
+        bus.write_u32(RAM_BASE + index * 4, 0xC0DE_0000 | index, &mut cycles)
+            .expect("source word");
+    }
+
+    let ctrl = CTRL_EN
+        | CTRL_INCR_READ
+        | (2 << CTRL_DATA_SIZE_SHIFT)
+        | (u32::from(crate::dreq::HSTX_DREQ) << CTRL_TREQ_SEL_SHIFT);
+    let base = map::DMA_BASE;
+    bus.write_u32(base, RAM_BASE, &mut cycles)
+        .expect("read addr");
+    bus.write_u32(base + 0x04, map::HSTX_FIFO_BASE + 0x04, &mut cycles)
+        .expect("write addr");
+    bus.write_u32(base + 0x08, SOURCE_WORDS, &mut cycles)
+        .expect("count");
+    bus.write_u32(base + 0x0C, ctrl, &mut cycles).expect("ctrl");
+
+    let moved = peripherals.pump_dma(&mut bus, 64);
+    assert_eq!(
+        moved, FIFO_DEPTH as u64,
+        "only the free slots may be filled"
+    );
+    assert_eq!(
+        u32::from(peripherals.hstx().fifo_level()),
+        FIFO_DEPTH as u32
+    );
+    assert!(!peripherals.hstx().fifo_overrun(), "WOF must stay clear");
+    let channel = peripherals.dma().channel_state(0).expect("ch0");
+    assert!(channel.busy, "the channel keeps its remaining count");
+    assert_eq!(channel.trans_count, SOURCE_WORDS - FIFO_DEPTH as u32);
 }
 
 #[test]
@@ -289,5 +426,8 @@ fn boot_peripherals_mounts_both_hstx_windows() {
     assert_eq!(peripherals.hstx().fifo_level(), 1);
 
     peripherals.advance(1);
+    // HSTX is host-pumped at the DMA batch cadence; advance it explicitly.
+    // HSTX 由宿主按 DMA 批次节拍推进；测试中显式推进。
+    peripherals.hstx_mut().advance(1);
     assert_eq!(peripherals.hstx_mut().drain_output(), [0x1234_5678]);
 }

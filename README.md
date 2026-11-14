@@ -133,6 +133,7 @@ Full design documents in `doc/`:
 - [Implementation Plan](doc/implementation-plan.md) — phased tasks with milestones
 - [Reference Gap Analysis](doc/reference-gap-analysis.md) — 验收主线（Stages 0–6）：真实 MicroPython UF2 → USB CDC → perfbench
 - [perfbench Report](doc/perfbench-report.md) — official `run-perfbench.py` results on the Arm and RISC-V MicroPython images
+- [GBA Bring-up Report](doc/gba-bringup-report.md) — running `emerald.uf2` (pokeemerald-rp2350) with core 1, HSTX scanout and a real game picture
 - [USB Device Model](doc/usb-device-model.md) — USB 设备控制器与主机桥设计
 - [Plugin Guide](doc/plugins.md) — how to create virtual device plugins
 - [API Reference](doc/crates/) — per-crate public API documentation

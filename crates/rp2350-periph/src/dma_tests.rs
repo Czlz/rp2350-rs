@@ -8,13 +8,17 @@
 
 use rp2350_core::bus::AddressBus;
 use rp2350_core::memory::{RamRegion, SimpleBus};
-use rp2350_core::mmio::{MmioDevice, mount_device};
+use rp2350_core::mmio::{MmioDevice, MmioWindow, mount_device};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::dma::{
     CTRL_BUSY, CTRL_CHAIN_TO_SHIFT, CTRL_DATA_SIZE_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_INCR_WRITE,
     CTRL_IRQ_QUIET, CTRL_RING_SEL, CTRL_RING_SIZE_SHIFT, CTRL_TREQ_SEL_SHIFT, Dma, DmaChannelState,
     TREQ_PERMANENT,
 };
+use crate::dreq;
 use crate::irq::IrqAssert;
 use crate::map;
 
@@ -56,6 +60,73 @@ const CHAN_ABORT: u32 = 0x464;
 
 /// Per-channel register stride / 每通道寄存器步长
 const STRIDE: u32 = 0x40;
+
+/// `AL1_CTRL` offset — non-triggering control write / `AL1_CTRL` 偏移：非触发控制写入
+const CH_AL1_CTRL_OFFSET: u32 = 0x10;
+
+/// `AL2_CTRL` offset — non-triggering control write / `AL2_CTRL` 偏移：非触发控制写入
+const CH_AL2_CTRL_OFFSET: u32 = 0x20;
+
+/// `AL3_CTRL` offset — non-triggering control write / `AL3_CTRL` 偏移：非触发控制写入
+const CH_AL3_CTRL_OFFSET: u32 = 0x30;
+
+/// `AL3_TRANS_COUNT` offset — rewrite value only / `AL3_TRANS_COUNT` 偏移：仅重载值
+const CH_AL3_TRANS_COUNT_OFFSET: u32 = 0x38;
+
+/// `AL3_READ_ADDR_TRIG` offset — write starts the channel / `AL3_READ_ADDR_TRIG` 偏移：写入启动通道
+const CH_AL3_READ_ADDR_TRIG_OFFSET: u32 = 0x3C;
+
+/// `CTRL_TRIG` offset / `CTRL_TRIG` 偏移
+const CH_CTRL_TRIG_OFFSET: u32 = 0x0C;
+
+/// `TRANS_COUNT` offset / `TRANS_COUNT` 偏移
+const CH_TRANS_COUNT_OFFSET: u32 = 0x08;
+
+/// Read address offset / 读地址偏移
+const CH_READ_ADDR_OFFSET: u32 = 0x00;
+
+/// Write address offset / 写地址偏移
+const CH_WRITE_ADDR_OFFSET: u32 = 0x04;
+
+/// `CTRL_TRIG.DATA_SIZE` = word / `CTRL_TRIG.DATA_SIZE` = 字
+const DATA_SIZE_WORD: u32 = 2;
+
+/// Address window of the stand-in HSTX FIFO / 替代 HSTX FIFO 的地址窗口
+const SINK_BASE: u32 = 0x4008_0000;
+
+/// 32-bit sink standing in for the HSTX FIFO data register
+/// 替代 HSTX FIFO 数据寄存器的 32 位接收器
+///
+/// The scanout DMA writes one word per data unit to a fixed `WRITE_ADDR`;
+/// recording every write is enough to prove that the ring keeps delivering.
+/// 扫描 DMA 每个数据单元向固定 `WRITE_ADDR` 写一个字；记录每次写入即可证明环
+/// 一直在投递数据。
+struct WordSink {
+    window: MmioWindow,
+    words: Arc<Mutex<Vec<u32>>>,
+}
+
+impl MmioDevice for WordSink {
+    fn name(&self) -> &str {
+        "test-word-sink"
+    }
+
+    fn window(&self) -> MmioWindow {
+        self.window
+    }
+
+    fn read32(&mut self, offset: u32) -> Option<u32> {
+        (offset == 0).then_some(0)
+    }
+
+    fn write32(&mut self, offset: u32, value: u32) -> bool {
+        if offset != 0 {
+            return false;
+        }
+        self.words.lock().push(value);
+        true
+    }
+}
 
 /// Test fixture: bus, DMA handle and shared interrupt set
 /// 测试夹具：总线、DMA 句柄与共享中断集合
@@ -168,8 +239,8 @@ fn configure(fixture: &mut Fixture, channel: usize, read: u32, write: u32, count
     let base = channel as u32 * STRIDE;
     fixture.reg_write(base, read);
     fixture.reg_write(base + 0x04, write);
-    fixture.reg_write(base + 0x08, count);
-    fixture.reg_write(base + 0x0C, ctrl);
+    fixture.reg_write(base + CH_TRANS_COUNT_OFFSET, count);
+    fixture.reg_write(base + CH_CTRL_TRIG_OFFSET, ctrl);
 }
 
 #[test]
@@ -328,6 +399,47 @@ fn permanent_request_ignores_host_dreq_level() {
 }
 
 #[test]
+fn enabled_selects_dreq_ignores_the_busy_flag() {
+    // A freshly triggered channel is enabled before `Dma::run` marks it busy;
+    // the host must still resynchronise it per unit, otherwise a batch runs with
+    // a stale DREQ level and overruns a small FIFO (the HSTX FIFO is 8 words).
+    // 刚被触发的通道先置 EN、之后才由 `Dma::run` 置 busy；宿主仍必须逐单元
+    // 重新同步，否则整批会用陈旧的 DREQ 电平执行并冲垮小 FIFO（HSTX 仅 8 字）。
+    let mut f = fixture();
+    f.dma.set_dreq(52, true);
+    configure(&mut f, 0, SRC, DST, 3, ctrl_word(0, 0, 52));
+    assert!(f.channel(0).busy, "configure() triggers the channel");
+    assert!(f.dma.enabled_selects_dreq(52, 52));
+    assert_eq!(f.run(3), 3);
+
+    // Idle but enabled: still reported, unlike `busy_selects_dreq`.
+    // 空闲但仍使能：仍会上报，与 `busy_selects_dreq` 不同。
+    let mut idle = fixture();
+    idle.reg_write(0x10, ctrl_word(0, 0, 52));
+    assert!(idle.dma.enabled_selects_dreq(52, 52));
+    assert!(!idle.dma.busy_selects_dreq(52, 52));
+
+    // Disabled and permanent selectors are never reported.
+    // 未使能与永久请求选择器都不上报。
+    let mut disabled = fixture();
+    disabled.reg_write(0x10, 0);
+    assert!(!disabled.dma.enabled_selects_dreq(52, 52));
+    configure(
+        &mut disabled,
+        0,
+        SRC,
+        DST,
+        3,
+        ctrl_word(0, 0, TREQ_PERMANENT),
+    );
+    assert!(
+        !disabled
+            .dma
+            .enabled_selects_dreq(TREQ_PERMANENT, TREQ_PERMANENT)
+    );
+}
+
+#[test]
 fn gated_dreq_pauses_and_resumes_transfers() {
     let mut f = fixture();
     write_bytes(&mut f, SRC, &[7, 8, 9]);
@@ -419,14 +531,25 @@ fn ring_write_wraps_within_the_ring_window() {
 }
 
 #[test]
-fn al1_ctrl_alias_triggers_the_channel() {
+fn al1_ctrl_alias_configures_without_triggering() {
+    // Pico SDK 的 dma_channel_configure(..., false) 写 al1_ctrl 且期望不启动。
+    // The Pico SDK writes al1_ctrl from dma_channel_configure(..., false) and
+    // expects the channel *not* to start.
     let mut f = fixture();
     write_bytes(&mut f, SRC, &[1, 2]);
     f.reg_write(0x00, SRC);
     f.reg_write(0x04, DST);
     f.reg_write(0x08, 2);
-    f.reg_write(0x10, ctrl_word(0, 0, TREQ_PERMANENT));
-    assert!(f.channel(0).busy);
+    f.reg_write(CH_AL1_CTRL_OFFSET, ctrl_word(0, 0, TREQ_PERMANENT));
+    let state = f.channel(0);
+    assert!(state.enabled);
+    assert!(!state.busy);
+    assert_eq!(f.run(2), 0, "al1_ctrl must not start the channel");
+
+    // 之后 MULTI_CHAN_TRIGGER 才真正启动（dma_channel_start）。
+    // Only MULTI_CHAN_TRIGGER starts it afterwards (dma_channel_start).
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    assert_eq!(f.channel(0).trans_count, 2);
     assert_eq!(f.run(2), 2);
     assert_eq!(read_bytes(&mut f, DST, 2), vec![1u8, 2]);
 }
@@ -495,4 +618,342 @@ fn alias_window_is_sixteen_kilobytes() {
     let fixture = fixture();
     assert_eq!(fixture.dma.window().size, map::DMA_SIZE);
     assert_eq!(map::DMA_SIZE, 0x4000);
+}
+
+// ---------------------------------------------------------------------------
+// SDK control-block ring / SDK 控制块环
+// ---------------------------------------------------------------------------
+
+/// Entries in each control-block ring / 每个控制块环的条目数
+const CB_RING_WORDS: usize = 256;
+/// Byte size of one control-block ring / 每个控制块环的字节数
+const CB_RING_BYTES: u32 = 1024;
+/// `RING_SIZE` log2 used by the SDK ring channels / SDK 环通道的 `RING_SIZE` log2
+const RING_LOG2: u32 = 10;
+/// Ring laps streamed by the test / 测试流过的环圈数
+const RING_LAPS: usize = 3;
+/// `cb_count` ring base / `cb_count` 环基地址
+const COUNT_RING: u32 = RAM_BASE;
+/// `cb_addr` ring base / `cb_addr` 环基地址
+const ADDR_RING: u32 = RAM_BASE + 0x400;
+/// First 1024 B line block / 第一个 1024 B 行块
+const LINE_A: u32 = RAM_BASE + 0x800;
+/// Second 1024 B line block / 第二个 1024 B 行块
+const LINE_B: u32 = RAM_BASE + 0xC00;
+/// Words in one line block / 一个行块的字数
+const BLOCK_WORDS: usize = 256;
+/// Border-line control-block word count / 边界行控制块字数
+const SHORT_COUNT: u32 = 21;
+/// Count that wraps the 1024 B read ring / 会环绕 1024 B 读环的计数
+const LONG_COUNT: u32 = 300;
+
+/// Word count of control-block `index` / 控制块 `index` 的字数
+fn ring_count(index: usize) -> u32 {
+    // 每第 8 个控制块跨越 1024 B 读环边界，用来验证环绕。
+    // Every eighth control block crosses the 1024 B read-ring boundary.
+    if index % 8 == 7 {
+        LONG_COUNT
+    } else {
+        SHORT_COUNT
+    }
+}
+
+/// Line block used by control-block `index` / 控制块 `index` 使用的行块
+fn ring_block(index: usize) -> u32 {
+    if index % 2 == 0 { LINE_A } else { LINE_B }
+}
+
+/// Payload word `word` of `block` / `block` 的第 `word` 个载荷字
+fn block_word(block: u32, word: usize) -> u32 {
+    let tag = if block == LINE_A {
+        0xA0A0_0000
+    } else {
+        0xB0B0_0000
+    };
+    tag + word as u32
+}
+
+/// One full lap of the expected FIFO stream / 一整圈期望的 FIFO 数据流
+fn expected_lap() -> Vec<u32> {
+    let mut stream = Vec::new();
+    for index in 0..CB_RING_WORDS {
+        let block = ring_block(index);
+        for word in 0..ring_count(index) as usize {
+            // 读环在 256 字（1024 B）处环绕，长计数会重放块首。
+            // The read ring wraps at 256 words, so a long count replays the head.
+            stream.push(block_word(block, word % BLOCK_WORDS));
+        }
+    }
+    stream
+}
+
+/// Build a `CTRL` word the way the Pico SDK config helpers do
+/// 按 Pico SDK 配置辅助函数的语义构造 `CTRL` 字
+///
+/// `dma_channel_get_default_config` yields word transfers, read increment and
+/// write hold; `channel_config_set_ring(.., false, n)` selects the read side.
+/// `dma_channel_get_default_config` 给出字宽传输、读递增、写保持；
+/// `channel_config_set_ring(.., false, n)` 选择读侧环绕。
+fn sdk_ctrl(treq: u8, ring_log2: u32, chain: usize) -> u32 {
+    CTRL_EN
+        | (DATA_SIZE_WORD << CTRL_DATA_SIZE_SHIFT)
+        | CTRL_INCR_READ
+        | (ring_log2 << CTRL_RING_SIZE_SHIFT)
+        | ((chain as u32) << CTRL_CHAIN_TO_SHIFT)
+        | (u32::from(treq) << CTRL_TREQ_SEL_SHIFT)
+}
+
+/// Program a channel exactly like `dma_channel_configure(..., false)`
+/// 完全按 `dma_channel_configure(..., false)` 编程通道
+fn sdk_configure(f: &mut Fixture, channel: usize, read: u32, write: u32, count: u32, ctrl: u32) {
+    let base = channel as u32 * STRIDE;
+    f.reg_write(base + CH_READ_ADDR_OFFSET, read);
+    f.reg_write(base + CH_WRITE_ADDR_OFFSET, write);
+    f.reg_write(base + CH_TRANS_COUNT_OFFSET, count);
+    // SDK 用 al1_ctrl 写配置：不触发传输。
+    // The SDK writes the config through al1_ctrl, which does not trigger.
+    f.reg_write(base + CH_AL1_CTRL_OFFSET, ctrl);
+}
+
+/// Program the three-channel `hstx_start_dma()` ring on a fresh fixture
+/// 在全新夹具上编程 `hstx_start_dma()` 的三通道路由
+fn program_ring(f: &mut Fixture) -> Arc<Mutex<Vec<u32>>> {
+    let words = Arc::new(Mutex::new(Vec::new()));
+    let window = MmioWindow::new(SINK_BASE, 4);
+    let sink = WordSink {
+        window,
+        words: Arc::clone(&words),
+    };
+    mount_device(&mut f.bus, Box::new(sink)).expect("word sink");
+    for index in 0..CB_RING_WORDS {
+        f.write_word(COUNT_RING + index as u32 * 4, ring_count(index));
+        f.write_word(ADDR_RING + index as u32 * 4, ring_block(index));
+    }
+    for word in 0..BLOCK_WORDS {
+        f.write_word(LINE_A + word as u32 * 4, block_word(LINE_A, word));
+        f.write_word(LINE_B + word as u32 * 4, block_word(LINE_B, word));
+    }
+    // DATA：1024 B 读环 → HSTX FIFO，DREQ_HSTX 节拍，链到 CB_COUNT。
+    let data = sdk_ctrl(dreq::HSTX_DREQ, RING_LOG2, 1);
+    sdk_configure(f, 0, LINE_A, SINK_BASE, SHORT_COUNT, data);
+    // CB_COUNT：环字 → DATA.al3_transfer_count（不触发），链到 CB_ADDR。
+    let cb_count = sdk_ctrl(TREQ_PERMANENT, RING_LOG2, 2);
+    sdk_configure(
+        f,
+        1,
+        COUNT_RING,
+        map::DMA_BASE + CH_AL3_TRANS_COUNT_OFFSET,
+        1,
+        cb_count,
+    );
+    // CB_ADDR：环字 → DATA.al3_read_addr_trig（触发），自链。
+    let cb_addr = sdk_ctrl(TREQ_PERMANENT, RING_LOG2, 2);
+    sdk_configure(
+        f,
+        2,
+        ADDR_RING,
+        map::DMA_BASE + CH_AL3_READ_ADDR_TRIG_OFFSET,
+        1,
+        cb_addr,
+    );
+    words
+}
+
+#[test]
+fn hstx_control_block_ring_streams_three_laps() {
+    let mut f = fixture();
+    let sink = program_ring(&mut f);
+    f.dma.set_dreq(dreq::HSTX_DREQ, true);
+    // 配置阶段不允许启动任何通道（al1_ctrl 非触发）。
+    // Configuration must not start anything (al1_ctrl does not trigger).
+    assert_eq!(f.dma.busy_mask(), 0, "configuration must not trigger");
+    f.reg_write(MULTI_CHAN_TRIGGER, 1 << 1); // dma_channel_start(CB_COUNT)
+    assert_eq!(f.dma.busy_mask(), 0b10, "only CB_COUNT starts");
+
+    let lap = expected_lap();
+    let target = lap.len() * RING_LAPS;
+    let mut budget = 0u64;
+    let mut saw_partial = false;
+    while sink.lock().len() < target {
+        let moved = f.run(97);
+        assert!(moved > 0, "ring stalled after {} words", sink.lock().len());
+        budget += moved;
+        assert!(budget < 4_000_000, "ring made no progress");
+        // 环指针必须留在自己的 1024 B 窗口内，且 EN 不会被链式清掉。
+        // Ring pointers stay inside their 1024 B windows and keep EN.
+        let (data, count, addr) = (f.channel(0), f.channel(1), f.channel(2));
+        assert!((COUNT_RING..COUNT_RING + CB_RING_BYTES).contains(&count.read_addr));
+        assert!((ADDR_RING..ADDR_RING + CB_RING_BYTES).contains(&addr.read_addr));
+        assert!((LINE_A..LINE_B + CB_RING_BYTES).contains(&data.read_addr));
+        let enabled = (data.ctrl | count.ctrl | addr.ctrl) & CTRL_EN;
+        assert_eq!(enabled, CTRL_EN, "a ring channel lost EN");
+        if data.busy {
+            // 工作计数只能来自 CB 写入的重载值。
+            // The working count can only come from the CB rewrite value.
+            assert!(data.trans_count > 0 && data.trans_count <= LONG_COUNT);
+            saw_partial |= data.trans_count < LONG_COUNT;
+        } else {
+            assert_eq!(data.trans_count, 0, "idle DATA keeps a drained count");
+        }
+    }
+    assert!(saw_partial, "never observed DATA mid-entry");
+
+    // 三圈数据流必须逐字一致：链式、重载与环绕都没有丢数据。
+    // Three laps must match word for word: chain, reload and wrap lose nothing.
+    let words = sink.lock().clone();
+    for lap_index in 0..RING_LAPS {
+        let start = lap_index * lap.len();
+        assert_eq!(
+            &words[start..start + lap.len()],
+            &lap[..],
+            "lap {lap_index}"
+        );
+    }
+    // 环没有提前停止：继续泵送仍会推进。
+    // The ring did not stop early: further pumping still progresses.
+    assert!(f.run(200) > 0, "ring stopped after three laps");
+    assert_ne!(f.dma.busy_mask(), 0);
+}
+
+#[test]
+fn read_ring_streams_a_line_block_twice() {
+    let mut f = fixture();
+    for word in 0..BLOCK_WORDS {
+        f.write_word(LINE_A + word as u32 * 4, block_word(LINE_A, word));
+    }
+    // 读环 1024 B + 计数 300 → 读完 256 字后重放块首 44 字。
+    // Read ring 1024 B with count 300 replays the first 44 words.
+    let ctrl = ctrl_word(0, DATA_SIZE_WORD, TREQ_PERMANENT) | (RING_LOG2 << CTRL_RING_SIZE_SHIFT);
+    configure(&mut f, 0, LINE_A, DST, LONG_COUNT, ctrl);
+    assert_eq!(f.run(u64::from(LONG_COUNT)), u64::from(LONG_COUNT));
+    assert_eq!(f.channel(0).read_addr, LINE_A + 44 * 4);
+    assert_eq!(f.read_word(DST + 255 * 4), block_word(LINE_A, 255));
+    assert_eq!(f.read_word(DST + 256 * 4), block_word(LINE_A, 0));
+    assert_eq!(f.read_word(DST + 299 * 4), block_word(LINE_A, 43));
+}
+
+#[test]
+fn al2_and_al3_ctrl_aliases_do_not_trigger() {
+    let mut f = fixture();
+    write_bytes(&mut f, SRC, &[3, 4]);
+    for (channel, offset) in [(0usize, CH_AL2_CTRL_OFFSET), (1, CH_AL3_CTRL_OFFSET)] {
+        let ctrl = sdk_ctrl(TREQ_PERMANENT, 0, channel);
+        sdk_configure(&mut f, channel, SRC, DST + channel as u32 * 0x10, 2, ctrl);
+        f.reg_write(channel as u32 * STRIDE + offset, ctrl);
+        assert!(
+            !f.channel(channel).busy,
+            "alias {offset:#04x} must not trigger"
+        );
+    }
+    assert_eq!(f.run(4), 0);
+    f.reg_write(MULTI_CHAN_TRIGGER, 0b11);
+    assert_eq!(f.run(4), 4);
+}
+
+#[test]
+fn al3_read_addr_trig_starts_an_enabled_idle_channel() {
+    let mut f = fixture();
+    write_bytes(&mut f, SRC + 0x40, &[7]);
+    sdk_configure(&mut f, 0, SRC, DST, 1, sdk_ctrl(TREQ_PERMANENT, 0, 0));
+    assert!(!f.channel(0).busy);
+    // 零值写入不是触发（只有 IRQ_QUIET 时才产生空触发中断）。
+    // A zero write is not a trigger (only a null-trigger IRQ with IRQ_QUIET).
+    f.reg_write(CH_AL3_READ_ADDR_TRIG_OFFSET, 0);
+    assert!(!f.channel(0).busy);
+    f.reg_write(CH_AL3_READ_ADDR_TRIG_OFFSET, SRC + 0x40);
+    assert!(f.channel(0).busy);
+    assert_eq!(f.channel(0).trans_count, 1);
+    assert_eq!(f.run(1), 1);
+    assert_eq!(f.read_word(DST), 7);
+}
+
+#[test]
+fn trans_count_writes_latch_a_reload_value() {
+    let mut f = fixture();
+    sdk_configure(&mut f, 0, SRC, DST, 1, sdk_ctrl(TREQ_PERMANENT, 0, 0));
+    f.reg_write(CH_AL3_TRANS_COUNT_OFFSET, 4);
+    assert!(!f.channel(0).busy, "0x38 must not trigger");
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    assert_eq!(f.channel(0).trans_count, 4);
+    assert_eq!(f.run(2), 2);
+    // 忙碌时写计数只改重载值，工作计数继续递减。
+    // A count write while busy only changes the reload value.
+    f.reg_write(CH_TRANS_COUNT_OFFSET, 9);
+    assert_eq!(f.channel(0).trans_count, 2);
+    assert_eq!(f.reg_read(CH_TRANS_COUNT_OFFSET), 2);
+    assert_eq!(f.run(2), 2);
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    assert_eq!(f.channel(0).trans_count, 9, "reload applies on restart");
+}
+
+#[test]
+fn chain_reloads_a_completed_one_shot_channel() {
+    let mut f = fixture();
+    write_bytes(&mut f, SRC, &[1, 2, 3, 4, 5, 6]);
+    // ch0（计数 2）↔ ch1（计数 1）构成三段式乒乓环。
+    // ch0 (count 2) <-> ch1 (count 1) form a 3-unit ping-pong ring.
+    sdk_configure(&mut f, 0, SRC, DST, 2, sdk_ctrl(TREQ_PERMANENT, 0, 1));
+    sdk_configure(
+        &mut f,
+        1,
+        DST,
+        DST + 0x100,
+        1,
+        sdk_ctrl(TREQ_PERMANENT, 0, 0),
+    );
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    // 没有重载语义时 ch1 只搬运一次，环在 3 个单元后停住。
+    // Without reload semantics ch1 moves one unit only and the ring dies at 3.
+    assert_eq!(f.run(9), 9);
+    assert_eq!(f.channel(1).trans_count, 0);
+    // 第九个单元是 ch1 完成，它把 ch0 重新装载为 2 并置为忙碌。
+    // Unit nine is ch1 completing, which reloads ch0 to 2 and makes it busy.
+    assert!(f.channel(0).busy);
+    assert_eq!(f.channel(0).trans_count, 2);
+    assert_eq!(f.dma.busy_mask(), 0b1);
+}
+
+#[test]
+fn multi_chan_trigger_skips_disabled_channels() {
+    let mut f = fixture();
+    write_bytes(&mut f, SRC, &[1, 2]);
+    sdk_configure(&mut f, 0, SRC, DST, 2, sdk_ctrl(TREQ_PERMANENT, 0, 0));
+    let disabled = sdk_ctrl(TREQ_PERMANENT, 0, 1) & !CTRL_EN;
+    sdk_configure(&mut f, 1, SRC, DST + 0x10, 2, disabled);
+    f.reg_write(MULTI_CHAN_TRIGGER, 0b11);
+    assert_eq!(f.dma.busy_mask(), 0b1, "only the enabled channel starts");
+}
+
+#[test]
+fn trigger_while_busy_keeps_the_working_count() {
+    let mut f = fixture();
+    sdk_configure(&mut f, 0, SRC, DST, 5, sdk_ctrl(TREQ_PERMANENT, 0, 0));
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    assert_eq!(f.run(2), 2);
+    // 忙碌通道上的触发被忽略，不会重置计数。
+    // A trigger on a busy channel is ignored and does not reload the count.
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    assert!(f.channel(0).busy);
+    assert_eq!(f.channel(0).trans_count, 3);
+    assert_eq!(f.run(3), 3);
+}
+
+#[test]
+fn zero_length_trigger_completes_chains_and_honours_irq_quiet() {
+    let mut f = fixture();
+    sdk_configure(&mut f, 0, SRC, DST, 0, sdk_ctrl(TREQ_PERMANENT, 0, 1));
+    sdk_configure(&mut f, 1, SRC, DST, 1, sdk_ctrl(TREQ_PERMANENT, 0, 1));
+    f.reg_write(MULTI_CHAN_TRIGGER, 1);
+    assert!(!f.channel(0).busy);
+    assert!(f.channel(1).busy, "the zero-length channel chains on");
+    assert_eq!(f.reg_read(INTR) & 1, 1);
+    assert_eq!(f.run(1), 1);
+    // 空触发：向 *_TRIG 写零，在 IRQ_QUIET 时仍产生完成中断。
+    // Null trigger: a zero write to a *_TRIG alias with IRQ_QUIET still
+    // raises the completion flag.
+    let quiet = sdk_ctrl(TREQ_PERMANENT, 0, 2) | CTRL_IRQ_QUIET;
+    sdk_configure(&mut f, 2, SRC, DST, 4, quiet);
+    f.reg_write(2 * STRIDE + CH_AL3_READ_ADDR_TRIG_OFFSET, 0);
+    assert!(!f.channel(2).busy);
+    assert_eq!(f.reg_read(INTR) & (1 << 2), 1 << 2);
 }

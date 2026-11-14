@@ -183,6 +183,24 @@ const EXPAND_SHIFT_WRITE_MASK: u32 = 0x1f1f_1f1f;
 /// `EXPAND_TMDS` writable mask / `EXPAND_TMDS` 可写掩码
 const EXPAND_TMDS_WRITE_MASK: u32 = 0x00ff_ffff;
 
+/// `CSR.CLKDIV` shift: pixel clock = clk_hstx / CLKDIV
+/// `CSR.CLKDIV` 移位：像素时钟 = clk_hstx / CLKDIV
+const CSR_CLKDIV_SHIFT: u32 = 28;
+
+/// `CSR.CLKDIV` mask / `CSR.CLKDIV` 掩码
+const CSR_CLKDIV_MASK: u32 = 0xf;
+
+/// `EXPAND_SHIFT.ENC_SHIFT` shift: bits per lane symbol on the encoded path
+/// `EXPAND_SHIFT.ENC_SHIFT` 移位：编码路径每通道每符号的位数
+const ENC_SHIFT_SHIFT: u32 = 16;
+
+/// `EXPAND_SHIFT.ENC_SHIFT` mask / `EXPAND_SHIFT.ENC_SHIFT` 掩码
+const ENC_SHIFT_MASK: u32 = 0x1f;
+
+/// Default `clk_hstx` divider from `clk_sys` (the validated DVI setup uses /2)
+/// 默认 `clk_hstx` 相对 `clk_sys` 的分频（已验证的 DVI 配置为 /2）
+const CLK_HSTX_DIV: u64 = 2;
+
 /// Command opcode shift (`[15:12]`) / 命令操作码移位（`[15:12]`）
 pub const CMD_OPCODE_SHIFT: u32 = 12;
 
@@ -234,6 +252,9 @@ struct Pending {
     /// When `Some(n)`, the single consumed word is emitted `n` times
     /// 为 `Some(n)` 时，单个已消费字输出 `n` 次
     repeat: Option<u32>,
+    /// `clk_sys` cycles the next consumed word occupies
+    /// 下一个被消费的字占用的 `clk_sys` 周期
+    word_cycles: u64,
 }
 
 /// Shared HSTX register, FIFO and command-expander state
@@ -378,6 +399,12 @@ impl HstxState {
     /// Push one FIFO word, setting `WOF` when full / 压入一个 FIFO 字，满时置位 `WOF`
     fn push(&mut self, word: u32) -> bool {
         if self.fifo.len() >= FIFO_DEPTH {
+            if !self.wof {
+                log::warn!(
+                    "HSTX: FIFO full, dropping word {word:#010X} (WOF) / \
+                     HSTX：FIFO 已满，丢弃字 {word:#010X}（WOF）"
+                );
+            }
             self.wof = true;
             return false;
         }
@@ -385,9 +412,28 @@ impl HstxState {
         true
     }
 
+    /// `clk_sys` cycles per pixel / 每个像素占用的 `clk_sys` 周期
+    ///
+    /// The pixel clock is `clk_hstx / CSR.CLKDIV`, and `clk_hstx` is assumed to
+    /// run at `clk_sys / 2` (the validated 640x480p60 DVI setup). This is what
+    /// paces the expander: one 256-word scanline block covers 800 pixels, so it
+    /// takes 800 pixel periods no matter how fast the FIFO is refilled.
+    /// 像素时钟为 `clk_hstx / CSR.CLKDIV`，`clk_hstx` 假定为 `clk_sys / 2`
+    /// （已验证的 640x480p60 DVI 配置）。这正是扩展器的节拍来源：一个 256 字的
+    /// 扫描行块覆盖 800 像素，因此无论 FIFO 补字多快，都占用 800 个像素周期。
+    fn cycles_per_pixel(&self) -> u64 {
+        let clkdiv = u64::from((self.csr >> CSR_CLKDIV_SHIFT) & CSR_CLKDIV_MASK);
+        CLK_HSTX_DIV * clkdiv.max(1)
+    }
+
+    /// Bits per lane symbol on the encoded path / 编码路径每通道每符号的位数
+    fn enc_shift(&self) -> u32 {
+        (self.expand_shift >> ENC_SHIFT_SHIFT) & ENC_SHIFT_MASK
+    }
+
     /// Number of TMDS data words for `count` pixels / `count` 个像素对应的 TMDS 数据字数
     fn tmds_words(&self, count: u32) -> u32 {
-        let shift = (self.expand_shift >> 16) & 0x1f;
+        let shift = self.enc_shift();
         if shift == 0 || count == 0 {
             count
         } else {
@@ -395,26 +441,36 @@ impl HstxState {
         }
     }
 
+    /// Pixels carried by one TMDS data word / 一个 TMDS 数据字承载的像素数
+    fn tmds_pixels_per_word(&self) -> u32 {
+        match self.enc_shift() {
+            0 => 1,
+            shift => (32 / shift).max(1),
+        }
+    }
+
     /// Start a non-repeating data command / 启动非重复数据命令
-    fn start_data(&mut self, words: u32) -> bool {
+    fn start_data(&mut self, words: u32, word_cycles: u64) -> bool {
         if words == 0 {
             return true;
         }
         self.pending = Some(Pending {
             words,
             repeat: None,
+            word_cycles,
         });
         false
     }
 
     /// Start a repeating data command / 启动重复数据命令
-    fn start_repeat(&mut self, copies: u32) -> bool {
+    fn start_repeat(&mut self, copies: u32, word_cycles: u64) -> bool {
         if copies == 0 {
             return true;
         }
         self.pending = Some(Pending {
             words: 1,
             repeat: Some(copies),
+            word_cycles,
         });
         false
     }
@@ -424,16 +480,23 @@ impl HstxState {
     fn decode_command(&mut self, word: u32) -> bool {
         let opcode = (word >> CMD_OPCODE_SHIFT) & CMD_OPCODE_MASK;
         let count = word & CMD_COUNT_MASK;
+        let cpp = self.cycles_per_pixel();
         match opcode {
-            0x0 => self.start_data(count),
-            0x1 => self.start_repeat(count),
+            // RAW: `count` words, one pixel period each.
+            // RAW：`count` 个字，每字一个像素周期。
+            0x0 => self.start_data(count, cpp),
+            // RAW_REPEAT: one word repeated for `count` pixel periods.
+            // RAW_REPEAT：一个字重复输出 `count` 个像素周期。
+            0x1 => self.start_repeat(count, u64::from(count) * cpp),
             0x2 => {
                 let words = self.tmds_words(count);
-                self.start_data(words)
+                let per_word = u64::from(self.tmds_pixels_per_word()) * cpp;
+                self.start_data(words, per_word)
             }
             0x3 => {
-                let copies = self.tmds_words(count);
-                self.start_repeat(copies)
+                // One word repeated for `count` pixel periods.
+                // 一个字重复输出 `count` 个像素周期。
+                self.start_repeat(count, u64::from(count) * cpp)
             }
             0xe => {
                 self.wait_cycles = u64::from(count);
@@ -472,46 +535,53 @@ impl HstxState {
         self.irq_status |= IRQ_UNDERRUN;
     }
 
-    /// Pop and expand at most one FIFO word / 至多弹出一个 FIFO 字并展开
+    /// Pop one FIFO word, expand it and schedule the next pop
+    /// 弹出一个 FIFO 字、展开它并安排下一次弹出
+    ///
+    /// Each popped word occupies the pixel time of the command that owns it, so
+    /// the expander drains the FIFO at the real scanout rate (a 256-word line
+    /// block takes 800 pixel periods) instead of one word per clock.
+    /// 每个被弹出的字占用其所属命令的像素时长，因此扩展器按真实扫描速率排空
+    /// FIFO（一个 256 字行块占 800 个像素周期），而不是每时钟一字。
     fn pump(&mut self) {
         let Some(word) = self.fifo.pop_front() else {
             return;
         };
+        self.starving = false;
         if self.csr & CSR_EXPAND_EN == 0 {
             // 扩展器关闭时每个 FIFO 字都是原始输出数据。
             // With the expander off every FIFO word is raw output data.
-            self.starving = false;
             self.output.push_back(word);
             return;
         }
         let retired = match self.pending.take() {
-            Some(Pending { words, repeat }) => {
-                self.starving = false;
-                if let Some(copies) = repeat {
+            Some(pending) => {
+                let mut words = pending.words;
+                if let Some(copies) = pending.repeat {
                     for _ in 0..copies {
                         self.output.push_back(word);
                     }
-                    true
+                    words = 0;
                 } else {
                     self.output.push_back(word);
-                    if words <= 1 {
-                        true
-                    } else {
-                        self.pending = Some(Pending {
-                            words: words - 1,
-                            repeat: None,
-                        });
-                        false
-                    }
+                    words = words.saturating_sub(1);
+                }
+                self.wait_cycles = pending.word_cycles;
+                if words > 0 {
+                    self.pending = Some(Pending {
+                        words,
+                        repeat: None,
+                        word_cycles: pending.word_cycles,
+                    });
+                    false
+                } else {
+                    true
                 }
             }
             None => self.decode_command(word),
         };
         if retired {
             self.irq_status |= IRQ_COMMAND_DONE;
-        }
-        if self.pending.is_some() && self.fifo.is_empty() {
-            self.note_underrun();
         }
     }
 
@@ -539,7 +609,12 @@ impl HstxState {
             }
             self.pump();
             self.produced = self.produced.saturating_add(1);
-            remaining -= 1;
+        }
+        // The window may end exactly when the next word is due: record the
+        // starve so a caller draining the FIFO in batches still counts it.
+        // 观察窗口可能正好停在需要下一个字时：记录断流，使分批排空的调用方不漏计。
+        if self.wait_cycles == 0 && self.fifo.is_empty() && self.pending.is_some() {
+            self.note_underrun();
         }
     }
 }
@@ -612,11 +687,15 @@ impl Hstx {
 
     /// Advance the modelled HSTX clock by `cycles` / 按 `cycles` 推进建模的 HSTX 时钟
     ///
-    /// One FIFO word is expanded per cycle while `EN` is set. The call does
-    /// nothing when `EN` is clear or the FIFO is idle, so it never invents
+    /// The expander is paced by the pixel clock: every popped word occupies the
+    /// pixel time of the command that owns it, so a 256-word scanline block
+    /// lasts 800 pixel periods (matching the real 25.2 MHz scanout). The call
+    /// does nothing when `EN` is clear or the FIFO is idle, so it never invents
     /// pixels, and it refreshes the shared interrupt line.
-    /// `EN` 置位时每周期展开一个 FIFO 字。`EN` 清零或 FIFO 空闲时不做任何事，
-    /// 因此不会凭空产生像素；调用后刷新共享中断线。
+    /// 扩展器按像素时钟节拍推进：每个被弹出的字占用其所属命令的像素时长，因此
+    /// 一个 256 字扫描行块持续 800 个像素周期（与真实 25.2 MHz 扫描一致）。
+    /// `EN` 清零或 FIFO 空闲时不做任何事，因此不会凭空产生像素；调用后刷新共享
+    /// 中断线。
     pub fn advance(&self, cycles: u64) {
         let asserted = {
             let mut state = self.state.lock();
@@ -665,6 +744,14 @@ impl Hstx {
         count
     }
 
+    /// Free entries in the command/data FIFO (`DREQ_HSTX` headroom)
+    /// 命令/数据 FIFO 的空闲项数（`DREQ_HSTX` 余量）
+    #[must_use]
+    pub fn fifo_room(&self) -> u8 {
+        let level = self.state.lock().fifo.len();
+        FIFO_DEPTH.saturating_sub(level).min(FIFO_DEPTH) as u8
+    }
+
     /// Whether the HSTX FIFO can accept another word (`DREQ_HSTX`)
     /// HSTX FIFO 是否还能接收一个字（`DREQ_HSTX`）
     #[must_use]
@@ -694,6 +781,12 @@ impl Hstx {
     #[must_use]
     pub fn unknown_commands(&self) -> u64 {
         self.state.lock().unknown_commands
+    }
+
+    /// Whether the FIFO has dropped a word (`WOF`) / FIFO 是否发生过写溢出（`WOF`）
+    #[must_use]
+    pub fn fifo_overrun(&self) -> bool {
+        self.state.lock().wof
     }
 
     /// Most recent unknown command word, if any / 最近一个未知命令字（如果有）

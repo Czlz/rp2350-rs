@@ -20,7 +20,7 @@ use rp2350_core::{
     SimpleBus, Uf2Arch, Uf2Image, XipMaintenanceRegion,
 };
 use rp2350_cpu::{CpuCore, CpuState};
-use rp2350_periph::BootPeripherals;
+use rp2350_periph::{BootPeripherals, Core1Launch};
 use rp2350_riscv::Hazard3Core;
 use rp2350_usb::{Controller, USBCTRL_IRQ};
 
@@ -51,7 +51,7 @@ const ADVANCE_INTERVAL: u64 = 10_000;
 /// DMA 控制器按轮转顺序访问 16 个通道，因此一批 16 个单元最多每个通道一个
 /// 单元，单一忙碌通道也不会超过一个单元。这样无需逐通道调度即可保证 CPU 始终
 /// 领先于 DMA 引擎。
-const DMA_PUMP_TRANSFERS: u64 = 16;
+const DMA_PUMP_TRANSFERS: u64 = 64;
 
 /// Maximum number of logged IRQ deliveries / 记录的中断投递条数上限
 const IRQ_LOG_LIMIT: usize = 8;
@@ -99,6 +99,59 @@ pub struct RunOptions {
     pub trace_steps: usize,
     /// Halt on undefined instructions instead of skipping / 遇到未定义指令即停机
     pub strict_decode: bool,
+    /// Memory ranges written to disk after the run / 运行结束后写入磁盘的内存区间
+    pub dumps: Vec<MemoryDump>,
+}
+
+/// One `--dump ADDR:LEN:PATH` request / 一条 `--dump ADDR:LEN:PATH` 请求
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDump {
+    /// First address to read / 起始地址
+    pub address: u32,
+    /// Number of bytes to read / 读取字节数
+    pub length: u32,
+    /// Destination file / 目标文件
+    pub path: PathBuf,
+}
+
+impl MemoryDump {
+    /// Parse `ADDR:LEN:PATH` with decimal or `0x`-prefixed hex numbers
+    /// 解析 `ADDR:LEN:PATH`，数字支持十进制或 `0x` 十六进制前缀
+    ///
+    /// # Errors
+    /// Returns a message naming the malformed field.
+    /// 返回指出格式错误字段的消息。
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut parts = spec.splitn(3, ':');
+        let address = parts
+            .next()
+            .ok_or_else(|| format!("missing address in `{spec}`"))?;
+        let length = parts
+            .next()
+            .ok_or_else(|| format!("missing length in `{spec}`"))?;
+        let path = parts
+            .next()
+            .ok_or_else(|| format!("missing path in `{spec}`"))?;
+        if path.is_empty() {
+            return Err(format!("empty path in `{spec}`"));
+        }
+        Ok(Self {
+            address: parse_number(address).ok_or_else(|| format!("bad address `{address}`"))?,
+            length: parse_number(length).ok_or_else(|| format!("bad length `{length}`"))?,
+            path: PathBuf::from(path),
+        })
+    }
+}
+
+/// Parse a decimal or `0x`-prefixed hexadecimal number
+/// 解析十进制或带 `0x` 前缀的十六进制数字
+fn parse_number(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        text.parse().ok()
+    }
 }
 
 /// Construction options shared by `run`, `repl` and `perfbench`
@@ -139,6 +192,13 @@ enum CoreHandle {
     /// Hazard3 RV32 core / Hazard3 RV32 核心
     RiscV(Box<Hazard3Core>),
 }
+
+/// Boot result of [`Machine::new`]: core 0, its boot vectors and core 1
+/// [`Machine::new`] 的启动结果：core0、其启动向量与 core1
+///
+/// Core 1 exists only for Arm images and starts in `Reset`.
+/// core1 仅对 Arm 映像存在，并以 `Reset` 启动。
+type BootedCores = (CoreHandle, Option<(u32, u32)>, Option<CortexM33Core>);
 
 /// Dispatch one [`CpuCore`] method to the active architecture variant
 /// 将单个 [`CpuCore`] 方法分发到当前架构分支
@@ -249,6 +309,16 @@ pub struct Machine {
     bootrom: Rp2350Bootrom,
     /// CPU core / CPU 核心
     core: CoreHandle,
+    /// Cortex-M33 core 1, released through the SIO FIFO launch protocol
+    /// 通过 SIO FIFO 启动协议释放的 Cortex-M33 core1
+    core1: Option<CortexM33Core>,
+    /// Why core 1 stopped, if it did / core1 的停机原因（若停机）
+    core1_halt: Option<String>,
+    /// Completed core-1 launches / 已完成的 core1 启动次数
+    core1_launches: u64,
+    /// Strict undefined-instruction mode, shared with core 1
+    /// 未定义指令严格模式，与 core1 共享
+    strict_decode: bool,
     /// Boot peripheral handles / 启动外设句柄
     peripherals: BootPeripherals,
     /// USB controller shared with the host bridge / 与主机桥共享的 USB 控制器
@@ -348,7 +418,7 @@ impl Machine {
 
         let (arch, elf_entry, image_description) = load_image(bytes, &mut bus, options.arch)?;
 
-        let (core, boot_vectors): (CoreHandle, Option<(u32, u32)>) = match arch {
+        let (core, boot_vectors, core1): BootedCores = match arch {
             ArchArg::Arm => {
                 let mut arm = CortexM33Core::new(CpuId::Core0);
                 arm.set_strict_decode(options.strict_decode);
@@ -377,7 +447,12 @@ impl Machine {
                 };
                 bus.write_u32(0xE000_ED08, FLASH_XIP_BASE, &mut seed_cycles)
                     .context("seed SCB_VTOR failed / 初始化 SCB_VTOR 失败")?;
-                (CoreHandle::Arm(Box::new(arm)), vectors)
+                // core1 以 Reset 状态创建：SIO FIFO 启动协议完成前绝不取指。
+                // Core 1 starts in Reset and never fetches before the SIO FIFO
+                // launch protocol hands it vectors.
+                let mut core1 = CortexM33Core::new(CpuId::Core1);
+                core1.set_strict_decode(options.strict_decode);
+                (CoreHandle::Arm(Box::new(arm)), vectors, Some(core1))
             }
             ArchArg::RiscV => {
                 let mut riscv = Hazard3Core::new(CpuId::Core0);
@@ -390,7 +465,7 @@ impl Machine {
                 // causes 2/5 reach the host diagnostic stub instead of an
                 // unfilled guest vector slot.
                 riscv.set_fatal_trap_vector(bootrom.riscv_exception_vector());
-                (CoreHandle::RiscV(Box::new(riscv)), None)
+                (CoreHandle::RiscV(Box::new(riscv)), None, None)
             }
         };
 
@@ -399,6 +474,10 @@ impl Machine {
             bus,
             bootrom,
             core,
+            core1,
+            core1_halt: None,
+            core1_launches: 0,
+            strict_decode: options.strict_decode,
             peripherals,
             usb,
             // 两种架构都使用合成 boot ROM：Arm 走表查询桩，RISC-V 走
@@ -515,11 +594,13 @@ impl Machine {
     pub fn hstx_state(&self) -> String {
         let hstx = self.peripherals.hstx();
         format!(
-            "hstx words={} underruns={} fifo={} enabled={}",
+            "hstx words={} underruns={} fifo={} enabled={} wof={} unknown={}",
             self.hstx_words(),
             hstx.output_underrun(),
             hstx.fifo_level(),
-            hstx.enabled()
+            hstx.enabled(),
+            hstx.fifo_overrun(),
+            hstx.unknown_commands()
         )
     }
 
@@ -686,6 +767,61 @@ impl Machine {
         self.core.state()
     }
 
+    /// Core 1 execution state, or `None` for non-Arm architectures
+    /// core1 执行状态；非 Arm 架构返回 `None`
+    ///
+    /// Core 1 starts in [`CpuState::Reset`] and only becomes `Running` after
+    /// the SIO FIFO launch protocol hands it vectors.
+    /// core1 以 [`CpuState::Reset`] 启动，只有在 SIO FIFO 启动协议交出向量后
+    /// 才进入 `Running`。
+    #[must_use]
+    pub fn core1_state(&self) -> Option<CpuState> {
+        self.core1.as_ref().map(CpuCore::state)
+    }
+
+    /// Core 1 program counter, or `None` / core1 程序计数器，无则 `None`
+    #[must_use]
+    pub fn core1_pc(&self) -> Option<u32> {
+        self.core1.as_ref().map(CpuCore::pc)
+    }
+
+    /// Core 1 stack pointer, or `None` / core1 栈指针，无则 `None`
+    #[must_use]
+    pub fn core1_sp(&self) -> Option<u32> {
+        self.core1.as_ref().map(|core| core.read_register(13))
+    }
+
+    /// Read one core-1 general-purpose register / 读取 core1 的一个通用寄存器
+    #[cfg(test)]
+    #[must_use]
+    pub fn core1_register(&self, index: u8) -> Option<u32> {
+        self.core1.as_ref().map(|core| core.read_register(index))
+    }
+
+    /// Number of completed core-1 launches / 已完成的 core1 启动次数
+    #[must_use]
+    pub fn core1_launch_count(&self) -> u64 {
+        self.core1_launches
+    }
+
+    /// Why core 1 stopped, if it did / core1 的停机原因（若停机）
+    ///
+    /// Core-1 faults are recorded here instead of [`Self::halt_reason`] so a
+    /// core-1 bus error never makes core 0 look like it crashed.
+    /// core1 故障记录在这里而不是 [`Self::halt_reason`]，因此 core1 的总线错误
+    /// 不会让 core0 看起来崩溃。
+    #[must_use]
+    pub fn core1_halt_reason(&self) -> Option<&str> {
+        self.core1_halt.as_deref()
+    }
+
+    /// Read a core-1 system-control register (test/diagnostic hook)
+    /// 读取 core1 系统控制寄存器（测试与诊断接口）
+    #[cfg(test)]
+    pub fn core1_system_register(&mut self, addr: u32) -> Option<u32> {
+        self.core1.as_mut().and_then(|core| core.system_read(addr))
+    }
+
     /// Dump a run of words from the bus, marking unmapped addresses
     /// 从总线转储一段连续字，对未映射地址做标记
     ///
@@ -752,15 +888,15 @@ impl Machine {
         }
     }
 
-    /// Execute one instruction (or one boot ROM trap)
-    /// 执行一条指令（或一次 boot ROM 陷阱）
+    /// Execute one instruction on each runnable core
+    /// 在每个可运行核心上各执行一条指令
     ///
     /// # Errors
-    /// Propagates bus errors raised while dispatching a boot ROM trap. CPU
-    /// execution errors are captured as a halt reason so `run` keeps its
-    /// historical "report and stop" behaviour.
-    /// 传播 boot ROM 陷阱分发期间的总线错误。CPU 执行错误会记录为停机原因，
-    /// 以保持 `run` 既有的“报告后停止”行为。
+    /// Propagates bus errors raised while dispatching a core-0 boot ROM trap.
+    /// Core-1 faults are captured in [`Self::core1_halt_reason`] and never abort
+    /// core 0.
+    /// 传播 core0 boot ROM 陷阱分发期间的总线错误。core1 故障记录在
+    /// [`Self::core1_halt_reason`] 中，绝不影响 core0。
     pub fn step(&mut self) -> Result<CpuState> {
         self.execute_step(None)
     }
@@ -810,6 +946,118 @@ impl Machine {
     }
 
     fn execute_step(&mut self, trace: Option<usize>) -> Result<CpuState> {
+        let state = self.execute_core0_step(trace)?;
+        self.step_core1();
+        Ok(state)
+    }
+
+    /// Advance core 1 by one instruction / 推进 core1 一条指令
+    ///
+    /// Handles the two handshakes that can change core 1's state (a `PSM`
+    /// hard reset and a completed SIO FIFO launch) before stepping it. The SIO
+    /// view is switched to core 1 around the instruction so `FIFO_WR`,
+    /// `FIFO_RD`, the doorbells and `CPUID` follow core 1's direction, and PPB
+    /// system writes are replayed into core 1 so its `VTOR`, `CPACR` and NVIC
+    /// stay independent from core 0's. A core-1 fault only stops core 1.
+    /// 在执行 core1 之前处理两种会改变其状态的握手（`PSM` 硬复位与已完成的 SIO
+    /// FIFO 启动）。指令执行前后把 SIO 视图切到 core1，使 `FIFO_WR`、`FIFO_RD`、
+    /// 门铃与 `CPUID` 遵循 core1 的方向；PPB 系统写入回放到 core1，使其
+    /// `VTOR`、`CPACR` 与 NVIC 与 core0 相互独立。core1 故障只停止 core1。
+    fn step_core1(&mut self) {
+        if self.halt.is_some() || self.budget_exhausted() {
+            return;
+        }
+        // PSM 置位 FRCE_OFF.PROC1：硬复位 core1 并重新启用 boot ROM 回显桩。
+        // FRCE_OFF.PROC1 set: hard-reset core 1 and re-arm the boot-ROM echo stub.
+        if self.peripherals.core1_reset_pending() && self.peripherals.take_core1_reset() {
+            self.peripherals.reset_core1_boot();
+            self.core1_halt = None;
+            if self.core1.is_some() {
+                let mut core1 = CortexM33Core::new(CpuId::Core1);
+                core1.set_strict_decode(self.strict_decode);
+                self.core1 = Some(core1);
+            }
+        }
+        if self.peripherals.core1_launch_pending() {
+            if let Some(launch) = self.peripherals.take_core1_launch() {
+                self.boot_core1(launch);
+            }
+        }
+        let Some(core1) = self.core1.as_mut() else {
+            return;
+        };
+        if core1.state() != CpuState::Running {
+            return;
+        }
+        self.peripherals.sio().select_core(CpuId::Core1);
+        // core1 也走合成 boot ROM 的陷阱分发：`rom_table_lookup` 桩位于
+        // 0x74，`runtime_init_per_core_bootrom_reset` 等每核初始化会调用它。
+        // Core 1 also goes through the synthetic boot ROM trap dispatch: the
+        // `rom_table_lookup` stub lives at 0x74 and the per-core runtime
+        // initializers call it.
+        let pc = core1.pc();
+        let result: std::result::Result<CpuState, String> =
+            if self.bootrom_applicable && self.bootrom.handles(pc) {
+                match self.bootrom.dispatch(core1, &mut self.bus) {
+                    Ok(Some(outcome)) => match outcome.halt {
+                        Some(halt) => Err(format!("core1 bootrom halt: {halt}")),
+                        None => Ok(CpuState::Running),
+                    },
+                    Ok(None) => core1.step(&mut self.bus).map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("core1: {error}")),
+                }
+            } else {
+                core1.step(&mut self.bus).map_err(|error| error.to_string())
+            };
+        self.peripherals.sio().select_core(CpuId::Core0);
+        // 按写入核心回放 PPB 系统写入：core1 的 CPACR/VTOR/NVIC 属于它自己。
+        // Replay PPB system writes into the writing core: core 1's CPACR, VTOR
+        // and NVIC belong to core 1.
+        for (addr, value) in self.peripherals.take_system_writes() {
+            core1.system_write(addr, value);
+        }
+        match result {
+            Ok(CpuState::Running) => {}
+            Ok(state) => {
+                self.core1_halt = Some(format!("core1 entered state {state:?}"));
+            }
+            Err(reason) => {
+                self.core1_halt = Some(reason);
+            }
+        }
+    }
+
+    /// Apply vectors from a completed FIFO launch / 应用已完成 FIFO 启动的向量
+    ///
+    /// The vector table is probed through the bus first, so a malformed `VTOR`
+    /// stops core 1 instead of faulting inside a half-initialized core.
+    /// 先通过总线探测向量表，使非法的 `VTOR` 只让 core1 停机，而不是在未完成
+    /// 初始化时触发故障。
+    fn boot_core1(&mut self, launch: Core1Launch) {
+        let mut cycles = 0u64;
+        if self.bus.read_u32(launch.vtor, &mut cycles).is_err()
+            || self
+                .bus
+                .read_u32(launch.vtor.wrapping_add(4), &mut cycles)
+                .is_err()
+        {
+            self.core1_halt = Some(format!("core1 vtor {:#010X} unreadable", launch.vtor));
+            return;
+        }
+        if let Some(core1) = self.core1.as_mut() {
+            core1.boot_at(launch.sp, launch.entry, launch.vtor);
+        }
+        if std::env::var_os("RP2350_TRACE_CORE1").is_some() {
+            eprintln!(
+                "[core1] launch vtor={:#010X} sp={:#010X} entry={:#010X}",
+                launch.vtor, launch.sp, launch.entry
+            );
+        }
+        self.core1_halt = None;
+        self.core1_launches = self.core1_launches.saturating_add(1);
+    }
+
+    fn execute_core0_step(&mut self, trace: Option<usize>) -> Result<CpuState> {
         if self.halt.is_some() || self.budget_exhausted() {
             return Ok(CpuState::Halted);
         }
@@ -836,7 +1084,13 @@ impl Machine {
                 // 陷阱步与原 run 路径一致：立即泵送中断，不在此处推进时基。
                 // Trap steps mirror the original run path: pump interrupts now and
                 // do not advance the timebase here.
-                pump(&mut self.core, &self.peripherals, &self.usb, &mut self.irqs);
+                pump(
+                    &mut self.core,
+                    self.core1.as_mut(),
+                    &self.peripherals,
+                    &self.usb,
+                    &mut self.irqs,
+                );
                 return Ok(CpuState::Running);
             }
         }
@@ -861,7 +1115,13 @@ impl Machine {
                     // 轨迹步与原 run 路径一致：每步泵送中断，不做自旋统计或时基推进。
                     // Trace steps mirror the original run path: pump every step and
                     // skip spin accounting and timebase advancement.
-                    pump(&mut self.core, &self.peripherals, &self.usb, &mut self.irqs);
+                    pump(
+                        &mut self.core,
+                        self.core1.as_mut(),
+                        &self.peripherals,
+                        &self.usb,
+                        &mut self.irqs,
+                    );
                 } else {
                     self.after_running_step();
                 }
@@ -940,7 +1200,13 @@ impl Machine {
         replay_system_writes(&mut self.core, &self.peripherals);
         if self.steps - self.pumped >= PUMP_INTERVAL {
             self.peripherals.service_core1_peer();
-            deliver_irqs(&mut self.core, &self.peripherals, &self.usb, &mut self.irqs);
+            deliver_irqs(
+                &mut self.core,
+                self.core1.as_mut(),
+                &self.peripherals,
+                &self.usb,
+                &mut self.irqs,
+            );
             self.pumped = self.steps;
         }
         if self.steps - self.advanced >= ADVANCE_INTERVAL {
@@ -973,9 +1239,12 @@ impl Machine {
         // Record the throttle point first: even when idle, the next probe waits
         // a full batch instead of locking on every step.
         self.dma_pumped = self.steps;
-        // HSTX advances independently of DMA: drain the host queue every batch
-        // and publish its FIFO-room DREQ before arbitration.
-        // HSTX 独立于 DMA 推进：每批排空宿主队列，并在仲裁前发布 FIFO 空间 DREQ。
+        // HSTX advances independently of DMA: drain the host queue every batch,
+        // advance the expander by one batch of cycles and publish its FIFO-room
+        // DREQ before arbitration.
+        // HSTX 独立于 DMA 推进：每批排空宿主队列、推进一个批次周期，并在仲裁前
+        // 发布 FIFO 空间 DREQ。
+        self.peripherals.hstx_mut().advance(PUMP_INTERVAL);
         let drained = self.peripherals.hstx_mut().take_output_count();
         self.hstx_words = self.hstx_words.saturating_add(drained);
         self.peripherals.sync_hstx_dreq();
@@ -1099,11 +1368,41 @@ pub fn run(options: &RunOptions) -> Result<()> {
         us = machine.time_us(),
         pc = machine.pc()
     )?;
+    print_post_mortem(&mut machine, &mut stdout)?;
+    write_dumps(&mut machine, &options.dumps)?;
+    for dump in &options.dumps {
+        writeln!(
+            stdout,
+            "[run] dump {:#010X}+{:#X} -> {}",
+            dump.address,
+            dump.length,
+            dump.path.display()
+        )?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Print the peripheral, register and UART diagnostics of a stopped machine
+/// 打印停机机器的外设、寄存器与 UART 诊断
+fn print_post_mortem(machine: &mut Machine, stdout: &mut impl Write) -> Result<()> {
     // DMA 统计只出现在 `run` 的宿主诊断行，`repl --exec` 的 stdout 不受影响。
     // The DMA counters only appear in `run`'s host diagnostics, so `repl --exec`
     // stdout semantics stay unchanged.
     writeln!(stdout, "[run] {}", machine.dma_state())?;
     writeln!(stdout, "[run] {}", machine.hstx_state())?;
+    if let Some(state) = machine.core1_state() {
+        writeln!(
+            stdout,
+            "[run] core1 state={state:?} pc={:#010X} sp={:#010X} launches={}",
+            machine.core1_pc().unwrap_or(0),
+            machine.core1_sp().unwrap_or(0),
+            machine.core1_launch_count()
+        )?;
+        if let Some(reason) = machine.core1_halt_reason() {
+            writeln!(stdout, "[run] core1 halt: {reason}")?;
+        }
+    }
     for index in 0..3 {
         if let Some(channel) = machine.peripherals.dma().channel_state(index) {
             writeln!(
@@ -1119,7 +1418,7 @@ pub fn run(options: &RunOptions) -> Result<()> {
             )?;
         }
     }
-    writeln!(stdout, "[run] {}", register_snapshot(&machine))?;
+    writeln!(stdout, "[run] {}", register_snapshot(machine))?;
     if !machine.irqs().is_empty() {
         writeln!(stdout, "[run] irq deliveries (first {IRQ_LOG_LIMIT}):")?;
         for line in machine.irqs() {
@@ -1135,7 +1434,35 @@ pub fn run(options: &RunOptions) -> Result<()> {
             writeln!(stdout)?;
         }
     }
-    stdout.flush()?;
+    Ok(())
+}
+
+/// Write every `--dump` range from the stopped machine / 写入停机机器的每条 `--dump` 区间
+fn write_dumps(machine: &mut Machine, dumps: &[MemoryDump]) -> Result<()> {
+    for dump in dumps {
+        write_memory_dump(&mut machine.bus, dump).with_context(|| {
+            format!("memory dump failed / 内存导出失败: {}", dump.path.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Read `dump.length` bytes from the bus and write them to `dump.path`
+/// 从总线读取 `dump.length` 字节并写入 `dump.path`
+///
+/// Reads go through the normal bus, so SRAM, flash and MMIO windows work; the
+/// caller is responsible for choosing a side-effect-free range.
+/// 读取走正常总线，因此 SRAM、Flash 与 MMIO 窗口都可用；调用方需选择无副作用的
+/// 区间。
+fn write_memory_dump(bus: &mut SimpleBus, dump: &MemoryDump) -> Result<()> {
+    let mut bytes = Vec::with_capacity(dump.length as usize);
+    let mut cycles = 0u64;
+    for offset in 0..dump.length {
+        let address = dump.address.wrapping_add(offset);
+        bytes.push(bus.read_u8(address, &mut cycles)?);
+    }
+    std::fs::write(&dump.path, &bytes)
+        .with_context(|| format!("cannot write {}", dump.path.display()))?;
     Ok(())
 }
 
@@ -1316,13 +1643,14 @@ fn load_image(
 /// 调用两半：系统写入立即生效，中断线保持节流。
 fn pump(
     core: &mut dyn CpuCore,
+    core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
     irq_log: &mut Vec<String>,
 ) {
     peripherals.service_core1_peer();
     replay_system_writes(core, peripherals);
-    deliver_irqs(core, peripherals, usb, irq_log);
+    deliver_irqs(core, core1, peripherals, usb, irq_log);
 }
 
 /// Replay PPB system writes into the core
@@ -1333,9 +1661,19 @@ fn replay_system_writes(core: &mut dyn CpuCore, peripherals: &BootPeripherals) {
     }
 }
 
-/// Deliver asserted interrupt lines / 投递已断言的中断线
+/// Deliver asserted interrupt lines to both cores / 向两个核心投递已断言的中断线
+///
+/// Every shared line reaches both NVICs and each core's enables decide whether
+/// it is taken; `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` are per-core endpoints and are
+/// taken from [`BootPeripherals::core1_irq_mask`] for core 1. This is what lets
+/// core 1 run HSTX's `DMA_IRQ_0` handler.
+/// 所有共享线同时送达两个 NVIC，由各核心的使能位决定是否响应；
+/// `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` 是按核端点，core1 使用
+/// [`BootPeripherals::core1_irq_mask`]。这正是 core1 能运行 HSTX
+/// `DMA_IRQ_0` 处理程序的原因。
 fn deliver_irqs(
     core: &mut dyn CpuCore,
+    core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
     irq_log: &mut Vec<String>,
@@ -1346,24 +1684,35 @@ fn deliver_irqs(
             continue;
         }
         core.signal_interrupt(irq);
-        log_irq(irq_log, irq, core.pc());
+        log_irq(irq_log, "", irq, core.pc());
     }
     // USB 控制器把 INTR & INTE 聚合到 INTS；固件清 INTS 后条件自然撤销。
     // The USB controller aggregates INTR & INTE into INTS; the condition
     // disappears when firmware clears INTS.
     if usb.irq_asserted() {
         core.signal_interrupt(USBCTRL_IRQ);
-        log_irq(irq_log, USBCTRL_IRQ, core.pc());
+        log_irq(irq_log, "", USBCTRL_IRQ, core.pc());
+    }
+    let Some(core1) = core1 else {
+        return;
+    };
+    let mask = peripherals.core1_irq_mask();
+    for irq in 0..64u16 {
+        if mask & (1u64 << irq) == 0 {
+            continue;
+        }
+        core1.signal_interrupt(irq);
+        log_irq(irq_log, "core1 ", irq, core1.pc());
     }
 }
 
 /// Record the latest interrupt deliveries in a bounded ring
 /// 在有界环形缓冲中记录最近的中断投递
-fn log_irq(irq_log: &mut Vec<String>, irq: u16, pc: u32) {
+fn log_irq(irq_log: &mut Vec<String>, core: &str, irq: u16, pc: u32) {
     if irq_log.len() == IRQ_LOG_LIMIT {
         irq_log.remove(0);
     }
-    irq_log.push(format!("[irq] signal {irq} at PC={pc:#010X}"));
+    irq_log.push(format!("[irq] {core}signal {irq} at PC={pc:#010X}"));
 }
 
 #[cfg(test)]
@@ -1513,7 +1862,7 @@ mod tests {
                 .channel_state(0)
                 .expect("ch0")
                 .trans_count,
-            1_000 - 16
+            1_000 - DMA_PUMP_TRANSFERS as u32
         );
 
         machine.run_cycles(PUMP_INTERVAL);
@@ -1794,6 +2143,23 @@ mod tests {
     }
 
     #[test]
+    fn memory_dump_specs_parse_decimal_and_hex() {
+        let dump = MemoryDump::parse("0x20063DF4:0x12C00:fb.bin").expect("spec");
+        assert_eq!(dump.address, 0x2006_3DF4);
+        assert_eq!(dump.length, 0x1_2C00);
+        assert_eq!(dump.path, PathBuf::from("fb.bin"));
+
+        let plain = MemoryDump::parse("537000000:1024:out.bin").expect("decimal");
+        assert_eq!(plain.address, 537_000_000);
+        assert_eq!(plain.length, 1024);
+
+        assert!(MemoryDump::parse("0x2000").is_err(), "missing fields");
+        assert!(MemoryDump::parse("zz:1:x").is_err(), "bad address");
+        assert!(MemoryDump::parse("1:zz:x").is_err(), "bad length");
+        assert!(MemoryDump::parse("1:2:").is_err(), "empty path");
+    }
+
+    #[test]
     fn machine_boots_and_stops_at_the_budget() {
         let elf = infinite_loop_elf();
         let options = MachineOptions {
@@ -1980,5 +2346,389 @@ mod tests {
         let arm = uf2_block(0xE48B_FF59, FLASH_XIP_BASE, &[0u8; 4]);
         let (arch, _, _) = load_image(&arm, &mut bus, None).expect("load arm");
         assert_eq!(arch, ArchArg::Arm);
+    }
+
+    // ---- core 1: launch protocol, stepping, IRQ routing ---------------------
+
+    /// SIO `FIFO_ST` as seen from core 0 / core0 视角的 SIO `FIFO_ST`
+    const SIO_FIFO_ST: u32 = 0xD000_0050;
+
+    /// SIO `FIFO_WR` / SIO `FIFO_WR`
+    const SIO_FIFO_WR: u32 = 0xD000_0054;
+
+    /// SIO `FIFO_RD` / SIO `FIFO_RD`
+    const SIO_FIFO_RD: u32 = 0xD000_0058;
+
+    /// `PSM_FRCE_OFF` SET alias / `PSM_FRCE_OFF` 的 SET 别名
+    const PSM_FRCE_OFF_SET: u32 = 0x4001_A004;
+
+    /// `PSM_FRCE_OFF` CLR alias / `PSM_FRCE_OFF` 的 CLR 别名
+    const PSM_FRCE_OFF_CLR: u32 = 0x4001_B004;
+
+    /// `PSM_FRCE_OFF.PROC1` / `PSM_FRCE_OFF.PROC1`
+    const PSM_PROC1: u32 = 0x0100_0000;
+
+    /// Core-1 code region inside SRAM / SRAM 中的 core1 代码区
+    const CORE1_CODE: u32 = SRAM_BASE + 0x8000;
+
+    /// Core-1 vector table inside SRAM / SRAM 中的 core1 向量表
+    const CORE1_VTOR: u32 = SRAM_BASE + 0x1000;
+
+    /// Core-1 initial stack pointer / core1 初始栈指针
+    const CORE1_STACK: u32 = SRAM_BASE + 0xA000;
+
+    /// Shared sentinel word / 共享哨兵字
+    const SENTINEL: u32 = SRAM_BASE + 0x9000;
+
+    /// `LDR r0,[pc,#4]; LDR r1,[pc,#8]; STR r0,[r1]; B .`
+    const STORE_PROGRAM: [u16; 4] = [0x4801, 0x4902, 0x6008, 0xE7FE];
+
+    /// `LDR r1,[pc,#8]; LDR r0,[r1]; STR r0,[r1,#4]; B .`
+    const COPY_PROGRAM: [u16; 4] = [0x4902, 0x6808, 0x6048, 0xE7FE];
+
+    /// `LDR r1,[pc,#8]; LDR r0,[r1]; ADDS r0,#1; STR r0,[r1]; B`
+    const COUNTER_LOOP: [u16; 5] = [0x4902, 0x6808, 0x3001, 0x6008, 0xE7FB];
+
+    /// Thumb `b .` / Thumb `b .`
+    const SPIN_PROGRAM: [u16; 1] = [0xE7FE];
+
+    /// Write a halfword program / 写入半字程序
+    fn bind_halfwords(machine: &mut Machine, base: u32, halfwords: &[u16]) {
+        let mut cycles = 0u64;
+        for (index, halfword) in halfwords.iter().enumerate() {
+            machine
+                .bus
+                .write_u16(base + index as u32 * 2, *halfword, &mut cycles)
+                .expect("code write");
+        }
+    }
+
+    /// Write `value` to `target` from the store program / 用存储程序把值写入目标
+    fn bind_store_program(machine: &mut Machine, base: u32, target: u32, value: u32) {
+        bind_halfwords(machine, base, &STORE_PROGRAM);
+        write_word(machine, base + 0x08, value);
+        write_word(machine, base + 0x0C, target);
+    }
+
+    /// Write a self-contained increment loop over `counter` / 写入自包含自增循环
+    fn bind_counter_program(machine: &mut Machine, base: u32, counter: u32) {
+        bind_halfwords(machine, base, &COUNTER_LOOP);
+        write_word(machine, base + 0x0C, counter);
+    }
+
+    /// Push the SDK's `{0,0,1,vtor,sp,entry}` stream and check every echo
+    /// 写入 SDK 的 `{0,0,1,vtor,sp,entry}` 命令流并校验每个回显
+    fn push_launch(machine: &mut Machine, vtor: u32, sp: u32, entry: u32) {
+        for word in [0, 0, 1, vtor, sp, entry] {
+            write_word(machine, SIO_FIFO_WR, word);
+            machine.peripherals.service_core1_peer();
+            assert_eq!(
+                read_word(machine, SIO_FIFO_RD),
+                word,
+                "the boot-ROM peer must echo {word:#010X}"
+            );
+        }
+        assert!(machine.peripherals.core1_launch_pending());
+    }
+
+    #[test]
+    fn the_launch_stream_boots_core1_from_entry_sp_and_vtor() {
+        // 命令流被识别后 core1 从 entry 启动，SP 与 VTOR 取自同一命令流。
+        // Once the stream is recognized core 1 boots at entry, with SP and VTOR
+        // taken from the same command stream.
+        let mut machine = machine_with_budget(1_000);
+        bind_halfwords(&mut machine, CORE1_CODE, &SPIN_PROGRAM);
+        assert_eq!(machine.core1_state(), Some(CpuState::Reset));
+
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        assert_eq!(machine.core1_state(), Some(CpuState::Reset));
+        machine.step().expect("launch step");
+
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        assert_eq!(machine.core1_pc(), Some(CORE1_CODE));
+        assert_eq!(machine.core1_sp(), Some(CORE1_STACK));
+        assert_eq!(
+            machine.core1_system_register(0xE000_ED08),
+            Some(CORE1_VTOR),
+            "core1 VTOR comes from the launch stream / core1 VTOR 来自启动流"
+        );
+        assert_eq!(machine.core1_launch_count(), 1);
+        assert_eq!(machine.core1_halt_reason(), None);
+    }
+
+    #[test]
+    fn core1_never_touches_shared_sram_before_release() {
+        // 未释放的 core1 处于 Reset：共享哨兵必须保持原值。
+        // An unreleased core 1 stays in Reset, so the shared sentinel keeps its
+        // original value.
+        let mut machine = machine_with_budget(1_000);
+        bind_store_program(&mut machine, CORE1_CODE, SENTINEL, 0x1234_5678);
+        write_word(&mut machine, SENTINEL, 0xDEAD_BEEF);
+
+        machine.run_cycles(200);
+
+        assert_eq!(machine.core1_state(), Some(CpuState::Reset));
+        assert_eq!(machine.core1_pc(), Some(0));
+        assert_eq!(read_word(&mut machine, SENTINEL), 0xDEAD_BEEF);
+        assert_eq!(machine.core1_launch_count(), 0);
+    }
+
+    #[test]
+    fn core1_writes_shared_sram_and_core0_reads_it() {
+        // core1 运行手写 Thumb 程序写共享 SRAM，core0 随后用同一总线读出。
+        // Core 1 runs a hand-written Thumb program that fills shared SRAM, then
+        // core 0 reads it back through the same bus.
+        let mut machine = machine_with_budget(1_000);
+        bind_store_program(&mut machine, CORE1_CODE, SENTINEL, 0x5EED_1234);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+
+        machine.run_cycles(4);
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        assert_eq!(read_word(&mut machine, SENTINEL), 0x5EED_1234);
+
+        bind_halfwords(&mut machine, SRAM_BASE + 0x8400, &COPY_PROGRAM);
+        write_word(&mut machine, SRAM_BASE + 0x840C, SENTINEL);
+        machine.write_register(15, SRAM_BASE + 0x8400);
+        for _ in 0..3 {
+            machine.step().expect("core0 copy");
+        }
+        assert_eq!(
+            read_word(&mut machine, SENTINEL + 4),
+            0x5EED_1234,
+            "core0 copied core1's store / core0 复制了 core1 的写入"
+        );
+    }
+
+    #[test]
+    fn core0_and_core1_keep_independent_register_files() {
+        // 两核寄存器文件独立：core1 的栈与寄存器改变不影响 core0。
+        // The register files are independent: core 1's stack and registers do
+        // not disturb core 0's.
+        let mut machine = machine_with_budget(1_000);
+        bind_halfwords(&mut machine, CORE1_CODE, &SPIN_PROGRAM);
+        machine.write_register(0, 0xAAAA_AAAA);
+        let core0_sp = machine.sp();
+
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.step().expect("launch step");
+
+        assert_eq!(machine.core1_register(0), Some(0));
+        assert_eq!(machine.core1_sp(), Some(CORE1_STACK));
+        assert_eq!(machine.register(0), 0xAAAA_AAAA);
+        assert_eq!(machine.sp(), core0_sp);
+    }
+
+    #[test]
+    fn both_cores_advance_their_own_counters() {
+        // 双核交替步进：每次 step 两个核心各执行一条指令，计数器同步增长。
+        // Alternating steps: each `step` retires one instruction per core, so the
+        // two counters grow together.
+        let mut machine = machine_with_budget(1_000);
+        bind_counter_program(&mut machine, CORE1_CODE, SENTINEL);
+        bind_counter_program(&mut machine, SRAM_BASE + 0x8400, SENTINEL + 4);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.write_register(15, SRAM_BASE + 0x8400);
+
+        machine.run_cycles(40);
+
+        assert_eq!(read_word(&mut machine, SENTINEL), 10);
+        assert_eq!(read_word(&mut machine, SENTINEL + 4), 10);
+    }
+
+    #[test]
+    fn a_halted_core1_does_not_stop_core0_or_consume_budget() {
+        // core1 的总线错误只停机 core1：core0 继续跑，预算按 core0 步数计。
+        // A core-1 bus error only stops core 1: core 0 keeps running and the
+        // budget still counts core-0 steps.
+        let mut machine = machine_with_budget(20);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, 0x3000_0000 | 1);
+
+        machine.run_cycles(5);
+        assert_eq!(machine.core1_state(), Some(CpuState::Halted));
+        assert!(machine.core1_halt_reason().is_some());
+        assert_eq!(machine.halt_reason(), None, "core0 must survive");
+        assert_eq!(machine.steps(), 5);
+
+        machine.run_cycles(5);
+        assert_eq!(machine.steps(), 10);
+
+        machine.run_cycles(100);
+        assert_eq!(machine.steps(), 20);
+        assert!(machine.budget_exhausted());
+    }
+
+    #[test]
+    fn core1_pushes_a_fifo_frame_that_core0_pops() {
+        // core1 写自己的 FIFO_WR 后，core0 的 FIFO_RD / SIO_IRQ_FIFO 必须看到它。
+        // After core 1 writes its own FIFO_WR, core 0's FIFO_RD and SIO_IRQ_FIFO
+        // must observe the frame.
+        let mut machine = machine_with_budget(1_000);
+        bind_store_program(&mut machine, CORE1_CODE, SIO_FIFO_WR, 0);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        let fifo_line = 1u64 << rp2350_periph::map::SIO_IRQ_FIFO;
+
+        machine.run_cycles(4);
+
+        assert_ne!(
+            read_word(&mut machine, SIO_FIFO_ST) & 1,
+            0,
+            "core0's receive FIFO has the frame / core0 收件箱有数据"
+        );
+        assert_ne!(machine.peripherals.irq_mask() & fifo_line, 0);
+        assert_eq!(read_word(&mut machine, SIO_FIFO_RD), 0);
+        assert_eq!(
+            machine.peripherals.irq_mask() & fifo_line,
+            0,
+            "popping releases the line / 弹出后释放中断线"
+        );
+    }
+
+    #[test]
+    fn core1_takes_a_dma_completion_interrupt() {
+        // DMA_IRQ_0 属于共享线；core1 使能后必须进入自己的 hstx 处理程序。
+        // DMA_IRQ_0 is a shared line; once core 1 enables it, its own handler
+        // must run.
+        let mut machine = machine_with_budget(1_000);
+        let handler = SRAM_BASE + 0x8800;
+        let irq = rp2350_periph::map::DMA_IRQ_0;
+        bind_halfwords(&mut machine, handler, &SPIN_PROGRAM);
+        bind_halfwords(&mut machine, CORE1_CODE, &SPIN_PROGRAM);
+        write_word(&mut machine, CORE1_VTOR, CORE1_STACK);
+        write_word(&mut machine, CORE1_VTOR + 4, CORE1_CODE | 1);
+        write_word(
+            &mut machine,
+            CORE1_VTOR + (16 + u32::from(irq)) * 4,
+            handler | 1,
+        );
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.step().expect("launch step");
+        machine
+            .core1
+            .as_mut()
+            .expect("core1")
+            .system_write(0xE000_E100, 1u32 << u32::from(irq));
+
+        program_channel(
+            &mut machine,
+            0,
+            SRAM_BASE + 0x1000,
+            SRAM_BASE + 0x2000,
+            1,
+            0,
+        );
+        write_word(&mut machine, DMA_BASE + 0x404, 1);
+        machine.run_cycles(2 * PUMP_INTERVAL);
+
+        assert_eq!(
+            machine.core1_pc(),
+            Some(handler),
+            "core1 entered its DMA_IRQ_0 handler / core1 已进入 DMA_IRQ_0 处理程序"
+        );
+    }
+
+    #[test]
+    fn psm_reset_then_relaunch_restarts_core1() {
+        // 置位 PROC1 硬复位 core1 并清空启动状态；清除后重新走一遍启动协议。
+        // Setting PROC1 hard-resets core 1 and drops the launch state; clearing
+        // it lets the launch protocol run again.
+        let mut machine = machine_with_budget(1_000);
+        bind_halfwords(&mut machine, CORE1_CODE, &SPIN_PROGRAM);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.step().expect("launch step");
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        assert_eq!(machine.core1_launch_count(), 1);
+
+        write_word(&mut machine, PSM_FRCE_OFF_SET, PSM_PROC1);
+        machine.step().expect("reset step");
+        assert_eq!(machine.core1_state(), Some(CpuState::Reset));
+        assert_eq!(machine.core1_pc(), Some(0));
+
+        write_word(&mut machine, PSM_FRCE_OFF_CLR, PSM_PROC1);
+        machine.peripherals.service_core1_peer();
+        assert_eq!(
+            read_word(&mut machine, SIO_FIFO_RD),
+            0,
+            "boot ROM acknowledges the release / boot ROM 确认释放"
+        );
+
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.step().expect("relaunch step");
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        assert_eq!(machine.core1_launch_count(), 2);
+    }
+
+    #[test]
+    fn gdb_single_steps_advance_core1() {
+        // GDB `resume` 走 `Machine::step`，因此单步必须同时推进 core1。
+        // GDB `resume` goes through `Machine::step`, so a single step must also
+        // advance core 1.
+        let mut machine = machine_with_budget(1_000);
+        bind_counter_program(&mut machine, CORE1_CODE, SENTINEL);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.step().expect("launch step");
+        let first_pc = machine.core1_pc().expect("core1 pc");
+        assert_eq!(read_word(&mut machine, SENTINEL), 0);
+
+        machine.step().expect("single step");
+        assert_ne!(machine.core1_pc(), Some(first_pc));
+        machine.step().expect("single step");
+        machine.step().expect("single step");
+        assert_eq!(read_word(&mut machine, SENTINEL), 1);
+    }
+
+    /// `emerald.uf2` used by the ignore-gated smoke test / 冒烟测试使用的固件
+    const EMERALD_UF2: &str =
+        r"E:\Source\mcu\pico\rp2350\gba\pokeemerald-rp2350\rp2350\hw\build_emerald\emerald.uf2";
+
+    #[test]
+    #[ignore = "long firmware smoke test / 长固件冒烟测试"]
+    fn emerald_runs_core1_hstx_without_bus_errors() {
+        // 真实固件冒烟：`main` 用 `multicore_launch_core1_with_stack` 启动
+        // core1_render，其第一件事是 hstx_display_start，因此 HSTX 输出字数必须
+        // 变为非零，且不得出现总线错误。
+        // Real-firmware smoke test: `main` launches `core1_render` through
+        // `multicore_launch_core1_with_stack`; its first action is
+        // `hstx_display_start`, so HSTX output words must become non-zero and no
+        // bus error may occur.
+        let Ok(bytes) = std::fs::read(EMERALD_UF2) else {
+            return;
+        };
+        let options = MachineOptions {
+            arch: None,
+            max_cycles: 500_000_000,
+            strict_decode: false,
+        };
+        let mut machine = Machine::new(&bytes, &options).expect("machine");
+        while machine.halt_reason().is_none() && !machine.budget_exhausted() {
+            machine.step().expect("step");
+        }
+        machine.finalize();
+
+        assert_eq!(machine.halt_reason(), None);
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        assert!(machine.core1_launch_count() >= 1);
+        assert!(
+            machine.hstx_words() > 0,
+            "hstx words={} dma={} / HSTX 输出字数为 0",
+            machine.hstx_words(),
+            machine.dma_transfers()
+        );
+        // Pixel-clock pacing keeps the expander in step with the DMA ring, so a
+        // healthy scanout shows no starvation episodes and (at most) a single
+        // start-up command/data hiccup.
+        // 像素时钟节拍使扩展器与 DMA 环同步，因此健康扫描不应有断流，命令/数据
+        // 相位错位最多出现一次（启动期）。
+        let hstx = machine.peripherals.hstx();
+        assert_eq!(
+            hstx.output_underrun(),
+            0,
+            "hstx underruns must stay at zero / HSTX 不应断流"
+        );
+        assert!(
+            hstx.unknown_commands() <= 1,
+            "unknown commands: {} / 未知命令过多",
+            hstx.unknown_commands()
+        );
+        assert!(machine.dma_transfers() > 0);
     }
 }

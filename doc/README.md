@@ -113,6 +113,7 @@ cargo doc --no-deps --document-private-items
 | [implementation-plan.md](implementation-plan.md) | Phased implementation plan with milestones |
 | [reference-gap-analysis.md](reference-gap-analysis.md) | Upstream gap analysis, UF2/RISC-V/RP2040/USB plan |
 | [perfbench-report.md](perfbench-report.md) | Official `run-perfbench.py` results on both MicroPython firmware images |
+| [gba-bringup-report.md](gba-bringup-report.md) | `emerald.uf2` (pokeemerald-rp2350) bring-up: defects fixed, HSTX/game-frame evidence |
 | [usb-device-model.md](usb-device-model.md) | USB device controller model + host bridge design |
 | [dependencies.md](dependencies.md) | Third-party crate inventory, version, usage |
 | [changelog.md](changelog.md) | Version changelog (Keep a Changelog) |

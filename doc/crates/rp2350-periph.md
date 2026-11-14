@@ -504,7 +504,7 @@ Opcode lives in bits `[15:12]`, count in bits `[11:0]` — the layout used by th
 | `0x0` | `hstx::CMD_RAW` | consume `count` data words, emit each once / 消费 `count` 个数据字，各输出一次 |
 | `0x1` | `hstx::CMD_RAW_REPEAT` | consume one data word, emit it `count` times / 消费一个字并输出 `count` 次 |
 | `0x2` | `hstx::CMD_TMDS` | consume `ceil(count * ENC_SHIFT / 32)` words (or `count` when `ENC_SHIFT = 0`), pass through unchanged / 消费相应字数并原样透传 |
-| `0x3` | `hstx::CMD_TMDS_REPEAT` | consume one word, emit it `count` times (TMDS word count) / 消费一个字并重复 |
+| `0x3` | `hstx::CMD_TMDS_REPEAT` | consume one word, emit it `count` times (one per pixel period) / 消费一个字并按 `count` 个像素周期重复输出 |
 | `0xE` | `hstx::CMD_WAIT` | **model extension**: wait `count` HSTX cycles, no output / **模型扩展**：等待，无输出 |
 | `0xF` | `hstx::CMD_NOP` | no payload, no output / 无载荷、无输出 |
 
@@ -519,25 +519,49 @@ never panic or raise the completion IRQ.
 不会 panic，也不会触发完成中断。
 
 With `EXPAND_EN = 0`, every FIFO word is raw output data and no command decoding
-happens — matching the datasheet's "raw FIFO data passed directly" mode.
+happens — matching the datasheet's "raw FIFO data passed directly" mode. The
+model does not pace this path: words pass through as fast as they arrive.
 `EXPAND_EN = 0` 时每个 FIFO 字都是原始输出数据，不做命令解码，对应数据手册的
-“原始 FIFO 数据直通”模式。
+“原始 FIFO 数据直通”模式。模型不为此路径计时：字以到达速度直接透传。
 
 ### Host-side output / 宿主侧输出
 
-`advance(cycles)` pops at most one FIFO word per HSTX cycle while `EN` is set,
+`advance(cycles)` is paced by the pixel clock, not by the clock count of words:
+the pixel period is `clk_hstx / CSR.CLKDIV` with `clk_hstx = clk_sys / 2`, so
+`2 * CLKDIV` `clk_sys` cycles per pixel (10 cycles with the validated
+`CLKDIV = 5`). Every popped word occupies the pixel time of the command that
+owns it — one period for `RAW`/`RAW_REPEAT`, `32 / ENC_SHIFT` periods per word
+for `TMDS`, `count` periods for a repeat command. A 256-word scanline block
+therefore lasts exactly 800 pixel periods (8000 `clk_sys` cycles at 252 MHz),
+which is one 640x480p60 scanline; that is what keeps the expander in step with
+the DMA ring instead of draining the FIFO 20x too fast and dropping words.
+`advance(cycles)` 由像素时钟而非「每周期一字」节拍：像素周期为
+`clk_hstx / CSR.CLKDIV`，其中 `clk_hstx = clk_sys / 2`，即每像素
+`2 * CLKDIV` 个 `clk_sys` 周期（已验证的 `CLKDIV = 5` 为 10 周期）。每个被弹出
+的字占用其所属命令的像素时长——`RAW`/`RAW_REPEAT` 一个周期，`TMDS` 每字
+`32 / ENC_SHIFT` 个周期，重复命令为 `count` 个周期。因此一个 256 字扫描行块
+正好持续 800 个像素周期（252 MHz 下 8000 个 `clk_sys` 周期），即一条
+640x480p60 扫描线；这正是扩展器与 DMA 环保持同步、而不是快 20 倍排空 FIFO
+并丢字的原因。
+
+`advance(cycles)` pops at most one FIFO word per word period while `EN` is set,
 expands it and queues the resulting 32-bit output words. `drain_output()` takes
-the whole queue; `take_scanline()` is an alias for scanline-oriented hosts.
+the whole queue; `take_scanline()` is an alias for scanline-oriented hosts, and
+`take_output_count()` discards it while returning the word count.
 `output_underrun()` counts FIFO starvation episodes while a command still needs
 data, and `advance` sets `IRQ_UNDERRUN`. `advance` does nothing when `EN` is
-clear or the FIFO is empty, so an idle HSTX never produces pixels. `reset()`
-restores the reset values and clears FIFOs, counters and the shared IRQ line.
-`advance(cycles)` 在 `EN` 置位时每个 HSTX 周期至多弹出一个 FIFO 字，展开并把
+clear or the FIFO is idle, so an idle HSTX never produces pixels.
+`output_words()` counts expanded words, `fifo_not_full()` is the `DREQ_HSTX`
+level, and `fifo_overrun()` reports the sticky `WOF`. `reset()` restores the
+reset values and clears FIFOs, counters and the shared IRQ line.
+`advance(cycles)` 在 `EN` 置位时按字周期至多弹出一个 FIFO 字，展开并把
 32 位输出字放入队列。`drain_output()` 取走整个队列；`take_scanline()` 是面向
-扫描线宿主的别名。`output_underrun()` 统计命令仍需数据时的 FIFO 断流次数，
-`advance` 会置位 `IRQ_UNDERRUN`。`EN` 清零或 FIFO 空闲时 `advance` 不做任何
-事，因此空闲 HSTX 不会产生像素。`reset()` 恢复复位值并清空 FIFO、计数器与
-共享中断线。
+扫描线宿主的别名，`take_output_count()` 丢弃队列并返回字数。
+`output_underrun()` 统计命令仍需数据时的 FIFO 断流次数，`advance` 会置位
+`IRQ_UNDERRUN`。`EN` 清零或 FIFO 空闲时 `advance` 不做任何事，因此空闲 HSTX
+不会产生像素。`output_words()` 统计已展开字数，`fifo_not_full()` 即
+`DREQ_HSTX` 电平，`fifo_overrun()` 报告粘滞的 `WOF`。`reset()` 恢复复位值并
+清空 FIFO、计数器与共享中断线。
 
 ```rust
 use rp2350_core::bus::AddressBus;
@@ -553,7 +577,9 @@ bus.write_u32(map::HSTX_FIFO_BASE + 0x04, hstx::CMD_RAW | 3, &mut cycles)?;
 for word in [0x0011_2233, 0x0044_5566, 0x0077_8899] {
     bus.write_u32(map::HSTX_FIFO_BASE + 0x04, word, &mut cycles)?;
 }
-peripherals.advance(4);
+// CLKDIV = 0 → 2 clk_sys per pixel → three RAW words need 6 cycles.
+// CLKDIV = 0 → 每像素 2 个 clk_sys → 三个 RAW 字需要 6 个周期。
+peripherals.advance(6);
 assert_eq!(peripherals.hstx_mut().drain_output(), [0x0011_2233, 0x0044_5566, 0x0077_8899]);
 ```
 
@@ -574,31 +600,32 @@ write-one-to-clear.
 ### Not modelled / 未建模项
 
 DVI/HDMI bit timing, the TMDS encoder and 10-bit symbol packing, the output
-shift register/clock generator (`CLKDIV`, `CLKPHASE`, `N_SHIFTS`, `SHIFT`),
-`BITx` pin crossbar routing, GPIO pin mapping, `EXPAND_TMDS` lane configuration,
-HSTX DMA handshakes (DREQ) and PIO coupled mode. TMDS data words are passed
-through unchanged; only the consumed word count is derived from
-`EXPAND_SHIFT.ENC_SHIFT`. No scanline/frame boundary, pixel format or
-`HstxDecoder` is provided. Hardware FIFO timing is approximated as one word per
-HSTX cycle.
+shift register/clock generator (`CLKDIV`, `CLKPHASE`, `N_SHIFTS`, `SHIFT` are
+stored but only `CLKDIV` and `ENC_SHIFT` feed the pacing), `BITx` pin crossbar
+routing, GPIO pin mapping, `EXPAND_TMDS` lane configuration and PIO coupled
+mode. TMDS data words are passed through unchanged; only the consumed word count
+and each word's pixel time are derived from `EXPAND_SHIFT`. No scanline/frame
+boundary, pixel format or `HstxDecoder` is provided. `DREQ_HSTX` (52) is
+modelled and asserted while the FIFO has room.
 DVI/HDMI 位时序、TMDS 编码器与 10 位符号打包、输出移位寄存器/时钟发生器
-（`CLKDIV`、`CLKPHASE`、`N_SHIFTS`、`SHIFT`）、`BITx` 引脚交叉开关、GPIO
-引脚映射、`EXPAND_TMDS` 通道配置、HSTX DMA 握手（DREQ）与 PIO 耦合模式均未
-建模。TMDS 数据字原样透传，只有消费字数由 `EXPAND_SHIFT.ENC_SHIFT` 推导。
-不提供扫描线/帧边界、像素格式或 `HstxDecoder`。硬件 FIFO 时序近似为每个
-HSTX 周期一个字。
+（`CLKDIV`、`CLKPHASE`、`N_SHIFTS`、`SHIFT` 仅保存，只有 `CLKDIV` 与
+`ENC_SHIFT` 参与节拍）、`BITx` 引脚交叉开关、GPIO 引脚映射、`EXPAND_TMDS`
+通道配置与 PIO 耦合模式均未建模。TMDS 数据字原样透传，只有消费字数与每字的
+像素时长由 `EXPAND_SHIFT` 推导。不提供扫描线/帧边界、像素格式或
+`HstxDecoder`。`DREQ_HSTX`（52）已建模，FIFO 有空间时断言。
 
 ---
 
 ## DMA
 
 `BootPeripherals::mount` installs one `Dma` at `0x5000_0000` (`map::DMA_BASE`,
-window `map::DMA_SIZE` = 4 KB). Clones share a single register file, so the
-bus-mounted device and the handles returned by `BootPeripherals::dma()` /
-`dma_mut()` observe the same state.
+window `map::DMA_SIZE` = 16 KB including the SET/CLR/XOR alias pages). Clones
+share a single register file, so the bus-mounted device and the handles returned
+by `BootPeripherals::dma()` / `dma_mut()` observe the same state.
 `BootPeripherals::mount` 在 `0x5000_0000`（`map::DMA_BASE`，窗口
-`map::DMA_SIZE` = 4 KB）挂载一个 `Dma`。克隆共享同一个寄存器文件，因此总线上
-的设备与 `BootPeripherals::dma()` / `dma_mut()` 返回的句柄看到相同状态。
+`map::DMA_SIZE` = 16 KB，含 SET/CLR/XOR 别名页）挂载一个 `Dma`。克隆共享同一个
+寄存器文件，因此总线上的设备与 `BootPeripherals::dma()` / `dma_mut()` 返回的
+句柄看到相同状态。
 
 ```rust
 pub struct Dma { /* shared register file + IrqAssert */ }
@@ -638,7 +665,7 @@ pub struct DmaChannelState {
 | `+0x04` | `WRITE_ADDR` | write address / 写地址 |
 | `+0x08` | `TRANS_COUNT` | remaining count (`[27:0]`) / 剩余计数（`[27:0]`） |
 | `+0x0C` | `CTRL_TRIG` | control + trigger / 控制 + 触发 |
-| `+0x10..=0x3C` | `AL1_*`/`AL2_*`/`AL3_*` | read/write/control aliases; `AL1_TRANS_COUNT_TRIG`, `AL2_WRITE_ADDR_TRIG`, `AL3_READ_ADDR_TRIG` also start the channel on a non-zero write / 读/写/控制别名；上述三个 `*_TRIG` 别名的非零写入同时启动通道 |
+| `+0x10..=0x3C` | `AL1_*`/`AL2_*`/`AL3_*` | read/write/count/control aliases. Only `CTRL_TRIG` and the `*_TRIG` aliases (`AL1_TRANS_COUNT_TRIG`, `AL2_WRITE_ADDR_TRIG`, `AL3_READ_ADDR_TRIG`) trigger; `AL1_CTRL`/`AL2_CTRL`/`AL3_CTRL` are plain, non-triggering writes / 读/写/计数/控制别名。只有 `CTRL_TRIG` 与 `*_TRIG` 别名（`AL1_TRANS_COUNT_TRIG`、`AL2_WRITE_ADDR_TRIG`、`AL3_READ_ADDR_TRIG`）会触发；`AL1_CTRL`/`AL2_CTRL`/`AL3_CTRL` 是普通的非触发写入 |
 | `0x400` | `INTR` | raw 16-bit status, W1C / 16 位原始状态，写 1 清零 |
 | `0x404`/`0x414`/`0x424`/`0x434` | `INTE0..3` | per-line enable / 每条线的使能 |
 | `0x408`/`0x418`/`0x428`/`0x438` | `INTF0..3` | per-line force / 每条线的强制位 |
@@ -664,14 +691,32 @@ clears both `EN` and `BUSY`.
 
 ### Transfer semantics / 传输语义
 
-- Writing `CTRL_TRIG` (or an ALx control alias) with `EN` set and a non-zero
-  value sets `BUSY` when `TRANS_COUNT > 0`; a zero count completes immediately.
-  `AL1_TRANS_COUNT_TRIG` / `AL2_WRITE_ADDR_TRIG` / `AL3_READ_ADDR_TRIG` and
-  `MULTI_CHAN_TRIGGER` also start the selected channels.
-  写 `CTRL_TRIG`（或 ALx 控制别名）且 `EN` 置位、值非零时，若
-  `TRANS_COUNT > 0` 则置 `BUSY`；计数为 0 时立即完成。
-  `AL1_TRANS_COUNT_TRIG` / `AL2_WRITE_ADDR_TRIG` / `AL3_READ_ADDR_TRIG` 与
-  `MULTI_CHAN_TRIGGER` 也会启动选中通道。
+- `TRANS_COUNT` (`0x08`) and the non-triggering count aliases (`AL2_TRANS_COUNT`,
+  `AL3_TRANS_COUNT`) latch a **rewrite** value. A trigger copies it into the
+  working count that `Dma::run` decrements; reads of `TRANS_COUNT` and
+  `DmaChannelState::trans_count` return the working count. Writing the count
+  while a channel is busy therefore only changes the value used by the next
+  start, exactly like the hardware reload register.
+  `TRANS_COUNT`（`0x08`）与非触发计数别名（`AL2_TRANS_COUNT`、`AL3_TRANS_COUNT`）
+  锁存**重载**值。触发器把它装载到 `Dma::run` 递减的工作计数；读 `TRANS_COUNT`
+  与 `DmaChannelState::trans_count` 返回工作计数。因此通道忙碌时写计数只改变
+  下一次启动使用的值，与硬件重载寄存器一致。
+- Triggers are `CTRL_TRIG`, `AL1_TRANS_COUNT_TRIG`, `AL2_WRITE_ADDR_TRIG`,
+  `AL3_READ_ADDR_TRIG` and `MULTI_CHAN_TRIGGER`. A trigger starts only a channel
+  whose `EN` is set and which is not already busy; `MULTI_CHAN_TRIGGER` skips
+  disabled channels and a trigger on a busy channel neither restarts it nor
+  reloads its count. `AL1_CTRL`/`AL2_CTRL`/`AL3_CTRL` never trigger — this is
+  what `dma_channel_configure(..., false)` relies on. A zero-length trigger
+  completes immediately: it raises `INTR` unless `IRQ_QUIET` and then follows
+  `CHAIN_TO`; a zero write to a `*_TRIG` alias is a *null trigger* that raises
+  the completion interrupt when `IRQ_QUIET` is set.
+  触发器为 `CTRL_TRIG`、`AL1_TRANS_COUNT_TRIG`、`AL2_WRITE_ADDR_TRIG`、
+  `AL3_READ_ADDR_TRIG` 与 `MULTI_CHAN_TRIGGER`。触发器只启动 `EN` 置位且不忙碌
+  的通道；`MULTI_CHAN_TRIGGER` 跳过禁用通道，忙碌通道上的触发既不重启也不重载
+  计数。`AL1_CTRL`/`AL2_CTRL`/`AL3_CTRL` 永不触发——`dma_channel_configure(...,
+  false)` 正依赖这一点。零长度触发立即完成：未置 `IRQ_QUIET` 时置位 `INTR`，
+  随后跟踪 `CHAIN_TO`；向 `*_TRIG` 别名写零是*空触发*，在置位 `IRQ_QUIET` 时
+  置位完成中断。
 - `Dma::run(bus, max_transfers)` visits channels round-robin and performs one
   unit per eligible channel step: read `DATA_SIZE` (`0`=byte, `1`=halfword,
   `2`=word, reserved `3` treated as word) from `READ_ADDR`, write it to
@@ -683,9 +728,14 @@ clears both `EN` and `BUSY`.
   单元宽度推进地址。
 - `RING_SIZE` is the log2 ring byte count. With a non-zero size, the read side
   wraps when `RING_SEL = 0` and the write side when `RING_SEL = 1`, using
-  `(addr & !mask) | ((addr + step) & mask)`.
+  `(addr & !mask) | ((addr + step) & mask)`. The wrap is applied after every
+  unit, so a `TRANS_COUNT` larger than the ring re-streams the window (the HSTX
+  line blocks use `RING_SIZE = 10` with `count = 512` to emit a 1024 B line
+  twice).
   `RING_SIZE` 是环字节数的 log2。非零时，`RING_SEL = 0` 环绕读侧、
   `RING_SEL = 1` 环绕写侧，公式为 `(addr & !mask) | ((addr + step) & mask)`。
+  环绕在每个单元之后应用，因此大于环的 `TRANS_COUNT` 会重复流出窗口（HSTX 行块
+  用 `RING_SIZE = 10` 与 `count = 512` 把 1024 B 行输出两次）。
 - `TRANS_COUNT` decrements after each unit and saturates at zero; reaching zero
   clears `BUSY`, sets `INTR[channel]` unless `IRQ_QUIET`, and starts
   `CHAIN_TO`. The return value of `run` counts attempted units, so a driver can
@@ -695,9 +745,11 @@ clears both `EN` and `BUSY`.
   尝试的单元数，驱动可据此限制每个 CPU 时间片内的 DMA 工作量。
 - `CHAN_ABORT` / `Dma::abort(mask)` clears `BUSY` but keeps `EN`, the addresses
   and the remaining count, matching the datasheet; a new trigger restarts the
-  channel from the current state.
+  channel and reloads `TRANS_COUNT` from the rewrite value (the partial count is
+  not resumed).
   `CHAN_ABORT` / `Dma::abort(mask)` 清除 `BUSY`，但保留 `EN`、地址与剩余计数，
-  与数据手册一致；再次触发会从当前状态重启通道。
+  与数据手册一致；再次触发会重启通道并从重载值重新装载 `TRANS_COUNT`（不会续接
+  部分计数）。
 - A bus read or write error latches `READ_ERROR` / `WRITE_ERROR`, clears
   `BUSY` and raises no completion interrupt.
   总线读/写错误会锁存 `READ_ERROR` / `WRITE_ERROR`、清除 `BUSY`，且不产生
@@ -753,20 +805,38 @@ interrupts without extra wiring. `INTR` and `INTSn` are write-one-to-clear;
 对应位，因此 `BootPeripherals::irq_mask()` 无需额外接线即可看到 DMA 中断。
 `INTR` 与 `INTSn` 为写 1 清零；`INTEn` / `INTFn` 只接受低 16 位。
 
+### Control-block ring / 控制块环
+
+The HSTX scanout uses the classic three-channel SDK ring, which the model
+reproduces end-to-end (`dma_tests::hstx_control_block_ring_streams_three_laps`):
+`DATA` streams a 1024 B line block into the HSTX FIFO (`RING_SIZE = 10`,
+`TREQ_SEL = DREQ_HSTX`, `CHAIN_TO = CB_COUNT`); `CB_COUNT` streams the next
+`TRANS_COUNT` word from a 1024 B ring into `DATA.AL3_TRANS_COUNT`
+(`CHAIN_TO = CB_ADDR`); `CB_ADDR` streams the next read address from a second
+1024 B ring into `DATA.AL3_READ_ADDR_TRIG`, which triggers `DATA` again. The CB
+channels keep `TRANS_COUNT = 1` forever, so the reload-on-trigger rule is what
+keeps the ring alive; a single missing reload stalls scanout permanently.
+HSTX 扫描输出使用 SDK 经典的三通道环，模型端到端复现
+（`dma_tests::hstx_control_block_ring_streams_three_laps`）：`DATA` 把 1024 B
+行块流入 HSTX FIFO（`RING_SIZE = 10`、`TREQ_SEL = DREQ_HSTX`、
+`CHAIN_TO = CB_COUNT`）；`CB_COUNT` 从 1024 B 环流出一个 `TRANS_COUNT` 字到
+`DATA.AL3_TRANS_COUNT`（`CHAIN_TO = CB_ADDR`）；`CB_ADDR` 从第二个 1024 B 环
+流出一个读地址到 `DATA.AL3_READ_ADDR_TRIG`，从而再次触发 `DATA`。CB 通道的
+`TRANS_COUNT` 永远保持 1，因此“触发时重载”是环持续运行的关键；漏掉一次重载
+就会让扫描输出永久停摆。
+
 ### Not modelled / 未建模项
 
 `BSWAP` byte swapping, `SNIFF_EN`/`SNIFF_CTRL`, `HIGH_PRIORITY` arbitration,
-`TRANS_COUNT` transfer modes (`[31:28]`), the reload/working-count split (a
-`TRANS_COUNT` write also replaces the remaining count while a channel is busy),
-the per-channel debug registers at `0x800..=0xBFF`, DMA pacing timers, AHB
-error recovery beyond clearing `BUSY` and the APB SET/CLR/XOR global aliases.
-Reads of unmodelled offsets return zero with a one-shot warning and writes are
-ignored. The DMA device never intercepts CPU bus traffic: transfers happen only
-inside `Dma::run`.
+the `TRANS_COUNT` transfer modes (`[31:28]`: self-trigger and endless
+transfers), the per-channel debug registers at `0x800..=0xBFF`, DMA pacing
+timers, AHB error recovery beyond clearing `BUSY` and the APB SET/CLR/XOR global
+aliases. Reads of unmodelled offsets return zero with a one-shot warning and
+writes are ignored. The DMA device never intercepts CPU bus traffic: transfers
+happen only inside `Dma::run`.
 `BSWAP` 字节交换、`SNIFF_EN`/`SNIFF_CTRL`、`HIGH_PRIORITY` 仲裁、
-`TRANS_COUNT` 传输模式（`[31:28]`）、重载值与工作计数的拆分（写
-`TRANS_COUNT` 会在通道忙碌时直接替换剩余计数）、`0x800..=0xBFF` 的通道调试
-寄存器、DMA 节拍定时器、除清除 `BUSY` 之外的 AHB 错误恢复，以及 APB
+`TRANS_COUNT` 传输模式（`[31:28]`：自触发与无限传输）、`0x800..=0xBFF` 的通道
+调试寄存器、DMA 节拍定时器、除清除 `BUSY` 之外的 AHB 错误恢复，以及 APB
 SET/CLR/XOR 全局别名均未建模。未建模偏移读出 0 并只警告一次，写入被忽略。
 DMA 设备不拦截 CPU 总线流量：传输只在 `Dma::run` 内部发生。
 
@@ -785,6 +855,23 @@ while the TX FIFO has room.
 `BootPeripherals::pump_dma(bus, units)` 一并完成；`rp2350-cli` 的 `Machine` 在
 受节流的 DMA 泵送点使用后者，因此 `TREQ_SEL = PIO0_TX0` 只会在 TX FIFO 有空位时
 写入。
+
+`pump_dma` applies two pacing rules so a batch cannot overrun a FIFO:
+
+- A **busy** PIO-paced channel (`busy_selects_dreq(0, 23)`) advances one unit per
+  `dma.run` call, because a PIO FIFO can fill inside the batch.
+- When any **enabled** channel selects `DREQ_HSTX` (52), the batch budget is
+  capped at `Hstx::fifo_room()`, so at most that many words can enter the 8-word
+  HSTX FIFO no matter how the round-robin cursor interleaves other channels.
+  `enabled_selects_dreq` deliberately ignores `BUSY`: a channel is enabled before
+  `dma.run` marks it busy, and using the busy flag here let a batch run with a
+  stale DREQ level, overfilling the FIFO, dropping a word (`WOF`) and
+  desynchronising the HSTX command/data phase.
+  `pump_dma` 用两条节拍规则避免批次冲垮 FIFO：忙碌的 PIO 节拍通道逐单元执行；
+  只要有已使能通道选中 `DREQ_HSTX`(52)，批次预算就被限制为 `Hstx::fifo_room()`。
+  `enabled_selects_dreq` 有意忽略 `BUSY`：通道在 `dma.run` 置 busy 之前就已使能，
+  若用 busy 判定，整批会用陈旧 DREQ 电平执行、灌满 FIFO、丢字（`WOF`）并让 HSTX
+  命令/数据相位失步。
 
 ```rust
 use rp2350_core::memory::SimpleBus;
@@ -891,55 +978,198 @@ impl RpGpio {
 }
 ```
 
+### Pad electrical model / pad 电气模型
+
+`gpio_pads::GpioPads` is the shared source of truth between `PADS_BANK0`
+programming and the `SIO` input register. A pin reads the SIO output latch when
+its output driver is enabled, and otherwise reads the pad level: the host-driven
+external level if the host is driving that pin, else its programmed pull-up
+(`PUE`) or pull-down (`PDE`). All pins reset to pull-down, so a firmware that
+calls `gpio_pull_up` on a button input sees a high level and an unpressed
+button rather than a stuck-low "all buttons held" reading.
+`gpio_pads::GpioPads` 是 `PADS_BANK0` 配置与 `SIO` 输入寄存器之间共享的唯一
+事实来源。输出驱动器使能时引脚读取 SIO 输出锁存，否则读取 pad 电平：宿主驱动
+该引脚时取外部电平，否则取配置的上拉（`PUE`）或下拉（`PDE`）。所有引脚复位为
+下拉，因此对按键输入调用 `gpio_pull_up` 的固件读到高电平（未按下），而不是
+被拉低的「所有按键都按下」。
+
+```rust
+pub struct GpioPads { /* external levels, driven mask, pull-up/pull-down masks */ }
+impl GpioPads {
+    pub fn new() -> Self;
+    pub fn set_pad(&self, pin: u32, value: u32);          // PADS_BANK0 word
+    pub fn set_external(&self, levels: u64);              // host drive, all pins
+    pub fn set_external_pin(&self, pin: u32, high: bool);
+    pub fn input_levels(&self) -> u64;
+    pub fn reset(&self);
+}
+```
+
+`BootPeripherals::pads()` hands out the handle so a host can inject button
+levels; `PADS_BANK0` writes feed `set_pad` and `SIO_GPIO_IN`/`GPIO_HI_IN` combine
+the latch with the pad levels.
+`BootPeripherals::pads()` 提供句柄供宿主注入按键电平；`PADS_BANK0` 写入会调用
+`set_pad`，`SIO_GPIO_IN`/`GPIO_HI_IN` 则把锁存与 pad 电平组合起来。
+
+---
+
+## BUSCTRL
+
+`busctrl::BusCtrl` models the `BUSCTRL` block at `map::BUSCTRL_BASE`
+(`0x4006_8000`): `BUS_PRIORITY` stores the DMA/core priority hints
+(`BUS_PRIORITY_ACK` always reads 1 because the model applies them immediately),
+`PERFCTR_EN` and the counter/selector registers are plain storage, and the
+standard SET/CLR/XOR aliases fold onto the 4 KB block. Firmware writes it during
+display bring-up (`bus_ctrl_hw->priority`).
+`busctrl::BusCtrl` 建模 `map::BUSCTRL_BASE`（`0x4006_8000`）处的 `BUSCTRL` 块：
+`BUS_PRIORITY` 保存 DMA/核心优先级提示（`BUS_PRIORITY_ACK` 恒读 1，因为模型
+立即生效），`PERFCTR_EN` 与计数器/选择寄存器为普通存储，标准 SET/CLR/XOR 别名
+折叠到 4 KB 块上。固件在显示初始化时写入它（`bus_ctrl_hw->priority`）。
+
 ---
 
 ## SIO
 
 ```rust
-pub struct RpSio {
-    pub cpu_id: u32,
-    pub gpio_in: u32,
-    pub gpio_out: u32,
-    pub gpio_oe: u32,
-    pub fifo_st: SioFifoStatus,
-    pub fifo_wr: u32,
-    pub fifo_rd: u32,
-    pub spinlocks: [u32; 32],
-    pub doorbell_out_set: u32,
-    pub doorbell_in: u32,
-    pub interp: [Interpolator; 2],
-    pub tmds: TmdsEncoder,
+pub struct Sio { /* shared state, core-0 IRQ mask, core-1 IRQ mask, view */ }
+impl Sio {
+    pub fn new(irq: IrqAssert) -> Self;
+    pub fn with_peer_irq(irq: IrqAssert, core1_irq: IrqAssert) -> Self;
+    pub fn select_core(&self, core: CpuId);
+    pub fn selected_core(&self) -> CpuId;
+    pub fn post_to_core(&self, value: u32);          // core-1 → core-0 frame
+    pub fn ring_core(&self, mask: u8);               // core-1 → core-0 doorbell
+    pub fn take_from_core(&self) -> Vec<u32>;        // drain core-0 → core-1 frames
+    pub fn pop_from_core(&self) -> Option<u32>;      // one core-0 → core-1 frame
+    pub fn peer_bells(&self) -> u8;
+    pub fn core1_irq_mask(&self) -> u64;
+    pub fn refresh_irq(&self);
 }
 ```
+
+Modelled registers: `CPUID`, `GPIO_IN/OUT/OUT_SET/OUT_CLR/OUT_XOR`, the `GPIO_HI_*`
+equivalents, `GPIO_OE` and its aliases, `FIFO_ST`, `FIFO_WR`, `FIFO_RD`,
+`SPINLOCK_ST` (all free) and `DOORBELL_OUT/IN_SET/CLR` at `0x180`.
+已建模寄存器：`CPUID`、`GPIO_IN/OUT/OUT_SET/OUT_CLR/OUT_XOR`、对应的
+`GPIO_HI_*`、`GPIO_OE` 及其别名、`FIFO_ST`、`FIFO_WR`、`FIFO_RD`、
+`SPINLOCK_ST`（全部空闲）以及 `0x180` 的 `DOORBELL_OUT/IN_SET/CLR`。
+
+### Per-core view / 按核视图
+
+The SIO window is per core on real silicon: both cores see `0xD000_0000`, but
+`FIFO_WR` feeds the *peer's* receive queue and `FIFO_RD` drains what the peer
+wrote. Because one bus serves both cores there is a single `Sio` device, and
+`select_core` flips its direction (one relaxed atomic store shared by every
+clone, including the bus-mounted device). A driver that steps two cores calls
+`select_core(Core1)` around core 1's instruction; the doorbells and `CPUID` flip
+with it, so core 1's `CPUID` reads 1 and its `DOORBELL_OUT_SET` rings core 0.
+真实芯片上 SIO 窗口是按核区分的：两个核心都在 `0xD000_0000` 看到它，但
+`FIFO_WR` 压入**对端**的接收队列、`FIFO_RD` 排空对端写入的数据。由于一条总线
+同时服务两个核心，这里只有一个 `Sio` 设备，由 `select_core` 翻转方向（一次
+relaxed 原子存储，所有克隆共享，含总线挂载的设备）。推进双核的驱动器在 core1
+的指令前后调用 `select_core(Core1)`；门铃与 `CPUID` 一并翻转，因此 core1 读到
+`CPUID == 1`，其 `DOORBELL_OUT_SET` 敲响 core 0。
+
+### Interrupt endpoints / 中断端点
+
+`SIO_IRQ_FIFO` (25) and `SIO_IRQ_BELL` (26) are per-core despite sharing line
+numbers: `Sio::new` publishes core 0's levels into the shared `IrqAssert`, and a
+second mask ([`Sio::core1_irq_mask`]) carries core 1's. `BootPeripherals`
+exposes both views (`irq_mask` for core 0, `core1_irq_mask` for core 1), so a
+FIFO frame pushed by core 0 only pends core 1 and vice versa.
+`SIO_IRQ_FIFO`（25）与 `SIO_IRQ_BELL`（26）虽然线号相同，但按核独立：
+`Sio::new` 把 core0 的电平发布到共享 `IrqAssert`，core1 的电平放在第二个掩码
+（[`Sio::core1_irq_mask`]）中。`BootPeripherals` 同时暴露两个视图（core0 用
+`irq_mask`，core1 用 `core1_irq_mask`），因此 core0 压入的 FIFO 帧只会挂起
+core1，反之亦然。
+
+### Not modelled yet / 尚未建模
+
+Hardware spinlocks (`SPINLOCK_ST` always reads all-free and the `SPINLOCKn`
+registers are unmapped), `INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, GPIO
+pin routing between SIO/IO_BANK0/PADS_BANK0, and exclusive/`LDREX`/`STREX`
+monitors. The FIFO is 8 entries deep per direction with sticky `WOF`/`ROE`.
+硬件自旋锁（`SPINLOCK_ST` 恒读全空闲，`SPINLOCKn` 寄存器未映射）、
+`INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新、SIO/IO_BANK0/PADS_BANK0 之间的引脚
+路由，以及独占访问/`LDREX`/`STREX` 监视器均未建模。每方向 FIFO 深度 8，带粘滞
+`WOF`/`ROE`。
 
 ---
 
 ## PSM and BOOTRAM / 电源状态机与 BOOTRAM
 
 ```rust
-pub struct Psm { /* FRCE_ON, FRCE_OFF, WDSEL, DONE */ }
+pub struct Psm { /* FRCE_ON, FRCE_OFF, WDSEL, DONE + release/reset flags */ }
 impl Psm {
     pub fn new() -> Self;
     pub fn with_core1_release(flag: Arc<AtomicBool>) -> Self;
+    pub fn with_core1_flags(release: Arc<AtomicBool>, reset: Arc<AtomicBool>) -> Self;
 }
 
+pub struct Core1Launch { pub vtor: u32, pub sp: u32, pub entry: u32 }
+
 impl BootPeripherals {
-    pub fn service_core1_peer(&self); // FIFO echo + core-1 boot-ROM ack
+    pub fn service_core1_peer(&self);            // boot-ROM echo + PSM ack
+    pub fn core1_launch_pending(&self) -> bool;
+    pub fn take_core1_launch(&self) -> Option<Core1Launch>;
+    pub fn core1_launch_count(&self) -> u64;
+    pub fn core1_launched(&self) -> bool;
+    pub fn take_core1_reset(&self) -> bool;
+    pub fn reset_core1_boot(&self);
     pub fn sio(&self) -> &Sio;
+    pub fn irq_mask(&self) -> u64;               // core-0 view
+    pub fn core1_irq_mask(&self) -> u64;         // core-1 view
 }
 ```
 
 `Psm` models `PSM_FRCE_ON`, `PSM_FRCE_OFF`, `PSM_WDSEL` and the derived
-`PSM_DONE` status; clearing `FRCE_OFF.PROC1` latches a core-1 release event
-that the simulation driver turns into the boot ROM's drain-and-`0` handshake.
+`PSM_DONE` status. `FRCE_OFF.PROC1` drives two one-shot flags:
+`0 → 1` latches a **hard reset** (the driver drops core 1's context and any
+pending launch), `1 → 0` latches a **release** (the boot-ROM peer drains core
+1's mailbox and pushes `0` to core 0). `multicore_reset_core1()` performs exactly
+that set-then-clear pair and waits for the `0`.
+`Psm` 模型实现 `PSM_FRCE_ON`、`PSM_FRCE_OFF`、`PSM_WDSEL` 与派生的 `PSM_DONE`
+状态。`FRCE_OFF.PROC1` 驱动两个一次性标志：`0 → 1` 锁存**硬复位**（驱动器丢弃
+core1 上下文与挂起的启动信息），`1 → 0` 锁存**释放**（boot ROM 对端清空 core1
+信箱并向 core0 推入 `0`）。`multicore_reset_core1()` 正是先置位再清除并等待该
+`0`。
+
+### Core-1 launch protocol / core1 启动协议
+
+pico-sdk `multicore_launch_core1_raw` writes the six-word stream
+`{0, 0, 1, vtor, sp, entry}` to `SIO_FIFO_WR` and waits for each word to be
+echoed through `SIO_FIFO_RD`. `BootPeripherals::service_core1_peer` is the
+resident core-1 boot ROM peer: it consumes one word at a time from core 0's
+outbox (`Sio::pop_from_core`), echoes it back (`Sio::post_to_core`) and watches a
+rolling six-word window. When the window matches `{0, 0, 1, …}` the launch is
+recorded — `vtor`, `sp` and `entry` become a `Core1Launch` — and the echo stub
+**retires**: from that point on the FIFO belongs to the real core 1 and the peer
+never touches it again. `take_core1_launch` hands the vectors to the driver,
+which probes the vector table and calls `CortexM33Core::boot_at(sp, entry, vtor)`.
+pico-sdk `multicore_launch_core1_raw` 向 `SIO_FIFO_WR` 写入六字流
+`{0, 0, 1, vtor, sp, entry}`，并逐字等待其经 `SIO_FIFO_RD` 回显。
+`BootPeripherals::service_core1_peer` 就是常驻的 core1 boot ROM 对端：它从
+core0 的发送队列逐字取出（`Sio::pop_from_core`）、回显（`Sio::post_to_core`），
+并维护一个六字滚动窗口。窗口匹配 `{0, 0, 1, …}` 时记录启动信息（`vtor`、`sp`、
+`entry` 组成 `Core1Launch`），随后**回显桩退役**：此后 FIFO 属于真实的 core1，
+对端不再触碰。`take_core1_launch` 把向量交给驱动器，驱动器先探测向量表再调用
+`CortexM33Core::boot_at(sp, entry, vtor)`。
+
+`entry` 在 SDK 2.x 中指 Flash 中的 `core1_trampoline`（`pop {r0,r1,pc}`），
+它的栈上已有 `{entry, stack_base, core1_wrapper}`，因此 core1 直接跳到
+`core1_wrapper` 并执行每核初始化。这些初始化里的 `rom_func_lookup`（表项
+`'SR'`）也必须经过合成 boot ROM 的陷阱分发，否则 core1 会执行到 `udf` 占位桩。
+`entry` points at the flash-resident `core1_trampoline` (`pop {r0,r1,pc}`) in
+SDK 2.x; its stack already holds `{entry, stack_base, core1_wrapper}`, so core 1
+lands in `core1_wrapper` and runs the per-core initializers. Their
+`rom_func_lookup` (`'SR'` table entry) must also go through the synthetic boot
+ROM trap dispatch, otherwise core 1 walks into the `udf` stubs.
+
 `BootRam` exposes the scratch RAM at `0x400E_0000`; its first word is a
 `bx lr` boot2 copy-out stub so pico-sdk `flash_init_boot2_copyout` can return
 while this model keeps flash XIP readable.
-PSM 模型实现 `PSM_FRCE_ON`、`PSM_FRCE_OFF`、`PSM_WDSEL` 与派生的 `PSM_DONE`
-状态；清除 `FRCE_OFF.PROC1` 会置位 core1 释放事件，仿真驱动器据此执行
-boot ROM 的“清空信箱并回送 0”握手。`BootRam` 暴露 `0x400E_0000` 的暂存
-RAM；首字为 `bx lr` boot2 拷出桩，使 pico-sdk 的
-`flash_init_boot2_copyout` 能立即返回，而本模型保持 Flash XIP 可读。
+`BootRam` 暴露 `0x400E_0000` 的暂存 RAM；首字为 `bx lr` boot2 拷出桩，使
+pico-sdk 的 `flash_init_boot2_copyout` 能立即返回，而本模型保持 Flash XIP 可读。
 
 ---
 

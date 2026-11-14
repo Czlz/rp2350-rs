@@ -3,25 +3,38 @@
 //! Models the single-cycle GPIO output, output-enable and input registers, the
 //! inter-core FIFO (8 entries), spinlocks and the RP2350 doorbells. GPIO values
 //! loop back as inputs; the pin matrix between SIO, IO_BANK0 and PADS_BANK0 is
-//! not connected yet. This block represents core 0's SIO window: FIFO writes go
-//! to the peer core's receive queue and FIFO reads drain the queue fed by the
-//! peer, so no core-1 scheduler is required to model the registers faithfully.
+//! not connected yet.
+//!
+//! The RP2350 SIO window is *per core*: both cores see it at `0xD000_0000`, but
+//! `FIFO_WR` pushes into the peer's receive queue and `FIFO_RD` drains the queue
+//! the peer filled. A single bus window therefore has to know which core is
+//! currently accessing it; [`Sio::select_core`] switches that view (cheap
+//! relaxed atomic store) so a driver that steps both cores can flip the FIFO,
+//! doorbell and `CPUID` direction around each core's instruction.
 //! 建模单周期 GPIO 输出、输出使能与输入寄存器、核间 FIFO（8 项）、自旋锁与
 //! RP2350 门铃。GPIO 值回环为输入；SIO、IO_BANK0 与 PADS_BANK0 之间的引脚
-//! 矩阵尚未连接。本块代表 core 0 的 SIO 窗口：FIFO 写进入对端核心的接收队列，
-//! FIFO 读取消费对端送入的数据，因此无需 core 1 调度器即可忠实建模寄存器。
+//! 矩阵尚未连接。
 //!
-//! Register offsets follow the RP2350 register map (足 `hardware/regs/sio.h`):
+//! RP2350 的 SIO 窗口是**按核**区分的：两个核心都在 `0xD000_0000` 看到它，但
+//! `FIFO_WR` 压入对端的接收队列、`FIFO_RD` 排空对端写入的队列。因此单个总线
+//! 窗口必须知道当前访问来自哪个核心；[`Sio::select_core`] 用于切换该视图
+//! （廉价的 relaxed 原子存储），使同时推进两个核心的驱动器能在每个核心的指令
+//! 前后翻转 FIFO、门铃与 `CPUID` 的方向。
+//!
+//! Register offsets follow the RP2350 register map (`hardware/regs/sio.h`):
 //! `GPIO_HI_*` is interleaved with `GPIO_*`, and the doorbells sit at `0x180`.
 //! 寄存器偏移遵循 RP2350 寄存器表（`hardware/regs/sio.h`）：`GPIO_HI_*` 与
 //! `GPIO_*` 交错排列，门铃位于 `0x180`。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use parking_lot::Mutex;
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
+use rp2350_core::types::CpuId;
 
+use super::gpio_pads::GpioPads;
 use super::irq::IrqAssert;
 use super::map;
 
@@ -120,6 +133,14 @@ enum Patch {
     Xor,
 }
 
+/// Index of a core inside per-core arrays / 核心在按核数组中的下标
+fn core_index(core: CpuId) -> usize {
+    match core {
+        CpuId::Core0 => 0,
+        CpuId::Core1 => 1,
+    }
+}
+
 /// Mutable SIO state shared by clones / 克隆间共享的可变 SIO 状态
 #[derive(Debug, Default)]
 struct SioState {
@@ -131,18 +152,18 @@ struct SioState {
     oe: u32,
     /// `GPIO_HI_OE` value / `GPIO_HI_OE` 值
     hi_oe: u32,
-    /// Frames sent to the peer core / 发往对端核心的数据
-    tx: VecDeque<u32>,
-    /// Frames received from the peer core / 来自对端核心的数据
-    rx: VecDeque<u32>,
-    /// Sticky write-overflow flag / 粘滞写溢出标志
-    wof: bool,
-    /// Sticky read-overflow flag / 粘滞读溢出标志
-    roe: bool,
-    /// Doorbells posted to this core / 投递给本核心的门铃
-    bell_in: u8,
-    /// Doorbells posted to the peer core / 投递给对端核心的门铃
-    bell_out: u8,
+    /// Frames core 0 wrote, delivered to core 1 / core0 写入、送往 core1 的帧
+    from_core0: VecDeque<u32>,
+    /// Frames core 1 wrote, delivered to core 0 / core1 写入、送往 core0 的帧
+    from_core1: VecDeque<u32>,
+    /// Sticky write-overflow flag per writer / 按写入方区分的粘滞写溢出标志
+    wof: [bool; 2],
+    /// Sticky read-overflow flag per reader / 按读取方区分的粘滞读溢出标志
+    roe: [bool; 2],
+    /// Doorbells posted to core 0 / 投递给 core0 的门铃
+    bell_core0: u8,
+    /// Doorbells posted to core 1 / 投递给 core1 的门铃
+    bell_core1: u8,
 }
 
 impl SioState {
@@ -155,93 +176,246 @@ impl SioState {
         };
     }
 
-    /// `FIFO_ST` value / `FIFO_ST` 值
-    fn fifo_status(&self) -> u32 {
+    /// Queue holding the frames `core` wrote / 保存 `core` 写入帧的队列
+    fn outbox(&self, core: CpuId) -> &VecDeque<u32> {
+        match core {
+            CpuId::Core0 => &self.from_core0,
+            CpuId::Core1 => &self.from_core1,
+        }
+    }
+
+    /// Queue holding the frames `core` reads / 保存 `core` 读取帧的队列
+    fn inbox(&self, core: CpuId) -> &VecDeque<u32> {
+        match core {
+            CpuId::Core0 => &self.from_core1,
+            CpuId::Core1 => &self.from_core0,
+        }
+    }
+
+    /// Mutable outbox of `core` / `core` 的可变发送队列
+    fn outbox_mut(&mut self, core: CpuId) -> &mut VecDeque<u32> {
+        match core {
+            CpuId::Core0 => &mut self.from_core0,
+            CpuId::Core1 => &mut self.from_core1,
+        }
+    }
+
+    /// Mutable inbox of `core` / `core` 的可变接收队列
+    fn inbox_mut(&mut self, core: CpuId) -> &mut VecDeque<u32> {
+        match core {
+            CpuId::Core0 => &mut self.from_core1,
+            CpuId::Core1 => &mut self.from_core0,
+        }
+    }
+
+    /// `FIFO_ST` value as seen by `core` / `core` 视角的 `FIFO_ST` 值
+    fn fifo_status(&self, core: CpuId) -> u32 {
+        let index = core_index(core);
         let mut status = 0;
-        if !self.rx.is_empty() {
+        if !self.inbox(core).is_empty() {
             status |= 1; // VLD
         }
-        if self.tx.len() < FIFO_DEPTH {
+        if self.outbox(core).len() < FIFO_DEPTH {
             status |= 1 << 1; // RDY
         }
-        if self.wof {
+        if self.wof[index] {
             status |= 1 << 2; // WOF
         }
-        if self.roe {
+        if self.roe[index] {
             status |= 1 << 3; // ROE
         }
         status
     }
+
+    /// Doorbells posted to `core` / 投递给 `core` 的门铃
+    fn bells_for(&self, core: CpuId) -> u8 {
+        match core {
+            CpuId::Core0 => self.bell_core0,
+            CpuId::Core1 => self.bell_core1,
+        }
+    }
+
+    /// Mutable doorbell set of `core` / `core` 的可变门铃集合
+    fn bells_mut(&mut self, core: CpuId) -> &mut u8 {
+        match core {
+            CpuId::Core0 => &mut self.bell_core0,
+            CpuId::Core1 => &mut self.bell_core1,
+        }
+    }
+
+    /// The other core / 另一个核心
+    fn peer(core: CpuId) -> CpuId {
+        match core {
+            CpuId::Core0 => CpuId::Core1,
+            CpuId::Core1 => CpuId::Core0,
+        }
+    }
 }
 
-/// SIO register block for core 0 / core 0 的 SIO 寄存器块
+/// SIO register block with a selectable per-core view
+/// 带可选按核视图的 SIO 寄存器块
 #[derive(Debug, Clone)]
 pub struct Sio {
     state: Arc<Mutex<SioState>>,
     irq: IrqAssert,
+    core1_irq: IrqAssert,
+    view: Arc<AtomicU8>,
+    pads: GpioPads,
 }
 
 impl Sio {
     /// Create the block with empty FIFOs and all pins low
     /// 创建 FIFO 为空、所有引脚为低的寄存器块
+    ///
+    /// The handle starts in the core-0 view and only publishes the core-0
+    /// `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` lines into `irq`.
+    /// 句柄以 core0 视图启动，且只把 core0 的 `SIO_IRQ_FIFO` /
+    /// `SIO_IRQ_BELL` 线发布到 `irq`。
     #[must_use]
     pub fn new(irq: IrqAssert) -> Self {
+        Self::with_peer_irq(irq, IrqAssert::new())
+    }
+
+    /// Create the block with distinct per-core interrupt lines
+    /// 创建带独立按核中断线的寄存器块
+    ///
+    /// `irq` receives the core-0 `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` lines and
+    /// `core1_irq` receives core 1's, so each NVIC only sees its own endpoint.
+    /// `irq` 接收 core0 的 `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` 线，`core1_irq`
+    /// 接收 core1 的，因此每个 NVIC 只看到自己的端点。
+    #[must_use]
+    pub fn with_peer_irq(irq: IrqAssert, core1_irq: IrqAssert) -> Self {
+        Self::with_peer_irq_and_pads(irq, core1_irq, GpioPads::new())
+    }
+
+    /// Create the block sharing pad electrical state with PADS_BANK0
+    /// 创建与 PADS_BANK0 共享 pad 电气状态的寄存器块
+    #[must_use]
+    pub fn with_peer_irq_and_pads(irq: IrqAssert, core1_irq: IrqAssert, pads: GpioPads) -> Self {
         Self {
             state: Arc::new(Mutex::new(SioState::default())),
             irq,
+            core1_irq,
+            view: Arc::new(AtomicU8::new(0)),
+            pads,
         }
     }
 
-    /// Hand a frame to this core's receive FIFO (peer-core hook)
-    /// 向本核心的接收 FIFO 送入一帧（对端核心挂钩）
+    /// Select which core's view the next bus accesses use
+    /// 选择后续总线访问使用的核心视图
     ///
-    /// A future core-1 scheduler uses this to answer a core-0 `FIFO_WR`; it also
-    /// lets tests exercise the receive path without a second core.
-    /// 未来的 core 1 调度器用它回应 core 0 的 `FIFO_WR`；测试也可借此在没有
-    /// 第二个核心时验证接收路径。
+    /// A multi-core driver calls this before stepping each core so `FIFO_WR`,
+    /// `FIFO_RD`, the doorbells and `CPUID` follow that core's direction. The
+    /// switch is one relaxed atomic store and is shared by every clone,
+    /// including the bus-mounted device.
+    /// 多核驱动器在推进每个核心之前调用此方法，使 `FIFO_WR`、`FIFO_RD`、门铃与
+    /// `CPUID` 遵循该核心的方向。切换只做一次 relaxed 原子存储，并由所有克隆
+    /// （含总线挂载的设备）共享。
+    pub fn select_core(&self, core: CpuId) {
+        let value = match core {
+            CpuId::Core0 => 0,
+            CpuId::Core1 => 1,
+        };
+        self.view.store(value, Ordering::Relaxed);
+    }
+
+    /// Currently selected core view / 当前选定的核心视图
+    #[must_use]
+    pub fn selected_core(&self) -> CpuId {
+        if self.view.load(Ordering::Relaxed) == 1 {
+            CpuId::Core1
+        } else {
+            CpuId::Core0
+        }
+    }
+
+    /// Hand a frame to core 0's receive FIFO (peer-core hook)
+    /// 向 core0 的接收 FIFO 送入一帧（对端核心挂钩）
+    ///
+    /// The core-1 boot-ROM peer uses this to echo a core-0 `FIFO_WR`; tests can
+    /// exercise the receive path without a second core.
+    /// core1 boot ROM 对端用它回显 core0 的 `FIFO_WR`；测试也可借此在没有第二个
+    /// 核心时验证接收路径。
     pub fn post_to_core(&self, value: u32) {
-        self.state.lock().rx.push_back(value);
+        self.state.lock().from_core1.push_back(value);
         self.refresh_irq();
     }
 
-    /// Ring this core's doorbell (peer-core hook)
-    /// 敲响本核心的门铃（对端核心挂钩）
+    /// Ring core 0's doorbell (peer-core hook) / 敲响 core0 的门铃（对端核心挂钩）
     ///
-    /// A core-1 scheduler calls this when core 1 writes its `DOORBELL_OUT_SET`;
-    /// the bits land in this core's `DOORBELL_IN` and assert `SIO_IRQ_BELL`.
-    /// core 1 写入自己的 `DOORBELL_OUT_SET` 时，core 1 调度器调用此函数；位落入
-    /// 本核心的 `DOORBELL_IN` 并断言 `SIO_IRQ_BELL`。
+    /// The bits land in core 0's `DOORBELL_IN` and assert `SIO_IRQ_BELL` on core
+    /// 0 only. / 位落入 core0 的 `DOORBELL_IN`，只断言 core0 的 `SIO_IRQ_BELL`。
     pub fn ring_core(&self, mask: u8) {
-        self.state.lock().bell_in |= mask;
+        self.state.lock().bell_core0 |= mask;
         self.refresh_irq();
     }
 
-    /// Drain the frames this core sent to the peer (peer-core hook)
-    /// 取走本核心发往对端的所有帧（对端核心挂钩）
+    /// Drain the frames core 0 sent to core 1 (peer-core hook)
+    /// 取走 core0 发往 core1 的所有帧（对端核心挂钩）
     #[must_use]
     pub fn take_from_core(&self) -> Vec<u32> {
-        self.state.lock().tx.drain(..).collect()
+        let mut state = self.state.lock();
+        let frames: Vec<u32> = state.from_core0.drain(..).collect();
+        drop(state);
+        self.refresh_irq();
+        frames
     }
 
-    /// Doorbells posted to the peer core / 投递给对端核心的门铃位
+    /// Pop one frame core 0 sent to core 1 / 弹出 core0 发往 core1 的一帧
+    ///
+    /// The resident core-1 boot ROM consumes the launch command stream one word
+    /// at a time so a launch leaves any later frames queued for the real core 1.
+    /// 常驻 core1 boot ROM 逐字消费启动命令流，使启动后到达的帧仍留在队列中交给
+    /// 真实的 core1。
+    #[must_use]
+    pub fn pop_from_core(&self) -> Option<u32> {
+        let mut state = self.state.lock();
+        let frame = state.from_core0.pop_front();
+        drop(state);
+        if frame.is_some() {
+            self.refresh_irq();
+        }
+        frame
+    }
+
+    /// Doorbells posted to core 1 / 投递给 core1 的门铃位
     #[must_use]
     pub fn peer_bells(&self) -> u8 {
-        self.state.lock().bell_out
+        self.state.lock().bell_core1
+    }
+
+    /// Interrupt mask of core 1's SIO lines / core1 SIO 中断线的掩码
+    ///
+    /// Excludes core 0's endpoint because `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` are
+    /// per-core despite sharing one number.
+    /// 不含 core0 的端点：`SIO_IRQ_FIFO` / `SIO_IRQ_BELL` 虽然编号相同，但按核
+    /// 独立。
+    #[must_use]
+    pub fn core1_irq_mask(&self) -> u64 {
+        self.core1_irq.mask()
     }
 
     /// Recompute the SIO interrupt lines / 重新计算 SIO 中断线
     ///
-    /// `SIO_IRQ_FIFO` follows the receive FIFO's `VLD` flag and `SIO_IRQ_BELL`
-    /// follows the doorbells posted to this core.
-    /// `SIO_IRQ_FIFO` 跟随接收 FIFO 的 `VLD` 标志，`SIO_IRQ_BELL` 跟随投递给
-    /// 本核心的门铃。
+    /// `SIO_IRQ_FIFO` follows the receiving core's `VLD` flag and
+    /// `SIO_IRQ_BELL` that core's doorbells, so the two cores get independent
+    /// levels for the same line numbers.
+    /// `SIO_IRQ_FIFO` 跟随接收核心的 `VLD` 标志、`SIO_IRQ_BELL` 跟随该核心的
+    /// 门铃，因此两个核心在同一线号上得到独立的电平。
     pub fn refresh_irq(&self) {
-        let (fifo, bell) = {
+        let (fifo0, bell0, fifo1, bell1) = {
             let state = self.state.lock();
-            (!state.rx.is_empty(), state.bell_in != 0)
+            (
+                !state.from_core1.is_empty(),
+                state.bell_core0 != 0,
+                !state.from_core0.is_empty(),
+                state.bell_core1 != 0,
+            )
         };
-        self.irq.set(map::SIO_IRQ_FIFO, fifo);
-        self.irq.set(map::SIO_IRQ_BELL, bell);
+        self.irq.set(map::SIO_IRQ_FIFO, fifo0);
+        self.irq.set(map::SIO_IRQ_BELL, bell0);
+        self.core1_irq.set(map::SIO_IRQ_FIFO, fifo1);
+        self.core1_irq.set(map::SIO_IRQ_BELL, bell1);
     }
 }
 
@@ -255,26 +429,40 @@ impl MmioDevice for Sio {
     }
 
     fn read32(&mut self, offset: u32) -> Option<u32> {
+        let view = self.selected_core();
         let mut state = self.state.lock();
         let value = match offset {
-            CPUID => Some(0),
-            // GPIO inputs loop the outputs back. GPIO 输入回环输出值。
-            GPIO_IN | GPIO_OUT => Some(state.out),
-            GPIO_HI_IN | GPIO_HI_OUT => Some(state.hi_out),
+            CPUID => Some(core_index(view) as u32),
+            // GPIO inputs combine the SIO output latch (when the pin is an
+            // output) with the pad pull/external level (when it is an input).
+            // GPIO 输入：输出引脚回环 SIO 输出锁存，输入引脚使用 pad 上下拉/外部电平。
+            GPIO_IN => {
+                let external = self.pads.input_levels() as u32;
+                Some((state.out & state.oe) | (external & !state.oe))
+            }
+            GPIO_OUT => Some(state.out),
+            GPIO_HI_IN => {
+                let external = (self.pads.input_levels() >> 32) as u32;
+                Some((state.hi_out & state.hi_oe) | (external & !state.hi_oe))
+            }
+            GPIO_HI_OUT => Some(state.hi_out),
             GPIO_OE => Some(state.oe),
             GPIO_HI_OE => Some(state.hi_oe),
-            FIFO_ST => Some(state.fifo_status()),
+            FIFO_ST => Some(state.fifo_status(view)),
             FIFO_RD => {
-                let value = state.rx.pop_front().unwrap_or_else(|| {
-                    state.roe = true;
+                let index = core_index(view);
+                let value = state.inbox_mut(view).pop_front().unwrap_or_else(|| {
+                    state.roe[index] = true;
                     0
                 });
                 Some(value)
             }
             // All 32 spinlocks report free. 全部 32 个自旋锁报告空闲。
             SPINLOCK_ST => Some(0xFFFF_FFFF),
-            DOORBELL_OUT_SET | DOORBELL_OUT_CLR => Some(u32::from(state.bell_out)),
-            DOORBELL_IN_SET | DOORBELL_IN_CLR => Some(u32::from(state.bell_in)),
+            DOORBELL_OUT_SET | DOORBELL_OUT_CLR => {
+                Some(u32::from(state.bells_for(SioState::peer(view))))
+            }
+            DOORBELL_IN_SET | DOORBELL_IN_CLR => Some(u32::from(state.bells_for(view))),
             _ => None,
         };
         drop(state);
@@ -283,6 +471,8 @@ impl MmioDevice for Sio {
     }
 
     fn write32(&mut self, offset: u32, value: u32) -> bool {
+        let view = self.selected_core();
+        let peer = SioState::peer(view);
         let mut state = self.state.lock();
         match offset {
             GPIO_OUT => state.out = value,
@@ -301,19 +491,21 @@ impl MmioDevice for Sio {
             GPIO_HI_OE_CLR => SioState::patch(&mut state.hi_oe, value, Patch::Clear),
             GPIO_OE_XOR => SioState::patch(&mut state.oe, value, Patch::Xor),
             GPIO_HI_OE_XOR => SioState::patch(&mut state.hi_oe, value, Patch::Xor),
-            // FIFO_WR pushes towards the peer; a full FIFO sets WOF.
-            // FIFO_WR 向对端压入；FIFO 满时置位 WOF。
+            // FIFO_WR pushes towards the peer; a full queue sets that writer's
+            // WOF. FIFO_WR 向对端压入；队列满时置位该写入方的 WOF。
             FIFO_WR => {
-                if state.tx.len() < FIFO_DEPTH {
-                    state.tx.push_back(value);
+                let index = core_index(view);
+                let outbox = state.outbox_mut(view);
+                if outbox.len() < FIFO_DEPTH {
+                    outbox.push_back(value);
                 } else {
-                    state.wof = true;
+                    state.wof[index] = true;
                 }
             }
-            DOORBELL_OUT_SET => state.bell_out |= (value & 0xFF) as u8,
-            DOORBELL_OUT_CLR => state.bell_out &= !(value & 0xFF) as u8,
-            DOORBELL_IN_SET => state.bell_in |= (value & 0xFF) as u8,
-            DOORBELL_IN_CLR => state.bell_in &= !(value & 0xFF) as u8,
+            DOORBELL_OUT_SET => *state.bells_mut(peer) |= (value & 0xFF) as u8,
+            DOORBELL_OUT_CLR => *state.bells_mut(peer) &= !(value & 0xFF) as u8,
+            DOORBELL_IN_SET => *state.bells_mut(view) |= (value & 0xFF) as u8,
+            DOORBELL_IN_CLR => *state.bells_mut(view) &= !(value & 0xFF) as u8,
             _ => {
                 drop(state);
                 return false;
@@ -347,6 +539,10 @@ mod tests {
         assert!(sio.write32(GPIO_OUT_CLR, 0b0010));
         assert_eq!(sio.read32(GPIO_OUT), Some(0b1000));
         assert!(sio.write32(GPIO_OUT_XOR, 0b1111));
+        // The input register reflects the pad: enable the outputs first, then
+        // the SIO latch drives them.
+        // 输入寄存器反映 pad：先使能输出，SIO 锁存才会驱动引脚。
+        assert!(sio.write32(GPIO_OE, 0xF));
         assert_eq!(sio.read32(GPIO_IN), Some(0b0111));
     }
 
@@ -424,5 +620,67 @@ mod tests {
         assert_eq!(sio.read32(DOORBELL_IN_SET), Some(0b100));
         assert!(sio.write32(DOORBELL_IN_CLR, 0b100));
         assert_eq!(irq.mask(), 0);
+    }
+
+    #[test]
+    fn the_core1_view_reverses_the_fifo_direction() {
+        // core1 的 FIFO_WR 必须进入 core0 的接收队列，FIFO_RD 读取 core0 写入的帧。
+        // Core 1's FIFO_WR must feed core 0's receive queue, and its FIFO_RD must
+        // drain what core 0 wrote.
+        let irq0 = IrqAssert::new();
+        let irq1 = IrqAssert::new();
+        let mut sio = Sio::with_peer_irq(irq0.clone(), irq1.clone());
+
+        sio.select_core(CpuId::Core0);
+        assert!(sio.write32(FIFO_WR, 0xC0DE));
+        assert_eq!(sio.read32(CPUID), Some(0));
+        assert_eq!(
+            irq1.mask(),
+            1 << map::SIO_IRQ_FIFO,
+            "core 1 sees the pending frame"
+        );
+        assert_eq!(irq0.mask(), 0);
+
+        sio.select_core(CpuId::Core1);
+        assert_eq!(sio.read32(CPUID), Some(1));
+        assert_eq!(sio.read32(FIFO_RD), Some(0xC0DE));
+        assert_eq!(irq1.mask(), 0);
+        assert!(sio.write32(FIFO_WR, 0xBEEF));
+        assert_eq!(irq0.mask(), 1 << map::SIO_IRQ_FIFO);
+
+        sio.select_core(CpuId::Core0);
+        assert_eq!(sio.read32(FIFO_RD), Some(0xBEEF));
+        assert_eq!(sio.pop_from_core(), None, "core 1 drained its inbox");
+    }
+
+    #[test]
+    fn doorbells_cross_between_cores() {
+        // core1 敲响的门铃只断言 core1 的 SIO_IRQ_BELL 线到 core0 的 NVIC。
+        // A doorbell rung by core 1 asserts only core 0's SIO_IRQ_BELL line.
+        let irq0 = IrqAssert::new();
+        let irq1 = IrqAssert::new();
+        let mut sio = Sio::with_peer_irq(irq0.clone(), irq1.clone());
+
+        sio.select_core(CpuId::Core1);
+        assert!(sio.write32(DOORBELL_OUT_SET, 0b10));
+        sio.select_core(CpuId::Core0);
+        assert_eq!(irq0.mask(), 1 << map::SIO_IRQ_BELL);
+        assert_eq!(sio.read32(DOORBELL_IN_SET), Some(0b10));
+        assert_eq!(irq1.mask(), 0);
+        assert_eq!(sio.peer_bells(), 0, "core 0 rang nobody");
+    }
+
+    #[test]
+    fn pad_pull_up_reaches_the_gpio_input_register() {
+        let pads = GpioPads::new();
+        pads.set_pad(0, super::super::gpio_pads::PAD_PUE);
+        let mut sio = Sio::with_peer_irq_and_pads(IrqAssert::new(), IrqAssert::new(), pads);
+        assert_eq!(sio.read32(GPIO_IN), Some(1));
+
+        // Enabling the output and driving it low overrides the pull-up.
+        // 使能输出并驱动低电平会覆盖上拉。
+        assert!(sio.write32(GPIO_OE, 1));
+        assert!(sio.write32(GPIO_OUT, 0));
+        assert_eq!(sio.read32(GPIO_IN), Some(0));
     }
 }

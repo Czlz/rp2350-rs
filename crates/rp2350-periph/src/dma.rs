@@ -17,6 +17,28 @@
 //! 的 `RING` 环绕，递减 `TRANS_COUNT`；完成时清除 `BUSY`、启动 `CHAIN_TO` 并在
 //! 该通道的原始中断位置位。
 //!
+//! # Triggers, reload and chaining / 触发、重载与链式
+//!
+//! `TRANS_COUNT` (`0x08`) and the non-triggering count aliases latch a
+//! *rewrite* value; a trigger copies it into the working count that [`Dma::run`]
+//! decrements. That split is what keeps SDK control-block rings alive: the CB
+//! channels are configured once with `TRANS_COUNT = 1` and then re-triggered
+//! forever by `CHAIN_TO`. Only `CTRL_TRIG` and the `AL1_TRANS_COUNT_TRIG` /
+//! `AL2_WRITE_ADDR_TRIG` / `AL3_READ_ADDR_TRIG` aliases trigger; `AL1_CTRL`,
+//! `AL2_CTRL` and `AL3_CTRL` are plain configuration writes (this is what
+//! `dma_channel_configure(..., false)` relies on), and `MULTI_CHAN_TRIGGER`
+//! only starts channels whose `EN` is set. A trigger on a busy channel is
+//! ignored, and a zero-length trigger completes immediately, raising `INTR`
+//! unless `IRQ_QUIET` is set, then follows `CHAIN_TO`.
+//! `TRANS_COUNT`（`0x08`）与非触发计数别名锁存*重载*值；触发器把它装载到
+//! [`Dma::run`] 递减的工作计数。正是这一拆分让 SDK 控制块环持续运行：CB 通道
+//! 只配置一次 `TRANS_COUNT = 1`，之后由 `CHAIN_TO` 无限次重新触发。只有
+//! `CTRL_TRIG` 与 `AL1_TRANS_COUNT_TRIG` / `AL2_WRITE_ADDR_TRIG` /
+//! `AL3_READ_ADDR_TRIG` 别名会触发；`AL1_CTRL`、`AL2_CTRL`、`AL3_CTRL` 是普通
+//! 配置写入（`dma_channel_configure(..., false)` 正是依赖这一点），
+//! `MULTI_CHAN_TRIGGER` 只启动 `EN` 置位的通道。忙碌通道上的触发被忽略；零长度
+//! 触发立即完成，未置 `IRQ_QUIET` 时置位 `INTR`，随后跟踪 `CHAIN_TO`。
+//!
 //! # DREQ / DREQ 请求
 //!
 //! `TREQ_SEL = 0x3F` is the permanent request and always runs. Every other
@@ -227,7 +249,7 @@ pub struct DmaChannelState {
     pub read_addr: u32,
     /// Current write address / 当前写地址
     pub write_addr: u32,
-    /// Remaining transfer count / 剩余传输次数
+    /// Working transfer count (not the rewrite value) / 工作传输计数（非重载值）
     pub trans_count: u32,
     /// Stored `CTRL_TRIG` value including `BUSY` / 存储的 `CTRL_TRIG` 值（含 `BUSY`）
     pub ctrl: u32,
@@ -250,7 +272,12 @@ pub struct DmaChannelState {
 struct Channel {
     read_addr: u32,
     write_addr: u32,
+    /// Working count, decremented once per data unit / 工作计数，每个数据单元递减一次
     trans_count: u32,
+    /// Rewrite value latched by a `TRANS_COUNT` write and copied into
+    /// `trans_count` by the next trigger / 写 `TRANS_COUNT` 锁存的重载值，
+    /// 由下一次触发装载到 `trans_count`
+    trans_count_reload: u32,
     ctrl: u32,
     busy: bool,
 }
@@ -425,6 +452,32 @@ impl Dma {
         })
     }
 
+    /// Whether any enabled channel selects a DREQ in `first..=last`
+    /// 是否有任一已使能通道选择了 `first..=last` 范围内的 DREQ
+    ///
+    /// The host uses this to pick the DREQ refresh granularity. Unlike
+    /// [`Self::busy_selects_dreq`] it ignores `BUSY`, which matters at the
+    /// moment a channel is triggered: a channel that is enabled but not yet
+    /// marked busy must still be resynchronised per unit, otherwise a whole
+    /// batch runs with a stale DREQ level and overruns a small FIFO (HSTX).
+    /// 宿主据此选择 DREQ 刷新粒度。与 [`Self::busy_selects_dreq`] 不同，它忽略
+    /// `BUSY`，这在通道刚被触发的瞬间很关键：已使能但尚未置 busy 的通道仍必须
+    /// 逐单元重新同步，否则整批会用陈旧的 DREQ 电平执行并冲垮小 FIFO（HSTX）。
+    ///
+    /// The permanent request is never reported.
+    /// 永久请求不计入。
+    #[must_use]
+    pub fn enabled_selects_dreq(&self, first: u8, last: u8) -> bool {
+        let state = self.state.lock();
+        state.channels.iter().any(|channel| {
+            if channel.ctrl & CTRL_EN == 0 {
+                return false;
+            }
+            let selector = ((channel.ctrl & CTRL_TREQ_SEL_MASK) >> CTRL_TREQ_SEL_SHIFT) as u8;
+            selector != TREQ_PERMANENT && selector >= first && selector <= last
+        })
+    }
+
     /// Current level of one host DREQ input / 某个宿主 DREQ 输入的当前电平
     ///
     /// Returns `None` for selectors `>= 64`.
@@ -564,7 +617,7 @@ impl Dma {
                     state.intr |= 1u16 << index;
                 }
                 if chain != index {
-                    start_channel(&mut state, chain);
+                    trigger_channel(&mut state, chain);
                 }
             }
         }
@@ -595,25 +648,55 @@ fn advance(address: u32, step: u32, ring_size: u32, ring: bool) -> u32 {
     (address & !mask) | (address.wrapping_add(step) & mask)
 }
 
-/// Start a channel and follow zero-length chains / 启动通道并追踪零长度链
-fn start_channel(state: &mut DmaState, mut index: usize) {
+/// Side effect of a channel register write / 通道寄存器写入的副作用
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteEffect {
+    /// The register is only stored / 仅存储寄存器值
+    Plain,
+    /// A non-zero value starts the channel; a zero value raises the
+    /// "null trigger" interrupt when `IRQ_QUIET` is set
+    /// 非零值启动通道；零值在置位 `IRQ_QUIET` 时产生“空触发”中断
+    Trigger,
+}
+
+/// Start a channel from a trigger, reloading its working count
+/// 由触发器启动通道并重新装载工作计数
+///
+/// Trigger rules modelled from the datasheet and the Pico SDK: only an
+/// enabled channel that is not already busy can be started, `TRANS_COUNT` is
+/// reloaded from the rewrite value on **every** start, and a zero-length
+/// channel completes immediately (raising `INTR` unless `IRQ_QUIET`, then
+/// following `CHAIN_TO`). The reload is what keeps control-block rings alive:
+/// the SDK configures the CB channels with `TRANS_COUNT = 1` once and then
+/// re-triggers them forever through `CHAIN_TO`.
+/// 依据数据手册与 Pico SDK 建模的触发规则：只有已使能且不忙碌的通道能被启动；
+/// **每次**启动都会从重载值重新装载 `TRANS_COUNT`；零长度通道立即完成（未置
+/// `IRQ_QUIET` 时置位 `INTR`，随后跟踪 `CHAIN_TO`）。重载是控制块环持续运行
+/// 的关键：SDK 只把 CB 通道的 `TRANS_COUNT` 配置为 1，之后完全依赖 `CHAIN_TO`
+/// 无限次重新触发。
+fn trigger_channel(state: &mut DmaState, mut index: usize) {
     // 零长度传输会立即完成并继续链式传递；最多遍历一轮以避免环路死循环。
     // A zero-length transfer completes immediately and continues chaining;
     // iterate at most one full round to avoid a cyclic chain spinning forever.
     for _ in 0..CHANNELS {
-        let (enabled, count, quiet, chain) = {
+        let (enabled, busy, reload, quiet, chain) = {
             let channel = &state.channels[index];
             (
                 channel.ctrl & CTRL_EN != 0,
-                channel.trans_count,
+                channel.busy,
+                channel.trans_count_reload,
                 channel.ctrl & CTRL_IRQ_QUIET != 0,
                 ((channel.ctrl & CTRL_CHAIN_TO_MASK) >> CTRL_CHAIN_TO_SHIFT) as usize,
             )
         };
-        if !enabled {
+        // 已禁用的通道被忽略；已在传输的通道不会被打断，也不会重置计数。
+        // A disabled channel is ignored; a busy channel is neither restarted
+        // nor forced to reload its count.
+        if !enabled || busy {
             return;
         }
-        if count != 0 {
+        state.channels[index].trans_count = reload;
+        if reload != 0 {
             state.channels[index].busy = true;
             return;
         }
@@ -654,6 +737,66 @@ fn write_unit(
         1 => bus.write_u16(address, value as u16, cycles),
         _ => bus.write_u32(address, value, cycles),
     }
+}
+
+/// Apply one per-channel register write, returning its side effect
+/// 应用一次通道寄存器写入，并返回其副作用
+///
+/// The destination register is addressed by its offset inside the channel
+/// block (`0x00..=0x3C`). Trigger policy lives in the caller so that a single
+/// `WriteEffect` decides between a plain store and a channel start.
+/// 目标寄存器由通道块内偏移（`0x00..=0x3C`）指定。触发策略留在调用方，用一个
+/// `WriteEffect` 区分普通存储与启动通道。
+fn write_channel_register(
+    state: &mut DmaState,
+    index: usize,
+    register: u32,
+    value: u32,
+) -> Option<WriteEffect> {
+    let channel = state.channels.get_mut(index)?;
+    let effect = match register {
+        CH_READ_ADDR | CH_AL1_READ_ADDR | CH_AL2_READ_ADDR => {
+            channel.read_addr = value;
+            WriteEffect::Plain
+        }
+        CH_AL3_READ_ADDR_TRIG => {
+            channel.read_addr = value;
+            WriteEffect::Trigger
+        }
+        CH_WRITE_ADDR | CH_AL1_WRITE_ADDR | CH_AL3_WRITE_ADDR => {
+            channel.write_addr = value;
+            WriteEffect::Plain
+        }
+        CH_AL2_WRITE_ADDR_TRIG => {
+            channel.write_addr = value;
+            WriteEffect::Trigger
+        }
+        // 计数别名只锁存重载值，由触发器装载到工作计数。
+        // The count aliases only latch the rewrite value; a trigger copies it
+        // into the working count.
+        CH_TRANS_COUNT | CH_AL2_TRANS_COUNT | CH_AL3_TRANS_COUNT => {
+            channel.trans_count_reload = value & TRANS_COUNT_MASK;
+            WriteEffect::Plain
+        }
+        CH_AL1_TRANS_COUNT_TRIG => {
+            channel.trans_count_reload = value & TRANS_COUNT_MASK;
+            WriteEffect::Trigger
+        }
+        CH_CTRL_TRIG => {
+            write_ctrl(channel, value);
+            WriteEffect::Trigger
+        }
+        // AL1/AL2/AL3_CTRL 是**非触发**控制别名：Pico SDK 的
+        // dma_channel_configure(..., false) 正是写 al1_ctrl 来配置通道而不启动。
+        // The AL1/AL2/AL3_CTRL aliases are non-triggering control writes;
+        // dma_channel_configure(..., false) relies on that.
+        CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
+            write_ctrl(channel, value);
+            WriteEffect::Plain
+        }
+        _ => return None,
+    };
+    Some(effect)
 }
 
 /// Apply a `CTRL_TRIG` write to a channel / 将 `CTRL_TRIG` 写入应用到通道
@@ -740,45 +883,23 @@ impl MmioDevice for Dma {
                 0x000..CHANNEL_REGION_END => {
                     let index = (offset / CHANNEL_STRIDE) as usize;
                     let register = offset % CHANNEL_STRIDE;
-                    let trigger;
-                    {
-                        let Some(channel) = state.channels.get_mut(index) else {
-                            return false;
-                        };
-                        trigger = match register {
-                            CH_READ_ADDR | CH_AL1_READ_ADDR | CH_AL2_READ_ADDR => {
-                                channel.read_addr = value;
-                                false
+                    let Some(effect) = write_channel_register(&mut state, index, register, value)
+                    else {
+                        return false;
+                    };
+                    match effect {
+                        WriteEffect::Plain => {}
+                        WriteEffect::Trigger if value != 0 => {
+                            trigger_channel(&mut state, index);
+                        }
+                        WriteEffect::Trigger => {
+                            // 零值写入是“空触发”：置位 IRQ_QUIET 时仍会产生完成中断。
+                            // A zero write is a null trigger: it still raises the
+                            // completion interrupt when IRQ_QUIET is set.
+                            if state.channels[index].ctrl & CTRL_IRQ_QUIET != 0 {
+                                state.intr |= 1u16 << index;
                             }
-                            CH_AL3_READ_ADDR_TRIG => {
-                                channel.read_addr = value;
-                                value != 0
-                            }
-                            CH_WRITE_ADDR | CH_AL1_WRITE_ADDR | CH_AL3_WRITE_ADDR => {
-                                channel.write_addr = value;
-                                false
-                            }
-                            CH_AL2_WRITE_ADDR_TRIG => {
-                                channel.write_addr = value;
-                                value != 0
-                            }
-                            CH_TRANS_COUNT | CH_AL2_TRANS_COUNT | CH_AL3_TRANS_COUNT => {
-                                channel.trans_count = value & TRANS_COUNT_MASK;
-                                false
-                            }
-                            CH_AL1_TRANS_COUNT_TRIG => {
-                                channel.trans_count = value & TRANS_COUNT_MASK;
-                                value != 0
-                            }
-                            CH_CTRL_TRIG | CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
-                                write_ctrl(channel, value);
-                                channel.ctrl & CTRL_EN != 0 && value != 0
-                            }
-                            _ => return false,
-                        };
-                    }
-                    if trigger {
-                        start_channel(&mut state, index);
+                        }
                     }
                     true
                 }
@@ -803,7 +924,7 @@ impl MmioDevice for Dma {
                 GLOBAL_MULTI_CHAN_TRIGGER => {
                     for index in 0..CHANNELS {
                         if value & (1u32 << index) != 0 {
-                            start_channel(&mut state, index);
+                            trigger_channel(&mut state, index);
                         }
                     }
                     true

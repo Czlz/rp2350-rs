@@ -30,6 +30,12 @@ pub const PSM_BASE: Address = 0x4001_8000;
 /// RESETS block base / RESETS 块基地址
 pub const RESETS_BASE: Address = 0x4002_0000;
 
+/// BUSCTRL block base / BUSCTRL 块基地址
+///
+/// Firmware programs the DMA/core bus priority hints here during display
+/// bring-up. / 固件在显示初始化时在这里配置 DMA/核心总线优先级提示。
+pub const BUSCTRL_BASE: Address = 0x4006_8000;
+
 /// IO_BANK0 base / IO_BANK0 基地址
 pub const IO_BANK0_BASE: Address = 0x4002_8000;
 

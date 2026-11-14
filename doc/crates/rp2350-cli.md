@@ -36,15 +36,44 @@ rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
 | `--max-cycles` | `20_000_000` | Instruction budget / 指令预算 |
 | `--trace-steps` | `16` | Boot-trace steps printed / 打印的启动轨迹步数 |
 | `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
+| `--dump` | none | `ADDR:LEN:PATH` memory dump written when the run stops (repeatable, decimal or `0x` hex) / 停机时写入的内存导出，可重复，支持十进制或 `0x` 十六进制 |
 
 `run` prints the image summary, core description and boot vectors, executes
 the first `trace_steps` steps as `[trace]` lines, then runs to halt or budget
 exhaustion. The report ends with the halt reason, a 32-step `[tail]` PC
 history, the simulated time, up to 8 logged IRQ deliveries, and any buffered
-UART0 output.
+UART0 output. Arm machines also print one `[run] core1 state=… pc=… sp=…
+launches=…` line (plus `[run] core1 halt: …` if core 1 stopped) after the
+DMA/HSTX counters.
 `run` 打印映像摘要、核心描述与启动向量，先按 `[trace]` 行执行前
 `trace_steps` 步，然后运行至停机或预算耗尽。报告以停机原因、32 步 `[tail]`
 PC 轨迹、模拟时间、最多 8 条已记录的中断投递以及缓冲的 UART0 输出收尾。
+Arm 机器还会在 DMA/HSTX 计数之后打印一行
+`[run] core1 state=… pc=… sp=… launches=…`（core1 停机时另有
+`[run] core1 halt: …`）。
+
+The diagnostic block is `[run] dma=<units> busy=<mask>`, then
+`[run] hstx words=<expanded> underruns=<episodes> fifo=<level> enabled=<bool>
+wof=<bool> unknown=<count>`, then three `[run] dma chN rd=… wr=… cnt=… ctrl=…
+busy=… chain=… treq=…` channel snapshots, then the core-1 line. `Machine` pumps
+HSTX on the DMA batch cadence (every 64 steps) with the periph pixel-clock
+pacing, so a healthy 60 Hz scanout advances `words` by ~134 400 per frame with
+`underruns=0`, `wof=false` and `unknown=0`.
+诊断块依次为 `[run] dma=<单元数> busy=<掩码>`、
+`[run] hstx words=<展开字数> underruns=<断流次数> fifo=<电平> enabled=<布尔>
+wof=<布尔> unknown=<计数>`、三条 `[run] dma chN rd=… wr=… cnt=… ctrl=…
+busy=… chain=… treq=…` 通道快照，最后是 core1 行。`Machine` 按 DMA 批次节拍
+（每 64 步）以 periph 的像素时钟节拍泵送 HSTX，因此健康的 60 Hz 扫描每帧让
+`words` 增加约 134 400，且 `underruns=0`、`wof=false`、`unknown=0`。
+
+Each `--dump` request then writes its bytes and prints
+`[run] dump 0x<addr>+0x<len> -> <path> (<n> bytes)`. This is the fastest way to
+capture a GBA framebuffer (`--dump 0x20063DF4:0x12C00:fb.bin` for
+pokeemerald-rp2350) without attaching GDB.
+每条 `--dump` 请求随后写入字节并打印
+`[run] dump 0x<addr>+0x<len> -> <path> (<n> bytes)`。这是不挂 GDB 也能抓取
+GBA 帧缓冲（pokeemerald-rp2350 为 `--dump 0x20063DF4:0x12C00:fb.bin`）的最快
+方式。
 
 ### `repl` — USB CDC raw REPL / USB CDC raw REPL
 
@@ -117,6 +146,20 @@ Ctrl-C/Ctrl-A/Ctrl-B/Ctrl-D，协议完全由对端（`pyboard.py`、
   基准可能不够；传 `--max-cycles 0` 表示不限制预算（`u64::MAX`）。该 `0`
   语义仅适用于 `repl`（`--exec` 与 `--stdio`）；`repl --exec` 的默认值仍为
   `300_000_000`。
+- **Mask-ROM view / 掩膜 ROM 视图**：before enumeration `repl` calls
+  `rp2350_usb_host::mask_rom::install()` to replace the synthetic `bootrom`
+  region with a read-through, write-dropping view. TinyUSB's EP0 has
+  `endpoint_control == NULL` and `hw_endpoint_start_next_buffer()` stores through
+  it on every control transfer; real mask ROM ignores that store, while a
+  write-rejecting region would halt the guest with
+  `Bus error at address 0x00000000` at the first SETUP. `run` does not enumerate
+  USB and keeps the original region.
+  枚举前 `repl` 调用 `rp2350_usb_host::mask_rom::install()`，把合成 `bootrom`
+  区域替换为读取透传、写入丢弃的视图。TinyUSB 的 EP0 满足
+  `endpoint_control == NULL`，而 `hw_endpoint_start_next_buffer()` 会在每次控制
+  传输中透过它写入；真实掩膜 ROM 会忽略该写入，拒绝写入的区域则会让客户机在
+  首个 SETUP 处以 `Bus error at address 0x00000000` 停机。`run` 不枚举 USB，
+  保留原区域。
 - **Limitations / 限制**：no PTY, no real serial port, no hardware flow
   control (only the 64 KiB bounded queue and OS pipe backpressure), no TLS and
   no multi-client. `--stdio` expects a byte-oriented pipe/file; interactive
@@ -136,7 +179,23 @@ python tools\pyboard.py --device "exec:E:\Source\mcu\pico\rp2350-rs\target\relea
 
 # run-perfbench.py with the same target / 用同一目标运行 run-perfbench.py
 python tests\run-perfbench.py -t "exec:E:\...\rp2350-cli.exe repl --file firmware.uf2 --stdio --max-cycles 0" tests\perf_bench\bm_float.py
+
+# pokeemerald-rp2350: banner after the firmware's 1500 ms sleep. Keep stdin
+# open until it appears; `--max-cycles 0` avoids the 2 s default cap.
+py hold_stdin.py | rp2350-cli.exe repl --file emerald.uf2 --stdio --max-cycles 0
 ```
+
+Measured on `emerald.uf2`: enumeration reaches
+`USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1` after ~1.8 M steps
+(~12 ms simulated), and the banner `=== Pokemon Emerald on RP2350 ===` arrives
+after ~297 M steps (~1.98 s) because the firmware sleeps 1500 ms. A stdin EOF
+only drains 50 ms after the last byte, so a plain `< nul` run stops before the
+banner.
+`emerald.uf2` 实测：枚举在约 180 万步（模拟 12 毫秒）后到达
+`USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`；由于固件休眠
+1500 毫秒，横幅 `=== Pokemon Emerald on RP2350 ===` 在约 2.97 亿步
+（模拟 1.98 秒）后出现。stdin EOF 后仅排空 50 毫秒，因此直接 `< nul` 的运行
+会在横幅前结束。
 
 > **Note / 注意**：`exec:` support and its quoting rules depend on the
 > `pyboard.py` version and host shell; any wrapper that pipes this process's
@@ -235,6 +294,13 @@ arm-none-eabi-gdb firmware.elf
   `--max-cycles` 未暴露。
   The machine budget is pinned to `u64::MAX`; stopping is driven only by GDB
   `c`/`s` requests and breakpoints (no `--max-cycles` flag).
+- 单步/继续同样推进 core1：`Machine::step` 先执行一条 core0 指令再执行一条
+  core1 指令，因此 `s`/`c` 不会让 core1 停摆，但 GDB 只能观察/修改 core0 的
+  寄存器与内存（无多核线程模型）。
+  Single-steps and continues advance core 1 too: `Machine::step` retires one
+  core-0 instruction and then one core-1 instruction, so `s`/`c` never starve
+  core 1 — but GDB only observes and edits core 0's registers (no multi-core
+  thread model).
 - 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点、
   监视点）保留，仅无应答模式协商会被重置。
   After a client disconnects `serve` keeps accepting; target state (memory,
@@ -494,7 +560,7 @@ pub struct MachineOptions {
     pub strict_decode: bool,
 }
 
-pub struct Machine { /* bus, bootrom, core, peripherals, usb … */ }
+pub struct Machine { /* bus, bootrom, core, core1, peripherals, usb … */ }
 impl Machine {
     pub fn new(bytes: &[u8], options: &MachineOptions) -> Result<Self>;
     pub fn step(&mut self) -> Result<CpuState>;
@@ -503,9 +569,24 @@ impl Machine {
     pub fn finalize(&mut self);                  // flush timebase + UART
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
-    // dma_transfers, dma_state, pio_busy_mask, pio_pc (test hook),
-    // take_uart_output, take_notices, recent_steps, register, dump_memory
+    // dma_transfers, dma_state, hstx_words, hstx_state, pio_busy_mask,
+    // pio_pc (test hook), core1_state, core1_pc, core1_sp, core1_launch_count,
+    // core1_halt_reason, take_uart_output, take_notices, recent_steps,
+    // register, dump_memory
     // debugger: read_register, write_register, xpsr, write_xpsr, cpu_state
+}
+
+pub struct RunOptions {
+    pub file: PathBuf,
+    pub arch: Option<ArchArg>,
+    pub max_cycles: u64,
+    pub trace_steps: usize,
+    pub strict_decode: bool,
+    pub dumps: Vec<MemoryDump>,       // --dump ADDR:LEN:PATH (repeatable)
+}
+
+impl MemoryDump {
+    pub fn parse(spec: &str) -> Result<Self, String>;
 }
 
 pub fn register_snapshot(machine: &Machine) -> String;  // R0..R12/SP/LR/PC line
@@ -573,6 +654,87 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
   for 1 000 000 consecutive steps (up to 4 warnings per run).
   当 PC 在同一个 32 字节窗口内连续停留 1 000 000 步时打印一次自旋告警
   （每次运行最多 4 条）。
+
+### Dual-core execution / 双核执行
+
+`Machine` owns a second Cortex-M33 (`CpuId::Core1`) for Arm images; RISC-V
+machines keep `core1: None`, so every core-1 diagnostic returns `None` there.
+Core 1 is created in `CpuState::Reset` and never fetches an instruction until
+the SIO FIFO launch protocol hands it vectors.
+Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 机器保持
+`core1: None`，因此其所有 core1 诊断都返回 `None`。core1 以 `CpuState::Reset`
+创建，在 SIO FIFO 启动协议交出向量前绝不取指。
+
+- **Launch protocol / 启动协议**：pico-sdk `multicore_launch_core1_raw` writes
+  `{0, 0, 1, vtor, sp, entry}` to `SIO_FIFO_WR` and waits for every word to be
+  echoed. `BootPeripherals::service_core1_peer` (called on every 64-step pump
+  and on traced/trap steps) plays the resident core-1 boot ROM: it echoes each
+  word, records `vtor`/`sp`/`entry` when the six-word window matches, and then
+  retires so real core-1 ↔ core-0 traffic is no longer stolen. The machine
+  consumes the vectors through `take_core1_launch`, probes the vector table and
+  calls `boot_at(sp, entry, vtor)` — `SP = sp`, `PC = entry & !1`,
+  `VTOR = vtor`; the final state is reported as `[run] core1 state=… pc=… sp=…
+  launches=…`.
+  **启动协议**：pico-sdk `multicore_launch_core1_raw` 向 `SIO_FIFO_WR` 写入
+  `{0, 0, 1, vtor, sp, entry}` 并等待逐字回显。
+  `BootPeripherals::service_core1_peer`（每 64 步泵送与轨迹/陷阱步调用）扮演
+  常驻 core1 boot ROM：回显每个字，六字窗口匹配时记录 `vtor`/`sp`/`entry`，
+  随后退役，使真实的 core1 ↔ core0 流量不再被窃取。机器通过
+  `take_core1_launch` 取走向量，探测向量表后调用 `boot_at(sp, entry, vtor)`，
+  即 `SP = sp`、`PC = entry & !1`、`VTOR = vtor`；结果由
+  `[run] core1 state=… pc=… sp=… launches=…` 报告。
+- **Stepping order / 步进顺序**：`Machine::step`, `trace_step`, `run_cycles`
+  and GDB `resume` all retire one core-0 instruction and then one core-1
+  instruction (when core 1 is `Running`). `steps`/`now_cycles`/`budget` only
+  count core-0 steps; a halted core 1 contributes its state and nothing else.
+  `Machine::step`、`trace_step`、`run_cycles` 与 GDB `resume` 都先退役一条
+  core0 指令，再退役一条 core1 指令（core1 处于 `Running` 时）。
+  `steps`/`now_cycles`/`budget` 只统计 core0 步数；停机的 core1 只贡献状态。
+- **Fault isolation / 故障隔离**：a core-1 bus error or undefined instruction
+  halts **core 1 only** and is reported by `core1_halt_reason()` and
+  `[run] core1 halt: …`; it never sets the machine's `halt_reason` and never
+  stops core 0.
+  **故障隔离**：core1 的总线错误或未定义指令**只停机 core1**，由
+  `core1_halt_reason()` 与 `[run] core1 halt: …` 报告；它绝不设置机器的
+  `halt_reason`，也不停止 core0。
+- **Per-core register state / 每核寄存器状态**：the SIO view is switched to
+  `Core1` around core 1's instruction, and PPB system writes (VTOR, CPACR,
+  NVIC, SysTick) are replayed into the core that executed them, so the two
+  cores keep independent vector tables, FPU enable state and NVIC enable masks.
+  core1 指令前后把 SIO 视图切到 `Core1`，PPB 系统写入（VTOR、CPACR、NVIC、
+  SysTick）回放到实际执行它的核心，因此两核各自保有独立的向量表、FPU 使能与
+  NVIC 使能掩码。
+- **IRQ routing / 中断路由**：every shared `IrqAssert` line is delivered to both
+  NVICs (each core's enables decide whether it is taken), except
+  `SIO_IRQ_FIFO`/`SIO_IRQ_BELL`, which are per-core endpoints fed by
+  `BootPeripherals::core1_irq_mask`. Core 1 therefore runs HSTX's `DMA_IRQ_0`
+  handler while core 0 keeps its own. Core-1 deliveries are logged as
+  `[irq] core1 signal <n> at PC=…`.
+  **中断路由**：共享 `IrqAssert` 的每条线都投递到两个 NVIC（由各核心的使能位
+  决定是否响应），但 `SIO_IRQ_FIFO`/`SIO_IRQ_BELL` 是按核端点，由
+  `BootPeripherals::core1_irq_mask` 提供。因此 core1 能运行 HSTX 的
+  `DMA_IRQ_0` 处理程序，core0 保有自己的中断。core1 的投递记录为
+  `[irq] core1 signal <n> at PC=…`。
+- **PSM reset semantics / PSM 复位语义**：setting `PSM_FRCE_OFF.PROC1`
+  hard-resets core 1 — the machine discards its context, re-arms the boot-ROM
+  echo stub and clears the launch state; clearing the bit releases it again and
+  the peer acknowledges with a `0` frame (what `multicore_reset_core1()`
+  waits for) unless a new launch was recorded.
+  **PSM 复位语义**：置位 `PSM_FRCE_OFF.PROC1` 会硬复位 core1 —— 机器丢弃其
+  上下文、重新启用 boot ROM 回显桩并清除启动状态；清除该位会再次释放，对端回送
+  一帧 `0`（`multicore_reset_core1()` 等待的确认），除非已记录新的启动信息。
+- **Not modelled / 未建模项**：SIO hardware spinlocks (`SPINLOCKn` registers are
+  unmapped and `SPINLOCK_ST` always reads free), exclusive/`LDREX`/`STREX`
+  monitors, DMA arbitration between cores, `WFI`/`WFE`/`SEV` as scheduling
+  points (they are no-ops), core-1 debug attachment and a multi-core GDB
+  `vCont`/thread model. Core 1 has no modelled mask ROM: a launch jumps straight
+  to `entry`, reproducing the post-ROM state, and only the trap stubs
+  (`rom_table_lookup` at `0x74`, the ROM function table) are dispatched.
+  **未建模项**：SIO 硬件自旋锁（`SPINLOCKn` 寄存器未映射，`SPINLOCK_ST` 恒读
+  空闲）、独占访问/`LDREX`/`STREX` 监视器、双核之间的 DMA 仲裁、作为调度点的
+  `WFI`/`WFE`/`SEV`（当前为空操作）、core1 调试接入与多核 GDB
+  `vCont`/线程模型。core1 不建模掩膜 ROM：启动直接跳到 `entry` 并复现
+  post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与 ROM 函数表）。
 
 ### DMA pump / DMA 泵送
 

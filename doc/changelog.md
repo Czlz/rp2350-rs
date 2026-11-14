@@ -8,6 +8,18 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `rp2350-periph` / `rp2350-cli`: dual-core execution — real Cortex-M33 core1 (`SIO_CPUID` per-core views, `{0,0,1,vtor,sp,entry}` launch handshake, PSM `FRCE_OFF.PROC1` reset/release, per-core PPB replay and IRQ routing), `Machine` steps both cores and reports `[run] core1 state=…`; pokeemerald's `core1_render` now runs and drives HSTX + PPU
+- `rp2350-periph`: `gpio_pads::GpioPads` shared pad electrical model — `PADS_BANK0` pulls drive `SIO_GPIO_IN` when a pin is an input, host-injected external levels win; `BootPeripherals::pads()`; fixes the "all buttons held" RFU soft reset in the GBA firmware
+- `rp2350-periph`: HSTX expander is now paced by the pixel clock — `2 * CSR.CLKDIV` `clk_sys` cycles per pixel, per-command word timing, a 256-word scanline block lasts 800 pixel periods; `output_words()`/`fifo_overrun()`/`fifo_not_full()`; removes the 20x over-draining that dropped words and desynchronised command/data phase
+- `rp2350-periph`: `BUSCTRL` block at `0x4006_8000` — priority/ack, `PERFCTR_EN`, counter registers and SET/CLR/XOR aliases
+- `rp2350-arm`: `MSPLIM`/`PSPLIM` — `MSR`/`MRS` support with reserved bits forced low (Pico SDK crt0 clears `MSPLIM` on both cores)
+- `rp2350-cli`: mask-ROM write-drop view during USB enumeration, so TinyUSB's unconditional EP0 `endpoint_control` write at address 0 no longer faults; emerald's USB CDC banner is readable via `repl --stdio`
+- `rp2350-periph`: DMA control-block ring fidelity — `TRANS_COUNT` reload vs working counter split, AL1/AL2/AL3 alias trigger rules, SDK-style `al1_ctrl` configuration, and a pump budget capped at the HSTX FIFO's free space so a batch can never overrun it; the emerald scanout ring streams three laps (42,912 words) verbatim
+- `rp2350-arm`: halving, dual-multiply and wide-multiply DSP instructions — SHADD/SHSUB/SHASX/SHSAX, UHADD/UHSUB/UHASX/UHSAX, SMLAD/SMLSD, SMUAD/SMUSD, SMLALD/SMLSLD (X variants), SMULWB/T, SMLAWB/T, SMMLS/SMMLSR and SXTAB16/UXTAB16; 20 tests
+- `rp2350-egui`: Virtual Lab wiring canvas — device/port model, wire validation, drag/connect/delete, pointer-anchored zoom and pan, tabbed view with preserved state; 17 tests
+- `rp2350-periph`: GBA bring-up support — SET/CLR/XOR atomic alias windows for PIO/DMA, PIO selectors 0..23 and `DREQ_HSTX=52`, HSTX FIFO-room pacing/output counters, and DMA ring/AL3 fixes; PIO/DMA windows widened to 16 KB
+- `rp2350-cli`: seed `SCB_VTOR` into the PPB window after Arm boot, fixing Pico SDK `runtime_init` copying an empty vector table; `Machine` drains HSTX output and reports `[run] hstx`/DMA snapshot diagnostics; `run --dump ADDR:LEN:PATH` exports memory ranges at halt
+- `rp2350-gdb`: reply `m1`/`l` to `qfThreadInfo`/`qsThreadInfo`, fixing GDB's immediate "Thread 1 exited" after connecting
 - `rp2350-periph`: PIO shared handles and IRQ routing — `SharedPio` (`Arc<Mutex<Pio>>` + MMIO proxy), `BootPeripherals::pio()`/`with_pio()`/`pump_pio_irqs()`, PIO0..2 IRQ lines 15..20 (flags 0..3 → IRQ_0, 4..7 → IRQ_1) and a `Machine` tick every 64 steps; 12 periph + 3 CLI tests
 - `rp2350-arm`: saturating and packed SIMD instructions — SASX/SSAX/UASX/USAX, QADD/QSUB/QDADD/QDSUB, QADD8/16, QSUB8/16, UQADD/UQSUB, QASX/QSAX/UQASX/UQSAX, SEL and SSAT/SSAT16/USAT/USAT16 with Q/GE semantics; 23 tests
 - `rp2350-egui`: read-only DMA/HSTX/PIO panels — busy masks, transfer counts, channel registers, FIFO levels, underrun, PIO SM addresses/pins/IRQs, `PeripheralSource` injection with placeholders; 14 tests
