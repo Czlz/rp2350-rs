@@ -23,6 +23,7 @@
 )]
 
 pub mod conditions;
+pub mod dual_core;
 pub mod exceptions;
 pub mod execute_thumb16;
 pub mod execute_thumb32;
@@ -33,6 +34,9 @@ pub mod systick;
 
 /// Cortex-M33 register set / Cortex-M33 寄存器组
 pub use registers::CortexM33Registers;
+
+/// Dual-core scheduling scaffold / 双核调度脚手架
+pub use dual_core::DualCoreM33;
 
 use std::collections::BTreeSet;
 

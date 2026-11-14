@@ -13,6 +13,7 @@
 | Module | Description / 描述 |
 |--------|-------------------|
 | `registers` | `CortexM33Registers`, PSR flags, CONTROL register |
+| `dual_core` | `DualCoreM33` two-core scheduling scaffold (core1 release gate) |
 | `conditions` | `Condition` (15 codes), `ITBlockState` (1-4 instruction blocks) |
 | `execute_thumb16` | Thumb-16 decoder + executor (~90 instructions) |
 | `execute_thumb32` | Thumb-32 decoder + executor (60+ ALU / Load-Store / system instructions) |
@@ -566,3 +567,83 @@ DCP 被建模为永远空闲。`MRC`/`MRRC` 将目标寄存器置零，`MCR`/`MC
 
 **Stack frame on exception entry** (8 words): R0-R3, R12, LR, PC, XPSR.
 **EXC_RETURN** values: `0xFFFFFFF1` (return to handler), `0xFFFFFFF9` (thread MSP), `0xFFFFFFFD` (thread PSP).
+
+---
+
+## Dual-core scheduling / 双核调度
+
+`DualCoreM33` (module `dual_core`) owns both Cortex-M33 cores and advances
+them in a fixed order. It is a scaffold: PSM release polling, SIO FIFO
+handshakes and the CLI `Machine` still run core0 only.
+`DualCoreM33`（模块 `dual_core`）持有两个 Cortex-M33 核心，并按固定顺序推进。
+它是脚手架：PSM 释放轮询、SIO FIFO 握手与 CLI `Machine` 仍只运行 core0。
+
+```rust
+pub struct DualCoreM33 { /* core0, core1, core1_released */ }
+
+impl DualCoreM33 {
+    pub fn new(core0: CortexM33Core) -> Self;
+    pub fn core(&self, id: CpuId) -> &CortexM33Core;
+    pub fn core_mut(&mut self, id: CpuId) -> &mut CortexM33Core;
+    pub fn is_core1_running(&self) -> bool;
+    pub fn release_core1(
+        &mut self, bus: &mut dyn AddressBus,
+        sp: u32, pc: u32, vtor: u32,
+    ) -> Result<(), CoreError>;
+    pub fn step(&mut self, bus: &mut dyn AddressBus)
+        -> Result<[CpuState; 2], CoreError>;
+    pub fn run_cycles(&mut self, bus: &mut dyn AddressBus, cycles: u64)
+        -> Result<u64, CoreError>;
+    pub fn signal_interrupt(&mut self, core: CpuId, irq: IrqNumber);
+}
+```
+
+Semantics / 语义:
+
+- `new(core0)` creates core1 with `CortexM33Core::new(CpuId::Core1)` in
+  `CpuState::Reset`. Core1 never fetches an instruction before a successful
+  `release_core1`.
+  `new(core0)` 用 `CortexM33Core::new(CpuId::Core1)` 创建处于
+  `CpuState::Reset` 的 core1；成功调用 `release_core1` 之前 core1 绝不取指。
+- `release_core1` first probes `vtor` and `vtor + 4` through `bus` (a bus error
+  leaves core1 halted), then applies `CortexM33Core::boot_at(sp, pc, vtor)`, so
+  `SP = sp`, `PC = pc & !1`, `VTOR = vtor`. Repeated calls **re-initialize**
+  core1: register file and NVIC are cleared, vectors are reapplied and
+  execution restarts at `pc`; pending interrupts are not preserved.
+  `release_core1` 先通过 `bus` 探测 `vtor` 与 `vtor + 4`（总线错误时 core1
+  保持停机），再调用 `CortexM33Core::boot_at(sp, pc, vtor)`，因此
+  `SP = sp`、`PC = pc & !1`、`VTOR = vtor`。重复调用会**重新初始化** core1：
+  寄存器文件与 NVIC 清零、重新应用向量并从 `pc` 重新开始执行；挂起中断不保留。
+- `is_core1_running()` is true only after a successful release while core1 is
+  `CpuState::Running`; a faulted/halted core1 reports `false`.
+  `is_core1_running()` 仅在成功释放且 core1 处于 `CpuState::Running` 时为真；
+  core1 故障或停机后返回 `false`。
+- `step` advances core0 first, then core1 (when running), returning
+  `[core0_state, core1_state]`. A halted core1 contributes its current state
+  without executing. Errors propagate immediately; if core0 fails, core1 is not
+  stepped in that call.
+  `step` 先推进 core0，再推进（运行中的）core1，返回
+  `[core0_state, core1_state]`。停机的 core1 只返回当前状态、不执行。
+  错误立即传播；core0 失败时该次调用不推进 core1。
+- `run_cycles` counts one per `step` (instruction width is irrelevant) and
+  stops early once both states are non-`Running`; a halted core1 alone never
+  stops core0.
+  `run_cycles` 每次 `step` 计 1 个周期（与指令宽度无关），两核状态都非
+  `Running` 时提前结束；仅 core1 停机不会阻止 core0 运行。
+- `signal_interrupt(core, irq)` targets exactly one core's NVIC; the other
+  core observes no pending/servicing change because the NVICs are independent.
+  `signal_interrupt(core, irq)` 只投递到指定核心的 NVIC；由于两核 NVIC 独立，
+  另一核心不会观察到挂起/服务状态变化。
+
+Not wired yet / 尚未接线:
+
+- PSM core1 release polling (`FRCE_OFF` / `PROC1` handshake) and SIO FIFO
+  boot messages.
+- CLI `Machine` dual-core mode; it still boots and steps core0 only and
+  emulates core1 through `BootPeripherals::service_core1_peer`.
+- Multicore GDB / debugger attachment.
+
+- PSM core1 释放轮询（`FRCE_OFF` / `PROC1` 握手）与 SIO FIFO 启动消息。
+- CLI `Machine` 双核模式；它仍只启动并单步 core0，并通过
+  `BootPeripherals::service_core1_peer` 模拟 core1。
+- 多核 GDB / 调试器接入。
