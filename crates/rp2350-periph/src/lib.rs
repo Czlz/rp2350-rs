@@ -24,6 +24,7 @@ pub mod bootram;
 pub mod clocks;
 pub mod cycle;
 pub mod dma;
+pub mod hstx;
 pub mod io_bank0;
 pub mod io_qspi;
 pub mod irq;
@@ -52,6 +53,7 @@ pub mod xosc;
 pub use boot::{BootPeripherals, Timebase};
 pub use cycle::CycleSink;
 pub use dma::Dma;
+pub use hstx::Hstx;
 pub use irq::IrqAssert;
 pub use pio::Pio;
 pub use traits::Peripheral;
@@ -59,6 +61,8 @@ pub use uart::UartSink;
 
 #[cfg(test)]
 mod dma_tests;
+#[cfg(test)]
+mod hstx_tests;
 
 use rp2350_core::mmio::MmioRegion;
 

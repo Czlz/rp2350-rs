@@ -77,6 +77,14 @@ pub const PWM1_BASE: Address = 0x400A_9000;
 /// TIMER0 base / TIMER0 基地址
 pub const TIMER0_BASE: Address = 0x400B_0000;
 
+/// HSTX control register block base (APB) / HSTX 控制寄存器块基地址（APB）
+///
+/// The control window holds `CSR`, `BIT0..BIT7`, `EXPAND_SHIFT` and
+/// `EXPAND_TMDS`; the command/data FIFO is a separate AHB block at
+/// [`HSTX_FIFO_BASE`]. 控制窗口包含 `CSR`、`BIT0..BIT7`、`EXPAND_SHIFT` 与
+/// `EXPAND_TMDS`；命令/数据 FIFO 是 [`HSTX_FIFO_BASE`] 处的独立 AHB 块。
+pub const HSTX_CTRL_BASE: Address = 0x400C_0000;
+
 /// XIP_QMI base / XIP_QMI 基地址
 pub const XIP_QMI_BASE: Address = 0x400D_0000;
 
@@ -159,6 +167,24 @@ pub const PIO1_BASE: Address = 0x5030_0000;
 
 /// PIO2 register block base / PIO2 寄存器块基地址
 pub const PIO2_BASE: Address = 0x5040_0000;
+
+/// HSTX FIFO register block base (AHB) / HSTX FIFO 寄存器块基地址（AHB）
+///
+/// The FIFO window holds `HSTX_FIFO_STAT` and the write-only `HSTX_FIFO_FIFO`.
+/// FIFO 窗口包含 `HSTX_FIFO_STAT` 与只写的 `HSTX_FIFO_FIFO`。
+pub const HSTX_FIFO_BASE: Address = 0x5060_0000;
+
+/// Size of each HSTX register window / 每个 HSTX 寄存器窗口大小
+pub const HSTX_SIZE: usize = 0x1000;
+
+/// Interrupt line asserted by the HSTX model / HSTX 模型断言的中断线
+///
+/// The RP2350 datasheet assigns no dedicated HSTX interrupt line, so the model
+/// borrows `SPARE_IRQ_0` (46) for the model-only underrun, command-done and
+/// unknown-command status bits.
+/// RP2350 数据手册没有专用 HSTX 中断线，因此模型借用 `SPARE_IRQ_0`（46）承载
+/// 仅模型的下溢、命令完成与未知命令状态位。
+pub const HSTX_IRQ: u16 = 46;
 
 /// SIO base / SIO 基地址
 pub const SIO_BASE: Address = 0xD000_0000;

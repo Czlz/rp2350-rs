@@ -22,6 +22,7 @@ use super::bootram::BootRam;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
 use super::dma::Dma;
+use super::hstx::Hstx;
 use super::io_bank0::IoBank0;
 use super::io_qspi::IoQspi;
 use super::irq::IrqAssert;
@@ -97,6 +98,7 @@ pub struct BootPeripherals {
     timer: Timer0,
     sio: Sio,
     dma: Dma,
+    hstx: Hstx,
     irq: IrqAssert,
     system_writes: SystemWriteLog,
     core1_release: Arc<AtomicBool>,
@@ -126,6 +128,7 @@ impl BootPeripherals {
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
         let sio = Sio::new(irq.clone());
         let dma = Dma::new(irq.clone());
+        let hstx = Hstx::new(irq.clone());
         let core1_release = Arc::new(AtomicBool::new(false));
 
         let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
@@ -145,6 +148,10 @@ impl BootPeripherals {
         apb.mount(Box::new(Adc::new()))?;
         apb.mount(Box::new(Pwm::new()))?;
         apb.mount(Box::new(timer.clone()))?;
+        // HSTX 控制寄存器位于 APB（0x400C_0000），FIFO 在 AHB 侧独立挂载。
+        // The HSTX control registers live in APB (0x400C_0000); the FIFO is
+        // mounted separately in AHB space.
+        apb.mount(hstx.ctrl_device())?;
         apb.mount(Box::new(Watchdog::new()))?;
         apb.mount(Box::new(XipQmi::new()))?;
         apb.mount(Box::new(BootRam::new()))?;
@@ -176,6 +183,9 @@ impl BootPeripherals {
         mount_device(bus, Box::new(Pio::new(0)))?;
         mount_device(bus, Box::new(Pio::new(1)))?;
         mount_device(bus, Box::new(Pio::new(2)))?;
+        // HSTX FIFO 位于 AHB 空间（0x5060_0000），与 PIO 块并列。
+        // The HSTX FIFO lives in AHB space (0x5060_0000) next to the PIO blocks.
+        mount_device(bus, hstx.fifo_device())?;
         // DMA 位于 AHB 空间，与 PIO 块并列；传输由宿主通过 `Dma::run` 驱动。
         // DMA lives in AHB space next to the PIO blocks; transfers are driven
         // by the host through `Dma::run`.
@@ -189,6 +199,7 @@ impl BootPeripherals {
             timer,
             sio,
             dma,
+            hstx,
             irq,
             system_writes,
             core1_release,
@@ -223,12 +234,16 @@ impl BootPeripherals {
     /// Advance the shared timebase and refresh TIMER0 interrupt lines
     /// 推进共享时基并刷新 TIMER0 中断线
     ///
-    /// DMA transfers are deliberately not pumped here: the host decides when
-    /// to call [`Dma::run`] with its own bus handle and cycle budget.
-    /// 这里有意不泵送 DMA 传输：由宿主用自己的总线句柄与周期预算决定何时调用
-    /// [`Dma::run`]。
+    /// The HSTX command expander is pumped with the same cycle budget; it does
+    /// no work while `CSR.EN` is clear, so firmware that never touches HSTX is
+    /// unaffected. DMA transfers are deliberately not pumped here: the host
+    /// decides when to call [`Dma::run`] with its own bus handle and cycle
+    /// budget. HSTX 命令扩展器按同一周期预算泵送；`CSR.EN` 清零时不做任何
+    /// 事，因此不接触 HSTX 的固件不受影响。这里有意不泵送 DMA 传输：由宿主用
+    /// 自己的总线句柄与周期预算决定何时调用 [`Dma::run`]。
     pub fn advance(&self, cycles: u64) {
         self.cycles.push(cycles);
+        self.hstx.advance(cycles);
         self.timer.refresh();
     }
 
@@ -264,6 +279,22 @@ impl BootPeripherals {
     /// 宿主执行传输所用的可变 DMA 句柄
     pub fn dma_mut(&mut self) -> &mut Dma {
         &mut self.dma
+    }
+
+    /// Shared HSTX handle / 共享的 HSTX 句柄
+    ///
+    /// The handle shares state with the APB control window and the AHB FIFO
+    /// window, so writes through the bus are visible here immediately.
+    /// 该句柄与 APB 控制窗口及 AHB FIFO 窗口共享状态，总线写入会立即在这里可见。
+    #[must_use]
+    pub fn hstx(&self) -> &Hstx {
+        &self.hstx
+    }
+
+    /// Mutable HSTX handle used to drain output words
+    /// 用于取走输出字的可变 HSTX 句柄
+    pub fn hstx_mut(&mut self) -> &mut Hstx {
+        &mut self.hstx
     }
 
     /// Elapsed microseconds since boot / 自启动以来的微秒数

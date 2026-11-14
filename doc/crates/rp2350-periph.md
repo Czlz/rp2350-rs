@@ -262,37 +262,179 @@ DMA 握手（TX/RX 的 DREQ）、RP2350 `RXFn_PUTGET*` 寄存器、`0x16C..0x184
 
 ## HSTX / 高速发送
 
+The HSTX model covers the two datasheet register windows, the 8-entry
+command/data FIFO, the command-expander subset and the host-side line-output
+API. It does **not** encode DVI/HDMI pixels. `Hstx` implements no `Peripheral`
+trait directly; [`Hstx::ctrl_device`] and [`Hstx::fifo_device`] expose the two
+`MmioDevice` adapters, and clones share one register/FIFO state.
+HSTX 模型覆盖数据手册的两个寄存器窗口、8 项命令/数据 FIFO、命令扩展器子集与
+宿主侧行输出 API，**不**做 DVI/HDMI 像素编码。`Hstx` 不直接实现 `Peripheral`；
+[`Hstx::ctrl_device`] 与 [`Hstx::fifo_device`] 暴露两个 `MmioDevice` 适配器，
+克隆共享同一寄存器/FIFO 状态。
+
 ```rust
-pub struct Hstx {
-    pub csr: u32,
-    pub clkdiv: u32,
-    pub fifo_levels: [u8; 8],
-    pub frame_buffer: Vec<u32>,         // raw 32-bit pixel words
-    pub pixel_count: usize,
-    pub pixel_read: usize,
-    pub frame_sender: Option<mpsc::Sender<DecodedFrame>>,
-    pub dma_ready: bool,
-    pub frame_ready_cycles: u64,
-}
+pub struct Hstx { /* shared register file + FIFO + command expander */ }
 
 impl Hstx {
-    pub fn consume_pixels(&mut self, count: usize) -> &[u32];
-    pub fn frame_ready(&self) -> bool;
-    pub fn snapshot(&self) -> Vec<u32>;
-    pub fn pixel_count(&self) -> usize;
-}
-
-pub struct HstxDecoder {
-    pub format: PixelFormat,
-    pub width: u32,
-    pub height: u32,
-    pub bytes_per_pixel: u8,
-}
-
-impl HstxDecoder {
-    pub fn decode(&self, raw: &[u32]) -> Vec<u8>;  // RGBA8 output
+    pub fn new(irq: IrqAssert) -> Self;
+    pub fn ctrl_device(&self) -> Box<dyn MmioDevice>;
+    pub fn fifo_device(&self) -> Box<dyn MmioDevice>;
+    pub fn push_command(&mut self, command: u32) -> bool;
+    pub fn push_data(&mut self, word: u32) -> bool;
+    pub fn advance(&self, cycles: u64);
+    pub fn drain_output(&mut self) -> Vec<u32>;
+    pub fn take_scanline(&mut self) -> Vec<u32>;
+    pub fn output_underrun(&self) -> u64;
+    pub fn fifo_level(&self) -> u8;
+    pub fn output_level(&self) -> usize;
+    pub fn enabled(&self) -> bool;
+    pub fn unknown_commands(&self) -> u64;
+    pub fn last_unknown_command(&self) -> Option<u32>;
+    pub fn reset(&mut self);
 }
 ```
+
+### Windows / 窗口
+
+| Window | Base | Constant | Contents |
+|--------|------|----------|----------|
+| APB control | `0x400C_0000` | `map::HSTX_CTRL_BASE` | `CSR`, `BIT0..BIT7`, `EXPAND_SHIFT`, `EXPAND_TMDS`, model IRQ registers |
+| AHB FIFO | `0x5060_0000` | `map::HSTX_FIFO_BASE` | `STAT`, `FIFO` |
+
+`BootPeripherals::mount` installs the control adapter into the APB router and
+mounts the FIFO adapter standalone in AHB space. `BootPeripherals::hstx()` /
+`hstx_mut()` return handles sharing that state, and `BootPeripherals::advance`
+pumps `Hstx::advance`.
+`BootPeripherals::mount` 把控制适配器装入 APB 路由器，并将 FIFO 适配器独立
+挂载到 AHB 空间。`BootPeripherals::hstx()` / `hstx_mut()` 返回共享状态的句柄，
+`BootPeripherals::advance` 会泵送 `Hstx::advance`。
+
+### Register subset / 寄存器子集
+
+- `CSR` (`+0x00`, reset `0x1005_0600`, write mask `0xFF1F_1F73`) — `EN` (bit 0)
+  gates FIFO popping; `EXPAND_EN` (bit 1) enables command expansion. `CLKDIV`,
+  `CLKPHASE`, `N_SHIFTS`, `SHIFT` and the coupled-mode bits are stored and read
+  back but have no timing effect.
+- `BIT0..BIT7` (`+0x04..+0x20`, mask `0x0003_1F1F`) and `EXPAND_SHIFT` (`+0x24`,
+  reset `0x0100_0100`), `EXPAND_TMDS` (`+0x28`) are storage only;
+  `EXPAND_SHIFT.ENC_SHIFT` (bits 20:16) drives the modelled TMDS word count.
+- `HSTX_FIFO_STAT` (`+0x00`) — `LEVEL[7:0]`, `FULL` (8), `EMPTY` (9) derived
+  from the queue; `WOF` (10) sticky write-while-full flag, write-one-to-clear.
+- `HSTX_FIFO_FIFO` (`+0x04`) — write-only; reads return zero. Writes while full
+  drop the word and set `WOF`.
+- `+0x30` `IRQ_STATUS` (W1C) and `+0x34` `IRQ_ENABLE` are **model-only**
+  registers, because silicon has no HSTX interrupt registers. Reserved/read-only
+  bits are masked, and unmodelled offsets follow the project one-shot warning
+  policy (read 0, write ignored).
+
+- `CSR`（`+0x00`，复位 `0x1005_0600`，写掩码 `0xFF1F_1F73`）——`EN`（位 0）
+  控制 FIFO 弹出，`EXPAND_EN`（位 1）启用命令扩展。`CLKDIV`、`CLKPHASE`、
+  `N_SHIFTS`、`SHIFT` 与耦合模式位仅存储/回读，无时序效果。
+- `BIT0..BIT7`（`+0x04..+0x20`，掩码 `0x0003_1F1F`）与 `EXPAND_SHIFT`
+  （`+0x24`，复位 `0x0100_0100`）、`EXPAND_TMDS`（`+0x28`）仅存储；
+  `EXPAND_SHIFT.ENC_SHIFT`（位 20:16）驱动建模的 TMDS 字数换算。
+- `HSTX_FIFO_STAT`（`+0x00`）——`LEVEL[7:0]`、`FULL`（8）、`EMPTY`（9）由
+  队列推导；`WOF`（10）为满写粘滞标志，写 1 清零。
+- `HSTX_FIFO_FIFO`（`+0x04`）——只写，读回 0；满时写入丢弃该字并置位 `WOF`。
+- `+0x30` `IRQ_STATUS`（写 1 清零）与 `+0x34` `IRQ_ENABLE` 是**仅模型**
+  寄存器，因为芯片没有 HSTX 中断寄存器。保留位/只读位被掩码，未建模偏移
+  沿用项目的一次性告警策略（读 0、写忽略）。
+
+### Command encoding / 命令编码
+
+Opcode lives in bits `[15:12]`, count in bits `[11:0]` — the layout used by the
+`HSTX_CMD_*` macros in `pico-examples`. A zero count means zero words/cycles.
+操作码位于位 `[15:12]`、计数位于位 `[11:0]`，与 `pico-examples` 的
+`HSTX_CMD_*` 宏一致。计数 0 表示 0 个字/周期。
+
+| Opcode | Constant | Behaviour / 行为 |
+|--------|----------|------------------|
+| `0x0` | `hstx::CMD_RAW` | consume `count` data words, emit each once / 消费 `count` 个数据字，各输出一次 |
+| `0x1` | `hstx::CMD_RAW_REPEAT` | consume one data word, emit it `count` times / 消费一个字并输出 `count` 次 |
+| `0x2` | `hstx::CMD_TMDS` | consume `ceil(count * ENC_SHIFT / 32)` words (or `count` when `ENC_SHIFT = 0`), pass through unchanged / 消费相应字数并原样透传 |
+| `0x3` | `hstx::CMD_TMDS_REPEAT` | consume one word, emit it `count` times (TMDS word count) / 消费一个字并重复 |
+| `0xE` | `hstx::CMD_WAIT` | **model extension**: wait `count` HSTX cycles, no output / **模型扩展**：等待，无输出 |
+| `0xF` | `hstx::CMD_NOP` | no payload, no output / 无载荷、无输出 |
+
+`CMD_WAIT` is not part of the hardware command set (which has no delay command);
+opcode `0xE` is otherwise undefined, so the model reserves it and documents the
+limitation. Unknown opcodes are consumed, counted in `unknown_commands()`, kept
+in `last_unknown_command()`, logged once per opcode, flagged in `IRQ_STATUS` and
+never panic or raise the completion IRQ.
+`CMD_WAIT` 不属于硬件命令集（硬件没有延迟命令）；操作码 `0xE` 本来未定义，
+模型保留它并记录该限制。未知操作码会被消费、计入 `unknown_commands()`、保存在
+`last_unknown_command()`、按操作码只记录一次日志、在 `IRQ_STATUS` 置位，且
+不会 panic，也不会触发完成中断。
+
+With `EXPAND_EN = 0`, every FIFO word is raw output data and no command decoding
+happens — matching the datasheet's "raw FIFO data passed directly" mode.
+`EXPAND_EN = 0` 时每个 FIFO 字都是原始输出数据，不做命令解码，对应数据手册的
+“原始 FIFO 数据直通”模式。
+
+### Host-side output / 宿主侧输出
+
+`advance(cycles)` pops at most one FIFO word per HSTX cycle while `EN` is set,
+expands it and queues the resulting 32-bit output words. `drain_output()` takes
+the whole queue; `take_scanline()` is an alias for scanline-oriented hosts.
+`output_underrun()` counts FIFO starvation episodes while a command still needs
+data, and `advance` sets `IRQ_UNDERRUN`. `advance` does nothing when `EN` is
+clear or the FIFO is empty, so an idle HSTX never produces pixels. `reset()`
+restores the reset values and clears FIFOs, counters and the shared IRQ line.
+`advance(cycles)` 在 `EN` 置位时每个 HSTX 周期至多弹出一个 FIFO 字，展开并把
+32 位输出字放入队列。`drain_output()` 取走整个队列；`take_scanline()` 是面向
+扫描线宿主的别名。`output_underrun()` 统计命令仍需数据时的 FIFO 断流次数，
+`advance` 会置位 `IRQ_UNDERRUN`。`EN` 清零或 FIFO 空闲时 `advance` 不做任何
+事，因此空闲 HSTX 不会产生像素。`reset()` 恢复复位值并清空 FIFO、计数器与
+共享中断线。
+
+```rust
+use rp2350_core::bus::AddressBus;
+use rp2350_core::memory::SimpleBus;
+use rp2350_periph::{BootPeripherals, hstx, map};
+
+let mut bus = SimpleBus::new();
+let mut peripherals = BootPeripherals::mount(&mut bus)?;
+let mut cycles = 0u64;
+
+bus.write_u32(map::HSTX_CTRL_BASE, hstx::CSR_EN | hstx::CSR_EXPAND_EN, &mut cycles)?;
+bus.write_u32(map::HSTX_FIFO_BASE + 0x04, hstx::CMD_RAW | 3, &mut cycles)?;
+for word in [0x0011_2233, 0x0044_5566, 0x0077_8899] {
+    bus.write_u32(map::HSTX_FIFO_BASE + 0x04, word, &mut cycles)?;
+}
+peripherals.advance(4);
+assert_eq!(peripherals.hstx_mut().drain_output(), [0x0011_2233, 0x0044_5566, 0x0077_8899]);
+```
+
+### Interrupts / 中断
+
+Silicon has no dedicated HSTX interrupt line. The model borrows `SPARE_IRQ_0`
+(`map::HSTX_IRQ` = 46) and defines `IRQ_STATUS`/`IRQ_ENABLE` at control offsets
+`+0x30`/`+0x34` with `IRQ_UNDERRUN` (0), `IRQ_COMMAND_DONE` (1) and
+`IRQ_UNKNOWN_COMMAND` (2). Any enabled status bit asserts the shared
+`IrqAssert` line, so `BootPeripherals::irq_mask()` reports it; status bits are
+write-one-to-clear.
+芯片没有专用 HSTX 中断线。模型借用 `SPARE_IRQ_0`（`map::HSTX_IRQ` = 46），在
+控制窗口 `+0x30`/`+0x34` 定义 `IRQ_STATUS`/`IRQ_ENABLE`，位为 `IRQ_UNDERRUN`
+（0）、`IRQ_COMMAND_DONE`（1）与 `IRQ_UNKNOWN_COMMAND`（2）。任一使能状态位
+置位即断言共享 `IrqAssert` 线，`BootPeripherals::irq_mask()` 可观察到；状态位
+写 1 清零。
+
+### Not modelled / 未建模项
+
+DVI/HDMI bit timing, the TMDS encoder and 10-bit symbol packing, the output
+shift register/clock generator (`CLKDIV`, `CLKPHASE`, `N_SHIFTS`, `SHIFT`),
+`BITx` pin crossbar routing, GPIO pin mapping, `EXPAND_TMDS` lane configuration,
+HSTX DMA handshakes (DREQ) and PIO coupled mode. TMDS data words are passed
+through unchanged; only the consumed word count is derived from
+`EXPAND_SHIFT.ENC_SHIFT`. No scanline/frame boundary, pixel format or
+`HstxDecoder` is provided. Hardware FIFO timing is approximated as one word per
+HSTX cycle.
+DVI/HDMI 位时序、TMDS 编码器与 10 位符号打包、输出移位寄存器/时钟发生器
+（`CLKDIV`、`CLKPHASE`、`N_SHIFTS`、`SHIFT`）、`BITx` 引脚交叉开关、GPIO
+引脚映射、`EXPAND_TMDS` 通道配置、HSTX DMA 握手（DREQ）与 PIO 耦合模式均未
+建模。TMDS 数据字原样透传，只有消费字数由 `EXPAND_SHIFT.ENC_SHIFT` 推导。
+不提供扫描线/帧边界、像素格式或 `HstxDecoder`。硬件 FIFO 时序近似为每个
+HSTX 周期一个字。
 
 ---
 
