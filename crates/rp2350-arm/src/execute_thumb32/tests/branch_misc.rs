@@ -125,6 +125,24 @@ fn msr_primask() {
 }
 
 #[test]
+fn msr_and_mrs_stack_limits() {
+    // `msr msplim, r0` is what Pico SDK crt0 clears on every core.
+    // Pico SDK 的 crt0 在每个核上用 `msr msplim, r0` 清零。
+    let mut r = CortexM33Registers::new();
+    r.write(0, 0x2008_1FFF);
+    assert_eq!(execute(0xF380_880A, &mut r), StepResult::Ok);
+    assert_eq!(r.msplim, 0x2008_1FF8, "bits[2:0] are reserved");
+    assert_eq!(execute(0xF3EF_800A, &mut r), StepResult::Ok);
+    assert_eq!(r.read(0), 0x2008_1FF8);
+
+    r.write(1, 0x2000_4007);
+    assert_eq!(execute(0xF381_880B, &mut r), StepResult::Ok);
+    assert_eq!(r.psplim, 0x2000_4000);
+    assert_eq!(execute(0xF3EF_810B, &mut r), StepResult::Ok);
+    assert_eq!(r.read(1), 0x2000_4000);
+}
+
+#[test]
 fn barriers_execute_as_no_ops() {
     let mut r = CortexM33Registers::new();
     assert_eq!(execute(0xF3BF_8F4F, &mut r), StepResult::Ok); // DSB

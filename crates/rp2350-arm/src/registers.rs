@@ -64,6 +64,10 @@ pub struct CortexM33Registers {
     pub basepri: u32,
     /// Fault Mask Register / 故障屏蔽寄存器
     pub faultmask: u32,
+    /// Main Stack Pointer limit / 主栈指针下限
+    pub msplim: u32,
+    /// Process Stack Pointer limit / 进程栈指针下限
+    pub psplim: u32,
     /// Floating-point registers S0-S31, FPSCR and FPEXC
     /// 浮点寄存器 S0-S31、FPSCR 与 FPEXC
     pub fpu: FpuRegisters,
@@ -91,6 +95,8 @@ impl CortexM33Registers {
             primask: 0,
             basepri: 0,
             faultmask: 0,
+            msplim: 0,
+            psplim: 0,
             fpu: FpuRegisters::new(),
             cpacr: 0,
             pending_usage_fault: false,

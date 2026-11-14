@@ -72,6 +72,8 @@ pub struct CortexM33Registers {
     pub primask: u32,       // Priority Mask / 优先级屏蔽
     pub basepri: u32,       // Base Priority / 基础优先级
     pub faultmask: u32,     // Fault Mask / 故障屏蔽
+    pub msplim: u32,        // Main Stack Pointer limit / 主栈指针下限
+    pub psplim: u32,        // Process Stack Pointer limit / 进程栈指针下限
 }
 
 impl CortexM33Registers {
@@ -906,10 +908,14 @@ When the FPU is active the frame is **extended** with the 17-word FP context
 ## Dual-core scheduling / 双核调度
 
 `DualCoreM33` (module `dual_core`) owns both Cortex-M33 cores and advances
-them in a fixed order. It is a scaffold: PSM release polling, SIO FIFO
-handshakes and the CLI `Machine` still run core0 only.
+them in a fixed order. It is a reusable scaffold: the CLI `Machine` drives its
+own pair of `CortexM33Core`s directly (see
+[`rp2350-cli`](rp2350-cli.md#dual-core-execution--双核执行)) because it also
+needs per-core PPB replay, SIO views and PSM handling.
 `DualCoreM33`（模块 `dual_core`）持有两个 Cortex-M33 核心，并按固定顺序推进。
-它是脚手架：PSM 释放轮询、SIO FIFO 握手与 CLI `Machine` 仍只运行 core0。
+它是可复用的脚手架：CLI `Machine` 直接驱动自己的一对 `CortexM33Core`（见
+[`rp2350-cli`](rp2350-cli.md#dual-core-execution--双核执行)），因为它还需要
+按核回放 PPB、SIO 视图与 PSM 处理。
 
 ```rust
 pub struct DualCoreM33 { /* core0, core1, core1_released */ }

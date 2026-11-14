@@ -155,6 +155,28 @@ fn ldrd_pre_index_write_back() {
 // === Pre/post-indexed 8-bit immediate ===
 
 #[test]
+fn strb_post_index_writes_byte_and_updates_base() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    r.write(3, 0xAB);
+    r.write(1, 0x100);
+    assert_eq!(run(0xF801_3B01, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u8(0x100), 0xAB);
+    assert_eq!(r.read(1), 0x101);
+}
+
+#[test]
+fn ldrb_post_index_reads_byte_and_updates_base() {
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    bus.poke_u32(0x100, 0x1122_3344);
+    r.write(1, 0x100);
+    assert_eq!(run(0xF811_3B01, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(3), 0x44);
+    assert_eq!(r.read(1), 0x101);
+}
+
+#[test]
 fn ldr_post_index_updates_base() {
     let mut r = CortexM33Registers::new();
     let mut bus = TestBus::new();
