@@ -503,6 +503,7 @@ impl Machine {
     pub fn finalize(&mut self);                  // flush timebase + UART
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
+    // dma_transfers, dma_state,
     // take_uart_output, take_notices, recent_steps, register, dump_memory
     // debugger: read_register, write_register, xpsr, write_xpsr, cpu_state
 }
@@ -570,6 +571,56 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
   for 1 000 000 consecutive steps (up to 4 warnings per run).
   当 PC 在同一个 32 字节窗口内连续停留 1 000 000 步时打印一次自旋告警
   （每次运行最多 4 条）。
+
+### DMA pump / DMA 泵送
+
+Firmware only programs the 16-channel DMA register block at `0x5000_0000`;
+transfers happen because the machine pumps them, not because the guest writes
+`CTRL_TRIG`.
+固件只写 `0x5000_0000` 的 16 通道 DMA 寄存器块；传输之所以发生，是机器在泵送
+它们，而不是客户机写了 `CTRL_TRIG`。
+
+- **Pump point / 泵送点**：`Machine::pump_dma_batch` is called from
+  `execute_step` immediately after a step retires and **before** interrupt
+  delivery. Plain `step`, `trace_step`, boot-ROM trap steps and GDB `resume`
+  single steps all funnel through this one call, so a debugger cannot starve
+  the DMA engine.
+  `Machine::pump_dma_batch` 在一步退役后、**中断投递之前**由 `execute_step`
+  调用。普通 `step`、`trace_step`、boot ROM 陷阱步与 GDB `resume` 单步都汇入
+  这一处调用，调试器因此无法让 DMA 引擎停摆。
+- **Budget / 预算**：throttled to one call per `PUMP_INTERVAL` (64) retired
+  steps and capped at `DMA_PUMP_TRANSFERS` (16) data units per call. The DMA
+  controller visits channels round-robin, so 16 units is at most one unit per
+  channel and never more than 16 units for a single busy channel: the CPU
+  always executes at least 64 instructions between batches and at least four
+  instructions per DMA unit.
+  按退役步数每 `PUMP_INTERVAL`（64）步节流一次，每次最多
+  `DMA_PUMP_TRANSFERS`（16）个数据单元。DMA 控制器按轮转顺序访问通道，因此
+  16 个单元最多是每通道一个单元、单一忙碌通道也不超过 16 个单元：CPU 在批次
+  之间至少执行 64 条指令，平均每个 DMA 单元至少 4 条指令。
+- **Idle path / 空闲路径**：the pump records its throttle point, probes
+  `Dma::busy_mask()` once and returns when no channel is busy — no bus access
+  and no register parsing on the hot path.
+  泵送先记录节流点，再探测一次 `Dma::busy_mask()`，无忙碌通道即返回：热路径
+  不访问总线、不解析寄存器。
+- **Diagnostics / 诊断**：`Machine::dma_transfers()` returns the cumulative
+  number of data units moved (one per performed transfer, not per byte) and
+  `Machine::dma_state()` renders `dma=<units> busy=<mask>`. `run` prints that
+  line as `[run] dma=… busy=…` next to the register snapshot. It is a host
+  diagnostic only: `repl --exec` stdout still carries guest bytes only.
+  `Machine::dma_transfers()` 返回累计搬运的数据单元数（按传输计，不按字节），
+  `Machine::dma_state()` 渲染为 `dma=<单元数> busy=<掩码>`。`run` 在寄存器快照
+  旁打印 `[run] dma=… busy=…`。它只是宿主诊断：`repl --exec` 的 stdout 仍只
+  承载客户机字节。
+- **Limitations / 限制**：no cycle-accurate arbitration or `HIGH_PRIORITY`
+  scheduling, no DREQ pacing-timer (`TREQ_SEL` `0x3B..=0x3E`) tick driving
+  and no HSTX DMA handshake. Every `Dma::run` unit costs one bus read plus one
+  bus write, but the instruction budget and peripheral timebase only count CPU
+  steps, so DMA traffic is not added to `steps` or `time_us`.
+  不做周期精确仲裁或 `HIGH_PRIORITY` 调度，不驱动 DREQ 节拍定时器
+  （`TREQ_SEL` `0x3B..=0x3E`），也不建模 HSTX DMA 握手。每个 `Dma::run` 单元
+  消耗一次总线读加一次总线写，但指令预算与外设时基只统计 CPU 步数，DMA 流量
+  不计入 `steps` 或 `time_us`。
 
 ---
 

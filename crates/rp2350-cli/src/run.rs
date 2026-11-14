@@ -42,6 +42,17 @@ const PUMP_INTERVAL: u64 = 64;
 /// Instructions between simulated-time advances / 推进模拟时间的指令间隔
 const ADVANCE_INTERVAL: u64 = 10_000;
 
+/// DMA data units moved per pump batch / 每次泵送批次搬运的 DMA 数据单元数
+///
+/// The DMA controller visits its 16 channels round-robin, so a batch of 16
+/// units can move at most one unit per channel and can never run longer than
+/// one unit for a single busy channel. This keeps the CPU ahead of the DMA
+/// engine without a per-channel scheduler.
+/// DMA 控制器按轮转顺序访问 16 个通道，因此一批 16 个单元最多每个通道一个
+/// 单元，单一忙碌通道也不会超过一个单元。这样无需逐通道调度即可保证 CPU 始终
+/// 领先于 DMA 引擎。
+const DMA_PUMP_TRANSFERS: u64 = 16;
+
 /// Maximum number of logged IRQ deliveries / 记录的中断投递条数上限
 const IRQ_LOG_LIMIT: usize = 8;
 
@@ -256,6 +267,10 @@ pub struct Machine {
     advanced: u64,
     /// Steps at the last interrupt pump / 上次中断泵送时的步数
     pumped: u64,
+    /// Steps at the last DMA pump / 上次 DMA 泵送时的步数
+    dma_pumped: u64,
+    /// Cumulative DMA data units moved by the host pump / 宿主泵送累计搬运的 DMA 数据单元数
+    dma_transfers: u64,
     /// Non-budget halt reason / 非预算原因的停机原因
     halt: Option<String>,
     /// Whether the peripheral timebase has been finalized / 外设时基是否已收尾
@@ -382,6 +397,8 @@ impl Machine {
             budget: options.max_cycles,
             advanced: 0,
             pumped: 0,
+            dma_pumped: 0,
+            dma_transfers: 0,
             halt: None,
             finished: false,
             irqs: Vec::new(),
@@ -439,6 +456,33 @@ impl Machine {
     #[must_use]
     pub fn now_cycles(&self) -> u64 {
         self.steps
+    }
+
+    /// Cumulative DMA data units moved by the host pump
+    /// 宿主泵送累计搬运的 DMA 数据单元数
+    ///
+    /// Counts one unit per performed transfer (not per byte) and stays `0`
+    /// until firmware enables a channel and the machine pumps it.
+    /// 按已执行的传输计数（不是按字节），在固件使能通道并被机器泵送前保持 `0`。
+    #[must_use]
+    pub fn dma_transfers(&self) -> u64 {
+        self.dma_transfers
+    }
+
+    /// One-line DMA diagnostic: `dma=<units> busy=<channel mask>`
+    /// 单行 DMA 诊断：`dma=<单元数> busy=<通道掩码>`
+    ///
+    /// Intended for machine-state lines only; it never changes `repl --exec`
+    /// stdout semantics because it is printed on the host diagnostics stream.
+    /// 仅用于机器状态行；它打印在宿主诊断流上，因此不改变 `repl --exec` 的
+    /// stdout 语义。
+    #[must_use]
+    pub fn dma_state(&self) -> String {
+        format!(
+            "dma={} busy={:#06X}",
+            self.dma_transfers(),
+            self.peripherals.dma().busy_mask()
+        )
     }
 
     /// Elapsed simulated microseconds / 已模拟的微秒数
@@ -713,6 +757,10 @@ impl Machine {
             if let Some(outcome) = self.bootrom.dispatch(&mut self.core, &mut self.bus)? {
                 self.steps += 1;
                 self.record_sync_trap();
+                // DMA 先于中断投递泵送，完成中断可在同一批次送达客户机。
+                // DMA is pumped before IRQ delivery so a completion interrupt
+                // is visible to the guest in the same batch.
+                self.pump_dma_batch();
                 if let Some(halt) = outcome.halt {
                     self.halt = Some(format!("bootrom halt: {halt}"));
                     self.finalize();
@@ -735,6 +783,12 @@ impl Machine {
             Ok(CpuState::Running) => {
                 self.steps += 1;
                 self.record_sync_trap();
+                // 唯一 DMA 泵送点：普通步、轨迹步、boot ROM 陷阱步与 GDB
+                // 单步都经过这里，调试器无法绕过 DMA 推进。
+                // The single DMA pump point: plain, traced, boot ROM trap and
+                // GDB single steps all pass here, so a debugger cannot bypass
+                // DMA progress.
+                self.pump_dma_batch();
                 if trace.is_some() {
                     // 轨迹步与原 run 路径一致：每步泵送中断，不做自旋统计或时基推进。
                     // Trace steps mirror the original run path: pump every step and
@@ -826,6 +880,37 @@ impl Machine {
         }
     }
 
+    /// Run one throttled DMA batch before interrupt delivery
+    /// 在中断投递前执行一个受节流的 DMA 批次
+    ///
+    /// Throttled to one call per [`PUMP_INTERVAL`] retired steps and capped at
+    /// [`DMA_PUMP_TRANSFERS`] data units, so the CPU always executes at least
+    /// that many instructions between batches. The idle path costs a single
+    /// `busy_mask` probe and never touches the bus.
+    /// 按已退役步数每 [`PUMP_INTERVAL`] 步节流一次，每批最多
+    /// [`DMA_PUMP_TRANSFERS`] 个数据单元，因此批次之间 CPU 至少执行同样多的
+    /// 指令。空闲路径只做一次 `busy_mask` 探测，不访问总线。
+    fn pump_dma_batch(&mut self) {
+        if self.steps - self.dma_pumped < PUMP_INTERVAL {
+            return;
+        }
+        // 先记节流点：即使当前空闲，下一次检查也推迟一整批，避免每步加锁。
+        // Record the throttle point first: even when idle, the next probe waits
+        // a full batch instead of locking on every step.
+        self.dma_pumped = self.steps;
+        if self.peripherals.dma().busy_mask() == 0 {
+            return;
+        }
+        // bus 与外设是不同字段，可直接分开借用，无需 RefCell。
+        // `bus` and the peripheral handle are distinct fields, so they borrow
+        // separately without a RefCell.
+        let moved = self
+            .peripherals
+            .dma_mut()
+            .run(&mut self.bus, DMA_PUMP_TRANSFERS);
+        self.dma_transfers = self.dma_transfers.saturating_add(moved);
+    }
+
     fn advance_timebase(&mut self) {
         if self.steps > self.advanced {
             self.peripherals.advance(self.steps - self.advanced);
@@ -897,6 +982,10 @@ pub fn run(options: &RunOptions) -> Result<()> {
         us = machine.time_us(),
         pc = machine.pc()
     )?;
+    // DMA 统计只出现在 `run` 的宿主诊断行，`repl --exec` 的 stdout 不受影响。
+    // The DMA counters only appear in `run`'s host diagnostics, so `repl --exec`
+    // stdout semantics stay unchanged.
+    writeln!(stdout, "[run] {}", machine.dma_state())?;
     writeln!(stdout, "[run] {}", register_snapshot(&machine))?;
     if !machine.irqs().is_empty() {
         writeln!(stdout, "[run] irq deliveries (first {IRQ_LOG_LIMIT}):")?;
@@ -1148,9 +1237,254 @@ fn log_irq(irq_log: &mut Vec<String>, irq: u16, pc: u32) {
 mod tests {
     use super::*;
     use crate::test_support::{cpacr_write_elf, infinite_loop_elf};
+    use rp2350_periph::dma::{
+        CTRL_CHAIN_TO_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_INCR_WRITE, CTRL_TREQ_SEL_SHIFT,
+        TREQ_PERMANENT,
+    };
+    use rp2350_periph::map::DMA_BASE;
 
     /// `SCB_CPACR` absolute address / `SCB_CPACR` 绝对地址
     const SCB_CPACR: u32 = 0xE000_ED88;
+
+    /// Per-channel register stride / 每通道寄存器步长
+    const CHANNEL_STRIDE: u32 = 0x40;
+
+    /// `CTRL_TRIG.DATA_SIZE` value for word transfers / 字传输的 `DATA_SIZE` 值
+    const DATA_SIZE_WORD: u32 = 2;
+
+    /// Program one word-mode RAM-to-RAM channel through the guest bus
+    /// 通过客户机总线编程一个字宽 RAM→RAM 通道
+    fn program_channel(
+        machine: &mut Machine,
+        channel: u32,
+        src: u32,
+        dst: u32,
+        count: u32,
+        chain_to: u8,
+    ) {
+        let base = DMA_BASE + channel * CHANNEL_STRIDE;
+        write_word(machine, base, src);
+        write_word(machine, base + 0x04, dst);
+        write_word(machine, base + 0x08, count);
+        let ctrl = CTRL_EN
+            | (DATA_SIZE_WORD << rp2350_periph::dma::CTRL_DATA_SIZE_SHIFT)
+            | CTRL_INCR_READ
+            | CTRL_INCR_WRITE
+            | (u32::from(TREQ_PERMANENT) << CTRL_TREQ_SEL_SHIFT)
+            | (u32::from(chain_to) << CTRL_CHAIN_TO_SHIFT);
+        write_word(machine, base + 0x0C, ctrl);
+    }
+
+    /// Write one word through the machine bus / 通过机器总线写入一个字
+    fn write_word(machine: &mut Machine, addr: u32, value: u32) {
+        let mut cycles = 0u64;
+        machine
+            .bus
+            .write_u32(addr, value, &mut cycles)
+            .expect("bus write");
+    }
+
+    /// Read one word through the machine bus / 通过机器总线读取一个字
+    fn read_word(machine: &mut Machine, addr: u32) -> u32 {
+        let mut cycles = 0u64;
+        machine.bus.read_u32(addr, &mut cycles).expect("bus read")
+    }
+
+    /// Build a machine with a fixed Arm budget / 构建带固定 Arm 预算的机器
+    fn machine_with_budget(max_cycles: u64) -> Machine {
+        let elf = infinite_loop_elf();
+        let options = MachineOptions {
+            arch: Some(ArchArg::Arm),
+            max_cycles,
+            strict_decode: false,
+        };
+        Machine::new(&elf, &options).expect("machine")
+    }
+
+    #[test]
+    fn dma_ram_to_ram_channel_completes_under_the_machine() {
+        // 固件只写 DMA 寄存器，传输应由机器主循环自动推进。
+        // Firmware only programs the DMA registers; the machine main loop must
+        // advance the transfer by itself.
+        let mut machine = machine_with_budget(1_000);
+        let src = SRAM_BASE + 0x1000;
+        let dst = SRAM_BASE + 0x2000;
+        let words = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        for (index, word) in words.iter().enumerate() {
+            write_word(&mut machine, src + index as u32 * 4, *word);
+        }
+        program_channel(&mut machine, 0, src, dst, 4, 0);
+
+        machine.run_cycles(200);
+
+        assert_eq!(machine.dma_transfers(), 4);
+        for (index, word) in words.iter().enumerate() {
+            assert_eq!(read_word(&mut machine, dst + index as u32 * 4), *word);
+        }
+        let state = machine.peripherals.dma().channel_state(0).expect("ch0");
+        assert_eq!(state.trans_count, 0);
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn a_busy_dma_channel_does_not_stall_the_cpu() {
+        // 长传输期间 CPU 必须继续执行，DMA 只在每批预算内推进。
+        // The CPU must keep executing during a long transfer; DMA only advances
+        // within its per-batch budget.
+        let mut machine = machine_with_budget(1_000);
+        program_channel(
+            &mut machine,
+            0,
+            SRAM_BASE + 0x1000,
+            SRAM_BASE + 0x4000,
+            1_000,
+            0,
+        );
+
+        machine.run_cycles(300);
+
+        assert_eq!(machine.steps(), 300);
+        assert!(machine.dma_transfers() > 0);
+        assert!(machine.dma_transfers() < 1_000);
+        assert!(
+            machine
+                .peripherals
+                .dma()
+                .channel_state(0)
+                .expect("ch0")
+                .busy
+        );
+    }
+
+    #[test]
+    fn the_dma_batch_budget_is_bounded() {
+        // 一个批次最多 16 个单元：不会一次搬完整块而长时间不返回。
+        // One batch moves at most 16 units, so a large block never blocks the
+        // main loop for long.
+        let mut machine = machine_with_budget(1_000);
+        program_channel(
+            &mut machine,
+            0,
+            SRAM_BASE + 0x1000,
+            SRAM_BASE + 0x4000,
+            1_000,
+            0,
+        );
+
+        machine.run_cycles(PUMP_INTERVAL);
+        assert_eq!(machine.dma_transfers(), DMA_PUMP_TRANSFERS);
+        assert_eq!(
+            machine
+                .peripherals
+                .dma()
+                .channel_state(0)
+                .expect("ch0")
+                .trans_count,
+            1_000 - 16
+        );
+
+        machine.run_cycles(PUMP_INTERVAL);
+        assert_eq!(machine.dma_transfers(), 2 * DMA_PUMP_TRANSFERS);
+    }
+
+    #[test]
+    fn idle_dma_reports_zero_transfers() {
+        // 未编程任何通道时泵送必须完全跳过，步进行为保持不变。
+        // With no channel programmed the pump must be a no-op and stepping must
+        // keep its historical behaviour.
+        let mut machine = machine_with_budget(5);
+        machine.run_cycles(5);
+
+        assert_eq!(machine.steps(), 5);
+        assert!(machine.budget_exhausted());
+        assert_eq!(machine.dma_transfers(), 0);
+        assert_eq!(machine.peripherals.dma().busy_mask(), 0);
+        assert_eq!(machine.dma_state(), "dma=0 busy=0x0000");
+    }
+
+    #[test]
+    fn chained_channels_complete_under_the_machine() {
+        // 链式通道：ch1 先被配置并中止，ch0 完成后由 CHAIN_TO 启动 ch1。
+        // Chained channels: ch1 is configured then aborted; completing ch0
+        // starts ch1 through CHAIN_TO.
+        let mut machine = machine_with_budget(1_000);
+        let src0 = SRAM_BASE + 0x1000;
+        let dst0 = SRAM_BASE + 0x2000;
+        let src1 = SRAM_BASE + 0x3000;
+        let dst1 = SRAM_BASE + 0x4000;
+        for index in 0..4u32 {
+            write_word(&mut machine, src0 + index * 4, 0xA000_0000 | index);
+        }
+        for index in 0..2u32 {
+            write_word(&mut machine, src1 + index * 4, 0xB000_0000 | index);
+        }
+        program_channel(&mut machine, 1, src1, dst1, 2, 1);
+        // CHAN_ABORT 只清 BUSY，保留 EN 与计数，链式启动即可重新开跑。
+        // CHAN_ABORT only clears BUSY, keeping EN and the count, so the chain
+        // can restart it.
+        write_word(&mut machine, DMA_BASE + 0x464, 1 << 1);
+        program_channel(&mut machine, 0, src0, dst0, 4, 1);
+
+        machine.run_cycles(200);
+
+        assert_eq!(machine.dma_transfers(), 6);
+        for index in 0..4u32 {
+            assert_eq!(
+                read_word(&mut machine, dst0 + index * 4),
+                0xA000_0000 | index
+            );
+        }
+        for index in 0..2u32 {
+            assert_eq!(
+                read_word(&mut machine, dst1 + index * 4),
+                0xB000_0000 | index
+            );
+        }
+        assert_eq!(machine.peripherals.dma().busy_mask(), 0);
+    }
+
+    #[test]
+    fn traced_steps_advance_the_dma_pump() {
+        // `run` 的轨迹前缀使用 trace_step；该路径也必须泵送 DMA。
+        // The `run` trace prefix uses trace_step; that path must pump DMA too.
+        let mut machine = machine_with_budget(1_000);
+        program_channel(
+            &mut machine,
+            0,
+            SRAM_BASE + 0x1000,
+            SRAM_BASE + 0x2000,
+            4,
+            0,
+        );
+
+        for index in 0..PUMP_INTERVAL as usize {
+            machine.trace_step(index).expect("trace step");
+        }
+
+        assert_eq!(machine.dma_transfers(), 4);
+        let _ = machine.take_notices();
+    }
+
+    #[test]
+    fn gdb_single_steps_also_pump_dma() {
+        // GDB `resume` 走 `step`；单步不能绕过 DMA 推进。
+        // GDB `resume` uses `step`; single stepping must not bypass DMA.
+        let mut machine = machine_with_budget(1_000);
+        program_channel(
+            &mut machine,
+            0,
+            SRAM_BASE + 0x1000,
+            SRAM_BASE + 0x2000,
+            4,
+            0,
+        );
+
+        for _ in 0..PUMP_INTERVAL {
+            machine.step().expect("step");
+        }
+
+        assert_eq!(machine.dma_transfers(), 4);
+    }
 
     #[test]
     fn machine_boots_and_stops_at_the_budget() {
