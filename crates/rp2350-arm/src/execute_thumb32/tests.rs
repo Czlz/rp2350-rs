@@ -8,3 +8,4 @@ mod dsp;
 mod fpu;
 mod load_store;
 mod multiply;
+mod saturating;

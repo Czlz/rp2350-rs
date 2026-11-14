@@ -147,6 +147,12 @@ pub fn execute_thumb32(
                 data_processing::execute_modified_immediate(instr, regs)
             } else if matches!(op, 0x20..=0x2F | 0x60..=0x6F) {
                 branch_misc::execute_plain_immediate(instr, regs)
+            } else if matches!(op, 0x30 | 0x32 | 0x38 | 0x3A) {
+                // SSAT/SSAT16/USAT/USAT16 share the plain-binary-immediate
+                // group; the DSP unit owns their saturation semantics.
+                // SSAT/SSAT16/USAT/USAT16 属于纯二进制立即数组，其饱和语义由
+                // DSP 单元负责。
+                dsp::execute_saturate(instr, regs)
             } else if matches!(op, 0x34 | 0x36 | 0x3C) {
                 branch_misc::execute_bitfield(instr, regs)
             } else {
