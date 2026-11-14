@@ -1,19 +1,18 @@
 # rp2350-gdb — Public API / 公共 API
 
-> GDB Remote Serial Protocol (RSP) Server for multi-core ARM Cortex-M33 debugging.
-> 用于多核 ARM Cortex-M33 调试的 GDB 远程串行协议（RSP）服务器。
+> GDB Remote Serial Protocol (RSP) protocol layer for RP2350 debugging.
+> 用于 RP2350 调试的 GDB 远程串行协议（RSP）协议层。
 >
-> **Status**: `GdbTarget` trait（`target.rs`）与 `CortexM33Target<B>` 适配器
-> （`cortex_m33.rs`，含 `DEFAULT_INSTRUCTION_BUDGET = 1_000_000`）已实现；
-> `GdbServer`（`server.rs`）仍为桩——`start()` 仅置标志并打日志，RSP/TCP
-> 传输未实现。下文 trait 清单是已实现的目标契约；`GdbServer` 字段规格为规划。
+> **Status**: 协议层已实现 — `rsp.rs` 提供包编解码（`$<payload>#<checksum>`、
+> `+`/`-` 应答、`}` 二进制转义、十六进制工具）与无 socket 的命令分发器
+> `RspSession<T>`；`CortexM33Target<B>` 为目标适配器。`GdbServer`
+> （`server.rs`）仍为桩：TCP 监听与 CLI `gdb` 接线尚未实现。
 >
-> **Status** (EN): the `GdbTarget` trait (`target.rs`) and the
-> `CortexM33Target<B>` adapter (`cortex_m33.rs`, with
-> `DEFAULT_INSTRUCTION_BUDGET = 1_000_000`) are implemented; `GdbServer`
-> (`server.rs`) is still a stub — `start()` only sets a flag and logs, and the
-> RSP/TCP transport is not implemented. The trait listing below is the
-> implemented contract; the `GdbServer` field specs are planned.
+> **Status** (EN): the protocol layer is implemented — `rsp.rs` provides packet
+> framing (`$<payload>#<checksum>`), `+`/`-` acknowledgements, `}` binary
+> escaping, hex helpers, and a socket-free dispatcher `RspSession<T>`.
+> `CortexM33Target<B>` is the target adapter. `GdbServer` (`server.rs`) is still
+> a stub: TCP listening and CLI `gdb` wiring are not implemented.
 
 ---
 
@@ -22,202 +21,167 @@
 ### `GdbTarget` Trait
 
 ```rust
-pub trait GdbTarget: Send + Sync {
-    fn architecture(&self) -> GdbArchitecture;
-    fn target_xml(&self) -> &str;
-    fn read_registers(&self) -> Vec<u8>;
-    fn write_registers(&mut self, data: &[u8]);
-    fn read_register(&self, regnum: usize) -> u32;
-    fn write_register(&mut self, regnum: usize, value: u32);
-    fn read_memory(&self, addr: u32, len: usize) -> Vec<u8>;
-    fn write_memory(&mut self, addr: u32, data: &[u8]);
-    fn insert_breakpoint(&mut self, addr: u32, kind: BreakpointKind) -> bool;
-    fn remove_breakpoint(&mut self, addr: u32, kind: BreakpointKind) -> bool;
-    fn insert_hw_breakpoint(&mut self, addr: u32) -> bool;
-    fn remove_hw_breakpoint(&mut self, addr: u32) -> bool;
-    fn insert_watchpoint(&mut self, addr: u32, len: u32, kind: WatchKind) -> bool;
-    fn remove_watchpoint(&mut self, addr: u32) -> bool;
-
-    fn step(&mut self);
-    fn resume(&mut self);
-    fn halt(&mut self, reason: StopReason);
-    fn stop_reason(&self) -> Option<StopReason>;
-    fn num_threads(&self) -> usize;          // 2 for RP2350
-    fn current_thread(&self) -> usize;       // active core
-    fn set_current_thread(&mut self, id: usize);
-
-    fn monitor_command(&self, cmd: &str) -> String;
+pub trait GdbTarget: Send {
+    fn register_count(&self) -> u32;               // default: 17 (R0-R15 + XPSR)
+    fn read_register(&mut self, register: u32) -> Result<u32, GdbError>;
+    fn write_register(&mut self, register: u32, value: u32) -> Result<(), GdbError>;
+    fn read_memory(&mut self, address: u32, length: usize) -> Result<Vec<u8>, GdbError>;
+    fn write_memory(&mut self, address: u32, bytes: &[u8]) -> Result<(), GdbError>;
+    fn set_breakpoint(&mut self, address: u32) -> Result<(), GdbError>;
+    fn clear_breakpoint(&mut self, address: u32) -> Result<(), GdbError>;
+    fn has_breakpoint(&self, address: u32) -> bool;
+    fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError>;
+    fn status(&self) -> TargetStatus;
 }
 ```
 
-### `GdbServer`
+支持类型 / Supporting types：
+
+- `ResumeMode`：`Continue` / `Step`
+- `StopReply { reason: StopReason, pc: u32 }`；`signal()` 返回 GDB 信号号
+- `StopReason`：`Breakpoint`、`SingleStep`、`Fault`、`Sleeping`、`Halted`、
+  `Reset`、`InstructionLimit`
+- `TargetStatus { state, stop_reason, pc, total_cycles }`
+- `GdbError`：`InvalidRegister`、`Bus(CoreError)`、`AddressOutOfRange`
+
+### `CortexM33Target<B>`
 
 ```rust
-pub struct GdbServer<T: GdbTarget> {
-    pub target: Arc<Mutex<T>>,
-    pub port: u16,
-    pub connections: Vec<GdbConnectionHandle>,
-    pub breakpoints: HashMap<u32, BreakpointEntry>,
-    pub watchpoints: Vec<WatchpointEntry>,
-    pub no_ack_mode: bool,
-    pub extended_mode: bool,
-}
-
-impl<T: GdbTarget + 'static> GdbServer<T> {
-    /// Create new server bound to a port.
-    pub async fn new(target: T, port: u16) -> Result<Self, GdbError>;
-
-    /// Start accepting connections.
-    pub async fn serve(&mut self) -> Result<(), GdbError>;
-
-    /// Stop server and disconnect all clients.
-    pub async fn shutdown(&mut self);
-}
+let target = CortexM33Target::new(core, bus)
+    .with_instruction_budget(DEFAULT_INSTRUCTION_BUDGET);
 ```
+
+`new()` 要求核心已启动（`CortexM33Core::boot`）。断点通过 PC 比较检测
+（不写入 BKPT 指令），`Continue` 从当前断点恢复时会先跨过该指令。
+`new()` expects a booted core (`CortexM33Core::boot`). Breakpoints are detected
+by PC comparison (no BKPT patching); resuming from a breakpoint steps over the
+current instruction first.
 
 ---
 
-## RSP Protocol Handling / RSP 协议处理
+## RSP Protocol Layer / RSP 协议层
 
-| Packet | Command | Description |
-|--------|---------|-------------|
-| `?` | halt reason | 停止原因查询 |
-| `g` | read registers | 读取所有寄存器 |
-| `G` | write registers | 写入所有寄存器 |
-| `p N` | read single reg | 读取单个寄存器 |
-| `P N=V` | write single reg | 写入单个寄存器 |
-| `m addr,len` | read memory | 读取内存 |
-| `M addr,len:data` | write memory | 写入内存 |
-| `c [addr]` | continue | 继续执行 |
-| `s [addr]` | step | 单步 |
-| `Z0,addr,kind` | insert sw bp | 插入软件断点 |
-| `z0,addr,kind` | remove sw bp | 移除软件断点 |
-| `Z1,addr,kind` | insert hw bp | 插入硬件断点 |
-| `z1,addr,kind` | remove hw bp | 移除硬件断点 |
-| `Z2/Z3/Z4` | watchpoints | 读写访问监视点 |
-| `Hc T` | set thread | 设置当前线程 |
-| `Hg T` | set thread (general) | 设置通用操作线程 |
-| `qC` | current thread | 当前线程 ID |
-| `qfThreadInfo` / `qsThreadInfo` | list threads | 列出线程 |
-| `qSupported` | feature negotiation | 特性协商 |
-| `qXfer:features:read:target.xml` | target description | 目标描述 XML |
-| `vCont?` / `vCont;c` / `vCont;s:T` | multi-core control | 多核运行控制 |
-| `vAttach;PID` | attach | 附加到进程 |
-| `qRcmd,cmd` | monitor command | 自定义 monitor 命令 |
-| `k` | kill | 终止调试 |
+`rsp.rs` 不执行 I/O，所有函数与分发器均可直接单元测试。传输层（后续任务）
+只需负责读写字节、解析 `+`/`-` 应答，并调用 `handle_frame` / `encode_packet`。
+`rsp.rs` performs no I/O; every function and the dispatcher are directly
+unit-testable. A future transport only reads/writes bytes, handles `+`/`-`
+acknowledgements, and calls `handle_frame` / `encode_packet`.
+
+### Packet Codec / 包编解码
+
+```rust
+use rp2350_gdb::{decode_packet, encode_packet, checksum, escape_binary, unescape_binary};
+
+let frame = encode_packet("m20000000,4");   // "$m20000000,4#.."（小写校验和）
+assert_eq!(decode_packet(frame.as_bytes())?, "m20000000,4");
+assert_eq!(checksum(b"OK"), 0x9a);
+
+let escaped = escape_binary(b"a$b#c}d*e"); // 保留字节转为 `}` + (byte ^ 0x20)
+assert_eq!(unescape_binary(&escaped)?, b"a$b#c}d*e");
+```
+
+| Item | Behavior / 行为 |
+|------|-----------------|
+| `checksum(payload)` | 8 位回绕和 / wrapping 8-bit sum |
+| `encode_packet(payload)` | `$<payload>#<2 位小写 hex>` |
+| `decode_packet(frame)` | 严格校验起始 `$`、终止 `#`、两位 hex 校验和、UTF-8 |
+| `escape_binary` / `unescape_binary` | `$`、`#`、`}`、`*` 的 `}` 转义 / RSP binary escaping |
+| `encode_hex` / `decode_hex` | 小写输出；偶数长度与字符合法性校验 |
+| `ACK` / `NACK` / `parse_ack` | `+` / `-` 应答字节与解析 |
+| `ERROR_REPLY` | `E01`，非法包与目标错误的通用回复 |
+
+非法帧（缺标记、校验和错误、非 UTF-8）由 `handle_frame` 回复 `E01`，不关闭
+连接。`k` 是唯一不产生回复的命令（返回 `None`）。
+Malformed frames are answered with `E01` by `handle_frame` instead of closing the
+connection. `k` is the only command with no reply (returns `None`).
+
+### Command Dispatcher / 命令分发
+
+```rust
+pub struct RspSession<T: GdbTarget> { /* target + no_ack_mode */ }
+
+impl<T: GdbTarget> RspSession<T> {
+    pub fn new(target: T) -> Self;
+    pub fn no_ack_mode(&self) -> bool;
+    pub fn target(&self) -> &T;
+    pub fn handle_packet(&mut self, payload: &str) -> Option<String>;
+    pub fn handle_frame(&mut self, frame: &[u8]) -> Option<String>;
+}
+```
+
+| Packet | Reply / 回复 | Notes |
+|--------|--------------|-------|
+| `qSupported[:features]` | `PacketSize=fff;QStartNoAckMode+;vContSupported+;hwbreak+` | 特性协商 |
+| `?` | `S05` | 附加查询（SIGTRAP） |
+| `g` | 每寄存器 4 字节小端 hex | 寄存器批量读 |
+| `G<hex>` | `OK` | 批量写；长度须为 4 的倍数且不超出寄存器数 |
+| `p N` | 8 位小端 hex | 单个寄存器读 |
+| `P N=<hex>` | `OK` | 单个寄存器写 |
+| `m addr,len` | 小写 hex 字节串 | 长度上限 `MAX_PACKET_SIZE`（0x0fff） |
+| `M addr,len:data` | `OK` | 数据字节数必须等于 `len` |
+| `c` / `C<sig>` | `S<sig>`（通常 `S05`） | `GdbTarget::resume(Continue)` |
+| `s` / `S<sig>` | `S<sig>` | `GdbTarget::resume(Step)` |
+| `Z0,addr,kind` / `z0,addr,kind` | `OK` | 软件断点（kind 校验，忽略值） |
+| `Z1,addr,kind` / `z1,addr,kind` | `OK` | 硬件断点（复用目标的断点模型） |
+| `D` | `OK` | detach |
+| `k` | 无回复 | 传输层应随后关闭连接 |
+| `qC` | `QC1` | 单核阶段固定线程 1 |
+| `qAttached` | `1` | 已附加到现有目标 |
+| `Hg<id>` / `Hc<id>` | `OK` | 线程选择空成功 |
+| `vCont?` | `vCont;c;s` | 最小单线程能力 |
+| `vCont;c[:id]` / `vCont;s[:id]` | `S05` | 单动作；多动作返回空包（多核待实现） |
+| `QStartNoAckMode` | `OK` | 置位 `no_ack_mode()`，状态化 |
+| 未知 / 不支持的 `q`、`Q`、`v` | 空包 `""` | 符合 RSP 探测约定 |
+
+错误映射：目标错误（非法寄存器、总线错误、地址越界）与非法参数均回复
+`E01`，会话保持可用；未知命令返回空包。
+Error mapping: target failures (invalid register, bus error, address overflow)
+and malformed arguments reply `E01` while the session stays usable; unknown
+commands return an empty packet.
+
+`QStartNoAckMode` 注意：传输层必须在发送 `OK` 之后才进入无应答模式；分发器只
+记录协商状态。
+`QStartNoAckMode` note: the transport must enter no-ack mode only after sending
+`OK`; the dispatcher only records the negotiated flag.
 
 ---
 
-## Breakpoint Model / 断点模型
+## Current Limitations / 当前限制
 
-### Software Breakpoints
+- 无 TCP 监听、无 `GdbServer` 会话循环、无 CLI `gdb` 子命令。
+- 无 `qXfer:features:read` / `target.xml`，无 multiprocess、watchpoint（`Z2`-`Z4`）。
+- `vCont` 仅单动作单线程；多核动作列表返回空包。
+- 无 `qRcmd` monitor 命令、无 `qfThreadInfo` / `qsThreadInfo`。
 
-```rust
-pub struct BreakpointEntry {
-    pub addr: u32,
-    pub kind: BreakpointKind, // 2 (Thumb 16-bit) or 4 (Thumb 32-bit)
-    pub original_bytes: Vec<u8>,  // saved for restore
-    pub enabled: bool,
-}
-
-// On insert: replace [addr..addr+kind] with BKPT #0 (0xBE00 / 0xF000BE00)
-// On remove: restore original bytes
-```
-
-### Hardware Breakpoints
-
-```rust
-// 8 hardware breakpoint slots (FPB unit on Cortex-M33)
-// Each slot can match instruction address exactly.
-pub fn insert_hw_breakpoint(&mut self, addr: u32) -> bool {
-    if let Some(slot) = self.hw_breakpoints.iter_mut().find(|s| s.is_none()) {
-        *slot = Some(addr);
-        true
-    } else {
-        false
-    }
-}
-```
-
-### Watchpoints
-
-```rust
-pub struct WatchpointEntry {
-    pub addr: u32,
-    pub len: u32,      // 1, 2, or 4 bytes
-    pub kind: WatchKind,
-    pub enabled: bool,
-}
-
-pub enum WatchKind {
-    Write,    // trigger on write
-    Read,     // trigger on read
-    Access,   // trigger on read or write
-}
-```
-
----
-
-## Multi-Core Debugging / 多核调试
-
-```rust
-// Thread mapping:
-// thread 1 = core0 (Cortex-M33)
-// thread 2 = core1 (Cortex-M33)
-
-// Select core0 as active:
-// → Hg1, Hc1
-
-// Single-step core0 only:
-// → vCont;s:1
-
-// Continue all:
-// → vCont;c
-
-// Continue core1, stop core0:
-// → vCont;c:2
-```
-
----
-
-## Monitor Commands / Monitor 命令
-
-```
-qRcmd,<hex-encoded-command>
-
-Commands:
-  pio         → dump all PIO state machine states
-  pio <N>     → dump PIO block N (0/1/2)
-  gpio        → dump all 48 GPIO pin states
-  gpio <N>    → dump GPIO pin N
-  dma         → dump all 16 DMA channel states
-  dma <N>     → dump DMA channel N
-  hstx        → dump HSTX frame statistics
-  registers   → dump CPU register values
-  memory <addr> <len> → hex dump memory
-  breakpoints → list all breakpoints
-  watchpoints → list all watchpoints
-  info        → system info (clock, cycles, flash usage)
-  trace       → dump ITM trace buffer
-```
+- No TCP listener, no `GdbServer` session loop, no CLI `gdb` subcommand.
+- No `qXfer:features:read` / `target.xml`, multiprocess, or watchpoints.
+- `vCont` is single-action single-thread only; multi-core action lists return
+  an empty packet.
+- No `qRcmd` monitor commands or thread-list queries.
 
 ---
 
 ## Usage Example / 使用示例
 
-```bash
-# Terminal 1: Start emulator with GDB
-cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf
+```rust
+use rp2350_gdb::{GdbTarget, RspSession, encode_packet};
 
-# Terminal 2: Connect with arm-none-eabi-gdb
+let mut session = RspSession::new(target);
+assert_eq!(session.handle_packet("?").as_deref(), Some("S05"));
+assert_eq!(session.handle_packet("g").is_some(), true);
+
+let frame = encode_packet("m20000000,4");
+let reply = session.handle_frame(frame.as_bytes()).unwrap();
+```
+
+未来 TCP 接线后的目标用法（规划）：
+Planned usage once the TCP transport lands:
+
+```bash
+cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf
 arm-none-eabi-gdb
 (gdb) target remote :3333
-(gdb) monitor info
-(gdb) load firmware.elf       # load via GDB
-(gdb) break main
-(gdb) continue
 (gdb) info registers
-(gdb) monitor gpio
 (gdb) stepi
 (gdb) detach
 ```
