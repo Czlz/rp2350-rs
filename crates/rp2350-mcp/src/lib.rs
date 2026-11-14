@@ -13,8 +13,11 @@
 #![allow(clippy::doc_markdown)]
 #![warn(missing_docs)]
 
+pub mod http;
 pub mod server;
 
+#[cfg(test)]
+mod http_tests;
 #[cfg(test)]
 mod tests;
 

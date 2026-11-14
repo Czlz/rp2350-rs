@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 
 mod devices;
 mod gdb_target;
+mod mcp_serve;
 mod perfbench;
 mod repl;
 mod run;
@@ -183,7 +184,7 @@ enum Commands {
     /// Start MCP server (`AgentFuse` integration) / 启动 MCP 服务器（`AgentFuse` 集成）
     McpServe {
         /// MCP listen port / MCP 监听端口
-        #[arg(short, long, default_value = "8080")]
+        #[arg(short, long, default_value_t = mcp_serve::DEFAULT_PORT)]
         port: u16,
     },
 }
@@ -284,8 +285,8 @@ fn main() {
             );
         }
         Commands::McpServe { port } => {
-            log::info!("Starting MCP server on port {port} (stub)");
-            log::info!("MCP server not yet implemented (Phase 3)");
+            let options = mcp_serve::McpServeOptions { port };
+            finish(mcp_serve::run(&options), "mcp-serve failed / MCP 服务失败");
         }
     }
 }

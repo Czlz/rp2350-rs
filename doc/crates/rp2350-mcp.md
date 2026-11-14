@@ -1,30 +1,95 @@
 # rp2350-mcp — MCP Server (AgentFuse) / MCP 服务器
 
-> **Crate**: `rp2350-mcp` | **Path**: `crates/rp2350-mcp` | **Status**: ✅ 方法层已实现 / method layer implemented — `McpServer::handle_request` 支持 `initialize` / `tools/list` / `tools/call`，并委托 `DeviceManager`。**HTTP/TCP 传输与 CLI `mcp-serve` 接线尚未实现**。
+> **Crate**: `rp2350-mcp` | **Path**: `crates/rp2350-mcp` | **Status**: ✅ 方法层与最小 HTTP/1.1 传输已实现 / method layer + minimal HTTP/1.1 transport implemented — `McpServer::handle_request` 支持 `initialize` / `tools/list` / `tools/call`，并委托 `DeviceManager`；`http::serve` 提供 `POST /mcp` 与 `GET /health`；CLI `mcp-serve` 已接线。
 >
-> **Status** (EN): The JSON-RPC method layer is implemented (`src/server.rs`, `src/tests.rs`): `initialize`, `tools/list`, `tools/call` (`list_devices` / `query_all` / `query_device` / `configure`) delegate to a shared `DeviceManager`. HTTP/TCP transport and the CLI `mcp-serve` wiring are still out of scope.
+> **Status** (EN): The JSON-RPC method layer (`src/server.rs`) implements `initialize`, `tools/list`, `tools/call` (`list_devices` / `query_all` / `query_device` / `configure`) over a shared `DeviceManager`. `src/http.rs` adds a minimal blocking HTTP/1.1 transport (`POST /mcp`, `GET /health`), and the CLI `mcp-serve` subcommand drives it.
 
 ---
 
 ## Overview / 概述
 
-MCP (Model-Context-Protocol) JSON-RPC server for AgentFuse integration. The
-current implementation is the **transport-agnostic method layer**: it accepts a
-JSON-RPC request string and returns a JSON-RPC response string. A future HTTP
-listener (or a WASM WebSocket bridge) only needs to forward bodies to
-`handle_request`.
-面向 AgentFuse 集成的 MCP (Model-Context-Protocol) JSON-RPC 服务器。当前实现为
-**与传输无关的方法层**：输入 JSON-RPC 请求字符串，返回 JSON-RPC 响应字符串。
-未来的 HTTP 监听器（或 WASM WebSocket 桥）只需把报文体转交给
-`handle_request`。
+MCP (Model-Context-Protocol) JSON-RPC server for AgentFuse integration. Two
+independent layers:
+
+1. **Method layer** (`src/server.rs`): accepts a JSON-RPC request string and
+   returns a JSON-RPC response string; transport-agnostic.
+2. **HTTP transport** (`src/http.rs`): one request per connection, `POST /mcp`
+   for JSON-RPC and `GET /health` for liveness. Only a body needs forwarding to
+   `handle_request`, so a WASM WebSocket bridge can reuse the same method layer.
+
+面向 AgentFuse 集成的 MCP (Model-Context-Protocol) JSON-RPC 服务器，分为两层：
+
+1. **方法层**（`src/server.rs`）：输入 JSON-RPC 请求字符串，返回 JSON-RPC 响应字符串，
+   与传输无关。
+2. **HTTP 传输**（`src/http.rs`）：每连接一条请求，`POST /mcp` 承载 JSON-RPC，
+   `GET /health` 用于存活探测。只需把报文体转交 `handle_request`，因此 WASM
+   WebSocket 桥可复用同一方法层。
+
+---
+
+## HTTP transport / HTTP 传输
+
+```text
+agent → TCP → http::serve(listener, &server, &shutdown)
+                 ├── GET  /health → 200 {"status":"ok", ...}
+                 └── POST /mcp | /  → McpServer::handle_request(body) → application/json
+```
+
+| Method | Path | Status | Notes / 说明 |
+|--------|------|--------|--------------|
+| `POST` | `/mcp`（别名 `/`） | `200` / `400` / `202` | JSON-RPC 响应；非法 JSON 用 `400` 承载 `-32700` 载荷；通知返回 `202` 空体 |
+| `GET` | `/health` | `200` | `{status, server, version, endpoint}` |
+| 其他方法 | `/mcp`、`/health` | `405` | 附带 `Allow: POST` / `Allow: GET` |
+| 其他路径 | — | `404` | 纯文本错误体 / plain-text body |
+
+Headers / 头部：`Content-Type: application/json`、精确的 `Content-Length`、
+`Connection: close`。请求侧要求 `Content-Length`（缺失 → `411`，
+`Transfer-Encoding` → `501`），请求头上限 8 KiB（`431`），报文体上限 1 MiB
+（`413`）；非法请求行、坏 `Content-Length`、截断报文 → `400`；
+非 `HTTP/1.x` → `505`。所有 4xx/5xx 都不终止服务器，连接级错误仅写 `warn` 日志。
+
+The transport never panics on bad input: parse/size failures become 4xx, and a
+failing connection is logged and dropped while the accept loop keeps running.
+
+### Serving / 启动方式
+
+```rust
+use std::sync::atomic::AtomicBool;
+
+// 阻塞式 accept 循环；shutdown 由其他线程置真后返回（HTTP 服务不需要 tokio）
+// Blocking accept loop; returns once another thread sets `shutdown`.
+pub fn serve(listener: TcpListener, server: &McpServer, shutdown: &AtomicBool) -> std::io::Result<()>;
+// 无停止标志的便捷入口 / convenience entry point without a shutdown flag
+pub fn serve_blocking(listener: TcpListener, server: &McpServer) -> std::io::Result<()>;
+// 单请求处理（测试/嵌入用） / single-request handling (tests, embedding)
+pub fn handle_http(server: &McpServer, request: &HttpRequest) -> HttpResponse;
+pub(crate) fn read_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, HttpError>;
+```
+
+`serve` 把监听器切到非阻塞模式、每 20 ms 轮询一次 `shutdown`，因此可在收到
+Ctrl-C 后干净退出；每个连接同步处理，请求严格串行（共用一把 `DeviceManager` 锁），
+单连接读写超时 10 s。
+`serve` switches the listener to non-blocking mode and polls `shutdown` every
+20 ms so Ctrl-C can stop it cleanly; connections are handled synchronously, so
+requests are serialized through the `DeviceManager` lock, with a 10 s per
+connection I/O timeout.
+
+`HttpRequest` / `HttpResponse` / `HttpError` 为公开类型：请求含
+`method` / `path`（已剥离查询串）/ `content_length` / `body`，响应含
+`status` / `content_type` / `body` / `allow`；`HttpError` 带 `status` 与
+`message`，`into_response()` 直接给出响应。
+`HttpRequest` / `HttpResponse` / `HttpError` are public: requests carry
+`method` / `path` (query stripped) / `content_length` / `body`; responses carry
+`status` / `content_type` / `body` / `allow`; `HttpError` holds `status` and
+`message` and renders itself via `into_response()`.
 
 ---
 
 ## Architecture / 架构
 
 ```
-AgentFuse IDE → (future HTTP/WS transport)
-                     └── McpServer::handle_request(&str) -> String
+AgentFuse IDE → HTTP/1.1 (POST /mcp)
+                     └── http::serve → McpServer::handle_request(&str) -> String
                              ├── initialize
                              ├── tools/list
                              └── tools/call
@@ -57,7 +122,8 @@ impl McpServer {
     pub fn port(&self) -> u16;
     pub fn is_running(&self) -> bool;
 
-    pub async fn start(&mut self) -> Result<(), std::io::Error>;  // 仅置标志 + 日志
+    /// Async placeholder: flips `running` only / 异步占位：仅翻转标志
+    pub async fn start(&mut self) -> Result<(), std::io::Error>;
     pub fn stop(&mut self);
 
     /// Handle one JSON-RPC request / 处理单个 JSON-RPC 请求
@@ -71,8 +137,11 @@ impl McpServer {
 
 `new(port)` keeps the original signature and creates a private empty
 `DeviceManager`; hosts that already own devices must use `with_manager`.
+`start()` / `stop()` remain the async-facing flag placeholders; the blocking
+transport is `rp2350_mcp::http::serve`.
 `new(port)` 保留原签名，内部创建空的私有 `DeviceManager`；已有设备的宿主必须使用
-`with_manager`。
+`with_manager`。`start()` / `stop()` 仍是面向异步宿主的标志占位；阻塞式传输由
+`rp2350_mcp::http::serve` 提供。
 
 ---
 
@@ -198,23 +267,53 @@ let response = server.handle_request(
 assert!(response.contains("led-1"));
 ```
 
+Over HTTP / 通过 HTTP：
+
+```rust
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use rp2350_mcp::McpServer;
+
+let listener = TcpListener::bind(("127.0.0.1", 8080))?;
+let server = McpServer::with_manager(listener.local_addr()?.port(), Arc::clone(&manager));
+let shutdown = AtomicBool::new(false);   // 另一线程置真即停止 / set by another thread
+rp2350_mcp::http::serve(listener, &server, &shutdown)?;
+```
+
+From a shell / 命令行验证：
+
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8080/health
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/mcp -ContentType 'application/json' `
+  -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+```
+
 ---
 
 ## Limitations / 限制
 
-- ⬜ 无 HTTP/TCP 传输：`start()` / `stop()` 仅维护 `running` 标志并写日志，不监听端口。
-- ⬜ 无 CLI `mcp-serve` 接线；CLI 侧仍需自行创建 `McpServer` 并调用 `handle_request`。
+- ⬜ 传输范围：无 TLS、无鉴权、无 SSE/流式、无 keep-alive、无分块编码；每连接一条
+  请求后关闭，超时 10 s，请求头 ≤ 8 KiB、报文体 ≤ 1 MiB。
+- ⬜ 单线程串行：`serve` 在 accept 线程内同步处理连接，每次调用锁住
+  `DeviceManager`，未做并发/背压控制。
+- ⬜ 不支持 JSON-RPC batch 数组（会回 `-32600`），也不支持 `Transfer-Encoding`（`501`）。
 - ⬜ 无插件热加载；设备由宿主在进程内注册（`DeviceManager::register` / `load_plugin`）。
+  CLI `mcp-serve` 的注册表为空，不扫描插件目录、也不挂接运行中的仿真。
 - ⬜ MCP 子集：未实现 `resources/*`、`prompts/*`、采样（sampling）与客户端能力协商；
   `initialize` 不回显客户端 `protocolVersion`。
-- ⬜ 通知（`notifications/*`）只返回空字符串，未更新任何会话状态。
+- ⬜ 通知（`notifications/*`）返回 `202` 空体，未更新任何会话状态。
 - ⬜ `tools/call` 结果仅放入 `content[0].text`，未提供 `structuredContent`。
-- ⬜ 单线程请求处理（每次调用锁住 `DeviceManager`），未做并发/背压控制。
 
-EN: No HTTP/TCP listener, no CLI wiring, no hot reload. The MCP surface is a
-subset (no resources/prompts/sampling, no client capability negotiation).
-Notifications are acknowledged with an empty body. Tool payloads are delivered
-as text content only. Requests are serialized through one manager mutex.
+EN: The transport is deliberately minimal: no TLS, auth, SSE, keep-alive or
+chunked bodies; one request per connection with a 10 s timeout, 8 KiB head and
+1 MiB body limits. Connections are handled serially on the accept thread, so
+requests share one manager mutex. JSON-RPC batch arrays and
+`Transfer-Encoding` are rejected. There is no hot reload, the CLI server starts
+with an empty registry, and the MCP surface remains a subset (no
+resources/prompts/sampling, no client capability negotiation). Notifications
+are acknowledged with `202` and an empty body; tool payloads are delivered as
+text content only.
 
 ---
 
@@ -223,11 +322,28 @@ as text content only. Requests are serialized through one manager mutex.
 | Crate | Why |
 |-------|-----|
 | `serde` + `serde_json` | JSON-RPC 编解码 / protocol codec |
+| `thiserror` | `HttpError` 派生 / `HttpError` derivation |
 | `parking_lot` | 共享 `DeviceManager` 锁 / shared manager lock |
 | `rp2350-virt-periph` | `DeviceManager` 查询与配置 API |
-| `tokio` | 预留异步运行时 / reserved for the future transport |
+| `tokio` | 仅供异步宿主预留；阻塞传输不需要 / reserved for async hosts; the blocking transport does not need it |
 | `log` | 生命周期日志 / lifecycle logging |
 | `rp2350-plugin` (dev) | 测试用 `RpPlugin`/`DevicePlugin` 实现 |
+
+---
+
+## Tests / 测试
+
+`src/tests.rs` 覆盖方法层（14 条），`src/http_tests.rs` 覆盖传输（12 条）：
+请求头/报文解析、`413`/`431`/`400`/`505` 上限与错误路径、`initialize` 与
+`tools/call` 往返、`/` 别名、`/health`、坏 JSON（`400` + `-32700`）、
+未知路径 `404` / 方法 `405`、通知 `202`、缺 `Content-Length` `411`。传输测试使用
+`127.0.0.1:0` + 后台线程，`AtomicBool` 关停后 join，全部离线可跑。
+`src/tests.rs` covers the method layer (14 tests); `src/http_tests.rs` covers the
+transport (12 tests): head/body parsing, `413`/`431`/`400`/`505` limits, the
+`initialize` and `tools/call` round trips, the `/` alias, `/health`, malformed
+JSON (`400` + `-32700`), unknown path `404` / wrong method `405`, notifications
+(`202`) and a missing `Content-Length` (`411`). Transport tests bind
+`127.0.0.1:0` on a background thread, stop it via an `AtomicBool` and join.
 
 ---
 

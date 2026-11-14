@@ -9,9 +9,9 @@
 > （`repl`）、基准测试（`perfbench`）。
 >
 > **Status**: implemented — `run` / `repl` / `perfbench` / `gdb` /
-> `list-devices` / `wire`. Stub — `mcp-serve` logs its arguments and returns.
+> `list-devices` / `wire` / `mcp-serve`.
 > **状态**: 已实现 — `run` / `repl` / `perfbench` / `gdb` / `list-devices` /
-> `wire`。桩 — `mcp-serve` 仅记录参数后返回。
+> `wire` / `mcp-serve`。
 
 ---
 
@@ -233,17 +233,58 @@ lists the IDs that were found), or out-of-bounds port index.
 > 接线表在进程结束时全部释放。当前**不持久化**，也不会挂接到模拟器运行，
 > 因此 `wire` 实际是接线/空跑检查工具。接线持久化与常驻宿主（GUI/MCP）为后续工作。
 
-### Stub / 桩
+### `mcp-serve` — MCP server over HTTP / HTTP 上的 MCP 服务器
 
 ```text
-rp2350 mcp-serve [--port 8080]              # logs "not yet implemented"
+rp2350 mcp-serve [--port 8080]
 ```
 
-`mcp-serve` listens on `8080` by default but does not start a server yet; the
-`DeviceManager` MCP query API (`mcp_query_all` / `mcp_query_device` /
-`mcp_list_devices`) is already available for it.
-`mcp-serve` 默认监听 `8080`，但尚未启动服务器；`DeviceManager` 的 MCP 查询
-API（`mcp_query_all` / `mcp_query_device` / `mcp_list_devices`）已可用。
+| Option / 选项 | Default / 默认 | Meaning / 含义 |
+|---------------|----------------|----------------|
+| `--port` (`-p`) | `8080` | TCP listen port on `0.0.0.0`; `0` picks a free port / `0.0.0.0` 上的 TCP 监听端口；`0` 由系统分配 |
+
+Binds the listener, prints the actual base address (so `--port 0` is usable),
+installs a Ctrl-C handler and then blocks in `rp2350_mcp::http::serve`:
+绑定监听器、打印实际基地址（因此 `--port 0` 可用）、安装 Ctrl-C 处理器，然后
+阻塞在 `rp2350_mcp::http::serve` 中：
+
+```text
+[mcp] listening on http://0.0.0.0:18080/mcp (POST JSON-RPC) / health: http://0.0.0.0:18080/health
+[mcp] press Ctrl-C to stop / 按 Ctrl-C 停止
+```
+
+| Endpoint | Method | Behaviour / 行为 |
+|----------|--------|------------------|
+| `/mcp`（别名 `/`） | `POST` | JSON-RPC 报文体 → `McpServer::handle_request`，返回 `application/json` |
+| `/health` | `GET` | `200 {"status":"ok","server":"rp2350-mcp","version":…,"endpoint":"/mcp"}` |
+
+```powershell
+rp2350 mcp-serve --port 18080
+# 另一个终端 / another terminal
+Invoke-RestMethod -Uri http://127.0.0.1:18080/health
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18080/mcp -ContentType 'application/json' `
+  -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18080/mcp -ContentType 'application/json' `
+  -Body '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_devices","arguments":{}}}'
+```
+
+**Stopping / 停止语义**：`Ctrl-C` 置真内部的 `AtomicBool` 关停标志，accept 循环
+在 20 ms 轮询点返回，`serve` 打印 `[mcp] server stopped` 后进程正常退出（退出码
+0）。没有 `--stop`/管理端点，也不做守护化；测试与嵌入场景可直接调用
+`rp2350_mcp::http::serve(listener, &server, &shutdown)`。
+`Ctrl-C` sets an internal `AtomicBool`; the accept loop returns on its next 20 ms
+poll, `serve` prints `[mcp] server stopped`, and the process exits with code 0.
+There is no stop endpoint or daemonization; tests and embedders call
+`rp2350_mcp::http::serve(listener, &server, &shutdown)` directly.
+
+**Scope / 范围**：本子命令**不加载插件**、也不启动仿真，注册表为空，因此
+`list_devices` 返回 `[]`、`query_device` 返回 `-32001`。无 TLS、无鉴权、无 SSE、
+无 keep-alive；请求头上限 8 KiB、报文体上限 1 MiB，非法 JSON 返回 `400`（载荷为
+JSON-RPC `-32700`），未知路径 `404`，错误方法 `405`。
+The subcommand loads no plugins and starts no simulation, so the registry is
+empty (`list_devices` → `[]`, `query_device` → `-32001`). No TLS, auth, SSE or
+keep-alive; 8 KiB head and 1 MiB body limits; malformed JSON → `400` carrying a
+JSON-RPC `-32700` payload, unknown paths → `404`, wrong methods → `405`.
 
 ---
 
@@ -356,7 +397,8 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
 | `rp2350-usb`, `rp2350-usb-host` | controller + CDC/raw-REPL front end / 控制器与前端 |
 | `rp2350-virt-periph` | `DeviceManager` behind `list-devices` / `wire` / 设备管理器 |
 | `rp2350-gdb` | RSP server behind `gdb` / `gdb` 子命令的 RSP 服务器 |
-| `rp2350-egui`, `rp2350-ffi`, `tokio` | linked for the future egui integration / 为后续 egui 集成预留 |
+| `rp2350-mcp` | `McpServer` + HTTP transport behind `mcp-serve` / `mcp-serve` 的服务器与 HTTP 传输 |
+| `rp2350-egui`, `rp2350-ffi`, `tokio` | linked for the future egui integration; `tokio` also waits for Ctrl-C / 为后续 egui 集成预留；`tokio` 另用于等待 Ctrl-C |
 
 ---
 
@@ -384,4 +426,7 @@ rp2350 list-devices --plugin-dir target/release
 
 # Wire the LED plugin's port 0 to GPIO25 and print the wiring table
 rp2350 wire --plugin-dir target/release --device com.rp2350-rs.led --port 0 --gpio 25
+
+# Serve the MCP JSON-RPC server over HTTP on port 18080
+rp2350 mcp-serve --port 18080
 ```

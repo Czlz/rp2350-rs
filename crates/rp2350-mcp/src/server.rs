@@ -2,12 +2,13 @@
 //! MCP 服务器方法层（JSON-RPC 2.0，不含传输）
 //!
 //! Implements `initialize` / `tools/list` / `tools/call` on top of a shared
-//! [`DeviceManager`]. HTTP/TCP transport and CLI wiring live outside this crate.
+//! [`DeviceManager`]. The minimal HTTP/1.1 transport lives in [`crate::http`];
+//! CLI wiring lives in `rp2350-cli`.
 //! 基于共享的 [`DeviceManager`] 实现 `initialize` / `tools/list` / `tools/call`。
-//! HTTP/TCP 传输与 CLI 接线不在本 crate 内。
+//! 最小 HTTP/1.1 传输位于 [`crate::http`]；CLI 接线位于 `rp2350-cli`。
 
-// 传输层尚未接入，start() 暂无 .await 调用；错误文档由 doc/crates 统一维护。
-// Transport is not wired yet, so start() has no .await; error docs live in doc/crates.
+// 方法层自身不涉及 I/O；错误文档由 doc/crates 统一维护。
+// The method layer performs no I/O; error docs live in doc/crates.
 #![allow(
     clippy::doc_markdown,
     clippy::missing_errors_doc,
@@ -100,6 +101,11 @@ impl McpServer {
     }
 
     /// Start the MCP server / 启动 MCP 服务器
+    ///
+    /// This only flips the `running` flag and logs, for async hosts that own
+    /// their own socket. The blocking HTTP transport is [`crate::http::serve`].
+    /// 该方法仅翻转 `running` 标志并写日志，供自行持有 socket 的异步宿主使用；
+    /// 阻塞式 HTTP 传输见 [`crate::http::serve`]。
     pub async fn start(&mut self) -> Result<(), std::io::Error> {
         self.running = true;
         log::info!("MCP server started on port {}", self.port);
