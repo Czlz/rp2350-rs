@@ -3,19 +3,19 @@
 > GDB Remote Serial Protocol (RSP) protocol layer for RP2350 debugging.
 > 用于 RP2350 调试的 GDB 远程串行协议（RSP）协议层。
 >
-> **Status**: 协议层与 TCP 服务已实现 — `rsp.rs` 提供包编解码（`$<payload>#<checksum>`、
+> **Status**: 协议层、TCP 服务与 CLI 接线均已实现 — `rsp.rs` 提供包编解码（`$<payload>#<checksum>`、
 > `+`/`-` 应答、`}` 二进制转义、十六进制工具）与无 socket 的命令分发器
-> `RspSession<T>`；`CortexM33Target<B>` 为目标适配器。`GdbServer`
-> （`server.rs`）提供阻塞式 TCP 监听、顺序接受客户端与字节级 RSP 帧循环。
-> CLI `gdb` 子命令尚未接线。
+> `Session<T>`；`CortexM33Target<B>` 与 CLI 的 `MachineTarget` 为两种目标适配器。
+> `GdbServer`（`server.rs`）提供阻塞式 TCP 监听、顺序接受客户端与字节级 RSP 帧循环；
+> `rp2350 gdb --file <ELF> --port <N>` 直接启动服务。
 >
-> **Status** (EN): the protocol layer and the TCP server are implemented —
-> `rsp.rs` provides packet framing (`$<payload>#<checksum>`), `+`/`-`
-> acknowledgements, `}` binary escaping, hex helpers, and a socket-free
-> dispatcher `RspSession<T>`. `CortexM33Target<B>` is the target adapter.
-> `GdbServer` (`server.rs`) provides a blocking TCP listener, sequential client
-> accept, and the byte-level RSP frame loop. The CLI `gdb` subcommand is not
-> wired yet.
+> **Status** (EN): the protocol layer, the TCP server and the CLI wiring are
+> implemented — `rsp.rs` provides packet framing (`$<payload>#<checksum>`),
+> `+`/`-` acknowledgements, `}` binary escaping, hex helpers, and a socket-free
+> dispatcher `Session<T>`. `CortexM33Target<B>` and the CLI `MachineTarget` are
+> the two target adapters. `GdbServer` (`server.rs`) provides a blocking TCP
+> listener, sequential client accept, and the byte-level RSP frame loop;
+> `rp2350 gdb --file <ELF> --port <N>` starts the server directly.
 
 ---
 
@@ -210,14 +210,16 @@ survives because one `Session` is shared for the whole `serve` call.
 
 ## Current Limitations / 当前限制
 
-- 无 CLI `gdb` 子命令；只能通过库 API 启动服务。
+- CLI `gdb` 已接线（`--file <ELF>`、默认端口 3333）；无 `--arch` 覆盖，RISC-V 目标读数 16（XPSR）返回 `E01`。
 - 单客户端串行：`serve` 在 `serve_connection` 返回前不接受新连接；无并发/多客户端。
 - 无 TLS、无 `qXfer:features:read` / `target.xml`，无 multiprocess、watchpoint（`Z2`-`Z4`）。
 - `vCont` 仅单动作单线程；多核动作列表返回空包。
 - 无 `qRcmd` monitor 命令、无 `qfThreadInfo` / `qsThreadInfo`。
 - `stop()` 只清标志，不能中断阻塞中的 `accept`（需要连接一次才退出）。
 
-- No CLI `gdb` subcommand; the server is library-only.
+- The CLI `gdb` subcommand is wired (`--file <ELF>`, default port 3333); there
+  is no `--arch` override, and register 16 (XPSR) returns `E01` on RISC-V
+  targets.
 - One client at a time: `serve` does not accept the next connection until the
   current `serve_connection` returns; no concurrency.
 - No TLS, no `qXfer:features:read` / `target.xml`, no multiprocess, no
@@ -262,8 +264,7 @@ server.serve(Box::new(target))?;
 `serve_with` is the test entry point: bind `127.0.0.1:0`, hand the listener to a
 background thread, then connect a client to the reported port.
 
-CLI `gdb` 子命令接线后的目标用法（规划）：
-Planned usage once the CLI `gdb` subcommand lands:
+CLI 用法 / CLI usage：
 
 ```bash
 cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf

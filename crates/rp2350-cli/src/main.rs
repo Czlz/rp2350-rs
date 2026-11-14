@@ -8,6 +8,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod gdb_target;
 mod perfbench;
 mod repl;
 mod run;
@@ -256,8 +257,14 @@ fn main() {
             }
         }
         Commands::Gdb { file, port } => {
-            log::info!("Starting GDB server on port {port} for firmware: {file} (stub)");
-            log::info!("GDB server not yet implemented (Phase 7)");
+            let options = gdb_target::GdbOptions {
+                file: file.into(),
+                port,
+            };
+            if let Err(error) = gdb_target::run(&options) {
+                log::error!("gdb failed / GDB 失败: {error:#}");
+                std::process::exit(1);
+            }
         }
         Commands::Wire { device, port, gpio } => {
             log::info!("Wiring device '{device}' port {port} to GPIO {gpio} (stub)");

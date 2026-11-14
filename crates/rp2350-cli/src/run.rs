@@ -112,6 +112,115 @@ impl Default for MachineOptions {
     }
 }
 
+/// Architecture-tagged CPU handle owned by [`Machine`]
+/// [`Machine`] 持有的带架构标记的 CPU 句柄
+///
+/// `Box<dyn CpuCore>` cannot reach architecture-specific entry points such as
+/// `CortexM33Core::write_xpsr`, which the GDB adapter needs to restore the
+/// program status register. Keeping the concrete cores in an enum preserves
+/// those calls without changing the shared [`CpuCore`] trait.
+/// `Box<dyn CpuCore>` 无法访问 `CortexM33Core::write_xpsr` 这类架构专有入口，
+/// 而 GDB 适配器恢复程序状态寄存器时需要它。用枚举保存具体核心即可保留这些
+/// 调用，无需修改共享的 [`CpuCore`] trait。
+enum CoreHandle {
+    /// Cortex-M33 core / Cortex-M33 核心
+    Arm(Box<CortexM33Core>),
+    /// Hazard3 RV32 core / Hazard3 RV32 核心
+    RiscV(Box<Hazard3Core>),
+}
+
+/// Dispatch one [`CpuCore`] method to the active architecture variant
+/// 将单个 [`CpuCore`] 方法分发到当前架构分支
+macro_rules! core_dispatch {
+    ($core:expr, $method:ident $(, $arg:expr)*) => {
+        match $core {
+            CoreHandle::Arm(core) => core.$method($($arg),*),
+            CoreHandle::RiscV(core) => core.$method($($arg),*),
+        }
+    };
+}
+
+impl CpuCore for CoreHandle {
+    fn cpu_id(&self) -> CpuId {
+        core_dispatch!(self, cpu_id)
+    }
+
+    fn arch(&self) -> rp2350_cpu::CpuArch {
+        core_dispatch!(self, arch)
+    }
+
+    fn init(&mut self, bus: &mut dyn AddressBus) -> Result<(), rp2350_core::error::CoreError> {
+        core_dispatch!(self, init, bus)
+    }
+
+    fn run_cycles(&mut self, bus: &mut dyn AddressBus, cycles: u64) -> (u64, CpuState) {
+        core_dispatch!(self, run_cycles, bus, cycles)
+    }
+
+    fn step(
+        &mut self,
+        bus: &mut dyn AddressBus,
+    ) -> Result<CpuState, rp2350_core::error::CoreError> {
+        core_dispatch!(self, step, bus)
+    }
+
+    fn signal_interrupt(&mut self, irq: u16) {
+        core_dispatch!(self, signal_interrupt, irq);
+    }
+
+    fn servicing_irq(&self) -> Option<u16> {
+        core_dispatch!(self, servicing_irq)
+    }
+
+    fn pc(&self) -> u32 {
+        core_dispatch!(self, pc)
+    }
+
+    fn set_pc(&mut self, pc: u32) {
+        core_dispatch!(self, set_pc, pc);
+    }
+
+    fn read_register(&self, index: u8) -> u32 {
+        core_dispatch!(self, read_register, index)
+    }
+
+    fn write_register(&mut self, index: u8, value: u32) {
+        core_dispatch!(self, write_register, index, value);
+    }
+
+    fn reset(&mut self) {
+        core_dispatch!(self, reset);
+    }
+
+    fn description(&self) -> String {
+        core_dispatch!(self, description)
+    }
+
+    fn system_write(&mut self, addr: u32, value: u32) {
+        core_dispatch!(self, system_write, addr, value);
+    }
+
+    fn system_read(&mut self, addr: u32) -> Option<u32> {
+        core_dispatch!(self, system_read, addr)
+    }
+
+    fn state(&self) -> CpuState {
+        core_dispatch!(self, state)
+    }
+
+    fn xpsr(&self) -> u32 {
+        core_dispatch!(self, xpsr)
+    }
+
+    fn csr_read(&self, addr: u32) -> u32 {
+        core_dispatch!(self, csr_read, addr)
+    }
+
+    fn total_cycles(&self) -> u64 {
+        core_dispatch!(self, total_cycles)
+    }
+}
+
 /// A booted RP2350 machine that can be stepped by any frontend
 /// 可被任意前端单步驱动的已启动 RP2350 机器
 ///
@@ -128,7 +237,7 @@ pub struct Machine {
     /// Synthetic boot ROM and trap dispatcher / 合成 boot ROM 与陷阱分发器
     bootrom: Rp2350Bootrom,
     /// CPU core / CPU 核心
-    core: Box<dyn CpuCore>,
+    core: CoreHandle,
     /// Boot peripheral handles / 启动外设句柄
     peripherals: BootPeripherals,
     /// USB controller shared with the host bridge / 与主机桥共享的 USB 控制器
@@ -220,7 +329,7 @@ impl Machine {
 
         let (arch, elf_entry, image_description) = load_image(bytes, &mut bus, options.arch)?;
 
-        let (core, boot_vectors): (Box<dyn CpuCore>, Option<(u32, u32)>) = match arch {
+        let (core, boot_vectors): (CoreHandle, Option<(u32, u32)>) = match arch {
             ArchArg::Arm => {
                 let mut arm = CortexM33Core::new(CpuId::Core0);
                 arm.set_strict_decode(options.strict_decode);
@@ -237,7 +346,7 @@ impl Machine {
                         .context("core boot failed / 核心启动失败")?;
                     Some((arm.read_register(13), arm.pc()))
                 };
-                (Box::new(arm), vectors)
+                (CoreHandle::Arm(Box::new(arm)), vectors)
             }
             ArchArg::RiscV => {
                 let mut riscv = Hazard3Core::new(CpuId::Core0);
@@ -250,7 +359,7 @@ impl Machine {
                 // causes 2/5 reach the host diagnostic stub instead of an
                 // unfilled guest vector slot.
                 riscv.set_fatal_trap_vector(bootrom.riscv_exception_vector());
-                (Box::new(riscv), None)
+                (CoreHandle::RiscV(Box::new(riscv)), None)
             }
         };
 
@@ -424,6 +533,49 @@ impl Machine {
         self.core.read_register(index)
     }
 
+    /// Read a core register by index (0-15) / 按索引读取核心寄存器（0-15）
+    #[must_use]
+    pub fn read_register(&self, index: u8) -> u32 {
+        self.core.read_register(index)
+    }
+
+    /// Write a core register by index (0-15) / 按索引写入核心寄存器（0-15）
+    pub fn write_register(&mut self, index: u8, value: u32) {
+        self.core.write_register(index, value);
+    }
+
+    /// Read the program status register (XPSR) / 读取程序状态寄存器（XPSR）
+    ///
+    /// Returns `0` for cores without an XPSR (RISC-V).
+    /// 没有 XPSR 的核心（RISC-V）返回 `0`。
+    #[must_use]
+    pub fn xpsr(&self) -> u32 {
+        self.core.xpsr()
+    }
+
+    /// Write the program status register (XPSR) / 写入程序状态寄存器（XPSR）
+    ///
+    /// Returns `false` when the active core has no XPSR (RISC-V), so a debugger
+    /// can report the register as unsupported instead of silently dropping the
+    /// write. / 当前核心没有 XPSR（RISC-V）时返回 `false`，调试器可据此报告该
+    /// 寄存器不受支持，而不是静默丢弃写入。
+    #[must_use]
+    pub fn write_xpsr(&mut self, value: u32) -> bool {
+        match &mut self.core {
+            CoreHandle::Arm(core) => {
+                core.write_xpsr(value);
+                true
+            }
+            CoreHandle::RiscV(_) => false,
+        }
+    }
+
+    /// Current core execution state / 当前核心执行状态
+    #[must_use]
+    pub fn cpu_state(&self) -> CpuState {
+        self.core.state()
+    }
+
     /// Dump a run of words from the bus, marking unmapped addresses
     /// 从总线转储一段连续字，对未映射地址做标记
     ///
@@ -558,7 +710,7 @@ impl Machine {
                 self.notices
                     .push(format!("[trace] {index:03} PC={pc:#010X} bootrom-trap"));
             }
-            if let Some(outcome) = self.bootrom.dispatch(&mut *self.core, &mut self.bus)? {
+            if let Some(outcome) = self.bootrom.dispatch(&mut self.core, &mut self.bus)? {
                 self.steps += 1;
                 self.record_sync_trap();
                 if let Some(halt) = outcome.halt {
@@ -569,12 +721,7 @@ impl Machine {
                 // 陷阱步与原 run 路径一致：立即泵送中断，不在此处推进时基。
                 // Trap steps mirror the original run path: pump interrupts now and
                 // do not advance the timebase here.
-                pump(
-                    &mut *self.core,
-                    &self.peripherals,
-                    &self.usb,
-                    &mut self.irqs,
-                );
+                pump(&mut self.core, &self.peripherals, &self.usb, &mut self.irqs);
                 return Ok(CpuState::Running);
             }
         }
@@ -592,12 +739,7 @@ impl Machine {
                     // 轨迹步与原 run 路径一致：每步泵送中断，不做自旋统计或时基推进。
                     // Trace steps mirror the original run path: pump every step and
                     // skip spin accounting and timebase advancement.
-                    pump(
-                        &mut *self.core,
-                        &self.peripherals,
-                        &self.usb,
-                        &mut self.irqs,
-                    );
+                    pump(&mut self.core, &self.peripherals, &self.usb, &mut self.irqs);
                 } else {
                     self.after_running_step();
                 }
@@ -673,15 +815,10 @@ impl Machine {
         // writes CPACR immediately before `mrc p4`/VFP instructions, so a
         // 64-step batch replay makes the core raise a spurious NOCP UsageFault.
         // IRQ lines stay throttled to avoid re-asserting a level IRQ each step.
-        replay_system_writes(&mut *self.core, &self.peripherals);
+        replay_system_writes(&mut self.core, &self.peripherals);
         if self.steps - self.pumped >= PUMP_INTERVAL {
             self.peripherals.service_core1_peer();
-            deliver_irqs(
-                &mut *self.core,
-                &self.peripherals,
-                &self.usb,
-                &mut self.irqs,
-            );
+            deliver_irqs(&mut self.core, &self.peripherals, &self.usb, &mut self.irqs);
             self.pumped = self.steps;
         }
         if self.steps - self.advanced >= ADVANCE_INTERVAL {

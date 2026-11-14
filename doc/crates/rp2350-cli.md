@@ -8,9 +8,9 @@
 > RISC-V 固件，并按三种模式驱动：带轨迹的 `run`、交互式 USB CDC raw REPL
 > （`repl`）、基准测试（`perfbench`）。
 >
-> **Status**: implemented — `run` / `repl` / `perfbench`. Stubs — `gdb`,
+> **Status**: implemented — `run` / `repl` / `perfbench` / `gdb`. Stubs —
 > `wire`, `list-devices`, `mcp-serve` log their arguments and return.
-> **状态**: 已实现 — `run` / `repl` / `perfbench`。桩 — `gdb`、`wire`、
+> **状态**: 已实现 — `run` / `repl` / `perfbench` / `gdb`。桩 — `wire`、
 > `list-devices`、`mcp-serve` 仅记录参数后返回。
 
 ---
@@ -100,20 +100,88 @@ The script is assembled by
 `bm_run(N, M)`）拼装，并经与 `repl` 相同的枚举 + raw REPL 路径执行；设备的
 `time norm result` 行被解析为 `BenchResult`（`SKIP` 直接短路）。
 
+### `gdb` — GDB remote debug server / GDB 远程调试服务器
+
+```text
+rp2350 gdb --file <ELF> [--port 3333]
+```
+
+| Option / 选项 | Default / 默认 | Meaning / 含义 |
+|---------------|----------------|----------------|
+| `--file` | required | Firmware (ELF; `--arch` is not exposed here) / 固件（ELF；此处不提供 `--arch`） |
+| `--port` | `3333` | TCP listen port (`0.0.0.0`) / TCP 监听端口（绑定 `0.0.0.0`） |
+
+`gdb` reads the ELF, builds the same `Machine` as `run`, prints the image summary,
+core description and start vectors, then hands the machine to
+`GdbServer`/`MachineTarget` and blocks in `serve`. The adapter forwards GDB
+register numbers `0..=15` to the core register file and `16` to XPSR; memory
+packets go through `Machine::bus` byte accesses. Breakpoints are PC comparisons
+(no `BKPT` patching), and `Continue` runs at most 1 000 000 instructions per
+request so an accidental infinite loop cannot block the server.
+`gdb` 读取 ELF、构建与 `run` 相同的 `Machine`，打印映像摘要、核心描述与启动
+向量，然后把机器交给 `GdbServer`/`MachineTarget` 并阻塞在 `serve`。适配器把
+GDB 寄存器号 `0..=15` 转发到核心寄存器组、`16` 转发到 XPSR；内存包通过
+`Machine::bus` 的字节访问完成。断点按 PC 比较（不写入 `BKPT`），单次
+`Continue` 最多执行 1 000 000 条指令，避免意外死循环阻塞服务器。
+
+```bash
+cargo run -p rp2350-cli -- gdb --file firmware.elf --port 3333
+# 另一个终端 / another terminal
+arm-none-eabi-gdb firmware.elf
+(gdb) target remote 127.0.0.1:3333
+(gdb) break main
+(gdb) continue
+(gdb) info registers
+```
+
+**Behaviour / 行为**
+
+- `resume` 通过 `Machine::step` 执行，因此 boot ROM 陷阱、中断泵送、PPB 系统
+  写入回放与外设时基都保持有效；`StopReply` 的 `Breakpoint`/`SingleStep`/
+  `Fault`/`Sleeping`/`Halted`/`Reset`/`InstructionLimit` 映射为对应 GDB 信号
+  （`S05` / `S0b` / `S02`）。
+  `resume` uses `Machine::step`, so boot ROM traps, interrupt pumping, PPB
+  replay and the peripheral timebase stay active; stop reasons map to GDB
+  signals (`S05` / `S0b` / `S02`).
+- 机器自身预算固定为 `u64::MAX`，停机时机完全由 GDB 的 `c`/`s` 与断点决定；
+  `--max-cycles` 未暴露。
+  The machine budget is pinned to `u64::MAX`; stopping is driven only by GDB
+  `c`/`s` requests and breakpoints (no `--max-cycles` flag).
+- 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点）保留，
+  仅无应答模式协商会被重置。
+  After a client disconnects `serve` keeps accepting; target state (memory,
+  registers, breakpoints) survives and only the no-ack negotiation is reset.
+
+**Limitations / 限制**
+
+- 无 `--arch` 覆盖：ELF 默认按 Cortex-M33 启动。RISC-V 核心没有 XPSR，
+  `p10`/`P10`（寄存器 16）会回复 `E01`。
+  No `--arch` override: ELF boots as Cortex-M33. RISC-V has no XPSR, so
+  `p10`/`P10` (register 16) replies `E01`.
+- 单客户端串行、无 TLS、无 `target.xml`（`qXfer:features:read`）、无 watchpoint
+  （`Z2`-`Z4`）、无多核 `vCont`、无 `qRcmd` monitor 命令；细节见
+  `doc/crates/rp2350-gdb.md`。
+  Single sequential client, no TLS, no `target.xml`, no watchpoints
+  (`Z2`-`Z4`), no multi-core `vCont`, no `qRcmd` monitor commands.
+- 不做 Flash 编程：Flash 窗口对客户机写保护，`M`/`load` 写 Flash 会以 `E01`
+  失败；SRAM 与已映射的可写 MMIO 可正常写入。
+  No flash programming: the flash window rejects guest writes, so `M`/`load`
+  into flash fails with `E01`; SRAM and writable mapped MMIO work normally.
+- 打印的监听地址在端口非 0 时即实际地址；端口 `0` 的实际端口由服务器日志给出。
+  The printed address is the actual one for non-zero ports; for port `0` the
+  assigned port is reported by the server log.
 ### Stubs / 桩
 
 ```text
-rp2350 gdb --file <ELF> [--port 3333]      # logs "not yet implemented"
 rp2350 wire --device <ID> --port <P> --gpio <PIN>   # logs and returns
 rp2350 list-devices                         # logs "no devices registered yet"
 rp2350 mcp-serve [--port 8080]              # logs "not yet implemented"
 ```
 
-`gdb` listens on port `3333` by default and `mcp-serve` on `8080`; neither
-starts a server. `wire` and `list-devices` do not touch the
-`rp2350-virt-periph` manager yet.
-`gdb` 默认监听端口 `3333`，`mcp-serve` 监听 `8080`；两者都不会真正启动服务
-器。`wire` 与 `list-devices` 尚未接入 `rp2350-virt-periph` 的管理器。
+`mcp-serve` listens on `8080` by default but does not start a server yet.
+`wire` and `list-devices` do not touch the `rp2350-virt-periph` manager yet.
+`mcp-serve` 默认监听 `8080`，但尚未真正启动服务器。`wire` 与 `list-devices`
+尚未接入 `rp2350-virt-periph` 的管理器。
 
 ---
 
@@ -143,6 +211,7 @@ impl Machine {
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
     // take_uart_output, take_notices, recent_steps, register, dump_memory
+    // debugger: read_register, write_register, xpsr, write_xpsr, cpu_state
 }
 
 pub fn register_snapshot(machine: &Machine) -> String;  // R0..R12/SP/LR/PC line
@@ -224,7 +293,8 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
 | `rp2350-periph` | `BootPeripherals`, `Peripheral` contract / 启动外设 |
 | `rp2350-usb`, `rp2350-usb-host` | controller + CDC/raw-REPL front end / 控制器与前端 |
 | `rp2350-virt-periph` | device manager (linked; not yet driven by stubs) / 设备管理器 |
-| `rp2350-gdb`, `rp2350-egui`, `rp2350-ffi`, `tokio` | linked for the future gdb/egui integration / 为后续集成预留 |
+| `rp2350-gdb` | RSP server behind `gdb` / `gdb` 子命令的 RSP 服务器 |
+| `rp2350-egui`, `rp2350-ffi`, `tokio` | linked for the future egui integration / 为后续 egui 集成预留 |
 
 ---
 
@@ -243,4 +313,7 @@ rp2350 repl --file firmware.uf2 --exec "print(6 * 7)"
 # Benchmark, 4x64 repetitions
 rp2350 perfbench --file firmware.uf2 --bench bm_float.py \
                  --benchrun benchrun.py --n 4 --m 64
+
+# Serve an ELF to GDB on port 3333
+rp2350 gdb --file firmware.elf --port 3333
 ```
