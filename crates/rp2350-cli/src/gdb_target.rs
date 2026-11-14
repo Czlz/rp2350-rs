@@ -11,11 +11,12 @@
 //! `resume` 使用 [`Machine::step`]，使 boot ROM 陷阱、中断泵送与外设时基保持
 //! 有效。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use rp2350_core::SimpleBus;
 use rp2350_core::bus::AddressBus;
 use rp2350_cpu::CpuState;
 use rp2350_gdb::target::regs;
@@ -30,6 +31,51 @@ use crate::run::{Machine, MachineOptions};
 /// forever; a client can simply issue `c` again to keep running.
 /// 该上限防止意外无限循环永久阻塞 RSP 服务器；客户端再次发送 `c` 即可继续运行。
 pub const DEFAULT_CONTINUE_BUDGET: u64 = 1_000_000;
+
+/// Start of the SRAM window (`0x2000_0000`) / SRAM 窗口起始地址（`0x2000_0000`）
+const SRAM_START: u32 = 0x2000_0000;
+/// End of the 520 KiB SRAM window (`0x2008_2000`) / 520 KiB SRAM 窗口结束地址（`0x2008_2000`）
+const SRAM_END: u32 = 0x2008_2000;
+
+/// Whether reads of `length` bytes at `address` are free of side effects
+/// `address` 起 `length` 字节的读取是否无副作用
+///
+/// Watchpoints sample memory on every executed instruction, so only SRAM is
+/// accepted. Peripheral and USB windows are rejected: reading them can pop
+/// FIFOs or advance device state, and the machine step counter must stay
+/// untouched. Flash is not accepted either because guests cannot write it.
+/// 监视点会在每条指令后采样内存，因此只接受 SRAM。外设与 USB 窗口被拒绝：读取
+/// 它们可能弹出 FIFO 或推进设备状态，而机器步数计数必须保持不变。Flash 也不
+/// 接受，因为客户机无法写入 Flash。
+fn watchable(address: u32, length: usize) -> bool {
+    let Ok(length) = u32::try_from(length) else {
+        return false;
+    };
+    let Some(last) = address.checked_add(length.saturating_sub(1)) else {
+        return false;
+    };
+    address >= SRAM_START && last < SRAM_END
+}
+
+/// Read `length` bytes without advancing the machine timeline
+/// 读取 `length` 字节且不推进机器时间线
+///
+/// The local `cycles` counter absorbs the bus latency accounting, so snapshot
+/// reads never change [`Machine::steps`] or the peripheral timebase.
+/// 局部 `cycles` 计数器吸收总线延迟记账，因此快照读取不会改变
+/// [`Machine::steps`] 或外设时基。
+fn read_watch_bytes(bus: &mut SimpleBus, address: u32, length: usize) -> Result<Vec<u8>, GdbError> {
+    let mut cycles = 0u64;
+    let mut bytes = Vec::with_capacity(length);
+    for offset in 0..length {
+        let offset = u32::try_from(offset).map_err(|_| GdbError::AddressOutOfRange(address))?;
+        let addr = address
+            .checked_add(offset)
+            .ok_or(GdbError::AddressOutOfRange(address))?;
+        bytes.push(bus.read_u8(addr, &mut cycles)?);
+    }
+    Ok(bytes)
+}
 
 /// Options for the `gdb` subcommand / `gdb` 子命令选项
 #[derive(Debug)]
@@ -52,6 +98,11 @@ pub struct MachineTarget {
     machine: Machine,
     /// Instruction breakpoints / 指令断点
     breakpoints: BTreeSet<u32>,
+    /// Write watchpoints with their last sampled bytes, keyed by `(address, length)`
+    /// 写监视点及其最近一次采样字节，以 `(地址, 长度)` 为键
+    watchpoints: BTreeMap<(u32, usize), Vec<u8>>,
+    /// Watchpoint address that caused the latest stop / 最近一次停止命中的监视点地址
+    last_watch: Option<u32>,
     /// Reason recorded by the most recent resume / 最近一次恢复执行记录的原因
     last_stop: Option<StopReason>,
     /// Instruction budget for a single `Continue` / 单次 `Continue` 的指令预算
@@ -65,16 +116,61 @@ impl MachineTarget {
         Self {
             machine,
             breakpoints: BTreeSet::new(),
+            watchpoints: BTreeMap::new(),
+            last_watch: None,
             last_stop: None,
             instruction_budget: DEFAULT_CONTINUE_BUDGET,
+        }
+    }
+
+    /// Sample every watchpoint and return the first address whose bytes changed
+    /// 采样所有监视点并返回首个字节发生变化的地址
+    ///
+    /// The stored snapshot is refreshed on a hit so a later `continue` does not
+    /// retrigger on the same value. Bus reads use a local cycle counter, so the
+    /// machine step counter is untouched.
+    /// 命中后刷新已存快照，使后续 `continue` 不会因同一值再次触发。总线读取使用
+    /// 局部周期计数器，不影响机器的步数计数。
+    fn changed_watchpoint(&mut self) -> Option<u32> {
+        let bus = &mut self.machine.bus;
+        let mut hit = None;
+        for (&(address, length), snapshot) in &mut self.watchpoints {
+            let Ok(observed) = read_watch_bytes(bus, address, length) else {
+                continue;
+            };
+            if observed != *snapshot {
+                *snapshot = observed;
+                if hit.is_none() {
+                    hit = Some(address);
+                }
+            }
+        }
+        hit
+    }
+
+    /// Re-sample every watchpoint to establish the pre-step baseline
+    /// 重新采样所有监视点以建立步前基线
+    fn refresh_watchpoints(&mut self) {
+        let bus = &mut self.machine.bus;
+        for (&(address, length), snapshot) in &mut self.watchpoints {
+            if let Ok(observed) = read_watch_bytes(bus, address, length) {
+                *snapshot = observed;
+            }
         }
     }
 
     /// Execute one instruction and map the result to a stop reason
     /// 执行一条指令并将结果映射为停止原因
     fn single_step(&mut self) -> StopReply {
+        self.refresh_watchpoints();
         match self.machine.step() {
-            Ok(CpuState::Running) => self.stop_reply(StopReason::SingleStep),
+            Ok(CpuState::Running) => {
+                if let Some(address) = self.changed_watchpoint() {
+                    self.last_watch = Some(address);
+                    return self.stop_reply(StopReason::Watchpoint);
+                }
+                self.stop_reply(StopReason::SingleStep)
+            }
             Ok(state) => self.stop_reply(self.reason_for_state(state)),
             Err(error) => {
                 log::debug!("GDB single step failed: {error:?}");
@@ -83,8 +179,8 @@ impl MachineTarget {
         }
     }
 
-    /// Run until a breakpoint, a non-running state, or the budget runs out
-    /// 运行直到断点、非运行状态或预算耗尽
+    /// Run until a breakpoint, watchpoint, non-running state, or budget limit
+    /// 运行直到断点、监视点、非运行状态或预算耗尽
     fn continue_until_stop(&mut self) -> StopReply {
         let mut budget = self.instruction_budget;
         // 首次迭代跳过 PC 检查，使从断点恢复执行时跨过当前指令，而不是立即
@@ -105,8 +201,17 @@ impl MachineTarget {
             }
             budget -= 1;
 
+            // Establish the pre-step baseline, then compare after the step so a
+            // store anywhere inside the watched range is detected.
+            // 先建立步前基线，步后比较，从而检测监视范围内的任意写入。
+            self.refresh_watchpoints();
             match self.machine.step() {
-                Ok(CpuState::Running) => {}
+                Ok(CpuState::Running) => {
+                    if let Some(address) = self.changed_watchpoint() {
+                        self.last_watch = Some(address);
+                        return self.stop_reply(StopReason::Watchpoint);
+                    }
+                }
                 Ok(state) => return self.stop_reply(self.reason_for_state(state)),
                 Err(error) => {
                     log::debug!("GDB continue stopped by error: {error:?}");
@@ -223,7 +328,30 @@ impl GdbTarget for MachineTarget {
         self.breakpoints.contains(&address)
     }
 
+    fn supports_watchpoints(&self) -> bool {
+        true
+    }
+
+    fn set_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        if !watchable(address, length) {
+            return Err(GdbError::Unsupported("watchpoints need SRAM windows"));
+        }
+        let snapshot = read_watch_bytes(&mut self.machine.bus, address, length)?;
+        self.watchpoints.insert((address, length), snapshot);
+        Ok(())
+    }
+
+    fn clear_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        self.watchpoints.remove(&(address, length));
+        Ok(())
+    }
+
+    fn watchpoint_hit(&self) -> Option<u32> {
+        self.last_watch
+    }
+
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError> {
+        self.last_watch = None;
         let reply = match mode {
             ResumeMode::Step => self.single_step(),
             ResumeMode::Continue => self.continue_until_stop(),
@@ -418,6 +546,113 @@ mod tests {
         let reply = target.resume(ResumeMode::Continue).expect("continue");
         assert_eq!(reply.reason, StopReason::InstructionLimit);
         assert_eq!(reply.signal(), 5);
+    }
+
+    /// SRAM address where the watchpoint test program is installed
+    /// 监视点测试程序所在的 SRAM 地址
+    const CODE_BASE: u32 = 0x2000_1000;
+
+    /// Install a Thumb program that stores one value into SRAM, then spins
+    /// 安装一段向 SRAM 写入一个值后自旋的 Thumb 程序
+    ///
+    /// `ldr r0, [pc, #8]` / `ldr r1, [pc, #12]` / `str[b] r1, [r0]` / `b .`,
+    /// with the address and value literals at `+0xC` and `+0x10`.
+    /// 程序为 `ldr r0, [pc, #8]` / `ldr r1, [pc, #12]` / `str[b] r1, [r0]` /
+    /// `b .`，地址与值常量位于 `+0xC` 与 `+0x10`。
+    fn install_store(target: &mut MachineTarget, byte: bool, address: u32, value: u32) {
+        let store = if byte { 0x7001u16 } else { 0x6001u16 };
+        let [low, high] = store.to_le_bytes();
+        let mut image = vec![0x02, 0x48, 0x03, 0x49, low, high, 0xFE, 0xE7];
+        image.resize(0x0C, 0);
+        image.extend_from_slice(&address.to_le_bytes());
+        image.extend_from_slice(&value.to_le_bytes());
+        target.write_memory(CODE_BASE, &image).expect("install");
+        target.write_register(regs::PC, CODE_BASE).expect("pc");
+    }
+
+    #[test]
+    fn write_watchpoint_stops_after_the_store() {
+        let mut target = target();
+        let steps = target.status().total_cycles;
+        target.set_watchpoint(SRAM_BASE, 4).expect("watch");
+        assert_eq!(
+            target.status().total_cycles,
+            steps,
+            "snapshot reads must not advance steps / 快照读取不得推进步数"
+        );
+        install_store(&mut target, false, SRAM_BASE, 0xDEAD_BEEF);
+
+        let reply = target.resume(ResumeMode::Continue).expect("continue");
+        assert_eq!(reply.reason, StopReason::Watchpoint);
+        assert_eq!(reply.pc, CODE_BASE + 6);
+        assert_eq!(reply.signal(), 5);
+        assert_eq!(target.watchpoint_hit(), Some(SRAM_BASE));
+        assert_eq!(
+            target.read_memory(SRAM_BASE, 4).expect("read sram"),
+            0xDEAD_BEEFu32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn writing_the_same_value_does_not_stop() {
+        let mut target = target();
+        let value = 0x1122_3344u32;
+        target
+            .write_memory(SRAM_BASE, &value.to_le_bytes())
+            .expect("prime sram");
+        target.set_watchpoint(SRAM_BASE, 4).expect("watch");
+        install_store(&mut target, false, SRAM_BASE, value);
+        target.instruction_budget = 16;
+
+        let reply = target.resume(ResumeMode::Continue).expect("continue");
+        assert_eq!(reply.reason, StopReason::InstructionLimit);
+        assert_eq!(target.watchpoint_hit(), None);
+    }
+
+    #[test]
+    fn byte_store_inside_a_four_byte_watchpoint_stops() {
+        let mut target = target();
+        target.set_watchpoint(SRAM_BASE, 4).expect("watch");
+        install_store(&mut target, true, SRAM_BASE + 2, 0x7F);
+
+        let reply = target.resume(ResumeMode::Continue).expect("continue");
+        assert_eq!(reply.reason, StopReason::Watchpoint);
+        assert_eq!(reply.pc, CODE_BASE + 6);
+        assert_eq!(
+            target.read_memory(SRAM_BASE + 2, 1).expect("read byte"),
+            vec![0x7F]
+        );
+    }
+
+    #[test]
+    fn watchpoints_reject_peripheral_windows() {
+        let mut target = target();
+        for address in [0x4000_0000u32, 0x5000_0000, 0xE000_ED88] {
+            assert!(matches!(
+                target.set_watchpoint(address, 4),
+                Err(GdbError::Unsupported(_))
+            ));
+        }
+        assert!(matches!(
+            target.set_watchpoint(SRAM_END - 2, 4),
+            Err(GdbError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn clearing_a_watchpoint_disables_detection() {
+        let mut target = target();
+        target.set_watchpoint(SRAM_BASE, 4).expect("watch");
+        target.clear_watchpoint(SRAM_BASE, 4).expect("clear");
+        install_store(&mut target, false, SRAM_BASE, 0xA5A5_5A5A);
+        target.instruction_budget = 16;
+
+        let reply = target.resume(ResumeMode::Continue).expect("continue");
+        assert_eq!(reply.reason, StopReason::InstructionLimit);
+        assert_eq!(
+            target.read_memory(SRAM_BASE, 4).expect("read sram"),
+            0xA5A5_5A5Au32.to_le_bytes()
+        );
     }
 
     /// One TCP round trip against the real server and machine target

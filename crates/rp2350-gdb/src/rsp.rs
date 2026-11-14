@@ -9,7 +9,9 @@
 //! 二进制转义、十六进制工具，以及把 RSP 命令映射到 [`GdbTarget`] 的
 //! [`Session`]。会话不接触 socket，因此所有包处理路径均可单元测试。
 
-use crate::target::{GdbError, GdbTarget, ResumeMode};
+use std::collections::BTreeSet;
+
+use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason};
 
 /// Positive acknowledgement byte sent by GDB / GDB 发送的肯定应答字节
 pub const ACK: u8 = b'+';
@@ -240,6 +242,9 @@ pub struct Session<T: GdbTarget> {
     target: T,
     /// Whether GDB requested no-acknowledgement mode / GDB 是否请求了无应答模式
     no_ack_mode: bool,
+    /// Write watchpoints requested by GDB, keyed by `(address, length)`
+    /// GDB 请求的写监视点，以 `(地址, 长度)` 为键
+    watchpoints: BTreeSet<(u32, usize)>,
 }
 
 impl<T: GdbTarget> Session<T> {
@@ -249,6 +254,7 @@ impl<T: GdbTarget> Session<T> {
         Self {
             target,
             no_ack_mode: false,
+            watchpoints: BTreeSet::new(),
         }
     }
 
@@ -269,9 +275,9 @@ impl<T: GdbTarget> Session<T> {
     ///
     /// Clears the `QStartNoAckMode` negotiation so a new client starts in
     /// acknowledged mode. The debug target itself is not touched: memory,
-    /// registers, and breakpoints survive a reconnect.
+    /// registers, breakpoints, and watchpoints survive a reconnect.
     /// 清除 `QStartNoAckMode` 协商结果，使新客户端从应答模式开始。调试目标本身
-    /// 不受影响：内存、寄存器与断点在重连后保持。
+    /// 不受影响：内存、寄存器、断点与监视点在重连后保持。
     pub fn reset_transport(&mut self) {
         self.no_ack_mode = false;
     }
@@ -340,7 +346,7 @@ impl<T: GdbTarget> Session<T> {
             }),
             b'Q' => Ok(self.handle_extended(payload)),
             b'v' => self.handle_v(payload),
-            b'q' => Ok(Self::query_reply(payload)),
+            b'q' => Ok(self.query_reply(payload)),
             _ => Ok(String::new()),
         }
     }
@@ -420,20 +426,64 @@ impl<T: GdbTarget> Session<T> {
         Ok("OK".to_string())
     }
 
-    /// Insert or remove a software/hardware breakpoint (`Z0`/`Z1`/`z0`/`z1`)
-    /// 插入或移除软件/硬件断点（`Z0`/`Z1`/`z0`/`z1`）
+    /// Insert or remove an instruction breakpoint (`Z0`/`Z1`) or a write
+    /// watchpoint (`Z2`/`z2`); read/access watchpoints reply empty
+    /// 插入或移除指令断点（`Z0`/`Z1`）或写监视点（`Z2`/`z2`）；读/访问监视点
+    /// 返回空包
     fn change_breakpoint(&mut self, args: &str, insert: bool) -> Result<String, Error> {
         let (kind, rest) = args.split_once(',').ok_or(Error::InvalidArgument)?;
-        if kind != "0" && kind != "1" {
-            return Err(Error::InvalidArgument);
-        }
         let (address, size) = rest.split_once(',').ok_or(Error::InvalidArgument)?;
         let address = parse_u32_hex(address)?;
-        parse_usize_hex(size)?;
+        let size = parse_usize_hex(size)?;
+        match kind {
+            "0" | "1" => {
+                if insert {
+                    self.target.set_breakpoint(address)?;
+                } else {
+                    self.target.clear_breakpoint(address)?;
+                }
+                Ok("OK".to_string())
+            }
+            "2" => self.change_watchpoint(address, size, insert),
+            // `Z3`/`Z4` (read/access watchpoints) are not implemented; an empty
+            // packet tells GDB that the request type is unsupported, while an
+            // `OK` would falsely claim that the watchpoint is armed.
+            // `Z3`/`Z4`（读/访问监视点）未实现；空包告知 GDB 该请求类型不受支持，
+            // 而回复 `OK` 会错误地声称监视点已生效。
+            "3" | "4" => Ok(String::new()),
+            _ => Err(Error::InvalidArgument),
+        }
+    }
+
+    /// Insert or remove a write watchpoint (`Z2`/`z2`)
+    /// 插入或移除写监视点（`Z2`/`z2`）
+    ///
+    /// Re-inserting or re-removing the same `(address, length)` is idempotent:
+    /// the session remembers armed watchpoints and only forwards the first
+    /// insert and the last remove to the target.
+    /// 对同一 `(地址, 长度)` 重复插入或删除是幂等的：会话记住已生效的监视点，只把
+    /// 首次插入与最后一次删除转发给目标。
+    fn change_watchpoint(
+        &mut self,
+        address: u32,
+        size: usize,
+        insert: bool,
+    ) -> Result<String, Error> {
+        // GDB encodes the watchpoint width in bytes; only the hardware-supported
+        // widths are meaningful for this target.
+        // GDB 用字节数表示监视点宽度；只有硬件支持的宽度对该目标有意义。
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return Ok(String::new());
+        }
+        let entry = (address, size);
         if insert {
-            self.target.set_breakpoint(address)?;
-        } else {
-            self.target.clear_breakpoint(address)?;
+            if !self.watchpoints.contains(&entry) {
+                self.target.set_watchpoint(address, size)?;
+                self.watchpoints.insert(entry);
+            }
+        } else if self.watchpoints.contains(&entry) {
+            self.target.clear_watchpoint(address, size)?;
+            self.watchpoints.remove(&entry);
         }
         Ok("OK".to_string())
     }
@@ -442,6 +492,12 @@ impl<T: GdbTarget> Session<T> {
     /// 继续或单步执行并格式化停止回复（`c`/`s`/`vCont`）
     fn resume(&mut self, mode: ResumeMode) -> Result<String, Error> {
         let reply = self.target.resume(mode)?;
+        if reply.reason == StopReason::Watchpoint {
+            let Some(address) = self.target.watchpoint_hit() else {
+                return Ok(format!("T{:02x}", reply.signal()));
+            };
+            return Ok(format!("T{:02x}watch:{address:x};", reply.signal()));
+        }
         Ok(format!("S{:02x}", reply.signal()))
     }
 
@@ -482,11 +538,19 @@ impl<T: GdbTarget> Session<T> {
     }
 
     /// Reply to `q...` queries / 回复 `q...` 查询
-    fn query_reply(payload: &str) -> String {
+    fn query_reply(&self, payload: &str) -> String {
         if payload.starts_with("qSupported") {
-            return format!(
+            let mut reply = format!(
                 "PacketSize={MAX_PACKET_SIZE:03x};QStartNoAckMode+;vContSupported+;hwbreak+"
             );
+            // `watchpoint+` is an extension hint: it is only advertised when the
+            // target really implements `Z2`/`z2`, so GDB can fall back cleanly.
+            // `watchpoint+` 是扩展提示：仅在目标真正实现 `Z2`/`z2` 时声明，
+            // 便于 GDB 干净地回退。
+            if self.target.supports_watchpoints() {
+                reply.push_str(";watchpoint+");
+            }
+            return reply;
         }
         if payload.starts_with("qAttached") {
             return "1".to_string();

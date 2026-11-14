@@ -87,15 +87,18 @@ pub enum StopReason {
     Reset,
     /// The resume instruction budget was exhausted / 恢复执行的指令预算耗尽
     InstructionLimit,
+    /// A write watchpoint observed a value change / 写监视点观察到值变化
+    Watchpoint,
 }
 
 impl StopReason {
     /// GDB signal number to report in a stop reply packet
     /// 停止回复包中应上报的 GDB 信号编号
     ///
-    /// Uses SIGTRAP for breakpoints and single steps, SIGSEGV for faults,
-    /// and SIGINT for other halts, following GDB's remote protocol conventions.
-    /// 断点与单步使用 SIGTRAP，故障使用 SIGSEGV，其他暂停使用 SIGINT，
+    /// Uses SIGTRAP for breakpoints, single steps, and watchpoints, SIGSEGV for
+    /// faults, and SIGINT for other halts, following GDB's remote protocol
+    /// conventions.
+    /// 断点、单步与监视点使用 SIGTRAP，故障使用 SIGSEGV，其他暂停使用 SIGINT，
     /// 符合 GDB 远程协议约定。
     #[must_use]
     pub fn signal(self) -> u8 {
@@ -106,7 +109,8 @@ impl StopReason {
             | Self::SingleStep
             | Self::Sleeping
             | Self::Reset
-            | Self::InstructionLimit => 5,
+            | Self::InstructionLimit
+            | Self::Watchpoint => 5,
         }
     }
 }
@@ -159,6 +163,15 @@ pub enum GdbError {
     /// 地址运算超出 32 位地址空间
     #[error("address out of range: {0:#010X} / 地址超出范围 {0:#010X}")]
     AddressOutOfRange(u32),
+
+    /// The target cannot provide this debugger feature
+    /// 目标无法提供该调试器特性
+    ///
+    /// Reported for capabilities a backend cannot emulate, such as write
+    /// watchpoints on a target without safe memory sampling.
+    /// 用于后端无法模拟的能力，例如无法安全采样内存的目标上的写监视点。
+    #[error("unsupported operation: {0} / 不支持的操作: {0}")]
+    Unsupported(&'static str),
 }
 
 /// Debug target contract used by the GDB RSP server
@@ -233,6 +246,50 @@ pub trait GdbTarget: Send {
     #[must_use]
     fn has_breakpoint(&self, address: u32) -> bool;
 
+    /// Whether the target can detect write watchpoints
+    /// 目标是否能够检测写监视点
+    ///
+    /// The RSP layer only advertises `watchpoint+` in `qSupported` when this
+    /// returns `true`; the default keeps watchpoint-free targets unchanged.
+    /// 仅当本方法返回 `true` 时 RSP 层才会在 `qSupported` 中声明
+    /// `watchpoint+`；默认值使未实现监视点的目标保持原行为。
+    #[must_use]
+    fn supports_watchpoints(&self) -> bool {
+        false
+    }
+
+    /// Add a write watchpoint covering `length` bytes at `address`
+    /// 在 `address` 处添加覆盖 `length` 字节的写监视点
+    ///
+    /// # Errors
+    /// The default implementation reports [`GdbError::Unsupported`] so existing
+    /// targets do not need to change.
+    /// 默认实现返回 [`GdbError::Unsupported`]，现有目标无需修改。
+    fn set_watchpoint(&mut self, _address: u32, _length: usize) -> Result<(), GdbError> {
+        Err(GdbError::Unsupported("write watchpoints"))
+    }
+
+    /// Remove the write watchpoint at `address` / 移除 `address` 处的写监视点
+    ///
+    /// # Errors
+    /// Defaults to [`GdbError::Unsupported`], mirroring
+    /// [`Self::set_watchpoint`]. / 与 [`Self::set_watchpoint`] 一致，默认返回
+    /// [`GdbError::Unsupported`]。
+    fn clear_watchpoint(&mut self, _address: u32, _length: usize) -> Result<(), GdbError> {
+        Err(GdbError::Unsupported("write watchpoints"))
+    }
+
+    /// Address of the watchpoint that caused the latest stop
+    /// 最近一次停止所命中的监视点地址
+    ///
+    /// The RSP layer appends `watch:<address>;` to a `T05` stop reply when this
+    /// returns `Some`. / 返回 `Some` 时 RSP 层会在 `T05` 停止回复后追加
+    /// `watch:<address>;`。
+    #[must_use]
+    fn watchpoint_hit(&self) -> Option<u32> {
+        None
+    }
+
     /// Resume execution according to `mode` / 按 `mode` 恢复执行
     ///
     /// # Errors
@@ -261,6 +318,19 @@ mod tests {
         assert_eq!(regs::PC, 15);
         assert_eq!(regs::XPSR, 16);
         assert_eq!(regs::COUNT, 17);
+    }
+
+    #[test]
+    fn watchpoint_stops_report_sigtrap() {
+        assert_eq!(StopReason::Watchpoint.signal(), 5);
+        assert_eq!(
+            StopReply {
+                reason: StopReason::Watchpoint,
+                pc: 0x2000_0000,
+            }
+            .signal(),
+            5
+        );
     }
 
     #[test]

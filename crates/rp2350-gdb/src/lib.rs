@@ -15,6 +15,12 @@ pub mod rsp;
 pub mod server;
 pub mod target;
 
+// 监视点测试放在独立子模块，保持 `lib.rs` 与 `rsp.rs` 在单文件代码行数上限内。
+// Watchpoint tests live in a submodule so `lib.rs` and `rsp.rs` stay within the
+// per-file code-line budget.
+#[cfg(test)]
+mod tests;
+
 pub use cortex_m33::{CortexM33Target, DEFAULT_INSTRUCTION_BUDGET};
 pub use rsp::{
     ACK, Ack, ERROR_REPLY, Error as RspError, MAX_PACKET_SIZE, NACK, Session as RspSession,

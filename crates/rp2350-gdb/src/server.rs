@@ -171,6 +171,22 @@ impl GdbTarget for Box<dyn GdbTarget + Send> {
         (**self).has_breakpoint(address)
     }
 
+    fn supports_watchpoints(&self) -> bool {
+        (**self).supports_watchpoints()
+    }
+
+    fn set_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        (**self).set_watchpoint(address, length)
+    }
+
+    fn clear_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        (**self).clear_watchpoint(address, length)
+    }
+
+    fn watchpoint_hit(&self) -> Option<u32> {
+        (**self).watchpoint_hit()
+    }
+
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError> {
         (**self).resume(mode)
     }
