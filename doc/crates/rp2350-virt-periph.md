@@ -7,7 +7,8 @@
 >
 > **Status**: 已实现 / implemented — `DeviceManager`（无参构造）、`register` /
 > `load_plugin` / `unregister` / `wire` / `sync_gpio` / `tick_all` /
-> `shutdown_all` / `mcp_query_all`、`PluginLoader`（目录扫描 + ABI 校验）、
+> `shutdown_all` / `mcp_query_all` / `mcp_query_device` / `mcp_list_devices` /
+> `apply_config`、`PluginLoader`（目录扫描 + ABI 校验）、
 > `WiringTable`、`DevicePlugin`/`DevicePort`、`ConfigSchema`。见文末“规划中”。
 
 ---
@@ -112,6 +113,19 @@ impl DeviceManager {
 
     /// MCP API: `{ "<id>": <state_snapshot()>, ... }` / MCP 查询所有设备状态
     pub fn mcp_query_all(&self) -> serde_json::Value;
+
+    /// MCP API: one device snapshot, `None` if unknown.
+    /// MCP API：单个设备状态，未注册时返回 None。
+    pub fn mcp_query_device(&self, id: &str) -> Option<serde_json::Value>;
+
+    /// MCP API: `[{id, name, has_ui, tags}]`, sorted by id.
+    /// MCP API：设备清单（按 id 排序）。
+    pub fn mcp_list_devices(&self) -> Vec<serde_json::Value>;
+
+    /// MCP API: apply JSON config through `DevicePlugin::apply_config`.
+    /// MCP API：通过 apply_config 应用 JSON 配置。
+    pub fn apply_config(&mut self, id: &str, config: &serde_json::Value)
+        -> Result<(), ConfigApplyError>;
 
     pub fn loader(&self) -> &PluginLoader;
     pub fn loader_mut(&mut self) -> &mut PluginLoader;
@@ -227,7 +241,16 @@ pub enum DeviceError {
     PortIndexOutOfBounds(usize),
 }
 pub enum ConfigError { MissingField(String), InvalidType { field, expected, actual }, OutOfRange { field, message } }
+pub enum ConfigApplyError {
+    DeviceNotFound(String),                  // manager-level: unknown id / 未知设备
+    Invalid(ConfigError),                    // plugin rejected config / 插件拒绝配置
+}
 ```
+
+`apply_config` 由 `DeviceManager` 负责查找设备（`DeviceNotFound`），再调用
+`DevicePlugin::apply_config` 并把 `ConfigError` 包装为 `Invalid`。
+`apply_config` resolves the device in the manager (`DeviceNotFound`) and then
+delegates to `DevicePlugin::apply_config`, wrapping `ConfigError` as `Invalid`.
 
 ---
 
@@ -254,12 +277,9 @@ dm.unregister("led-1")?;                       // shutdown + unwire
 - ⬜ `DeviceManager` 层的自动扫描与一键加载（`scan_and_load` 目前只在
   `PluginLoader` 上，且不实例化设备）；目录约定 `plugins/`、
   `plugins/third-party/` 及 first-party/third-party 来源标记。
-- ⬜ `DeviceManager::mcp_query_device` / `mcp_configure`（当前只有
-  `mcp_query_all`）。
 - ⬜ 接线 JSON 持久化（`WiringTable` 已可序列化，但没有保存/加载文件入口）。
 - ⬜ CLI `wire` / `list-devices` / `mcp-serve` 子命令仍为桩（见
   [rp2350-cli.md](rp2350-cli.md)）。
-- ⬜ Manager-level auto scan-and-load, per-device `mcp_query_device` /
-  `mcp_configure`, wiring-file persistence, and the CLI wiring subcommands are
-  planned; the `PluginLoader` scan/loading and in-process registration above are
-  what exists today.
+- ⬜ Manager-level auto scan-and-load, wiring-file persistence, and the CLI
+  wiring subcommands are planned; the `PluginLoader` scan/loading and in-process
+  registration above are what exists today.

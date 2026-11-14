@@ -3387,7 +3387,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "parking_lot",
  "rp2350-core",
+ "rp2350-plugin",
  "rp2350-virt-periph",
  "serde",
  "serde_json",

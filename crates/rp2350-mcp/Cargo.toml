@@ -14,7 +14,11 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 
 # Internal
 rp2350-core = { workspace = true }
 rp2350-virt-periph = { workspace = true }
+
+[dev-dependencies]
+rp2350-plugin = { workspace = true }

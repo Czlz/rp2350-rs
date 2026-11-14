@@ -22,7 +22,7 @@ use rp2350_core::gpio::GpioPin;
 use rp2350_plugin::PluginContext;
 
 use super::device::DevicePlugin;
-use super::error::DeviceError;
+use super::error::{ConfigError, DeviceError};
 use super::loader::{LoadedPlugin, PluginLoader};
 use super::wiring::WiringTable;
 
@@ -41,6 +41,19 @@ struct ManagedDevice {
     /// Declared after `plugin` so the plugin (and its vtable) drops first.
     /// 声明在 `plugin` 之后，确保插件（及其 vtable）先于库被释放。
     library: Option<rp2350_ffi::SafeLibrary>,
+}
+
+/// Error returned by [`DeviceManager::apply_config`]
+/// [`DeviceManager::apply_config`] 返回的错误
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigApplyError {
+    /// The requested device is not registered / 请求的设备未注册
+    #[error("Device not found: {0} / 设备未找到: {0}")]
+    DeviceNotFound(String),
+
+    /// The plugin rejected the configuration / 插件拒绝了该配置
+    #[error(transparent)]
+    Invalid(#[from] ConfigError),
 }
 
 /// Device manager — the central hub for all virtual peripheral plugins
@@ -218,6 +231,60 @@ impl DeviceManager {
         serde_json::Value::Object(states)
     }
 
+    /// MCP API: query one device state; `None` when the ID is unknown
+    /// MCP API：查询单个设备状态；ID 不存在时返回 `None`
+    #[must_use]
+    pub fn mcp_query_device(&self, id: &str) -> Option<serde_json::Value> {
+        self.devices
+            .get(id)
+            .map(|managed| managed.plugin.state_snapshot())
+    }
+
+    /// MCP API: list devices as `[{id, name, has_ui, tags}]`, sorted by ID
+    /// MCP API：列出设备（id/name/has_ui/tags），按 ID 排序
+    #[must_use]
+    pub fn mcp_list_devices(&self) -> Vec<serde_json::Value> {
+        let mut entries: Vec<serde_json::Value> = self
+            .devices
+            .iter()
+            .map(|(id, managed)| {
+                let metadata = managed.plugin.metadata();
+                serde_json::json!({
+                    "id": id,
+                    "name": metadata.name,
+                    "has_ui": managed.plugin.has_ui(),
+                    "tags": metadata.tags,
+                })
+            })
+            .collect();
+        // HashMap 迭代顺序不稳定，按 ID 排序保证 MCP 输出可复现。
+        // HashMap iteration order is unstable; sort by ID for reproducible MCP output.
+        entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        entries
+    }
+
+    /// MCP API: apply a JSON configuration to one device
+    /// MCP API：向单个设备应用 JSON 配置
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigApplyError::DeviceNotFound`] for an unknown ID and
+    /// [`ConfigApplyError::Invalid`] when the plugin rejects the configuration.
+    /// 未知 ID 返回 [`ConfigApplyError::DeviceNotFound`]，插件拒绝配置时返回
+    /// [`ConfigApplyError::Invalid`]。
+    pub fn apply_config(
+        &mut self,
+        id: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), ConfigApplyError> {
+        let managed = self
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| ConfigApplyError::DeviceNotFound(id.to_string()))?;
+        managed.plugin.apply_config(config)?;
+        Ok(())
+    }
+
     /// Get a reference to the plugin loader / 获取插件加载器引用
     #[must_use]
     pub fn loader(&self) -> &PluginLoader {
@@ -252,6 +319,7 @@ impl Default for DeviceManager {
 mod tests {
     use super::*;
     use crate::device::DevicePort;
+    use crate::error::ConfigError;
     use rp2350_plugin::PluginContext;
     use rp2350_plugin::RpPlugin;
     use rp2350_plugin::error::PluginError;
@@ -289,6 +357,14 @@ mod tests {
         }
         fn on_gpio_change(&mut self, _port_index: usize, level: bool) {
             self.level = level;
+        }
+        fn apply_config(&mut self, config: &serde_json::Value) -> Result<(), ConfigError> {
+            let level = config
+                .get("level")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| ConfigError::MissingField("level".to_string()))?;
+            self.level = level;
+            Ok(())
         }
     }
 
@@ -335,5 +411,61 @@ mod tests {
             .unwrap();
         let result = dm.mcp_query_all();
         assert!(result.get("led-1").is_some());
+    }
+
+    #[test]
+    fn mcp_query_device_hit_and_miss() {
+        let mut dm = DeviceManager::new();
+        dm.register("led-1".into(), Box::new(TestLed::new()))
+            .unwrap();
+        assert_eq!(
+            dm.mcp_query_device("led-1").unwrap()["level"],
+            serde_json::json!(false)
+        );
+        assert!(dm.mcp_query_device("missing").is_none());
+    }
+
+    #[test]
+    fn mcp_list_devices_reports_metadata() {
+        let mut dm = DeviceManager::new();
+        dm.register("led-1".into(), Box::new(TestLed::new()))
+            .unwrap();
+        let devices = dm.mcp_list_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["id"], "led-1");
+        assert_eq!(devices[0]["name"], "Test LED");
+        assert_eq!(devices[0]["has_ui"], false);
+        assert_eq!(devices[0]["tags"], serde_json::json!(["led", "test"]));
+    }
+
+    #[test]
+    fn apply_config_updates_device() {
+        let mut dm = DeviceManager::new();
+        dm.register("led-1".into(), Box::new(TestLed::new()))
+            .unwrap();
+        dm.apply_config("led-1", &serde_json::json!({ "level": true }))
+            .unwrap();
+        assert_eq!(
+            dm.mcp_query_device("led-1").unwrap()["level"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn apply_config_reports_errors() {
+        let mut dm = DeviceManager::new();
+        dm.register("led-1".into(), Box::new(TestLed::new()))
+            .unwrap();
+        let missing_device = dm.apply_config("missing", &serde_json::json!({ "level": true }));
+        assert!(matches!(
+            missing_device,
+            Err(ConfigApplyError::DeviceNotFound(_))
+        ));
+
+        let invalid_config = dm.apply_config("led-1", &serde_json::json!({}));
+        assert!(matches!(
+            invalid_config,
+            Err(ConfigApplyError::Invalid(ConfigError::MissingField(_)))
+        ));
     }
 }
