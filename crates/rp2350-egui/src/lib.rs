@@ -4,23 +4,28 @@
 //! drag-and-drop GPIO wiring, HSTX video output panel, register/memory
 //! viewers, debug controls, and virtual peripheral device widgets.
 //!
-//! Landed today: the register viewer plus the read-only DMA, HSTX and PIO
-//! peripheral panels. They read snapshots through
-//! [`app::PeripheralSource`] and render `not exposed` when the host machine
-//! has not attached a source yet.
+//! Landed today: the register viewer, the read-only DMA, HSTX and PIO
+//! peripheral panels, and the Virtual Lab wiring canvas (device nodes, ports,
+//! drag-to-wire, delete, pan and zoom). The panels read snapshots through
+//! [`app::PeripheralSource`] and render `not exposed` when the host machine has
+//! not attached a source yet. The canvas is an editor model only: it does not
+//! drive the simulator and is not persisted.
 //!
 //! 提供基于 eframe 的 GUI 应用：虚拟实验室画布（拖拽 GPIO 接线）、
 //! HSTX 视频输出面板、寄存器/内存查看器、调试控件和虚拟外设小部件。
 //!
-//! 当前已落地：寄存器查看器，以及只读的 DMA、HSTX 与 PIO 外设面板。面板通过
+//! 当前已落地：寄存器查看器、只读的 DMA、HSTX 与 PIO 外设面板，以及虚拟实验室
+//! 连线画布（设备节点、端口、拖拽连线、删除、平移与缩放）。面板通过
 //! [`app::PeripheralSource`] 读取快照，宿主机器尚未挂载来源时渲染
-//! `not exposed`。
+//! `not exposed`。画布仅为编辑模型：不驱动仿真，也不持久化。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
 pub mod app;
 pub mod canvas;
+mod canvas_view;
 pub mod panels;
 
 pub use app::EmuApp;
+pub use canvas::CanvasState;

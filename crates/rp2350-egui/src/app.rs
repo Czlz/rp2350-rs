@@ -14,18 +14,31 @@
 //!
 //! All panels are read-only: they never write a register, they refresh on every
 //! frame, and they live in a scroll area so a small window cannot overflow.
+//! The Virtual Lab canvas, by contrast, is an editor model: it can move devices
+//! and add/remove wires, but it never touches the simulator.
 //! 所有面板均为只读：从不写寄存器、每帧刷新，并置于滚动区内，窗口很小时也不会
-//! 溢出。
+//! 溢出。虚拟实验室画布则是一个编辑模型：可移动设备、增删连线，但从不接触仿真器。
 
 use rp2350_arm::CortexM33Core;
 use rp2350_core::types::CpuId;
 use rp2350_cpu::CpuCore;
 
+use crate::canvas::CanvasState;
 use crate::panels::{
     DmaView, HstxView, NOT_EXPOSED, PioView, RegisterPanel, format_dma_busy, format_dma_channel,
     format_dma_count, format_hstx_fifo, format_hstx_row, format_hstx_scanline, format_pio_block,
     format_pio_row,
 };
+
+/// Top-level view selected by the tab bar / 标签栏选中的顶层视图
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActiveView {
+    /// Virtual Lab wiring canvas / 虚拟实验室连线画布
+    #[default]
+    VirtualLab,
+    /// Register and peripheral panels / 寄存器与外设面板
+    Panels,
+}
 
 /// Read-only snapshot source for the DMA, HSTX and PIO panels
 /// DMA、HSTX 与 PIO 面板的只读快照来源
@@ -66,6 +79,11 @@ pub struct EmuApp {
     peripherals: Option<Box<dyn PeripheralSource>>,
     /// Selected DMA channel shown by the DMA panel / DMA 面板选中的通道
     selected_dma_channel: usize,
+    /// Virtual Lab canvas model, preserved while switching views
+    /// 虚拟实验室画布模型，切换视图时保留
+    canvas: CanvasState,
+    /// Active top-level view / 当前顶层视图
+    view: ActiveView,
 }
 
 impl EmuApp {
@@ -77,7 +95,31 @@ impl EmuApp {
             core,
             peripherals: None,
             selected_dma_channel: 0,
+            canvas: CanvasState::sample(),
+            view: ActiveView::default(),
         }
+    }
+
+    /// Canvas model, for host integration and tests / 画布模型，供宿主集成与测试使用
+    #[must_use]
+    pub fn canvas(&self) -> &CanvasState {
+        &self.canvas
+    }
+
+    /// Mutable canvas model / 可变画布模型
+    pub fn canvas_mut(&mut self) -> &mut CanvasState {
+        &mut self.canvas
+    }
+
+    /// Active top-level view / 当前顶层视图
+    #[must_use]
+    pub fn active_view(&self) -> ActiveView {
+        self.view
+    }
+
+    /// Switch the active top-level view / 切换当前顶层视图
+    pub fn set_active_view(&mut self, view: ActiveView) {
+        self.view = view;
     }
 
     /// Attach a read-only peripheral snapshot source / 挂载只读外设快照来源
@@ -163,6 +205,27 @@ impl EmuApp {
                     .show(ui, |ui| pio_panel(ui, pio.as_ref()));
             });
     }
+
+    /// Render the top tab bar / 渲染顶部标签栏
+    fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.view,
+                ActiveView::VirtualLab,
+                "Virtual Lab / 虚拟实验室",
+            );
+            ui.selectable_value(&mut self.view, ActiveView::Panels, "Panels / 寄存器与外设");
+        });
+        ui.separator();
+    }
+
+    /// Render whichever view the tab bar selected / 渲染标签栏选中的视图
+    fn show_active_view(&mut self, ui: &mut egui::Ui) {
+        match self.view {
+            ActiveView::VirtualLab => self.canvas.show(ui),
+            ActiveView::Panels => self.show_panels(ui),
+        }
+    }
 }
 
 /// Render the DMA panel / 渲染 DMA 面板
@@ -231,7 +294,8 @@ impl eframe::App for EmuApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(self.title.as_str());
             ui.add_space(8.0);
-            self.show_panels(ui);
+            self.show_tab_bar(ui);
+            self.show_active_view(ui);
         });
     }
 }
@@ -468,5 +532,41 @@ mod tests {
             format_pio_row(1, &machine),
             "PIO1 SM2 PC=0x0010 (16) TX=4/4 RX=0/4"
         );
+    }
+
+    /// Render the active tab into a headless context / 在无窗口上下文中渲染当前标签页
+    fn render_view(app: &mut EmuApp, size: egui::Vec2) -> usize {
+        let context = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..egui::RawInput::default()
+        };
+        let output = context.run_ui(raw, |ui| app.show_active_view(ui));
+        let shapes = output.shapes.len();
+        output.drop_without_applying_deltas();
+        assert!(shapes > 0, "active view should emit draw shapes");
+        shapes
+    }
+
+    #[test]
+    fn virtual_lab_tab_renders_headlessly() {
+        let mut app = EmuApp::sample();
+        assert_eq!(app.active_view(), ActiveView::VirtualLab);
+        assert_eq!(app.canvas().nodes.len(), 3);
+        render_view(&mut app, egui::vec2(760.0, 600.0));
+        render_view(&mut app, egui::vec2(80.0, 60.0));
+    }
+
+    #[test]
+    fn switching_views_preserves_canvas_state() {
+        let mut app = EmuApp::sample();
+        let nodes = app.canvas().nodes.len();
+        let wires = app.canvas().wires.len();
+        app.set_active_view(ActiveView::Panels);
+        render_view(&mut app, egui::vec2(760.0, 600.0));
+        app.set_active_view(ActiveView::VirtualLab);
+        assert_eq!(app.canvas().nodes.len(), nodes);
+        assert_eq!(app.canvas().wires.len(), wires);
+        render_view(&mut app, egui::vec2(760.0, 600.0));
     }
 }

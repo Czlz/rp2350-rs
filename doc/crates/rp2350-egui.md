@@ -3,18 +3,21 @@
 > egui GUI crate: Virtual Electronics Lab, HSTX video display, register/memory viewers, debug controls.
 > egui GUI crate：虚拟电子实验室、HSTX 视频显示、寄存器/内存查看器、调试控制。
 >
-> **Status**: 骨架 — 实际仅实现 `EmuApp`（`app.rs`）、寄存器面板（`panels.rs` 的
+> **Status**: 骨架 — 已实现 `EmuApp`（`app.rs`）、寄存器面板（`panels.rs` 的
 > `RegisterPanel`/`RegisterSnapshot`）、只读 DMA/HSTX/PIO 外设面板
-> （`panels.rs` 的快照类型与格式化函数 + `app.rs` 的渲染函数）与 `canvas`
-> 模块；下文的 HSTX 视频解码面板、虚拟实验室画布、内存/GPIO/终端/调试器面板等
-> 均为目标设计，尚未实现。
+> （`panels.rs` 的快照类型与格式化函数 + `app.rs` 的渲染函数）、`canvas.rs` 的
+> 画布数据模型/几何层，以及 `canvas_view.rs` 的 egui 绘制与拖拽交互。应用顶部
+> 标签栏可在「虚拟实验室」与「寄存器与外设」之间切换。下文的 HSTX 视频解码面板、
+> 内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
 >
 > **Status** (EN): skeleton — `EmuApp` (`app.rs`), the register panel
 > (`panels.rs`: `RegisterPanel`, `RegisterSnapshot`), the read-only DMA/HSTX/PIO
 > peripheral panels (`panels.rs` snapshot types and formatters, rendered by
-> `app.rs`) and the `canvas` module are implemented; the HSTX video decoder
-> panel, virtual-lab canvas and the memory/GPIO/terminal/debugger panels below
-> are target designs, not yet implemented.
+> `app.rs`), the canvas data model/geometry layer (`canvas.rs`) and the egui
+> painter + drag interaction (`canvas_view.rs`) are implemented. A top tab bar
+> switches between the Virtual Lab and the register/peripheral panels. The HSTX
+> video decoder panel and the memory/GPIO/terminal/debugger panels below remain
+> target designs.
 
 ---
 
@@ -23,10 +26,11 @@
 ```
 rp2350-egui/
 └── src/
-    ├── lib.rs            # module declarations + re-export EmuApp
-    ├── app.rs            # EmuApp — eframe::App implementation (已落地 / landed)
+    ├── lib.rs            # module declarations + re-export EmuApp, CanvasState
+    ├── app.rs            # EmuApp — eframe::App + tab bar (已落地 / landed)
     ├── panels.rs         # RegisterPanel / RegisterSnapshot / XpsrFlags (已落地 / landed)
-    ├── canvas.rs         # Virtual Lab canvas — Phase 3 stub（桩）
+    ├── canvas.rs         # Virtual Lab 数据模型与几何（已落地 / landed）
+    ├── canvas_view.rs    # Virtual Lab egui 绘制与输入（已落地 / landed）
     └── main.rs           # binary entry / 二进制入口
 
 Read-only peripheral panels landed in `panels.rs` + `app.rs`:
@@ -37,10 +41,16 @@ Read-only peripheral panels landed in `panels.rs` + `app.rs`:
     只读外设面板已落地于 `panels.rs` + `app.rs`：上述快照类型、`format_*` 格式化
     函数，以及 `app.rs` 中的 `PeripheralSource` trait 与三个渲染函数。
 
+Canvas split: `canvas.rs` holds the pure model/geometry (unit-testable without a
+painter) while `canvas_view.rs` adds `CanvasState::show` and the painter. The
+split keeps both files under the project's 500-code-line cap.
+画布拆分：`canvas.rs` 保存纯数据模型与几何（无需画笔即可单元测试），
+`canvas_view.rs` 提供 `CanvasState::show` 与绘制逻辑。拆分保证两个文件都符合
+项目单文件 500 行代码上限。
+
 Planned target layout (Phase 3, not yet created / 规划中的目标结构，尚未创建):
-    panels/{lab, hstx_view, registers→已并入 panels.rs, memory, pio_view,
-            gpio_view, terminal, debugger}.rs
-    canvas/{chip_view, pin_widget, device_widget, wire, drag_drop}.rs
+    panels/{hstx_view, memory, pio_view, gpio_view, terminal, debugger}.rs
+    canvas/{chip_view, pin_widget, device_widget, drag_drop}.rs
     theme.rs, icons.rs
 ```
 
@@ -51,6 +61,14 @@ Planned target layout (Phase 3, not yet created / 规划中的目标结构，尚
 **已落地 / Landed** (`app.rs`)：
 
 ```rust
+/// Top-level view selected by the tab bar / 标签栏选中的顶层视图
+pub enum ActiveView {
+    /// Virtual Lab wiring canvas (default) / 虚拟实验室连线画布（默认）
+    VirtualLab,
+    /// Register and peripheral panels / 寄存器与外设面板
+    Panels,
+}
+
 /// The main egui application / 主 egui 应用程序
 pub struct EmuApp {
     /// Window title / 窗口标题
@@ -58,6 +76,15 @@ pub struct EmuApp {
     /// Inspected core (trait object keeps the UI core-agnostic)
     /// 被检视的核心（trait 对象使 UI 与具体核心解耦）
     core: Box<dyn CpuCore>,
+    /// Optional peripheral snapshot source / 可选的外设快照来源
+    peripherals: Option<Box<dyn PeripheralSource>>,
+    /// Selected DMA channel shown by the DMA panel / DMA 面板选中的通道
+    selected_dma_channel: usize,
+    /// Virtual Lab canvas model, preserved while switching views
+    /// 虚拟实验室画布模型，切换视图时保留
+    canvas: CanvasState,
+    /// Active top-level view / 当前顶层视图
+    view: ActiveView,
 }
 
 impl EmuApp {
@@ -69,34 +96,47 @@ impl EmuApp {
     /// Attach a read-only peripheral snapshot source (DMA/HSTX/PIO)
     /// 挂载只读外设快照来源（DMA/HSTX/PIO）
     pub fn with_peripheral_source(self, source: Box<dyn PeripheralSource>) -> Self;
+    /// Canvas model accessors / 画布模型访问器
+    pub fn canvas(&self) -> &CanvasState;
+    pub fn canvas_mut(&mut self) -> &mut CanvasState;
+    /// Read or switch the active tab / 读取或切换当前标签页
+    pub fn active_view(&self) -> ActiveView;
+    pub fn set_active_view(&mut self, view: ActiveView);
     /// Run the application with a native window
     /// 以原生窗口运行应用
     pub fn run(self) -> Result<(), eframe::Error>;
 }
 
 impl eframe::App for EmuApp {
-    /// One CentralPanel + RegisterPanel::new(core).show(ui)
+    /// Heading + tab bar + active view (`VirtualLab` or `Panels`)
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame);
 }
 ```
 
+Tab switching only changes the `view` field: `CanvasState` (nodes, wires, pan,
+zoom, selection) is owned by `EmuApp` and survives switching back and forth.
+切换标签页只改 `view` 字段：`CanvasState`（节点、连线、平移、缩放、选中项）
+由 `EmuApp` 持有，来回切换不会丢失。
+
 **目标设计 / Target design（规划中 / planned，Phase 3）**：扩展为
 `chip: Arc<Mutex<RP2350Chip>>` + `gdb_server` 句柄 + `plugin_host` + 左侧外设/
-插件面板、中央 `VirtualLabCanvas`、右侧寄存器/HSTX 面板、底部 UART 终端与
-状态栏，以及 `render_menu()` / `tick_simulator(multiplier)` 执行控制。
+插件面板、右侧寄存器/HSTX 面板、底部 UART 终端与状态栏，以及
+`render_menu()` / `tick_simulator(multiplier)` 执行控制。
 
 ---
 
 ## Read-Only Peripheral Panels / 只读外设面板
 
-`EmuApp` 在一个 `ScrollArea` 中按「寄存器 → DMA → HSTX → PIO」顺序渲染可折叠面板
-（`egui::CollapsingHeader`，默认展开）。面板每帧重新取快照，从不写寄存器；窗口
-很小（测试用 120×90）时只产生滚动条，不 panic。
+`EmuApp` 在「Panels / 寄存器与外设」标签页中，于一个 `ScrollArea` 内按
+「寄存器 → DMA → HSTX → PIO」顺序渲染可折叠面板（`egui::CollapsingHeader`，
+默认展开）。面板每帧重新取快照，从不写寄存器；窗口很小（测试用 120×90）时只产生
+滚动条，不 panic。启动默认标签页是「Virtual Lab / 虚拟实验室」。
 
 `EmuApp` renders the register viewer followed by three collapsible
 (`egui::CollapsingHeader`, open by default) peripheral panels inside one
-`ScrollArea`. Every panel re-reads its snapshot each frame, never writes a
-register, and a very small window (120×90 in tests) only produces scrollbars.
+`ScrollArea` on the "Panels" tab. Every panel re-reads its snapshot each frame,
+never writes a register, and a very small window (120×90 in tests) only produces
+scrollbars. The default tab on startup is "Virtual Lab".
 
 ### Snapshot source / 快照来源
 
@@ -139,11 +179,20 @@ pub trait PeripheralSource {
 Covers the busy mask (including the empty mask), hexadecimal transfer count and
 channel rows, out-of-range channel selection, FIFO empty/full, the HSTX underrun
 row, missing-API placeholders, `IRQ` mask decoding, hexadecimal PIO state-machine
-rows, plus headless rendering with and without a source and at 120×90.
+rows, plus headless rendering with and without a source and at 120×90. Two
+app-level tests render the Virtual Lab tab (including an 80×60 window) and check
+that switching tabs preserves the canvas nodes and wires.
+此外，应用级测试渲染虚拟实验室标签页（含 80×60 小窗口），并验证切换标签页后
+画布节点与连线保持不变。
 
 ---
 
 ## Window Layout / 窗口布局
+
+Current implementation: a heading, a two-tab bar (Virtual Lab / Panels), and the
+active view below it. The richer layout below is the target design.
+当前实现：标题、两个标签页（虚拟实验室 / 寄存器与外设）以及下方的当前视图。
+下面更丰富的布局是目标设计。
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -185,121 +234,129 @@ rows, plus headless rendering with and without a source and at 120×90.
 
 ## Virtual Lab Canvas / 虚拟实验室画布
 
-### Core Components / 核心组件
+### Data model / 数据模型
 
 ```rust
-/// The central canvas where users wire GPIO pins to virtual peripherals.
-/// 用户将 GPIO 引脚连线到虚拟外设的中央画布。
-pub struct VirtualLabCanvas {
-    /// Chip view widget (RP2350 package + 48 GPIO pins).
-    pub chip_view: ChipViewWidget,
+/// Signal direction of a canvas port / 画布端口的信号方向
+pub enum PortKind { Input, Output, Bidirectional }
 
-    /// Placed device widgets.
-    pub devices: Vec<PlacedDevice>,
+/// A connection point on a device node / 设备节点上的连接点
+pub struct Port {
+    pub name: String,
+    pub kind: PortKind,
+    /// Offset from the node's top-left corner / 相对节点左上角的偏移
+    pub offset: Vec2,
+}
 
-    /// Established connections.
+/// A device placed on the canvas / 放置在画布上的设备
+pub struct DeviceNode {
+    /// Stable identifier (matches WiringTable device IDs) / 稳定标识
+    pub id: String,
+    pub name: String,
+    pub pos: Pos2,
+    pub size: Vec2,
+    pub ports: Vec<Port>,
+}
+
+/// Reference to one port of one device / 指向某个设备某个端口的引用
+pub struct Endpoint { pub device: usize, pub port: usize }
+/// A wire between two device ports / 两个设备端口之间的连线
+pub struct Wire { pub from: Endpoint, pub to: Endpoint }
+
+pub enum Selection { Device(usize), Wire(usize) }
+pub enum DragState {
+    Device { device: usize, grab: Vec2 },
+    Wire { from: Endpoint },
+}
+pub enum WireError {
+    UnknownEndpoint, SameDevice, SamePort, Direction, Duplicate,
+}
+
+/// Canvas model: devices, wires, viewport and interaction state
+/// 画布模型：设备、连线、视口与交互状态
+pub struct CanvasState {
+    pub nodes: Vec<DeviceNode>,
     pub wires: Vec<Wire>,
-
-    /// Current drag operation.
-    pub dragging: Option<DragWire>,
-
-    /// Canvas pan/zoom.
-    pub viewport: CanvasViewport,
-
-    /// Grid snap.
-    pub snap_to_grid: bool,
-    pub grid_size: f32,
-}
-
-impl VirtualLabCanvas {
-    /// Render the full canvas.
-    pub fn show(&mut self, ui: &mut egui::Ui, chip: &RP2350Chip);
-
-    /// Add a device from the palette.
-    pub fn add_device(&mut self, device_type: DeviceType, position: Pos2);
-
-    /// Remove a device.
-    pub fn remove_device(&mut self, device_id: &str);
-
-    /// Connect two ports with a wire.
-    pub fn add_wire(&mut self, source: WireEndpoint, target: WireEndpoint);
-
-    /// Remove a wire.
-    pub fn remove_wire(&mut self, wire_index: usize);
-
-    /// Auto-arrange devices.
-    pub fn auto_layout(&mut self);
-
-    /// Save canvas layout to file.
-    pub fn save_layout(&self, path: &Path);
-
-    /// Load canvas layout from file.
-    pub fn load_layout(&mut self, path: &Path);
+    pub pan: Vec2,
+    pub zoom: f32,
+    pub selected: Option<Selection>,
+    pub drag: Option<DragState>,
 }
 ```
 
-### Chip View Widget / 芯片视图组件
+`CanvasState::sample()` builds the demo net shown on startup: an RP2350 node
+(`GPIO25` output, `GPIO26` input, `GPIO27` bidirectional) wired to an LED input
+and a button output. `CanvasState::show(ui)` lives in `canvas_view.rs` and
+draws the grid, device boxes, coloured port dots, cubic-bezier wires and the
+selected highlight.
+`CanvasState::sample()` 构建启动时的示例网络：RP2350 节点（`GPIO25` 输出、
+`GPIO26` 输入、`GPIO27` 双向）连接 LED 输入与按钮输出。`CanvasState::show(ui)`
+位于 `canvas_view.rs`，绘制网格、设备框、按方向着色的端口圆点、三次贝塞尔
+连线与选中高亮。
 
-```rust
-pub struct ChipViewWidget {
-    /// Pin positions on canvas (48 pins + 6 QSPI pins).
-    pub pin_positions: HashMap<u8, Pos2>,
+### Geometry and API / 几何与 API
 
-    /// Pin labels.
-    pub pin_labels: HashMap<u8, String>,
+| API | Behaviour / 行为 |
+|-----|------------------|
+| `world_to_screen(viewport, world)` / `screen_to_world(viewport, screen)` | `screen = viewport.min + world * zoom + pan`; the inverse divides by `zoom`. |
+| `set_zoom(zoom)` / `set_pan(pan)` | Zoom is clamped to `[0.25, 4.0]`, pan to `±4096 px`. |
+| `hit_test_device(world)` | Topmost node whose box contains the point. / 命中最上层设备框。 |
+| `hit_test_port(world)` | Topmost port within an 8 px screen radius (scaled by zoom). / 命中 8 px 屏幕半径内的端口。 |
+| `hit_test_wire(world)` | Nearest wire within 6 px of its sampled bezier. / 命中贝塞尔采样线 6 px 内的连线。 |
+| `begin_drag` / `update_drag` / `finish_drag` | Port hit starts a wire, device hit starts a move with a grab offset, wire hit only selects. `finish_drag` returns whether a wire was added. |
+| `validate_wire(from, to)` / `add_wire` | Wires must join different devices; the source must be `Output`/`Bidirectional` and the sink `Input`/`Bidirectional`. `add_wire` swaps reversed input→output calls, and rejects duplicates in either order. |
+| `remove_wire(index)` / `remove_node(index)` | `remove_node` cascades all touching wires and remaps surviving endpoint device indices. |
+| `delete_selected()` | Deletes the selected device or wire; returns whether something was removed. |
+| `select(selection)` | Replaces the selection (`None` clears it). |
+| `port_position(endpoint)` / `wire_points(wire)` | Resolve an endpoint / a wire to world-space positions and bezier control points. |
 
-    /// Pin color mapping by function.
-    pub pin_colors: HashMap<PinFunction, Color32>,
+Wire legality in short: 自连（同设备或同端点）、输入→输入、输出→输出、重复连线都被
+拒绝；反向的输入→输出调用会被规范化为输出→输入。
 
-    /// Chip body rectangle.
-    pub chip_rect: Rect,
+### Interaction / 交互
 
-    /// Internal structure labels.
-    pub internal_labels: Vec<InternalLabel>,
-}
+| Input / 输入 | Effect / 效果 |
+|--------------|---------------|
+| Left press on a device, then drag | Moves the device by the grab offset; ports keep their relative offsets. / 按抓取偏移移动设备，端口相对位置不变。 |
+| Left press on a port, drag, release on another port | Shows a yellow preview line; on release adds a wire when legal. / 显示黄色预览线，合法的端口上释放即建线。 |
+| Left press on a wire | Selects the wire (yellow highlight); `Delete` removes it. |
+| `Delete` while the canvas is hovered/focused | Deletes the selected device (cascading wires) or wire. |
+| Mouse wheel / ctrl+wheel | Zooms the whole canvas within the clamp. / 在钳制范围内缩放画布。 |
+| Middle-button drag, or space + left drag | Pans the canvas by the pointer delta. / 按指针增量平移画布。 |
 
-impl ChipViewWidget {
-    /// Render the chip package.
-    pub fn show(&mut self, ui: &mut egui::Ui, chip_state: &ChipState);
+Colours: input ports green, output ports red, bidirectional ports purple;
+selected devices/wires are yellow. A tiny window only shrinks the viewport
+(`ui.available_size()` is clamped to at least 64×64), so painting never panics.
 
-    /// Draw a single pin (circle + label + direction arrow).
-    fn draw_pin(&self, ui: &mut egui::Ui, pin: u8, pos: Pos2, state: &GpioPin);
+### Limits / 限制
 
-    /// Highlight connected pins.
-    fn highlight_connected(&self, ui: &mut egui::Ui, pin: u8, pos: Pos2);
-}
-```
+- 画布是纯编辑模型：**不驱动仿真**，端口不会读写 `GPIO`，也不会调用
+  `DeviceManager`/`WiringTable`。
+- **未持久化**：没有布局保存/加载、自动布局、网格吸附、撤销/重做、主题系统。
+- 没有设备面板/芯片视图：设备只能通过 `add_device` 或 `sample()` 代码添加，
+  连线只在设备端口之间建立，尚未连接到 RP2350 芯片引脚。
+- The canvas is editor-only: it never drives the simulator, never persists, and
+  has no device palette, chip view, snapping, undo/redo or theming yet.
 
-### Wire Rendering / 连线渲染
+### Tests / 测试
 
-```rust
-pub struct Wire {
-    pub source: WireEndpoint,
-    pub target: WireEndpoint,
-    pub color: Color32,
-    pub width: f32,
-}
+`cargo test -p rp2350-egui` 中画布相关测试（`canvas_view.rs` 的 `tests`）：
 
-pub fn draw_wire(ui: &mut egui::Ui, wire: &Wire) {
-    // Cubic bezier from source to target
-    let control_offset = Vec2::new(50.0, 0.0);
-    let p0 = wire.source.position;
-    let p1 = p0 + control_offset;
-    let p2 = wire.target.position - control_offset;
-    let p3 = wire.target.position;
+- 空画布默认值；设备/端口命中与未命中；
+- 缩放 + 平移后的世界↔屏幕坐标往返（1e-3 容差）、缩放与平移边界钳制；
+- 同端点/同设备/未知端点拒绝、输入→输入拒绝、正反序重复连线拒绝；
+- 输出→输入成功且方向被规范化、双向端口两个方向都可连；
+- 删除设备级联删除连线并重映射索引；
+- 设备拖拽更新位置且端口偏移不变、端口拖拽建线、空白释放不建线；
+- 选中设备/连线的删除、`remove_wire` 越界返回 `None`；
+- 空画布、单节点与 20×20 极小窗口的无窗口渲染不 panic。
 
-    // Signal animation: moving dash pattern
-    let animated_offset = (ui.ctx().input(|i| i.time) * 100.0) % 30.0;
-
-    // Draw bezier curve
-    ui.painter().add(Shape::CubicBezier(epaint::CubicBezierShape {
-        points: [p0, p1, p2, p3],
-        closed: false,
-        fill: Color32::TRANSPARENT,
-        stroke: Stroke::new(wire.width, wire.color),
-    }));
-}
-```
+English: default/empty state, device and port hits and misses, world↔screen
+round-trip after zoom/pan, zoom/pan clamping, self/same-device/unknown endpoint
+rejection, input→input rejection, duplicate rejection in both orders,
+output→input normalisation, bidirectional ports, cascade deletion with index
+remapping, device drag with stable port offsets, wire drag/release, selected
+deletion, and headless rendering of empty/single-node canvases at 20×20.
 
 ---
 
@@ -338,7 +395,13 @@ impl HstxView {
 
 ---
 
-## Drag-and-Drop Interaction / 拖拽交互
+## Drag-and-Drop Interaction (target) / 拖拽交互（目标设计）
+
+The implemented canvas interaction is documented in
+[Interaction / 交互](#interaction--交互) above. The richer palette/chip workflow
+below is still a target design and is not implemented yet.
+已实现的画布交互见上文「Interaction / 交互」。下面更丰富的调色板/芯片工作流仍是
+目标设计，尚未实现。
 
 ```
 1. User clicks a peripheral card in the left panel.
