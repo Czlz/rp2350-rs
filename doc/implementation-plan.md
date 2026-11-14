@@ -225,23 +225,30 @@ Supports both GUI and headless/MCP mode.
 - PSRAM / QSPI Flash 可通过 QSPI 命令正常访问
 - 插件 ABI 设计验证通过：所有设备作为独立 `.dll` 加载/卸载/热替换
 
-> **P1 进度 / P1 progress（2026-11-14）**：MCP 方法层已落地 —— `McpServer` 的
-> `initialize`/`tools/list`/`tools/call`（`list_devices`/`query_all`/`query_device`/
-> `configure`）委托 `DeviceManager`；`mcp_query_device`/`apply_config` 已加入 Manager。
-> HTTP/TCP 传输与 CLI `mcp-serve` 接线待办。
-> The MCP method layer has landed: McpServer implements initialize/tools/list/tools/call
-> (list_devices, query_all, query_device, configure) on top of DeviceManager, which gained
-> mcp_query_device and apply_config. HTTP/TCP transport and CLI mcp-serve wiring remain.
+> **P1 进度 / P1 progress（2026-11-14）**：MCP 方法层与最小 HTTP 传输均已落地 ——
+> `McpServer` 的 `initialize`/`tools/list`/`tools/call`（`list_devices`/`query_all`/
+> `query_device`/`configure`）委托 `DeviceManager`；`POST /mcp`（别名 `/`）与
+> `GET /health` 提供 HTTP 传输，CLI `mcp-serve` 已接线（默认 8080）。剩余：TLS/鉴权、
+> 插件热加载。
+> The MCP method layer and a minimal HTTP transport have landed: McpServer implements
+> initialize/tools/list/tools/call (list_devices, query_all, query_device, configure) on
+> top of DeviceManager, with `POST /mcp` (alias `/`) and `GET /health` served over HTTP;
+> the CLI `mcp-serve` subcommand is wired (default 8080). TLS/authentication and plugin
+> hot reload remain.
 
 > **P1 进度 / P1 progress（2026-11-14）**：插件系统端到端已打通 ——
 > `DeviceManager::scan_and_load(dir)` 自动实例化目录内设备插件，CLI `list-devices`
 > 与 `wire` 已接入真实设备管理器（一次性进程语义，已写入文档）；`mcp_list_devices`
-> 补充端口信息。剩余：GUI 调色板/连线、接线持久化、热替换。
+> 补充端口信息；第二方插件 `uart-terminal` 已落地（TX 位采样解码、RX 位时序输出、
+> baud/data_bits/stop_bits 配置、状态快照，11 条测试）。剩余：GUI 调色板/连线、
+> 接线持久化、热替换。
 > The plugin system is now wired end to end: DeviceManager::scan_and_load(dir)
 > instantiates device plugins from a directory, and the CLI list-devices / wire
 > subcommands drive a real manager (one-shot process semantics documented);
-> mcp_list_devices now includes port information. GUI palette/wiring, wiring
-> persistence and hot replacement remain.
+> mcp_list_devices now includes port information, and the second-party `uart-terminal`
+> plugin has landed (TX bit sampling, RX bit-timed output, baud/data_bits/stop_bits
+> configuration, state snapshot, 11 tests). GUI palette/wiring, wiring persistence and
+> hot replacement remain.
 
 ---
 

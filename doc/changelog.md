@@ -58,6 +58,9 @@
 - `rp2350-arm`: DSP packed SIMD — `SADD8`/`SSUB8`/`SADD16`/`SSUB16` and the `UADD`/`USUB` variants with per-lane GE flags in `APSR[19:16]`, `SXTB16`/`UXTB16` with the rotate field, and `USAD8`/`USADA8`; `MRS APSR` / `MSR APSR_g|nzcvqg` expose GE
 - `rp2350-virt-periph`: `DeviceManager::scan_and_load(dir)` — instantiates every device plugin in a directory (metadata ID or file stem, duplicate/failure skipped with a warning) and `PluginLoader::scan_dir` helper
 - `rp2350-cli`: `list-devices` and `wire` subcommands now scan a plugin directory, build a real `DeviceManager` and print device/wiring tables (one-shot process semantics)
+- `rp2350-mcp`: minimal HTTP/1.1 transport — `POST /mcp` (alias `/`) forwards the body to `handle_request`, `GET /health` reports status, with `400/404/405/411/413/431/501/505` handling, 8 KiB header / 1 MiB body limits, connection timeouts and a pollable shutdown flag
+- `rp2350-cli`: `mcp-serve` starts the MCP HTTP transport (default port 8080) and prints both endpoints
+- `plugins/uart-terminal`: second-party UART terminal plugin — `TX` (input) is sampled at the configured baud to decode start/data/stop bits LSB-first, `RX` (output) shifts bytes out with the same bit timing; `baud`/`data_bits`/`stop_bits`/`rx_line`/`clock_hz` configuration, framing-error accounting and a state snapshot (11 tests)
 
 ### Fixed / 修复
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
