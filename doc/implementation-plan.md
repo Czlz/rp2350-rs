@@ -11,6 +11,20 @@
 > `repl` / `perfbench` subcommands, beyond the original Phase 1 list), and Stage 6
 > (the perfbench comparison report) is in progress.
 
+> **P1 功能进度 / P1 feature progress（2026-11-14）**
+>
+> | 领域 / Area | 状态 / Status | 已落地 / Landed | 待办 / Remaining |
+> |---|---|---|---|
+> | PIO | 🚧 | 3 blocks × 4 SMs 寄存器块、FIFO、指令存储；状态机执行（9 类指令、autopush/autopull、wrap、stall） | 引脚映射/side-set、delay/分数 CLKDIV、FIFO join、DMA 握手、IRQ 路由、`Pio::tick` 接入主循环 |
+> | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`） | watchpoint、多核 `vCont`、`target.xml`、monitor 命令 |
+> | MCP | ✅ | JSON-RPC 方法层（`initialize`/`tools/list`/`tools/call`）、HTTP 传输、CLI `mcp-serve` | TLS/鉴权、插件热加载 |
+> | 插件 / Plugins | ✅ | ABI、`DeviceManager::scan_and_load`、CLI `list-devices`/`wire`、LED 与 UART Terminal 插件 | GUI 调色板/连线、接线持久化、热替换 |
+> | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、DSP 并行 SIMD/GE 标志 | VFP 惰性压栈、饱和指令 |
+> | 双核 / Dual-core | 🚧 | core1 WFE + SIO FIFO 桩；双核调度脚手架（本波） | PSM 释放接线、SIO 门铃、CLI 双核模式、GDB 多核 |
+>
+> 状态标记：✅ 完成（P1 范围） · 🚧 部分完成 · ⏳ 未开始。
+> Status markers: ✅ done for P1 scope · 🚧 partial · ⏳ not started.
+
 ---
 
 ## 固件验证清单 / Firmware Verification Checklist（内核门禁 / core gate）

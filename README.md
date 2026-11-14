@@ -15,14 +15,17 @@
 
 > 状态标注 / Status: ✅ 已实现 implemented · 🚧 部分 partial · ⏳ 规划 planned（阶段计划见 [implementation-plan](doc/implementation-plan.md) 与 [reference-gap-analysis](doc/reference-gap-analysis.md)）
 
-- ✅ **ARM Cortex-M33** — Thumb-16/32 解码器、FPv5-SP FPU、NVIC/异常/SysTick、GPIO(CP0)/DCP(CP4) 协处理器
+- ✅ **ARM Cortex-M33** — Thumb-16/32 解码器、FPv5-SP FPU、NVIC/异常/SysTick、GPIO(CP0)/DCP(CP4) 协处理器、DSP 并行 SIMD（SADD/SSUB/UADD/USUB、SXTB16/UXTB16、USAD8/USADA8）
 - ✅ **RISC-V Hazard3** — RV32IMAC + C 压缩指令、machine CSRs、Xh3irq 外部中断、picobin 启动
 - ✅ **USB 全链路** — 设备控制器模型 + 主机桥枚举 + raw REPL：真实 MicroPython UF2 可启动、进入 REPL 并跑通 `perfbench` 基准
 - ✅ **合成 bootrom + XIP Flash** — 32 KB 合成 ROM（`rom_table_lookup`/flash 擦写/sysinfo/reboot）、16 MB Flash XIP、非缓存别名与维护窗口
 - ✅ **启动外设桩** — RESETS/CLOCKS/XOSC/PLL/TIMER/SIO/IO_BANK0/PADS/UART0/PPB/BOOTRAM/TICKS/POWMAN/IO_QSPI/XIP_QMI
-- ✅ **插件系统** — libloading 动态加载 `.dll`/`.so`/`.dylib`，LED 参考插件
-- 🚧 **双核** — core1 常驻 WFE（SIO FIFO/门铃语义保留），真双核调度已排期
-- ⏳ **PIO**（3 blocks × 4 SMs + assembler）、**DMA**（16 通道链式 + DREQ）、**HSTX** 视频输出、**GDB RSP Server**（vCont 多核调试）、**Virtual Electronics Lab**（egui 拖线连线）、**DSP 扩展**、**PSRAM** — 规划中
+- 🚧 **PIO** — 3 blocks × 4 SMs 寄存器块 + 状态机执行（JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET、autopush/autopull、wrap、stall）；引脚映射/side-set/DMA 握手待补
+- ✅ **GDB RSP** — 协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、总线内存、PC 断点、resume）；watchpoint/多核 `vCont`/`target.xml` 待补
+- ✅ **MCP** — JSON-RPC 方法层 + HTTP/1.1 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve`
+- ✅ **插件系统** — libloading 动态加载 `.dll`/`.so`/`.dylib`，目录扫描 + CLI `list-devices`/`wire`，LED 与 UART Terminal 插件
+- 🚧 **双核** — core1 常驻 WFE（SIO FIFO/门铃语义保留），双核调度脚手架开发中
+- ⏳ **DMA**（16 通道链式 + DREQ）、**HSTX** 视频输出、**Virtual Electronics Lab**（egui 拖线连线）、**PSRAM** — 规划中
 
 ---
 
@@ -47,8 +50,15 @@ cargo run -p rp2350-cli -- repl --file RPI_PICO2-*.uf2 --exec "print('hello')"
 # Run a MicroPython performance benchmark / 运行 MicroPython 性能基准
 cargo run -p rp2350-cli -- perfbench --file RPI_PICO2-*.uf2 --bench bm_fannkuch.py --benchrun benchrun.py
 
-# Start with GDB server (stub — server not yet wired / 桩——服务器尚未接线)
+# Start the GDB RSP server / 启动 GDB RSP 服务器
 cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf
+
+# List device plugins and create a wiring entry / 列出设备插件并建立接线
+cargo run -p rp2350-cli -- list-devices --plugin-dir target/release
+cargo run -p rp2350-cli -- wire --plugin-dir target/release --device com.rp2350-rs.led --port 0 --gpio 25
+
+# Start the MCP HTTP server (POST /mcp, GET /health) / 启动 MCP HTTP 服务器
+cargo run -p rp2350-cli -- mcp-serve --port 8080
 
 # Run all tests
 cargo test --all-features
@@ -91,12 +101,13 @@ rp2350-rs/
 │   ├── rp2350-virt-periph/       # DeviceManager, DevicePlugin, WiringTable, plugin loading
 │   ├── rp2350-plugin/            # Base plugin trait (RpPlugin, PluginContext, ABI exports)
 │   ├── rp2350-ffi/               # SafeLibrary RAII wrapper (libloading)
-│   ├── rp2350-gdb/               # GDB RSP: target trait + Cortex-M33 adapter (server stub)
+│   ├── rp2350-gdb/               # GDB RSP: protocol layer, TCP server, target adapters
 │   ├── rp2350-egui/              # egui GUI (register panels; Virtual Lab planned)
-│   ├── rp2350-cli/               # CLI: run / repl / perfbench (gdb, wire, mcp-serve stubs)
-│   └── rp2350-mcp/               # MCP Server (AgentFuse integration — stub)
+│   ├── rp2350-cli/               # CLI: run / repl / perfbench / gdb / list-devices / wire / mcp-serve
+│   └── rp2350-mcp/               # MCP Server: JSON-RPC methods + HTTP transport
 ├── plugins/
-│   └── led/                      # LED virtual device plugin (first-party; TF Card / UART Terminal 等规划中)
+│   ├── led/                      # LED virtual device plugin (first-party)
+│   └── uart-terminal/            # UART terminal plugin (bit-timed TX decode / RX encode)
 └── doc/                          # design documents (architecture, plan, APIs)
 ```
 

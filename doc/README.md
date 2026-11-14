@@ -10,12 +10,14 @@
 | Item | Detail |
 |------|--------|
 | **Chip** | RP2350 (Raspberry Pi Pico 2) |
-| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU + NVIC/异常/SysTick + GPIO/DCP 协处理器（core1 常驻 WFE，真双核排期中） |
+| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU + NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP 并行 SIMD（core1 常驻 WFE，双核调度脚手架开发中） |
 | **RISC-V** | Hazard3 RV32IMAC + C（已实现，CLI `--arch riscv` 可用） |
 | **USB** | 设备控制器模型 + 主机桥 + raw REPL：真实 MicroPython UF2 → `perfbench` 全链路可跑 |
+| **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）；引脚/side-set/DMA 待补 |
 | **GUI** | egui 0.37 (eframe + wgpu) — 寄存器面板（Virtual Electronics Lab 规划中） |
-| **Debug** | GDB RSP Server (TCP :3333) — target 抽象层就绪，服务器为桩 |
-| **Plugins** | libloading + abi_stable — dynamic .dll/.so/.dylib loading（LED 参考插件已就绪） |
+| **Debug** | GDB RSP：协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、内存、断点、resume）；watchpoint/多核 vCont 规划中 |
+| **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` |
+| **Plugins** | libloading + abi_stable — 目录扫描 + CLI `list-devices`/`wire`；LED 与 UART Terminal 插件已就绪 |
 | **Platform** | Windows / Linux / macOS / Web (WASM planned) |
 | **Performance** | Target 200+ MCPS (single core, release build) |
 | **Repository** | [github.com/Czlz/rp2350-rs](https://github.com/Czlz/rp2350-rs) |
@@ -46,12 +48,13 @@ rp2350-rs/
 │   ├── rp2350-virt-periph/       # Virtual Device Manager (DevicePlugin, PluginLoader, WiringTable, DeviceManager)
 │   ├── rp2350-plugin/            # plugin base trait (RpPlugin, PluginContext, PluginMetadata, ABI)
 │   ├── rp2350-ffi/               # FFI safety wrapper (SafeLibrary — libloading RAII)
-│   ├── rp2350-gdb/               # GDB RSP (target trait + Cortex-M33 adapter; server stub)
+│   ├── rp2350-gdb/               # GDB RSP: protocol layer, TCP server, target adapters
 │   ├── rp2350-egui/              # egui GUI (register panels; Virtual Lab planned)
-│   ├── rp2350-cli/               # CLI entry point (clap: run/repl/perfbench; gdb/wire/list-devices/mcp-serve stubs)
-│   └── rp2350-mcp/               # MCP Server (AgentFuse integration — stub)
+│   ├── rp2350-cli/               # CLI: run/repl/perfbench/gdb/list-devices/wire/mcp-serve
+│   └── rp2350-mcp/               # MCP Server: JSON-RPC methods + HTTP transport
 ├── plugins/                      # ★ all virtual devices as independent plugins
-│   └── led/                      # first-party: LED（TF Card / UART Terminal / Debug Probe / PSRAM / QSPI Flash 规划中）
+│   ├── led/                      # first-party: LED
+│   └── uart-terminal/            # first-party: UART terminal (TX bit decode / RX bit encode)
 ├── tests/
 ├── doc/
 └── .github/
@@ -78,8 +81,15 @@ cargo run -q -p rp2350-cli -- repl --file RPI_PICO2-20260824-v1.29.0.uf2 --exec 
 # Run a MicroPython performance benchmark / 运行 MicroPython 性能基准
 cargo run -q -p rp2350-cli -- perfbench --file RPI_PICO2-20260824-v1.29.0.uf2 --bench bm_fannkuch.py --benchrun benchrun.py
 
-# Start GDB server only (stub / 桩)
+# Start the GDB RSP server / 启动 GDB RSP 服务器
 cargo run -q -p rp2350-cli -- gdb --port 3333 --file firmware.elf
+
+# List device plugins / create a wiring entry / 列出设备插件、建立接线
+cargo run -q -p rp2350-cli -- list-devices --plugin-dir target/release
+cargo run -q -p rp2350-cli -- wire --plugin-dir target/release --device com.rp2350-rs.led --port 0 --gpio 25
+
+# Start the MCP HTTP server / 启动 MCP HTTP 服务器
+cargo run -q -p rp2350-cli -- mcp-serve --port 8080
 
 # Example: boot the MicroPython RP2350 UF2
 cargo run -q -p rp2350-cli -- run --file RPI_PICO2-20260824-v1.29.0.uf2 --trace-steps 40
