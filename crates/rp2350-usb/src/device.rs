@@ -669,4 +669,46 @@ mod tests {
         core.write_reg_masked(MAIN_CTRL + 3, Alias::Rw, 0x00, 0xFF00_0000);
         assert_eq!(core.read_reg(MAIN_CTRL), 0x00FF_FFFF);
     }
+
+    #[test]
+    fn irq_line_waits_for_inte_and_clears_on_setup_ack() {
+        // IRQ timing: a pending SETUP must not assert the line until the guest
+        // enables the source in INTE, and acknowledging it releases the line.
+        // 中断时序：挂起的 SETUP 在客户机于 INTE 使能该源前不得拉高中断线，
+        // 确认接收后中断线应立即释放。
+        let mut core = enabled_core();
+        let setup = crate::setup::SetupPacket::standard_in(0x06, 0x0100, 0, 8);
+        assert!(core.host_setup(&setup));
+        assert_ne!(core.intr() & INTR_SETUP_REQ, 0);
+        assert!(!core.irq_asserted(), "INTE=0 must mask the USBCTRL line");
+        core.write_reg(INTE, Alias::Rw, INTR_SETUP_REQ);
+        assert!(core.irq_asserted());
+        core.acknowledge_setup();
+        assert!(!core.irq_asserted());
+    }
+
+    #[test]
+    fn buff_status_irq_releases_after_write_one_to_clear() {
+        let mut core = enabled_core();
+        core.write_reg(INTE, Alias::Rw, INTR_BUFF_STATUS);
+        core.complete_buffer(0, Direction::In, true);
+        assert!(core.irq_asserted());
+        let bit = regs::buff_status_bit(0, Direction::In);
+        core.write_reg(BUFF_STATUS, Alias::Rw, bit);
+        assert!(!core.irq_asserted());
+        // TRANS_COMPLETE is a separate W1C latch on SIE_STATUS.
+        // TRANS_COMPLETE 是 SIE_STATUS 上独立的写 1 清零锁存。
+        assert_ne!(core.read_reg(SIE_STATUS) & SIE_STATUS_TRANS_COMPLETE, 0);
+        core.write_reg(SIE_STATUS, Alias::Rw, SIE_STATUS_TRANS_COMPLETE);
+        assert_eq!(core.intr() & INTR_TRANS_COMPLETE, 0);
+    }
+
+    #[test]
+    fn forced_interrupt_stays_asserted_until_intf_is_cleared() {
+        let mut core = enabled_core();
+        core.write_reg(INTF, Alias::Rw, INTR_DEV_SUSPEND);
+        assert!(core.irq_asserted(), "INTF bypasses INTE");
+        core.write_reg(INTF, Alias::Rw, 0);
+        assert!(!core.irq_asserted());
+    }
 }

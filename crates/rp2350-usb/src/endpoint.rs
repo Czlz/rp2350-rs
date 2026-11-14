@@ -425,4 +425,88 @@ mod tests {
         assert_eq!(UsbCore::ep_ctrl_base(), 0x008);
         assert_eq!(UsbCore::setup_packet_offset(), 0x000);
     }
+
+    #[test]
+    fn ep0_in_data_stage_is_followed_by_an_out_status_stage() {
+        // Full control-IN transfer: SETUP -> data IN -> host OUT ZLP status.
+        // 完整控制 IN 传输：SETUP -> 数据 IN -> 主机 OUT 零长包状态阶段。
+        let mut core = ready_core();
+        core.write_reg(regs::INTE, Alias::Rw, regs::INTR_SETUP_REQ);
+        let packet = SetupPacket::standard_in(0x06, 0x0100, 0, 8);
+        assert!(core.host_setup(&packet));
+        assert!(core.irq_asserted());
+        core.acknowledge_setup();
+        assert!(!core.irq_asserted(), "setup ack must release the line");
+        for i in 0..8u8 {
+            core.write_dpram_u8(UsbCore::ep0_buffer() + usize::from(i), i + 1);
+        }
+        core.write_dpram_u32(
+            regs::ep_buf_ctrl_offset(0, Direction::In),
+            BUF_CTRL_AVAIL | BUF_CTRL_FULL | 8,
+        );
+        let InResponse::Data(data) = core.host_in(0) else {
+            panic!("expected EP0 IN data");
+        };
+        assert_eq!(data.bytes(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            core.read_reg(regs::BUFF_STATUS) & regs::buff_status_bit(0, Direction::In),
+            regs::buff_status_bit(0, Direction::In)
+        );
+        core.write_reg(
+            regs::BUFF_STATUS,
+            Alias::Rw,
+            regs::buff_status_bit(0, Direction::In),
+        );
+        core.write_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out), BUF_CTRL_AVAIL);
+        assert_eq!(
+            core.host_out(0, &[]),
+            OutResponse::Ack { last: true },
+            "the host's zero-length OUT completes the status stage"
+        );
+    }
+
+    #[test]
+    fn setup_aborts_a_partially_armed_ep0_transfer() {
+        // USB 2.0: a SETUP token aborts any pending data stage on the default
+        // pipe, so the host must see NAK until the guest re-arms EP0.
+        // USB 2.0：SETUP 令牌会中止默认管道上未完成的数据阶段，因此客户机重新
+        // 布防前，主机必须看到 NAK。
+        let mut core = ready_core();
+        core.write_dpram_u32(
+            regs::ep_buf_ctrl_offset(0, Direction::In),
+            BUF_CTRL_AVAIL | BUF_CTRL_FULL | 4,
+        );
+        core.write_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out), BUF_CTRL_AVAIL);
+        let packet = SetupPacket::standard_out(0x05, 2, 0, 0);
+        assert!(core.host_setup(&packet));
+        assert_eq!(
+            core.read_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::In)),
+            0
+        );
+        assert_eq!(
+            core.read_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out)),
+            0
+        );
+        assert_eq!(core.host_in(0), InResponse::Nak);
+        assert_eq!(core.host_out(0, &[]), OutResponse::Nak);
+    }
+
+    #[test]
+    fn zero_length_in_status_stage_reports_an_empty_packet() {
+        // An OUT request's status stage is a device IN zero-length packet.
+        // OUT 请求的状态阶段是设备发出的 IN 零长包。
+        let mut core = ready_core();
+        let packet = SetupPacket::standard_out(0x09, 1, 0, 0);
+        assert!(core.host_setup(&packet));
+        core.acknowledge_setup();
+        core.write_dpram_u32(
+            regs::ep_buf_ctrl_offset(0, Direction::In),
+            BUF_CTRL_AVAIL | BUF_CTRL_FULL | BUF_CTRL_LAST,
+        );
+        let InResponse::Data(status) = core.host_in(0) else {
+            panic!("expected the status ZLP");
+        };
+        assert!(status.is_empty());
+        assert!(status.last);
+    }
 }

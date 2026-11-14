@@ -482,6 +482,19 @@ pub fn run(options: &ReplOptions) -> Result<()> {
         strict_decode: options.strict_decode,
     };
     let mut machine = Machine::new(&bytes, &machine_options)?;
+    // TinyUSB 的 EP0 没有端点控制寄存器，`hw_endpoint_start_next_buffer()` 每次
+    // 控制传输都会写 `*ep->endpoint_control`（EP0 为 NULL）。真实 RP2350 的掩膜
+    // ROM 会忽略地址 0 的写入；合成 boot ROM 区域默认拒绝写入，会让客户机在首个
+    // SETUP 阶段以 `Bus error at 0x00000000` 停机。这里换成写入丢弃的掩膜 ROM
+    // 视图，再开始枚举。
+    // TinyUSB's EP0 has no endpoint-control register, so
+    // `hw_endpoint_start_next_buffer()` writes `*ep->endpoint_control` (NULL for
+    // EP0) on every control transfer. Real RP2350 mask ROM ignores stores to
+    // address 0; the synthetic boot ROM region rejects them, which halted the
+    // guest at the first SETUP with `Bus error at 0x00000000`. Swap in the
+    // write-dropping mask-ROM view before enumeration starts.
+    rp2350_usb_host::mask_rom::install(&mut machine.bus)
+        .context("mask ROM view install failed / 掩膜 ROM 视图安装失败")?;
     let stdio = options.stdio;
     let report = if stdio {
         Report::Stderr

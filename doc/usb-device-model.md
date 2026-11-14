@@ -324,7 +324,105 @@ HostTransport (stdio / TCP)  ⇄  RawReplSession  ⇄  CdcChannel  ⇄  UsbHostB
 
 ---
 
-## 11. 参考 / References
+## 11. EP0、掩膜 ROM 与中断时序（实测）/ EP0, Mask ROM and IRQ Timing
+
+### 11.1 EP0 的空端点控制指针 / EP0's null endpoint-control pointer
+
+TinyUSB 的 RP2040 端口在 `dcd_rp2040.c::hw_endpoint_init()` 中对 EP0 显式设置
+`ep->endpoint_control = NULL`（EP0 没有端点控制寄存器），而
+`rp2040_usb.c::hw_endpoint_start_next_buffer()` 在每次控制传输开始时无条件执行
+`*ep->endpoint_control = ep_ctrl`。真实 RP2350 在 `0x0000_0000..0x0000_7FFF`
+是掩膜 ROM，硬件静默忽略该写入。
+
+本模拟器的合成 boot ROM 区域（`rp2350-bootrom` 的 `RomRegion`）此前拒绝客户机
+写入，于是同一存储在地址 0 产生
+`Bus error at address 0x00000000: AccessDenied`；PC 落在
+`hw_endpoint_start_next_buffer`，客户机在首个 SETUP 阶段停机。已确认这不是
+NVIC/VTOR 问题：向量表在 RAM 中、IRQ 14 正常分发，`R5` 指向
+`hw_endpoints[0][1]`（EP0 IN）。
+
+修复位于主机集成层：`rp2350-usb-host::mask_rom::install()` 先复制 boot ROM
+窗口内容，再把 `bootrom` 区域替换为“读取透传、写入丢弃”的
+`MaskRom`。`repl` 在开始枚举前安装它；`run` 不枚举 USB，因此不需要该视图。
+后续若 `rp2350-bootrom` 把掩膜 ROM 写入建模为忽略，可直接删除该 shim。
+
+TinyUSB's RP2040 port explicitly sets `ep->endpoint_control = NULL` for EP0 in
+`dcd_rp2040.c::hw_endpoint_init()` (EP0 has no endpoint-control register), while
+`rp2040_usb.c::hw_endpoint_start_next_buffer()` unconditionally executes
+`*ep->endpoint_control = ep_ctrl` at the start of every control transfer. On a
+real RP2350 the window at `0x0000_0000..0x0000_7FFF` is mask ROM, which silently
+ignores that store.
+
+The emulator's synthetic boot ROM region (`rp2350-bootrom`'s `RomRegion`) used to
+reject guest writes, so the same store raised
+`Bus error at address 0x00000000: AccessDenied` with the PC inside
+`hw_endpoint_start_next_buffer`, halting the guest at the first SETUP. This is
+**not** an NVIC/VTOR problem: the RAM vector table and IRQ 14 delivery are fine,
+and `R5` points at `hw_endpoints[0][1]` (EP0 IN).
+
+The fix lives in the host integration layer:
+`rp2350-usb-host::mask_rom::install()` snapshots the boot ROM window and replaces
+the `bootrom` region with a read-through, write-dropping `MaskRom` view. `repl`
+installs it before enumeration; `run` never enumerates USB and does not need it.
+If `rp2350-bootrom` later models mask ROM writes as ignored, this shim can be
+deleted.
+
+### 11.2 中断时序 / Interrupt timing
+
+- 控制器只在 `INTS = (INTR & INTE) | INTF != 0` 时拉高 `USBCTRL_IRQ`；客户机
+  未在 `INTE` 使能某源时，即使 `INTR` 已锁存也不会产生中断线。
+- `INTR` 是只读聚合：`BUFF_STATUS`、`EP_ABORT_DONE`、`EP_STATUS_STALL_NAK` 由
+  W1C 清零；`SETUP_REC` / `TRANS_COMPLETE` / `BUS_RESET` 由 `SIE_STATUS` 的
+  W1C 清零；`DEV_SOF` 由读 `SOF_RD` 清除。
+- 电平中断会在每个仿真批次重复投递，直到客户机清源；`INTF` 强制位不受
+  `INTE` 屏蔽，写 0 才释放。
+- NVIC 仍负责最终屏蔽与优先级；控制器不模拟 PC 级抢占。
+
+- The controller asserts `USBCTRL_IRQ` only while
+  `INTS = (INTR & INTE) | INTF != 0`; a latched `INTR` bit whose `INTE` enable is
+  clear does not raise the line.
+- `INTR` is a read-only aggregate: `BUFF_STATUS`, `EP_ABORT_DONE` and
+  `EP_STATUS_STALL_NAK` are W1C; `SETUP_REC` / `TRANS_COMPLETE` / `BUS_RESET`
+  are W1C in `SIE_STATUS`; `DEV_SOF` clears when `SOF_RD` is read.
+- A level interrupt is re-signalled every simulation batch until the guest
+  clears its source; `INTF` forced bits bypass `INTE` and clear on a zero write.
+- The NVIC still owns final masking and priority; there is no PC-level
+  preemption inside the controller.
+
+### 11.3 实测时序（emerald.uf2）/ Measured timing
+
+| Event | Steps | Simulated |
+|-------|-------|-----------|
+| `USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1` | ~1.8 M | ~12 ms |
+| Game banner `=== Pokemon Emerald on RP2350 ===` | ~297 M | ~1.98 s |
+
+The game calls `sleep_ms(1500)` after `stdio_init_all()`, so the banner needs
+225 M+ steps. The `--stdio` EOF drain window is only 50 ms (simulated); keep
+stdin open (for example from a pipe) long enough to reach the banner.
+
+固件在 `stdio_init_all()` 后执行 `sleep_ms(1500)`，因此横幅需要 2.25 亿步以上。
+`--stdio` 的 EOF 排空窗口只有 50 毫秒（模拟时间）；需要保持 stdin 打开（例如
+用管道）足够久才能读到横幅。
+
+### 11.4 已知限制 / Limitations
+
+- 主机桥当前不调度 SOF：`host_sof()` 已实现，但 `poll()` 不按 1 ms 帧周期调用。
+  TinyUSB 的 errata-15 路径因此看到陈旧的 `e15_last_sof`，批量 IN 缓冲立即启动，
+  而不是等待 SOF 中断。
+- 可选的字符串描述符若被设备 STALL，会被主机桥跳过，不中止枚举；必需请求
+  STALL 仍判定失败。
+- 未建模等时/大容量存储/音频类、双缓冲 OUT、位级总线时序与 CRC/位填充。
+
+- The host bridge does not schedule SOFs: `host_sof()` exists, but `poll()` never
+  issues one per 1 ms frame. TinyUSB's errata-15 path therefore sees a stale
+  `e15_last_sof` and starts bulk-IN buffers immediately instead of waiting for
+  the SOF interrupt.
+- An optional string descriptor that the device stalls is skipped instead of
+  aborting enumeration; a stall on a required request still fails.
+- Isochronous/MSC/audio classes, double-buffered OUT, bit-level bus timing and
+  CRC/bit-stuffing are not modelled.
+
+## 12. 参考 / References
 
 - RP2350 Datasheet, Chapter 12 (USB), §12.7 register list.
 - pico-sdk `src/rp2350/hardware_regs/include/hardware/regs/{usb.h,intctrl.h,addressmap.h}`.

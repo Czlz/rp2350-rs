@@ -446,9 +446,7 @@ impl UsbHostBridge {
             match self.controller.host_in(0) {
                 InResponse::NoDevice => self.device_lost(),
                 InResponse::Nak => self.nak(now),
-                InResponse::Stall => self.fail(HostError::Stall {
-                    request: request_code,
-                }),
+                InResponse::Stall => self.stall(now, request_code),
                 InResponse::Data(packet) => {
                     let Some(transfer) = self.transfer.as_mut() else {
                         return HostProgress::Wait(now);
@@ -499,9 +497,7 @@ impl UsbHostBridge {
             match self.controller.host_out(0, &chunk) {
                 OutResponse::NoDevice => self.device_lost(),
                 OutResponse::Nak => self.nak(now),
-                OutResponse::Stall => self.fail(HostError::Stall {
-                    request: request_code,
-                }),
+                OutResponse::Stall => self.stall(now, request_code),
                 OutResponse::Ack { last } => {
                     if let Some(transfer) = self.transfer.as_mut() {
                         transfer.sent += chunk_len;
@@ -532,12 +528,7 @@ impl UsbHostBridge {
             match response {
                 OutResponse::NoDevice => ("no-device", self.device_lost()),
                 OutResponse::Nak => ("nak", self.nak(now)),
-                OutResponse::Stall => (
-                    "stall",
-                    self.fail(HostError::Stall {
-                        request: request.setup.b_request,
-                    }),
-                ),
+                OutResponse::Stall => ("stall", self.stall(now, request.setup.b_request)),
                 OutResponse::Ack { last } => (
                     if last { "ack-last" } else { "ack" },
                     self.complete_transfer(now),
@@ -548,12 +539,7 @@ impl UsbHostBridge {
             match response {
                 InResponse::NoDevice => ("no-device", self.device_lost()),
                 InResponse::Nak => ("nak", self.nak(now)),
-                InResponse::Stall => (
-                    "stall",
-                    self.fail(HostError::Stall {
-                        request: request.setup.b_request,
-                    }),
-                ),
+                InResponse::Stall => ("stall", self.stall(now, request.setup.b_request)),
                 InResponse::Data(packet) => (
                     if packet.is_empty() {
                         "data-zlp"
@@ -574,6 +560,24 @@ impl UsbHostBridge {
     fn nak(&mut self, now: u64) -> HostProgress {
         self.retry_at = now + self.us_to_cycles(100);
         HostProgress::Wait(self.retry_at)
+    }
+
+    /// Skip an optional request the device stalled, or fail enumeration
+    /// 跳过设备返回 STALL 的可选请求，否则判定枚举失败
+    ///
+    /// String descriptors are best effort: a device may legitimately stall them
+    /// and enumeration must continue with the descriptors already parsed.
+    /// 字符串描述符是尽力而为的：设备可以合法地对它们返回 STALL，枚举应携带已解析
+    /// 的描述符继续。
+    fn stall(&mut self, now: u64, request: u8) -> HostProgress {
+        let optional = self.transfer.as_ref().is_some_and(|t| t.request.optional);
+        if optional {
+            self.transfer = None;
+            self.retry_at = now + self.us_to_cycles(20);
+            HostProgress::Wait(self.retry_at)
+        } else {
+            self.fail(HostError::Stall { request })
+        }
     }
 
     fn complete_transfer(&mut self, now: u64) -> HostProgress {
@@ -686,5 +690,310 @@ impl UsbHostBridge {
         self.transfer = None;
         self.queue.clear();
         HostProgress::Detached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rp2350_usb::UsbCore;
+    use rp2350_usb::regs::{
+        self, Alias, BUF_CTRL_AVAIL, BUF_CTRL_FULL, BUF_CTRL_LAST, BUF_CTRL_STALL,
+        MAIN_CTRL_CONTROLLER_EN, SIE_CTRL_PULLUP_EN, SIE_STATUS_SETUP_REC,
+    };
+
+    /// An 18-byte device descriptor with string indices 1/2/3
+    /// 带字符串索引 1/2/3 的 18 字节设备描述符
+    const DEVICE_DESC: [u8; 18] = [
+        18, 1, 0x00, 0x02, 0x02, 0x02, 0x00, 0x40, 0x09, 0x12, 0x02, 0x00, 0x00, 0x02, 0x01, 0x02,
+        0x03, 0x01,
+    ];
+
+    /// A 46-byte CDC configuration: control interface 0, data interface 1,
+    /// bulk IN 0x81 and bulk OUT 0x02.
+    /// 46 字节 CDC 配置：控制接口 0、数据接口 1、批量 IN 0x81、批量 OUT 0x02。
+    const CONFIG_DESC: [u8; 46] = [
+        9, 2, 46, 0, 2, 1, 0, 0xC0, 0x01, // configuration
+        9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0x00, // CDC control interface
+        5, 0x24, 0x00, 0x10, 0x01, // CDC functional header
+        9, 4, 1, 0, 2, 0x0A, 0x00, 0x00, 0x00, // CDC data interface
+        7, 5, 0x81, 0x02, 0x40, 0, 1, // bulk IN
+        7, 5, 0x02, 0x02, 0x40, 0, 1, // bulk OUT
+    ];
+
+    /// EP0 control-transfer phase the scripted firmware is serving
+    /// 脚本化固件当前服务的 EP0 控制传输阶段
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Ep0 {
+        Idle,
+        InData,
+        OutData(usize),
+        InStatus,
+        OutStatus,
+    }
+
+    /// Scripted guest that answers control transfers like TinyUSB's DCD
+    /// 像 TinyUSB DCD 一样应答控制传输的脚本化客户机
+    // 测试脚本用三个独立开关分别控制字符串 STALL、设备描述符 STALL 与静默，
+    // 组合起来覆盖枚举的可选/必需/超时分支。
+    // The test script needs three independent switches for string stalls,
+    // device-descriptor stalls and silence to cover optional/required/timeout.
+    #[allow(clippy::struct_excessive_bools)]
+    struct FakeFirmware {
+        controller: Controller,
+        state: Ep0,
+        stall_strings: bool,
+        stall_device: bool,
+        respond: bool,
+        configured: bool,
+    }
+
+    impl FakeFirmware {
+        fn new() -> Self {
+            let controller = Controller::new();
+            controller.with_core(|core| {
+                core.write_reg(regs::MAIN_CTRL, Alias::Rw, MAIN_CTRL_CONTROLLER_EN);
+                core.write_reg(regs::SIE_CTRL, Alias::Rw, SIE_CTRL_PULLUP_EN);
+                core.host_attach();
+            });
+            Self {
+                controller,
+                state: Ep0::Idle,
+                stall_strings: false,
+                stall_device: false,
+                respond: true,
+                configured: false,
+            }
+        }
+
+        fn payload(setup: SetupPacket) -> Vec<u8> {
+            match (setup.b_request, setup.w_value >> 8) {
+                (request::GET_DESCRIPTOR, 0x01) => DEVICE_DESC.to_vec(),
+                (request::GET_DESCRIPTOR, 0x02) => CONFIG_DESC.to_vec(),
+                (request::GET_DESCRIPTOR, 0x03) => vec![4, 3, 0x09, 0x04],
+                _ => Vec::new(),
+            }
+        }
+
+        fn arm_in(core: &mut UsbCore, data: &[u8]) {
+            let offset = regs::ep_buf_ctrl_offset(0, Direction::In);
+            core.write_dpram_u32(offset, 0);
+            for (index, byte) in data.iter().enumerate() {
+                core.write_dpram_u8(UsbCore::ep0_buffer() + index, *byte);
+            }
+            let mut ctrl = BUF_CTRL_AVAIL | BUF_CTRL_FULL | data.len() as u32;
+            if data.len() < MAX_CONTROL_PACKET {
+                ctrl |= BUF_CTRL_LAST;
+            }
+            core.write_dpram_u32(offset, ctrl);
+        }
+
+        fn arm_out(core: &mut UsbCore) {
+            core.write_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out), BUF_CTRL_AVAIL);
+        }
+
+        fn begin(&mut self, setup: SetupPacket) {
+            let length = usize::from(setup.w_length);
+            let descriptor_type = setup.w_value >> 8;
+            let payload = Self::payload(setup);
+            let stall = (self.stall_strings
+                && setup.b_request == request::GET_DESCRIPTOR
+                && descriptor_type == 0x03)
+                || (self.stall_device
+                    && setup.b_request == request::GET_DESCRIPTOR
+                    && descriptor_type == 0x01);
+            if setup.b_request == request::SET_CONFIGURATION {
+                self.configured = true;
+            }
+            self.state = if setup.w_length == 0 {
+                Ep0::InStatus
+            } else if setup.direction() == Direction::Out {
+                Ep0::OutData(length)
+            } else {
+                Ep0::InData
+            };
+            if stall {
+                self.state = Ep0::Idle;
+            }
+            let data = payload[..length.min(payload.len()).min(MAX_CONTROL_PACKET)].to_vec();
+            self.controller.with_core(|core| {
+                if stall {
+                    core.write_dpram_u32(
+                        regs::ep_buf_ctrl_offset(0, Direction::In),
+                        BUF_CTRL_STALL,
+                    );
+                } else if setup.w_length == 0 || setup.direction() == Direction::In {
+                    Self::arm_in(core, &data);
+                } else {
+                    Self::arm_out(core);
+                }
+            });
+        }
+
+        fn after_in(&mut self) {
+            match self.state {
+                Ep0::InData => {
+                    self.controller.with_core(Self::arm_out);
+                    self.state = Ep0::OutStatus;
+                }
+                Ep0::InStatus => self.state = Ep0::Idle,
+                _ => {}
+            }
+        }
+
+        fn after_out(&mut self) {
+            match self.state {
+                Ep0::OutData(remaining) => {
+                    let left = remaining.saturating_sub(MAX_CONTROL_PACKET);
+                    if left > 0 {
+                        self.controller.with_core(Self::arm_out);
+                        self.state = Ep0::OutData(left);
+                    } else {
+                        self.controller.with_core(|core| Self::arm_in(core, &[]));
+                        self.state = Ep0::InStatus;
+                    }
+                }
+                Ep0::OutStatus => self.state = Ep0::Idle,
+                _ => {}
+            }
+        }
+
+        /// Handle one guest-side interrupt: SETUP first, then buffer status
+        /// 处理一次客户机侧中断：先 SETUP，再处理缓冲状态
+        fn service(&mut self) {
+            if !self.respond {
+                return;
+            }
+            let (setup, buff) = self.controller.with_core(|core| {
+                let setup = (core.read_reg(regs::SIE_STATUS) & SIE_STATUS_SETUP_REC != 0)
+                    .then(|| core.setup_packet());
+                (setup, core.read_reg(regs::BUFF_STATUS))
+            });
+            if let Some(setup) = setup {
+                self.controller.with_core(UsbCore::acknowledge_setup);
+                self.begin(setup);
+                return;
+            }
+            if buff & regs::buff_status_bit(0, Direction::In) != 0 {
+                self.controller.with_core(|core| {
+                    core.write_reg(
+                        regs::BUFF_STATUS,
+                        Alias::Rw,
+                        regs::buff_status_bit(0, Direction::In),
+                    );
+                });
+                self.after_in();
+            }
+            if buff & regs::buff_status_bit(0, Direction::Out) != 0 {
+                self.controller.with_core(|core| {
+                    core.write_reg(
+                        regs::BUFF_STATUS,
+                        Alias::Rw,
+                        regs::buff_status_bit(0, Direction::Out),
+                    );
+                });
+                self.after_out();
+            }
+        }
+
+        fn detach(&self) {
+            self.controller.with_core(|core| {
+                core.write_reg(regs::SIE_CTRL, Alias::Clear, SIE_CTRL_PULLUP_EN);
+            });
+        }
+    }
+
+    /// Drive the bridge and the scripted guest against one shared timeline
+    /// 在同一时间线上驱动主机桥与脚本化客户机
+    fn enumerate(firmware: &mut FakeFirmware) -> (HostProgress, UsbHostBridge) {
+        let mut bridge = UsbHostBridge::new(firmware.controller.clone());
+        let mut now = 0u64;
+        for _ in 0..20_000 {
+            firmware.service();
+            match bridge.poll(now) {
+                HostProgress::Wait(next) => {
+                    now = next.max(now + 1);
+                    firmware.service();
+                }
+                outcome => return (outcome, bridge),
+            }
+        }
+        panic!("enumeration did not terminate");
+    }
+
+    #[test]
+    fn enumeration_discovers_cdc_endpoints_and_skips_stalled_strings() {
+        let mut firmware = FakeFirmware::new();
+        // Devices may STALL string descriptors; enumeration must still finish.
+        // 设备可以对字符串描述符返回 STALL；枚举仍必须完成。
+        firmware.stall_strings = true;
+        let (outcome, bridge) = enumerate(&mut firmware);
+        let HostProgress::Configured(endpoints) = outcome else {
+            panic!("expected configured, got {outcome:?}");
+        };
+        assert_eq!(
+            endpoints,
+            CdcEndpoints {
+                in_address: 0x81,
+                in_max_packet: 64,
+                out_address: 0x02,
+                out_max_packet: 64,
+                interface: 1,
+            }
+        );
+        assert_eq!(bridge.address(), 1);
+        assert!(
+            firmware.configured,
+            "SET_CONFIGURATION must reach the guest"
+        );
+        assert_eq!(
+            bridge.device_info().map(|info| info.vendor_id),
+            Some(0x1209)
+        );
+        assert_eq!(
+            bridge.config_info().and_then(|info| info.data_interface),
+            Some(1)
+        );
+        assert!(bridge.progress_line().contains("stage=configured"));
+    }
+
+    #[test]
+    fn stalled_required_request_fails_enumeration() {
+        let mut firmware = FakeFirmware::new();
+        firmware.stall_device = true;
+        let (outcome, bridge) = enumerate(&mut firmware);
+        assert_eq!(
+            outcome,
+            HostProgress::Failed(HostError::Stall {
+                request: request::GET_DESCRIPTOR
+            })
+        );
+        assert!(bridge.progress_line().contains("stage=failed"));
+    }
+
+    #[test]
+    fn silent_firmware_times_out() {
+        let mut firmware = FakeFirmware::new();
+        firmware.respond = false;
+        let (outcome, _) = enumerate(&mut firmware);
+        assert!(matches!(
+            outcome,
+            HostProgress::Failed(HostError::Timeout { .. })
+        ));
+    }
+
+    #[test]
+    fn losing_the_pull_up_detaches_the_device() {
+        let mut firmware = FakeFirmware::new();
+        firmware.respond = false;
+        let mut bridge = UsbHostBridge::new(firmware.controller.clone());
+        let mut now = 0u64;
+        // First poll attaches, resets the bus and starts the request queue.
+        // 首次轮询完成附着、总线复位并启动请求队列。
+        let _ = bridge.poll(now);
+        now += 1_000_000;
+        let _ = bridge.poll(now);
+        firmware.detach();
+        assert_eq!(bridge.poll(now + 1), HostProgress::Detached);
     }
 }
