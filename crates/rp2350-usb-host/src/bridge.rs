@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use rp2350_usb::controller::Controller;
 use rp2350_usb::endpoint::{InResponse, OutResponse};
-use rp2350_usb::regs::Direction;
+use rp2350_usb::regs::{self, Direction};
 use rp2350_usb::setup::{SetupPacket, request};
 
 use crate::descriptor::{ConfigInfo, DescriptorError, DeviceInfo, parse_config, parse_device};
@@ -13,6 +13,10 @@ use crate::descriptor::{ConfigInfo, DescriptorError, DeviceInfo, parse_config, p
 /// Full-speed control endpoint maximum packet size
 /// 全速控制端点最大包长
 const MAX_CONTROL_PACKET: usize = 64;
+
+/// Number of control-transfer trace entries kept for diagnostics
+/// 为诊断保留的控制传输轨迹条目数
+const TRACE_DEPTH: usize = 12;
 
 /// CDC bulk endpoints discovered during enumeration
 /// 枚举过程中发现的 CDC 批量端点
@@ -135,6 +139,8 @@ pub struct UsbHostBridge {
     /// Transfer snapshot captured before a failure clears it
     /// 失败清空传输前保存的现场快照
     failed_transfer: Option<String>,
+    /// Newest control-transfer events, oldest first / 最新的控制传输事件，最旧在前
+    trace: VecDeque<String>,
 }
 
 impl UsbHostBridge {
@@ -158,6 +164,7 @@ impl UsbHostBridge {
             deadline: 0,
             last_error: None,
             failed_transfer: None,
+            trace: VecDeque::new(),
         }
     }
 
@@ -215,9 +222,16 @@ impl UsbHostBridge {
                 )
             },
         );
+        // EP0 寄存器快照与最近的阶段轨迹能把「设备显式 STALL」与「主机过早
+        // 发送状态令牌 / 设备尚未布防」区分开。
+        // The EP0 register snapshot plus the recent phase trace distinguish a
+        // device-side STALL from a status token issued before the guest armed
+        // the endpoint.
+        let ep0 = self.ep0_snapshot();
+        let trace = self.trace.iter().cloned().collect::<Vec<_>>().join(" | ");
         format!(
             "stage={stage}, address={}, queued={}, transfer=[{transfer}], \
-             device={}, config={}",
+             device={}, config={}, ep0[{ep0}], trace=[{trace}]",
             self.address,
             self.queue.len(),
             self.device.is_some(),
@@ -240,6 +254,43 @@ impl UsbHostBridge {
 
     fn us_to_cycles(&self, microseconds: u64) -> u64 {
         (u64::from(self.sysclk_hz) * microseconds).div_ceil(1_000_000)
+    }
+
+    /// Snapshot of the endpoint-0 state a control transfer depends on
+    /// 控制传输依赖的端点 0 状态快照
+    ///
+    /// `ep0_in`/`ep0_out` are the 16-bit buffer-control halves, `sie` is
+    /// `SIE_STATUS`, `buff` is `BUFF_STATUS`, `cpu` is `BUFF_CPU_SHOULD_HANDLE`
+    /// and `stall_arm` is `EP_STALL_ARM`. A `STALL` bit in `ep0_in` proves the
+    /// device stalled the IN status stage instead of NAK-ing it.
+    /// `ep0_in`/`ep0_out` 为 16 位缓冲控制半字，`sie` 为 `SIE_STATUS`，
+    /// `buff` 为 `BUFF_STATUS`，`cpu` 为 `BUFF_CPU_SHOULD_HANDLE`，
+    /// `stall_arm` 为 `EP_STALL_ARM`。`ep0_in` 中的 `STALL` 位可证明是设备
+    /// 显式 STALL 了 IN 状态阶段，而不是返回 NAK。
+    fn ep0_snapshot(&self) -> String {
+        self.controller.with_core(|core| {
+            let in_ctrl = core.read_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::In));
+            let out_ctrl = core.read_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out));
+            format!(
+                "ep0_in=0x{:04X} ep0_out=0x{:04X} sie=0x{:08X} buff=0x{:08X} \
+                 cpu=0x{:08X} stall_arm=0x{:08X}",
+                in_ctrl & 0xFFFF,
+                out_ctrl & 0xFFFF,
+                core.read_reg(regs::SIE_STATUS),
+                core.read_reg(regs::BUFF_STATUS),
+                core.read_reg(regs::BUFF_CPU_SHOULD_HANDLE),
+                core.read_reg(regs::EP_STALL_ARM),
+            )
+        })
+    }
+
+    /// Append one diagnostic trace entry, dropping the oldest when full
+    /// 追加一条诊断轨迹条目，满时丢弃最旧条目
+    fn trace_event(&mut self, event: String) {
+        if self.trace.len() == TRACE_DEPTH {
+            self.trace.pop_front();
+        }
+        self.trace.push_back(event);
     }
 
     fn begin_enumeration(&mut self, now: u64) {
@@ -365,6 +416,15 @@ impl UsbHostBridge {
                 if let Some(transfer) = self.transfer.as_mut() {
                     transfer.phase = next;
                 }
+                self.trace_event(format!(
+                    "setup kind={:?} req=0x{:02X} w_value=0x{:04X} w_index=0x{:04X} \
+                     w_length={}",
+                    request.kind,
+                    request.setup.b_request,
+                    request.setup.w_value,
+                    request.setup.w_index,
+                    request.setup.w_length
+                ));
                 self.retry_at = now + self.us_to_cycles(20);
                 HostProgress::Wait(self.retry_at)
             }
@@ -460,25 +520,55 @@ impl UsbHostBridge {
         let Some(request) = self.transfer.as_ref().map(|t| t.request.clone()) else {
             return HostProgress::Wait(now);
         };
-        if request.setup.direction() == Direction::In {
-            match self.controller.host_out(0, &[]) {
-                OutResponse::NoDevice => self.device_lost(),
-                OutResponse::Nak => self.nak(now),
-                OutResponse::Stall => self.fail(HostError::Stall {
-                    request: request.setup.b_request,
-                }),
-                OutResponse::Ack { .. } => self.complete_transfer(now),
+        // 状态阶段是控制传输最容易误判的阶段：OUT 请求的状态阶段由设备发
+        // IN ZLP，IN 请求的状态阶段由主机发 OUT ZLP。先记录 EP0 现场再发令牌。
+        // The status stage is where control transfers are easiest to misjudge:
+        // an OUT request ends with a device IN ZLP, an IN request with a host
+        // OUT ZLP. Snapshot EP0 before issuing the token.
+        let snapshot = self.ep0_snapshot();
+        let direction = request.setup.direction();
+        let (outcome, progress) = if direction == Direction::In {
+            let response = self.controller.host_out(0, &[]);
+            match response {
+                OutResponse::NoDevice => ("no-device", self.device_lost()),
+                OutResponse::Nak => ("nak", self.nak(now)),
+                OutResponse::Stall => (
+                    "stall",
+                    self.fail(HostError::Stall {
+                        request: request.setup.b_request,
+                    }),
+                ),
+                OutResponse::Ack { last } => (
+                    if last { "ack-last" } else { "ack" },
+                    self.complete_transfer(now),
+                ),
             }
         } else {
-            match self.controller.host_in(0) {
-                InResponse::NoDevice => self.device_lost(),
-                InResponse::Nak => self.nak(now),
-                InResponse::Stall => self.fail(HostError::Stall {
-                    request: request.setup.b_request,
-                }),
-                InResponse::Data(_) => self.complete_transfer(now),
+            let response = self.controller.host_in(0);
+            match response {
+                InResponse::NoDevice => ("no-device", self.device_lost()),
+                InResponse::Nak => ("nak", self.nak(now)),
+                InResponse::Stall => (
+                    "stall",
+                    self.fail(HostError::Stall {
+                        request: request.setup.b_request,
+                    }),
+                ),
+                InResponse::Data(packet) => (
+                    if packet.is_empty() {
+                        "data-zlp"
+                    } else {
+                        "data"
+                    },
+                    self.complete_transfer(now),
+                ),
             }
-        }
+        };
+        self.trace_event(format!(
+            "status req=0x{:02X} dir={direction:?} {snapshot} -> {outcome}",
+            request.setup.b_request
+        ));
+        progress
     }
 
     fn nak(&mut self, now: u64) -> HostProgress {
