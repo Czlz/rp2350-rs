@@ -16,6 +16,7 @@
 | `conditions` | `Condition` (15 codes), `ITBlockState` (1-4 instruction blocks) |
 | `execute_thumb16` | Thumb-16 decoder + executor (~90 instructions) |
 | `execute_thumb32` | Thumb-32 decoder + executor (60+ ALU / Load-Store / system instructions) |
+| `execute_thumb32::dsp` | Packed SIMD parallel add/subtract with APSR.GE (`SADD8` … `USUB16`) |
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
@@ -82,8 +83,10 @@ impl CortexM33Registers {
     pub fn apsr_c(&self) -> bool;
     pub fn apsr_v(&self) -> bool;
     pub fn apsr_q(&self) -> bool;
+    pub fn apsr_ge(&self) -> u32;             // APSR[19:16]
     pub fn set_apsr_nzcv(&mut self, n: bool, z: bool, c: bool, v: bool);
     pub fn set_apsr_q(&mut self, q: bool);
+    pub fn set_apsr_ge(&mut self, ge: u32);
 
     // Stack control
     pub fn get_sp(&self, spsel: bool) -> u32;
@@ -296,15 +299,64 @@ pub enum StepResult {
 
 The Thumb-32 decoder is fully implemented (see `execute_thumb32`): 60+ ALU,
 load/store and miscellaneous system instructions, plus the FPU and
-coprocessor chapters below. DSP halfword multiplies are covered for
-`SMULBB/SMULBT/SMULTB/SMULTT`, their `SMLA*` accumulating forms and
-`SMMUL/SMMLA` high-word modular forms. Packed SIMD such as `SADD8`/`USADA8`
-and the `SXTB16/UXTB16` pair remain undefined.
+coprocessor chapters below.
+
+DSP coverage / DSP 覆盖清单:
+
+- **Halfword multiply**: `SMULBB/SMULBT/SMULTB/SMULTT`, their `SMLA*`
+  accumulating forms (including the `Q` overflow flag) and the
+  `SMMUL/SMMLA` high-word modular forms.
+- **Packed parallel add/subtract** (`execute_thumb32::dsp`):
+  `SADD8/SSUB8/SADD16/SSUB16` and `UADD8/USUB8/UADD16/USUB16`.
+  Each byte/halfword lane is computed independently and wraps modulo
+  2^8/2^16. `APSR.GE` receives one flag per byte lane, or a duplicated
+  pair per halfword lane (`GE[1:0]` for bits[15:0], `GE[3:2]` for
+  bits[31:16]). Signed variants set GE when the full-width sum or
+  difference is `>= 0`; unsigned variants set GE on carry-out (add) or
+  no-borrow (subtract). N, Z, C, V and Q are unchanged, and GE never
+  participates in the `GE`/`LT` condition codes (those still test
+  `N == V`).
+- **Packed byte extend**: `SXTB16/UXTB16` with the `ror #0/#8/#16/#24`
+  rotate field. Flags are unchanged. The accumulating `SXTAB16/UXTAB16`
+  forms remain undefined.
+- **Sum of absolute differences**: `USAD8` (Ra = 1111) and `USADA8`
+  (accumulate into Ra). Flags are unchanged.
+
+Still undefined / 仍未实现: saturating (`QADD8/QSUB8/QADD16/QSUB16`,
+`UQADD*`, `UQSUB*`), halving (`SHADD*`, `SHSUB*`, `UHADD*`, `UHSUB*`),
+exchange (`SASX/SSAX/UASX/USAX`) and `SEL`.
+
+`APSR.GE` is stored in `xpsr[19:16]` (`apsr_ge`/`set_apsr_ge`), is
+preserved by `set_apsr_nzcv` and exception stacking, and is readable and
+writable through `MRS APSR` / `MSR APSR_g` / `MSR APSR_nzcvqg`.
+
 Thumb-32 解码器已完整实现（见 `execute_thumb32`）：60+ 条 ALU、Load/Store
-与杂项系统指令，以及下文的 FPU 与协处理器章节。DSP 半字乘法已覆盖
-`SMULBB/SMULBT/SMULTB/SMULTT`、对应的 `SMLA*` 累加形式与
-`SMMUL/SMMLA` 高字模乘；`SADD8`/`USADA8` 等打包 SIMD 与
-`SXTB16/UXTB16` 仍未实现。
+与杂项系统指令，以及下文的 FPU 与协处理器章节。
+
+DSP 覆盖清单：
+
+- **半字乘法**：`SMULBB/SMULBT/SMULTB/SMULTT`、对应的 `SMLA*` 累加形式
+  （含 `Q` 溢出标志）与 `SMMUL/SMMLA` 高字模乘。
+- **打包并行加/减**（`execute_thumb32::dsp`）：
+  `SADD8/SSUB8/SADD16/SSUB16` 与 `UADD8/USUB8/UADD16/USUB16`。
+  每个字节/半字通道独立运算并按 2^8/2^16 回绕。`APSR.GE` 为每个字节
+  通道写入一个标志，半字通道写入一对重复标志（bits[15:0] 对应
+  `GE[1:0]`，bits[31:16] 对应 `GE[3:2]`）。有符号变体在完整宽度和/差
+  大于等于零时置 GE；无符号变体在加法产生进位、减法无借位时置 GE。
+  N、Z、C、V、Q 不变，GE 也绝不参与 `GE`/`LT` 条件码（后者仍比较
+  `N == V`）。
+- **打包字节扩展**：`SXTB16/UXTB16`，支持 `ror #0/#8/#16/#24`
+  rotate 字段，不更新标志。累加形式 `SXTAB16/UXTAB16` 仍未实现。
+- **绝对差之和**：`USAD8`（Ra = 1111）与 `USADA8`（累加到 Ra），
+  不更新标志。
+
+仍未实现：饱和（`QADD8/QSUB8/QADD16/QSUB16`、`UQADD*`、`UQSUB*`）、
+折半（`SHADD*`、`SHSUB*`、`UHADD*`、`UHSUB*`）、交换
+（`SASX/SSAX/UASX/USAX`）与 `SEL`。
+
+`APSR.GE` 存放于 `xpsr[19:16]`（`apsr_ge`/`set_apsr_ge`），
+`set_apsr_nzcv` 与异常压栈都会保留它，并可通过 `MRS APSR` /
+`MSR APSR_g` / `MSR APSR_nzcvqg` 读写。
 
 ---
 

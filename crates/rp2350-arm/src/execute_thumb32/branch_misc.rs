@@ -109,8 +109,10 @@ fn execute_mrs(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
     let rd = ((instr >> 8) & 0xF) as u8;
     let sysm = (instr & 0xFF) as u8;
     let value = match sysm {
-        0x00 => regs.xpsr & 0xF800_0000, // APSR
-        0x03 => regs.xpsr & 0xFF00_01FF, // xPSR / PSR
+        // APSR: NZCVQ plus GE[3:0] (ARMv8-M APSR bits[19:16]).
+        // APSR：NZCVQ 加上 GE[3:0]（ARMv8-M APSR 的 bits[19:16]）。
+        0x00 => regs.xpsr & 0xF80F_0000,
+        0x03 => regs.xpsr & 0xFF0F_01FF, // xPSR / PSR
         0x05 => regs.xpsr & 0x0000_01FF, // IPSR
         0x10 => regs.primask & 1,        // PRIMASK
         0x11 | 0x12 => regs.basepri,     // BASEPRI / BASEPRI_MAX (reads current BASEPRI)
@@ -138,12 +140,26 @@ fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult 
             let value = regs.read(rn);
             match sysm {
                 0x00 => {
-                    regs.set_apsr_nzcv(
-                        value & 0x8000_0000 != 0,
-                        value & 0x4000_0000 != 0,
-                        value & 0x2000_0000 != 0,
-                        value & 0x1000_0000 != 0,
-                    );
+                    // APSR writes are qualified by the mask field in
+                    // bits[11:8]: 0b1000 = nzcvq, 0b0100 = g, 0b1100 = both.
+                    // APSR 写入由 bits[11:8] 的掩码字段限定：
+                    // 0b1000 = nzcvq，0b0100 = g，0b1100 = 两者。
+                    let mask = (instr >> 8) & 0xF;
+                    if mask & 0x8 != 0 {
+                        regs.set_apsr_nzcv(
+                            value & 0x8000_0000 != 0,
+                            value & 0x4000_0000 != 0,
+                            value & 0x2000_0000 != 0,
+                            value & 0x1000_0000 != 0,
+                        );
+                        regs.set_apsr_q(value & (1 << 27) != 0);
+                    }
+                    if mask & 0x4 != 0 {
+                        regs.set_apsr_ge((value >> 16) & 0xF);
+                    }
+                    if mask & 0x3 != 0 || mask == 0 {
+                        return StepResult::Undefined;
+                    }
                 }
                 0x10 => regs.primask = value & 1,
                 0x11 => regs.basepri = value,

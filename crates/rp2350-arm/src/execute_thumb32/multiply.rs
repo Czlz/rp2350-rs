@@ -93,6 +93,34 @@ pub(super) fn execute(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
             regs.write(rd, accumulated as u32);
             StepResult::Ok
         }
+        // USAD8/USADA8 (DSP extension): sum of the absolute differences of the
+        // four byte lanes. Ra = 15 selects the non-accumulating USAD8 form.
+        // Flags are not modified.
+        // USAD8/USADA8（DSP 扩展）：四个字节通道绝对差之和。Ra = 15 表示
+        // 非累加的 USAD8 形式。不更新标志。
+        0x7 => {
+            if bits7_4 != 0x0 {
+                return StepResult::Undefined;
+            }
+            if rd == 15 {
+                return StepResult::Undefined;
+            }
+            let a = regs.read(rn);
+            let b = regs.read(rm);
+            let mut sum = 0u32;
+            for i in 0..4u32 {
+                let a_lane = (a >> (i * 8)) & 0xFF;
+                let b_lane = (b >> (i * 8)) & 0xFF;
+                sum += a_lane.abs_diff(b_lane);
+            }
+            let result = if ra_or_lo == 0xF {
+                sum
+            } else {
+                regs.read(ra_or_lo).wrapping_add(sum)
+            };
+            regs.write(rd, result);
+            StepResult::Ok
+        }
         // SMULL: signed 64-bit product, low word in bits[15:12], high in [11:8].
         // SMULL：有符号 64 位乘积，低位字写入 bits[15:12]，高位字写入 [11:8]。
         0x8 => {

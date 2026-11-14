@@ -255,6 +255,26 @@ impl CortexM33Registers {
         self.xpsr & 0x1000_0000 != 0
     }
 
+    /// Extract the four GE flags from `APSR[19:16]`
+    /// 从 `APSR[19:16]` 提取四个 GE 标志
+    ///
+    /// `GE[0]` corresponds to `bits[7:0]` (or `[15:0]`) of a packed SIMD result
+    /// and `GE[3]` to `bits[31:24]` (or `[31:16]`). GE is not part of the NZCV
+    /// condition flags: the `GE`/`LT` condition codes still test `N == V`.
+    /// `GE[0]` 对应打包 SIMD 结果的 `bits[7:0]`（或 `[15:0]`），`GE[3]` 对应
+    /// `bits[31:24]`（或 `[31:16]`）。GE 不属于 NZCV 条件标志：`GE`/`LT`
+    /// 条件码仍然比较 `N == V`。
+    #[must_use]
+    pub fn apsr_ge(&self) -> u32 {
+        (self.xpsr >> 16) & 0xF
+    }
+
+    /// Write the four GE flags into `APSR[19:16]`
+    /// 把四个 GE 标志写入 `APSR[19:16]`
+    pub fn set_apsr_ge(&mut self, ge: u32) {
+        self.xpsr = (self.xpsr & !0x000F_0000) | ((ge & 0xF) << 16);
+    }
+
     /// Update NZCV flags from APSR condition flag values
     /// 从 APSR 条件标志值更新 NZCV 标志
     pub fn set_apsr_nzcv(&mut self, n: bool, z: bool, c: bool, v: bool) {
@@ -306,9 +326,19 @@ impl CortexM33Registers {
         }
     }
 
+    /// Write the cumulative saturation flag (APSR.Q)
+    /// 写入累积饱和标志（APSR.Q）
+    pub fn set_apsr_q(&mut self, q: bool) {
+        if q {
+            self.xpsr |= 1 << 27;
+        } else {
+            self.xpsr &= !(1 << 27);
+        }
+    }
+
     /// Set the cumulative saturation flag (APSR.Q) / 设置累积饱和标志（APSR.Q）
     pub fn set_q_flag(&mut self) {
-        self.xpsr |= 1 << 27;
+        self.set_apsr_q(true);
     }
 }
 
@@ -408,6 +438,45 @@ mod tests {
         assert!(!regs.apsr_z());
         assert!(regs.apsr_c());
         assert!(!regs.apsr_v());
+    }
+
+    #[test]
+    fn ge_flags_round_trip_without_touching_nzcv() {
+        let mut regs = CortexM33Registers::new();
+        regs.set_apsr_ge(0b1010);
+        assert_eq!(regs.apsr_ge(), 0b1010);
+
+        // NZCV updates must leave GE untouched and vice versa.
+        // NZCV 更新不得改动 GE，反之亦然。
+        regs.set_apsr_nzcv(true, false, true, false);
+        assert_eq!(regs.apsr_ge(), 0b1010);
+        assert!(regs.apsr_n());
+        assert!(!regs.apsr_z());
+        assert!(regs.apsr_c());
+        assert!(!regs.apsr_v());
+
+        regs.set_apsr_ge(0b1111);
+        assert!(regs.apsr_n());
+        assert!(!regs.apsr_z());
+        assert!(regs.apsr_c());
+        assert!(!regs.apsr_v());
+
+        // GE/LT condition codes use N == V, never APSR.GE.
+        // GE/LT 条件码使用 N == V，绝不读取 APSR.GE。
+        assert!(!Condition::Ge.evaluate(&regs));
+        assert!(Condition::Lt.evaluate(&regs));
+    }
+
+    #[test]
+    fn set_apsr_q_updates_only_bit_27() {
+        let mut regs = CortexM33Registers::new();
+        regs.set_apsr_ge(0b0101);
+        regs.set_apsr_q(true);
+        assert_eq!(regs.xpsr & (1 << 27), 1 << 27);
+        assert_eq!(regs.apsr_ge(), 0b0101);
+        regs.set_apsr_q(false);
+        assert_eq!(regs.xpsr & (1 << 27), 0);
+        assert_eq!(regs.apsr_ge(), 0b0101);
     }
 
     #[test]

@@ -13,21 +13,21 @@ use crate::execute_thumb16::StepResult;
 use crate::registers::CortexM33Registers;
 
 use super::{
-    ShiftType, add_with_carry, set_arith_flags, set_logic_flags, shift_immediate, shift_register,
-    sign_extend, sub_with_carry,
+    ShiftType, add_with_carry, dsp, set_arith_flags, set_logic_flags, shift_immediate,
+    shift_register, sign_extend, sub_with_carry,
 };
 
 /// Execute data-processing (modified immediate), `op1 == 0b10`, bit 25 clear
 /// 执行数据处理（改良立即数），`op1 == 0b10`，位 25 清零
 ///
-/// The opcode nibble is instruction bits [24:21] and the S bit is bit 20.
-/// The 12-bit immediate is `i:imm3:imm8` (i = bit 26, imm3 = bits [14:12],
-/// imm8 = bits [7:0]) and is expanded by [`thumb_expand_imm`]. This group
+/// The opcode nibble is instruction `bits[24:21]` and the S bit is bit 20.
+/// The 12-bit immediate is `i:imm3:imm8` (i = bit 26, imm3 = `bits[14:12]`,
+/// imm8 = `bits[7:0]`) and is expanded by [`thumb_expand_imm`]. This group
 /// also encodes `MOV.W` (ORR with Rn = 1111), `MVN.W` (ORN with Rn = 1111),
 /// the flag-only forms `TST/TEQ/CMN/CMP` (Rd = 1111 with S = 1), and the
 /// `ADD/SUB (SP) immediate` forms where Rn = Rd = 1101.
-/// 操作码半字节为指令位 [24:21]，S 位为位 20。12 位立即数为
-/// `i:imm3:imm8`（i = 位 26，imm3 = 位段 [14:12]，imm8 = 位段 [7:0]），由
+/// 操作码半字节为指令 `bits[24:21]`，S 位为位 20。12 位立即数为
+/// `i:imm3:imm8`（i = 位 26，imm3 = `bits[14:12]`，imm8 = `bits[7:0]`），由
 /// [`thumb_expand_imm`] 展开。该组还编码 `MOV.W`（Rn = 1111 的 ORR）、
 /// `MVN.W`（Rn = 1111 的 ORN）、仅改标志的 `TST/TEQ/CMN/CMP`
 ///（Rd = 1111 且 S = 1）以及 Rn = Rd = 1101 的 `ADD/SUB (SP) immediate`。
@@ -243,6 +243,39 @@ pub(super) fn execute_register_shifted_or_misc(
     // Register-controlled shifts require bits[15:12] = 1111.
     // 寄存器控制移位要求 bits[15:12] = 1111。
     let fixed_hi = ((instr >> 12) & 0xF) == 0xF;
+
+    // Packed SIMD parallel add/subtract shares this top-level opcode range but
+    // occupies a disjoint encoding space.
+    // 打包 SIMD 并行加/减共享该顶层操作码范围，但编码空间互不重叠。
+    if let Some(result) = dsp::try_execute(instr, regs) {
+        return result;
+    }
+
+    // Parallel byte extend: SXTB16/UXTB16 sign- or zero-extend bytes[7:0] and
+    // [23:16] into two halfwords, honouring the same rotate field as SXTB.
+    // Flags are not modified by these two encodings.
+    // 并行字节扩展：SXTB16/UXTB16 把 bytes[7:0] 与 [23:16] 符号/零扩展到两个
+    // 半字，rotate 字段与 SXTB 一致。这两条编码不更新标志。
+    if fixed_hi && matches!(bits23_20, 0x2 | 0x3) && (0x8..=0xB).contains(&hw2_bits7_4) {
+        // SXTAB16/UXTAB16 (Rn != 1111) are not modeled.
+        // 不建模 SXTAB16/UXTAB16（Rn != 1111）。
+        if rn_field != 0xF || rd == 15 {
+            return StepResult::Undefined;
+        }
+        let rotate = ((instr >> 4) & 0x3) * 8;
+        let value = regs.read(rm).rotate_right(rotate);
+        let result = if bits23_20 == 0x2 {
+            let low = sign_extend(value & 0xFF, 8) & 0xFFFF;
+            let high = (sign_extend((value >> 16) & 0xFF, 8) & 0xFFFF) << 16;
+            high | low
+        } else {
+            // UXTB16 keeps bytes 0 and 2 in place; bytes 1 and 3 are dropped.
+            // UXTB16 保留字节 0 与 2 的位置，丢弃字节 1 与 3。
+            (value & 0xFF) | (value & 0x00FF_0000)
+        };
+        regs.write(rd, result);
+        return StepResult::Ok;
+    }
 
     // Extend instructions: Rn determines the plain or accumulating form and
     // second-halfword bits[7:4] = 0b10xx carry the rotate amount in bits[5:4].
