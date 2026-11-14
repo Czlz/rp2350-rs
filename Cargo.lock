@@ -3298,6 +3298,7 @@ dependencies = [
  "rp2350-egui",
  "rp2350-ffi",
  "rp2350-gdb",
+ "rp2350-mcp",
  "rp2350-periph",
  "rp2350-riscv",
  "rp2350-usb",
@@ -3425,6 +3426,16 @@ version = "0.1.0"
 dependencies = [
  "rp2350-core",
  "rp2350-cpu",
+]
+
+[[package]]
+name = "rp2350-uart-terminal"
+version = "0.1.0"
+dependencies = [
+ "rp2350-core",
+ "rp2350-plugin",
+ "rp2350-virt-periph",
+ "serde_json",
 ]
 
 [[package]]

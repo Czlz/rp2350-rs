@@ -1,0 +1,20 @@
+[package]
+name = "rp2350-uart-terminal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rp2350_uart_terminal"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rp2350-plugin = { workspace = true }
+rp2350-virt-periph = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rp2350-core = { workspace = true }

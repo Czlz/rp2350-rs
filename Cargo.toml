@@ -17,6 +17,7 @@ members = [
     "crates/rp2350-cli",
     "crates/rp2350-mcp",
     "plugins/led",
+    "plugins/uart-terminal",
 ]
 
 [workspace.package]
@@ -79,6 +80,7 @@ rp2350-egui = { path = "crates/rp2350-egui" }
 rp2350-cli = { path = "crates/rp2350-cli" }
 rp2350-mcp = { path = "crates/rp2350-mcp" }
 rp2350-led-plugin = { path = "plugins/led" }
+rp2350-uart-terminal = { path = "plugins/uart-terminal" }
 
 [profile.release]
 opt-level = 3

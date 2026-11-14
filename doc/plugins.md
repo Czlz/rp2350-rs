@@ -1,9 +1,10 @@
 # Plugin Development Guide / 插件开发指南
 
 > All virtual devices (first-party and third-party) live in the `plugins/` directory as independent crates.
-> Currently only the reference LED plugin has landed; the others below are planned.
+> Two device plugins have landed so far: the reference LED plugin and the UART terminal;
+> the others below are planned.
 > 所有虚拟设备（第一方和第三方）作为独立 crate 存放在 `plugins/` 目录。
-> 目前仅参考 LED 插件落地，其余为规划项。
+> 目前已有两个插件落地：参考 LED 插件与 UART 终端，其余为规划项。
 
 ---
 
@@ -17,8 +18,12 @@ plugins/
 │   │   └── lib.rs
 │   └── tests/
 │       └── dynamic_load.rs    #   loads the built .dll via DeviceManager
+├── uart-terminal/             # UART Terminal (first-party, landed / 已落地)
+│   ├── Cargo.toml             #   cdylib + rlib
+│   └── src/
+│       ├── lib.rs             #   bit-level UART decoder / serializer
+│       └── tests.rs           #   bit-timing tests (115200 / 9600)
 ├── tfcard/                    # (planned / 规划中) TF Card — SPI + SDIO
-├── uart-terminal/             # (planned / 规划中) UART Terminal
 ├── debug-probe/               # (planned / 规划中) Debug Probe
 ├── psram/                     # (planned / 规划中) PSRAM
 ├── qspi-flash/                # (planned / 规划中) QSPI Flash
@@ -172,6 +177,116 @@ pub extern "C" fn rp2350_device_plugin_create() -> *mut dyn DevicePlugin {
 > 没有 destroy 导出：宿主用 `Box::from_raw` 回收实例，`SafeLibrary` RAII 关闭库。
 > No destroy export: the host reclaims the instance via `Box::from_raw`, and
 > `SafeLibrary` RAII closes the library.
+
+---
+
+## Landed Example / 已落地示例：UART Terminal（`plugins/uart-terminal`）
+
+A bit-level UART terminal: it samples the MCU's `TX` line, decodes
+start bit + data bits (LSB first) + stop bit into bytes, and can shift bytes
+back out on the `RX` line at the configured baud rate.
+一个位级 UART 终端：采样 MCU 的 `TX` 线，把 起始位 + 数据位（LSB 优先）+ 停止位
+解码为字节，并能按配置的波特率在 `RX` 线上把字节移出。
+
+| Item / 项目 | Value / 值 |
+|-------------|-----------|
+| Device ID | `com.rp2350-rs.uart-terminal` |
+| Name | `UART_TERMINAL` |
+| Ports | `0 = TX` (`Input`, sampled from MCU GPIO) · `1 = RX` (`Output`, drives MCU GPIO) |
+| GUI | `has_ui = false` (headless only / 纯无头) |
+| Tags | `["uart", "terminal"]` |
+| Library | `rp2350_uart_terminal.dll` / `librp2350_uart_terminal.so` / `.dylib` |
+
+### Configuration / 配置
+
+`config_schema()` properties (all optional / 全部可选)：
+
+| Field | Type | Default | Meaning / 含义 |
+|-------|------|---------|----------------|
+| `baud` | integer | `115200` | Line speed, `1..=10_000_000` / 波特率 |
+| `data_bits` | integer | `8` | Data bits per frame, `5..=8` / 每帧数据位 |
+| `stop_bits` | integer | `1` | Stop bits per frame, `1..=2` / 每帧停止位 |
+| `rx_line` | boolean | `true` | Idle (mark) level of the `RX` line / `RX` 空闲电平 |
+| `clock_hz` | integer | `150000000` | Cycles per second used to derive bit timing / 由周期换算位时间的时钟频率 |
+
+```jsonc
+// apply_config example / apply_config 示例
+{ "baud": 9600, "data_bits": 8, "stop_bits": 1, "rx_line": true }
+```
+
+Invalid values (wrong JSON type, `baud = 0`, `data_bits = 9`, `stop_bits = 0`,
+`clock_hz = 0`, `baud > clock_hz`) return `ConfigError::InvalidType` /
+`ConfigError::OutOfRange`; a rejected configuration never mutates the device.
+非法值返回 `ConfigError::InvalidType` / `ConfigError::OutOfRange`；
+被拒绝的配置不会改变设备状态。
+
+### Timing / 时序
+
+`PluginContext::current_cycles()` only exposes cycles, so the bit period is
+`bit_cycles = clock_hz / baud`. The receiver samples at bit **centers**
+(1.5 · bit_cycles after the observed start edge, then every `bit_cycles`),
+and one `tick()` may cover several sample points — using absolute cycles keeps
+chunked host stepping drift-free. At the default 150 MHz clock a 115200 baud
+bit lasts 1302 cycles; steering `clock_hz` also lets hosts match any other
+system clock.
+`PluginContext::current_cycles()` 只暴露周期数，因此位周期为
+`bit_cycles = clock_hz / baud`。接收端在位**中心**采样（观察到起始边沿后
+1.5 · bit_cycles，之后每 `bit_cycles` 一次），一次 `tick()` 可跨过多个采样点；
+采用绝对周期可避免主机分块推进产生漂移。默认 150 MHz 时钟下 115200 波特率的
+一位为 1302 周期；调整 `clock_hz` 可匹配其它系统时钟。
+
+A frame whose stop bit does not match the idle level is dropped and counted in
+`framing_errors`. 停止位不等于空闲电平的帧会被丢弃并计入 `framing_errors`。
+
+### State snapshot / 状态快照
+
+```jsonc
+{
+  "name": "UART_TERMINAL",
+  "baud": 115200, "data_bits": 8, "stop_bits": 1,
+  "rx_line": true, "clock_hz": 150000000, "bit_cycles": 1302,
+  "rx_bytes": 1,            // bytes decoded from TX / 从 TX 解码的字节数
+  "tx_bytes": 0,            // bytes shifted out on RX / 从 RX 移出的字节数
+  "last_byte": 65,          // last decoded byte, null before the first / 最近解码字节
+  "last_tx_byte": null,     // last byte shifted out on RX / 最近移出字节
+  "buffer_len": 1,          // retained receive bytes (max 4096) / 缓冲字节数
+  "framing_errors": 0,
+  "recent_hex": "41",       // last 16 bytes as hex / 最近 16 字节十六进制
+  "recent_ascii": "A"       // last 16 bytes as printable ASCII / 可打印形式
+}
+```
+
+### Sending bytes (device → host) / 发送字节（device → host）
+
+`send_byte(byte)` / `send_bytes(&[u8])` queue bytes that the next `tick()`
+calls shift out on the `RX` output port (start bit, LSB-first data, stop bit).
+There is **no MCP entry point** for this direction yet, so it is reachable only
+from library callers and tests; wiring `send_byte` into the MCP/CLI layer is
+pending.
+`send_byte(byte)` / `send_bytes(&[u8])` 将字节排入队列，后续 `tick()` 在 `RX`
+输出端口移出（起始位、LSB 优先数据、停止位）。该方向**尚无 MCP 入口**，
+目前只能由库调用方与测试触发；把 `send_byte` 接入 MCP/CLI 层待完成。
+
+### Build & inspect / 编译与查看
+
+```bash
+cargo build --release -p rp2350-uart-terminal
+cargo test -p rp2350-uart-terminal          # 11 tests / 11 个测试
+cargo run --release -p rp2350-cli -- list-devices --plugin-dir target/release
+# com.rp2350-rs.led / LED / has_ui=false / ports=[LED]
+# com.rp2350-rs.uart-terminal / UART_TERMINAL / has_ui=false / ports=[TX,RX]
+```
+
+Wiring example (MCU GPIO4 → `TX`, MCU GPIO5 ← `RX`):
+接线示例（MCU GPIO4 → `TX`，MCU GPIO5 ← `RX`）：
+
+```bash
+cargo run --release -p rp2350-cli -- wire --plugin-dir target/release \
+      --device com.rp2350-rs.uart-terminal --port 0 --gpio 4
+```
+
+> Wiring is one-shot today (no persistence, no emulator attach) — same as the
+> LED plugin. 与 LED 插件相同，接线目前是一次性的（无持久化、不挂接模拟器）。
 
 ---
 
