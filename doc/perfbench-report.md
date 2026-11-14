@@ -38,7 +38,7 @@ MicroPython 性能套件结果。目标为两个原生 RP2350 MicroPython 固件
 | Rust | `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0` |
 | Python (driver + truth) | CPython 3.14.4 via the Windows `py` launcher |
 | Emulator build | `cargo build --release -p rp2350-cli` |
-| Emulator revision | `0a599a0` (FPv5-SP arithmetic fix) |
+| Emulator revision | `1f71b9f` (PIO pins, FPv5-SP arithmetic + lazy stacking, MCP auth) |
 | Harness revision | `d2d095d0fe6e83c53fd0ef90643f7d2b8b1c1645` |
 | Harness changes | **none** to `run-perfbench.py`, `test_utils.py` or `perf_bench/*` |
 
@@ -128,26 +128,26 @@ Table columns / 列说明:
 | Benchmark | Arm ticks (µs) | Arm score | RISC-V ticks (µs) | RISC-V score | Arm/RISC-V ticks | Status |
 |---|---:|---:|---:|---:|---:|---|
 | `bm_chaos` | 68,267 | 732 | 87,200 | 573 | 0.78x | pass |
-| `bm_fannkuch` | 40,533 | 148 | 48,400 | 124 | 0.84x | pass |
-| `bm_fft` | 145,733 | 5,270 | 237,600 | 3,232 | 0.61x | pass |
-| `bm_float` | 21,666 | 11,539 | 49,534 | 5,047 | 0.44x | pass |
+| `bm_fannkuch` | 40,534 | 148 | 48,400 | 124 | 0.84x | pass |
+| `bm_fft` | 145,734 | 5,270 | 237,534 | 3,233 | 0.61x | pass |
+| `bm_float` | 21,667 | 11,538 | 49,533 | 5,047 | 0.44x | pass |
 | `bm_hexiom` | 94,334 | 106 | 111,867 | 89 | 0.84x | pass |
-| `bm_nqueens` | 118,666 | 8,427 | 142,467 | 7,019 | 0.83x | pass |
-| `bm_pidigits` | 48,200 | 1,349 | 58,934 | 1,103 | 0.82x | pass |
+| `bm_nqueens` | 118,666 | 8,427 | 142,600 | 7,013 | 0.83x | pass |
+| `bm_pidigits` | 48,200 | 1,349 | 58,933 | 1,103 | 0.82x | pass |
 | `bm_wordcount` | 70,400 | 114 | 86,933 | 92 | 0.81x | pass |
-| `core_import_mpy_multi` | 38,133 | 1,311 | 43,400 | 1,152 | 0.88x | pass |
-| `core_import_mpy_single` | 4,600 | 217 | 5,133 | 195 | 0.90x | pass |
-| `core_locals` | 84,067 | 95 | 91,800 | 87 | 0.92x | pass |
-| `core_qstr` | 12,133 | 330 | 12,800 | 312 | 0.95x | pass |
+| `core_import_mpy_multi` | 38,067 | 1,313 | 43,400 | 1,152 | 0.88x | pass |
+| `core_import_mpy_single` | 4,533 | 221 | 5,200 | 192 | 0.87x | pass |
+| `core_locals` | 84,133 | 95 | 91,800 | 87 | 0.92x | pass |
+| `core_qstr` | 12,200 | 328 | 12,867 | 311 | 0.95x | pass |
 | `core_str` | 127,534 | 47 | 128,467 | 47 | 0.99x | pass |
-| `core_yield_from` | 33,534 | 596 | 43,467 | 460 | 0.77x | pass |
+| `core_yield_from` | 33,533 | 596 | 43,467 | 460 | 0.77x | pass |
 | `misc_aes` | 36,200 | 884 | 46,533 | 688 | 0.78x | pass |
-| `misc_mandel` | 59,866 | 6,682 | 108,867 | 3,674 | 0.55x | pass |
-| `misc_pystone` | 60,467 | 4,961 | 72,067 | 4,163 | 0.84x | pass |
-| `misc_raytrace` | 66,867 | 748 | 83,600 | 598 | 0.80x | pass |
-| `viper_call0` | 33,600 | 893 | 36,000 | 833 | 0.93x | pass |
-| `viper_call1a` | 34,867 | 860 | 37,200 | 806 | 0.94x | pass |
-| `viper_call1b` | 42,066 | 713 | 44,800 | 670 | 0.94x | pass |
+| `misc_mandel` | 59,867 | 6,681 | 108,934 | 3,672 | 0.55x | pass |
+| `misc_pystone` | 60,533 | 4,956 | 72,066 | 4,163 | 0.84x | pass |
+| `misc_raytrace` | 66,933 | 747 | 83,533 | 599 | 0.80x | pass |
+| `viper_call0` | 33,600 | 893 | 36,067 | 832 | 0.93x | pass |
+| `viper_call1a` | 34,800 | 862 | 37,200 | 806 | 0.94x | pass |
+| `viper_call1b` | 42,000 | 714 | 44,800 | 670 | 0.94x | pass |
 | `viper_call1c` | 42,000 | 714 | 44,867 | 669 | 0.94x | pass |
 | `viper_call2a` | 35,600 | 843 | 38,000 | 789 | 0.94x | pass |
 | `viper_call2b` | 47,867 | 627 | 51,000 | 588 | 0.94x | pass |
@@ -223,14 +223,16 @@ stdio bridge adds no measurable perturbation:
 
 Guest ticks depend on the executed instruction stream and on when USB
 interrupts are delivered, not on host speed or parallel load. Repeat runs of the
-same benchmark on the same firmware agree to within a few timer ticks
-(<0.2%; at most 67 ticks in the runs above), so the `-a 1` choice reports
-`0.0000` standard deviation. Use `-a 8` when variance is the goal, at 8× the
-wall-clock cost.
+same benchmark on the same firmware differ by at most a few timer ticks: 67–133
+ticks (≤0.2 % on the larger benchmarks, ≤1.5 % on the 5 ms
+`core_import_mpy_single`). The `-a 1` choice therefore reports `0.0000`
+standard deviation; use `-a 8` when variance is the goal, at 8× the wall-clock
+cost.
 
 客户机 ticks 取决于执行的指令流与 USB 中断的送达相位，不受宿主速度或并发负载
-影响。同一固件的重复运行结果相差不超过几个计时 tick（<0.2%；上述运行中最大
-67 tick）；`-a 1` 因而标准差为 0。如需方差信息可用 `-a 8`，但墙钟开销为 8 倍。
+影响。同一固件的重复运行最多相差几十个计时 tick：67–133 tick（较大基准
+≤0.2%，5 ms 的 `core_import_mpy_single` ≤1.5%）。`-a 1` 因而标准差为 0；
+如需方差信息可用 `-a 8`，但墙钟开销为 8 倍。
 
 ---
 
