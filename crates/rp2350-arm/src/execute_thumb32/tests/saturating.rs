@@ -476,16 +476,15 @@ fn q_flag_survives_non_saturating_dsp_instructions() {
 
 #[test]
 fn reserved_dsp_and_saturation_encodings_stay_undefined() {
-    // Halving lanes (bits[7:4] = 2/6), reserved variants 3/7/0xC, the
-    // QDADD/QSUB sub-opcodes above 0xB, SEL outside op 0xA, and SSAT
-    // encodings with bit 5 set or Rd = 15.
-    // 折半通道（bits[7:4] = 2/6）、保留变体 3/7/0xC、0xB 以上的
-    // QDADD/QSUB 子操作码、op 0xA 之外的 SEL，以及位 5 置位或 Rd = 15 的
-    // SSAT 编码。
+    // Reserved lane variants 3/7/0xC, the QDADD/QSUB sub-opcodes above 0xB,
+    // SEL outside op 0xA, and SSAT encodings with bit 5 set or Rd = 15.
+    // The halving variants 2/6 are real instructions and are covered by
+    // `dsp_extra`.
+    // 保留的通道变体 3/7/0xC、0xB 以上的 QDADD/QSUB 子操作码、
+    // op 0xA 之外的 SEL，以及位 5 置位或 Rd = 15 的 SSAT 编码。
+    // 折半变体 2/6 是真实指令，由 `dsp_extra` 覆盖。
     let cases = [
-        0xFA81_F022, // SHADD8: halving, not modeled
         0xFA81_F032, // reserved variant 3
-        0xFA81_F062, // UHADD8: halving, not modeled
         0xFA81_F072, // reserved variant 7
         0xFA81_F0C2, // reserved variant 0xC
         0xFA82_F0C1, // QADD with sub-opcode 0xC

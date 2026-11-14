@@ -253,18 +253,19 @@ pub(super) fn execute_register_shifted_or_misc(
 
     // Parallel byte extend: SXTB16/UXTB16 sign- or zero-extend bytes[7:0] and
     // [23:16] into two halfwords, honouring the same rotate field as SXTB.
-    // Flags are not modified by these two encodings.
+    // The accumulating SXTAB16/UXTAB16 forms add the two halfwords
+    // independently, wrapping modulo 2^16. None of these four encodings
+    // updates a flag.
     // 并行字节扩展：SXTB16/UXTB16 把 bytes[7:0] 与 [23:16] 符号/零扩展到两个
-    // 半字，rotate 字段与 SXTB 一致。这两条编码不更新标志。
+    // 半字，rotate 字段与 SXTB 一致。累加形式 SXTAB16/UXTAB16 对两个半字
+    // 分别相加，按 2^16 回绕。这四条编码都不更新标志。
     if fixed_hi && matches!(bits23_20, 0x2 | 0x3) && (0x8..=0xB).contains(&hw2_bits7_4) {
-        // SXTAB16/UXTAB16 (Rn != 1111) are not modeled.
-        // 不建模 SXTAB16/UXTAB16（Rn != 1111）。
-        if rn_field != 0xF || rd == 15 {
+        if rd == 15 || rm == 15 {
             return StepResult::Undefined;
         }
         let rotate = ((instr >> 4) & 0x3) * 8;
         let value = regs.read(rm).rotate_right(rotate);
-        let result = if bits23_20 == 0x2 {
+        let extended = if bits23_20 == 0x2 {
             let low = sign_extend(value & 0xFF, 8) & 0xFFFF;
             let high = (sign_extend((value >> 16) & 0xFF, 8) & 0xFFFF) << 16;
             high | low
@@ -272,6 +273,16 @@ pub(super) fn execute_register_shifted_or_misc(
             // UXTB16 keeps bytes 0 and 2 in place; bytes 1 and 3 are dropped.
             // UXTB16 保留字节 0 与 2 的位置，丢弃字节 1 与 3。
             (value & 0xFF) | (value & 0x00FF_0000)
+        };
+        let result = if rn_field == 0xF {
+            extended
+        } else {
+            // Per-halfword addition: each lane wraps on its own.
+            // 逐半字相加：每个通道独立回绕。
+            let base = regs.read(rn_field);
+            let low = (base & 0xFFFF).wrapping_add(extended & 0xFFFF) & 0xFFFF;
+            let high = ((base >> 16).wrapping_add(extended >> 16) & 0xFFFF) << 16;
+            high | low
         };
         regs.write(rd, result);
         return StepResult::Ok;

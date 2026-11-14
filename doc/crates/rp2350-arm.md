@@ -17,7 +17,8 @@
 | `conditions` | `Condition` (15 codes), `ITBlockState` (1-4 instruction blocks) |
 | `execute_thumb16` | Thumb-16 decoder + executor (~90 instructions) |
 | `execute_thumb32` | Thumb-32 decoder + executor (60+ ALU / Load-Store / system instructions) |
-| `execute_thumb32::dsp` | Packed SIMD add/subtract (`SADD8` … `USAX`), saturating `Q*`/`UQ*`, `QADD`/`QSUB`/`QDADD`/`QDSUB`, `SSAT`/`USAT`/`SSAT16`/`USAT16`, `SEL` |
+| `execute_thumb32::dsp` | Packed SIMD add/subtract (`SADD8` … `USAX`), halving (`SH*`/`UH*`), saturating `Q*`/`UQ*`, `QADD`/`QSUB`/`QDADD`/`QDSUB`, `SSAT`/`USAT`/`SSAT16`/`USAT16`, `SEL` |
+| `execute_thumb32::multiply` | `MUL`/`MLA`/`MLS`, long multiplies, divides, and the DSP multiply family (`SMULxy`, `SMULW*`, `SMLAW*`, `SMMUL`/`SMMLA`/`SMMLS`, `SMLAD`/`SMLSD`/`SMUAD`/`SMUSD`, `SMLALD`/`SMLSLD`, `USAD8`) |
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
@@ -307,8 +308,20 @@ coprocessor chapters below.
 DSP coverage / DSP 覆盖清单:
 
 - **Halfword multiply**: `SMULBB/SMULBT/SMULTB/SMULTT`, their `SMLA*`
-  accumulating forms (including the `Q` overflow flag) and the
-  `SMMUL/SMMLA` high-word modular forms.
+  accumulating forms (including the `Q` overflow flag), the
+  `SMMUL`/`SMMULR`/`SMMLA`/`SMMLAR` high-word modular forms, the wide
+  `SMULWB`/`SMULWT`/`SMLAWB`/`SMLAWT` forms (top word of a 32×16 product,
+  `Q` set when the 48-bit accumulation overflows), and the dual forms
+  `SMLAD`/`SMLADX`/`SMUAD`/`SMUADX` (add) plus
+  `SMLSD`/`SMLSDX`/`SMUSD`/`SMUSDX` (subtract). `X` rotates the second
+  operand by 16 bits, so the products are top×bottom and bottom×top.
+  These set `APSR.Q` exactly once, when the final infinite-precision sum does
+  not fit in 32 bits — `SMUAD`/`SMUSD` (`Ra = 1111`) included. The long dual
+  forms `SMLALD`/`SMLALDX`/`SMLSLD`/`SMLSLDX` accumulate into `RdHi:RdLo`
+  and wrap modulo 2^64 without touching any flag.
+- **Most-significant-word multiply subtract**: `SMMLS`/`SMMLSR` compute
+  `(Ra<<32 - Rn*Rm)` and keep the high word, adding the rounding constant
+  `0x8000_0000` before the extraction for `SMMLSR`.
 - **Packed parallel add/subtract** (`execute_thumb32::dsp`):
   `SADD8/SSUB8/SADD16/SSUB16`, `UADD8/USUB8/UADD16/USUB16` and the
   exchanged forms `SASX/SSAX/UASX/USAX`. Each byte/halfword lane is
@@ -317,6 +330,12 @@ DSP coverage / DSP 覆盖清单:
   bits[15:0], `GE[3:2]` for bits[31:16]). Signed variants set GE when the
   full-width sum or difference is `>= 0`; unsigned variants set GE on
   carry-out (add) or no-borrow (subtract). N, Z, C, V and Q are unchanged.
+- **Halving parallel add/subtract**: `SHADD8/SHSUB8/SHADD16/SHSUB16`,
+  `UHADD8/UHSUB8/UHADD16/UHSUB16`, `SHASX/SHSAX` and `UHASX/UHSAX`. Each lane
+  writes `(a ± b) >> 1` (bits `[n:1]` of the full-width result, so a negative
+  result shifts arithmetically) and wraps into its own lane width. Unlike the
+  wrapping `S*`/`U*` group, the halving group updates **no flag at all**:
+  `GE`, `Q` and `NZCV` are all preserved (ARM ARM `SHADD8` … `UHSUB16`).
 - **Saturating parallel add/subtract**: `QADD8/QSUB8/QADD16/QSUB16`,
   `UQADD8/UQSUB8/UQADD16/UQSUB16`, `QASX/QSAX` and `UQASX/UQSAX`. Each lane
   saturates to the signed `[-2^(n-1), 2^(n-1)-1]` or unsigned
@@ -336,9 +355,11 @@ DSP coverage / DSP 覆盖清单:
   values to zero.
 - **Byte select**: `SEL` copies each byte from `Rn` when the matching
   `APSR.GE` bit is set and from `Rm` otherwise; it modifies no flag.
-- **Packed byte extend**: `SXTB16/UXTB16` with the `ror #0/#8/#16/#24`
-  rotate field. Flags are unchanged. The accumulating `SXTAB16/UXTAB16`
-  forms remain undefined.
+- **Packed byte extend**: `SXTB16/UXTB16` and the accumulating
+  `SXTAB16/UXTAB16` forms, all with the `ror #0/#8/#16/#24` rotate field.
+  The accumulating forms add the two extended bytes to the matching halfwords
+  of `Rn` independently, so each 16-bit lane wraps on its own. Flags are
+  unchanged.
 - **Sum of absolute differences**: `USAD8` (Ra = 1111) and `USADA8`
   (accumulate into Ra). Flags are unchanged.
 
@@ -347,38 +368,44 @@ Flag rules / 标志规则 (ARM ARM):
 | Group | `APSR.GE` | `APSR.Q` | `N/Z/C/V` |
 |-------|-----------|----------|-----------|
 | `SADD*`/`SSUB*`/`UADD*`/`USUB*`, `SASX`/`SSAX`/`UASX`/`USAX` | written (per lane) | unchanged | unchanged |
+| `SHADD*`/`SHSUB*`/`SHASX`/`SHSAX`, `UHADD*`/`UHSUB*`/`UHASX`/`UHSAX` | unchanged | unchanged | unchanged |
 | `QADD8`…`UQSAX` | unchanged | set when saturated (sticky) | unchanged |
 | `QADD`/`QSUB`/`QDADD`/`QDSUB` | unchanged | set when saturated (sticky) | unchanged |
 | `SSAT`/`USAT`/`SSAT16`/`USAT16` | unchanged | set when saturated (sticky) | unchanged |
+| `SMLAxy`, `SMLAWy`, `SMLAD`/`SMLADX`, `SMLSD`/`SMLSDX`, `SMUAD`/`SMUADX`, `SMUSD`/`SMUSDX` | unchanged | set on 32-bit overflow (sticky) | unchanged |
+| `SMLALD`/`SMLALDX`, `SMLSLD`/`SMLSLDX`, `SMULxy`, `SMULWy`, `SMMUL`/`SMMLA`/`SMMLS`, `USAD8`/`USADA8`, `SXTAB16`/`UXTAB16` | unchanged | unchanged | unchanged |
 | `SEL` | read only | unchanged | unchanged |
 
-`Q` is cumulative: a saturating instruction only ever sets it, so software
-clears it explicitly (`MSR APSR_nzcvq`) before a sequence and tests it once
-afterwards. GE never participates in the `GE`/`LT` condition codes (those
-still test `N == V`).
+`Q` is cumulative: a saturating or overflowing instruction only ever sets it,
+so software clears it explicitly (`MSR APSR_nzcvq`) before a sequence and tests
+it once afterwards. GE never participates in the `GE`/`LT` condition codes
+(those still test `N == V`). The accumulate-then-check rule matters for
+`SMLAD`: the products `0x4000_0000 + 0x4000_0000 - 1` do **not** set `Q`,
+because the architecturally checked value is the single infinite-precision
+sum `0x7FFF_FFFF`.
 
-仍未实现 / still undefined: halving (`SHADD8/SHSUB8/SHADD16/SHSUB16`,
-`SHASX/SHSAX`, `UHADD8/UHSUB8/UHADD16/UHSUB16`, `UHASX/UHSAX`) and
-`SXTAB16/UXTAB16`. The multiply/DSP forms `SMLAD/SMLADX/SMLSD/SMLSDX`,
-`SMLALD/SMLSLD/SMLALDX/SMLSLDX`, `SMUAD/SMUSD`, `SMMLS` and
-`SMULW/SMLAW/SMULWB/SMLAWT` are also still undefined. `SSAT`/`USAT` are only
-decoded in their Thumb-32 encoding; the 16-bit Thumb encodings remain
-undefined as well.
+仍未实现 / still undefined: `SMLALxy` (`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`,
+the 64-bit accumulating halfword products). Everything else in the DSP
+add/subtract, halving, saturating and multiply chapters that ARMv8-M defines
+for Cortex-M33 is decoded.
 
-仍未实现：折半（`SHADD8/SHSUB8/SHADD16/SHSUB16`、`SHASX/SHSAX`、
-`UHADD8/UHSUB8/UHADD16/UHSUB16`、`UHASX/UHSAX`）与
-`SXTAB16/UXTAB16`。乘加 DSP 形式 `SMLAD/SMLADX/SMLSD/SMLSDX`、
-`SMLALD/SMLSLD/SMLALDX/SMLSLDX`、`SMUAD/SMUSD`、`SMMLS` 及
-`SMULW/SMLAW/SMULWB/SMLAWT` 同样仍未实现。`SSAT`/`USAT` 目前只解码
-Thumb-32 编码，16 位 Thumb 编码仍未实现。
+仍未实现：`SMLALxy`（`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`，即 64 位累加的
+半字乘积）。DSP 加/减、折半、饱和与乘法章节中 ARMv8-M 为 Cortex-M33 定义的
+其余编码均已解码。
 
 `SSAT`/`USAT`/`SSAT16`/`USAT16` live in the data-processing
 (plain-binary-immediate) group; the top-level decoder routes
 `bits[26:20] = 0x30/0x32/0x38/0x3A` to `dsp::execute_saturate` before the
-bitfield group, keeping the existing dispatch layering.
-`SSAT`/`USAT`/`SSAT16`/`USAT16` 属于数据处理（纯二进制立即数）组；
-顶层解码器在位域组之前把 `bits[26:20] = 0x30/0x32/0x38/0x3A` 分派给
-`dsp::execute_saturate`，保持既有分派层次。
+bitfield group, keeping the existing dispatch layering. These four mnemonics
+have **only** the 32-bit T1 encoding — ARMv8-M defines no 16-bit Thumb form
+(`arm-none-eabi-as` rejects them for Thumb-only cores), so there is no
+Thumb-16 `SSAT`/`USAT` gap to fill.
+
+`SSAT`/`USAT`/`SSAT16`/`USAT16` 属于数据处理（纯二进制立即数）组；顶层解码器在
+位域组之前把 `bits[26:20] = 0x30/0x32/0x38/0x3A` 分派给
+`dsp::execute_saturate`，保持既有分派层次。这四条助记符**只有** 32 位 T1
+编码 —— ARMv8-M 没有定义 16 位 Thumb 形式（`arm-none-eabi-as` 对仅支持 Thumb
+的内核会直接拒绝），因此不存在待补齐的 Thumb-16 `SSAT`/`USAT`。
 
 `APSR.GE` is stored in `xpsr[19:16]` (`apsr_ge`/`set_apsr_ge`), is
 preserved by `set_apsr_nzcv` and exception stacking, and is readable and
@@ -390,7 +417,16 @@ Thumb-32 解码器已完整实现（见 `execute_thumb32`）：60+ 条 ALU、Loa
 DSP 覆盖清单：
 
 - **半字乘法**：`SMULBB/SMULBT/SMULTB/SMULTT`、对应的 `SMLA*` 累加形式
-  （含 `Q` 溢出标志）与 `SMMUL/SMMLA` 高字模乘。
+  （含 `Q` 溢出标志）、`SMMUL`/`SMMULR`/`SMMLA`/`SMMLAR` 高字模乘、宽形式
+  `SMULWB`/`SMULWT`/`SMLAWB`/`SMLAWT`（32×16 乘积取高字，48 位累加上溢时置
+  `Q`），以及双乘形式 `SMLAD`/`SMLADX`/`SMUAD`/`SMUADX`（加）与
+  `SMLSD`/`SMLSDX`/`SMUSD`/`SMUSDX`（减）。`X` 把第二操作数循环右移 16 位，
+  乘积为高×低与低×高。这些指令只在最终无限精度和不落入 32 位时置一次
+  `APSR.Q`（`Ra = 1111` 的 `SMUAD`/`SMUSD` 同样置位）。长双乘形式
+  `SMLALD`/`SMLALDX`/`SMLSLD`/`SMLSLDX` 累加到 `RdHi:RdLo`，按模 2^64
+  回绕且不修改任何标志。
+- **高字乘减**：`SMMLS`/`SMMLSR` 计算 `(Ra<<32 - Rn*Rm)` 并取高字，
+  `SMMLSR` 在取高字前加舍入常量 `0x8000_0000`。
 - **打包并行加/减**（`execute_thumb32::dsp`）：
   `SADD8/SSUB8/SADD16/SSUB16`、`UADD8/USUB8/UADD16/USUB16` 以及交换形式
   `SASX/SSAX/UASX/USAX`。每个字节/半字通道独立运算并按 2^8/2^16 回绕。
@@ -398,6 +434,11 @@ DSP 覆盖清单：
   （bits[15:0] 对应 `GE[1:0]`，bits[31:16] 对应 `GE[3:2]`）。有符号变体在
   完整宽度和/差大于等于零时置 GE；无符号变体在加法产生进位、减法无借位时
   置 GE。N、Z、C、V、Q 不变。
+- **折半并行加/减**：`SHADD8/SHSUB8/SHADD16/SHSUB16`、
+  `UHADD8/UHSUB8/UHADD16/UHSUB16`、`SHASX/SHSAX` 与 `UHASX/UHSAX`。每个通道
+  写入 `(a ± b) >> 1`（即完整宽度结果的 `[n:1]` 位，负值按算术右移），并按
+  各自通道宽度回绕。与回绕的 `S*`/`U*` 组不同，折半组**不修改任何标志**：
+  `GE`、`Q` 与 `NZCV` 全部保持（ARM ARM `SHADD8` … `UHSUB16`）。
 - **饱和并行加/减**：`QADD8/QSUB8/QADD16/QSUB16`、
   `UQADD8/UQSUB8/UQADD16/UQSUB16`、`QASX/QSAX` 与 `UQASX/UQSAX`。每个通道
   饱和到有符号 `[-2^(n-1), 2^(n-1)-1]` 或无符号 `[0, 2^n-1]` 范围而非回绕；
@@ -414,15 +455,24 @@ DSP 覆盖清单：
   `USAT`/`USAT16` 把输入视为有符号数，负值钳制为零。
 - **字节选择**：`SEL` 在对应 `APSR.GE` 位置位时从 `Rn` 复制该字节，否则取
   `Rm`；不修改任何标志。
-- **打包字节扩展**：`SXTB16/UXTB16`，支持 `ror #0/#8/#16/#24` rotate 字段，
-  不更新标志。累加形式 `SXTAB16/UXTAB16` 仍未实现。
+- **打包字节扩展**：`SXTB16/UXTB16` 及累加形式 `SXTAB16/UXTAB16`，均支持
+  `ror #0/#8/#16/#24` rotate 字段。累加形式把扩展后的两个字节分别加到 `Rn`
+  的对应半字上，每个 16 位通道独立回绕。不更新标志。
 - **绝对差之和**：`USAD8`（Ra = 1111）与 `USADA8`（累加到 Ra），
   不更新标志。
 
 标志规则（ARM ARM）见上文英文表格：并行 `S*`/`U*` 与交换形式写 GE；
-饱和形式只置保持型 Q；`SEL` 只读 GE。`Q` 为累积位，饱和指令只会置位，
-因此软件需先用 `MSR APSR_nzcvq` 显式清除，执行完序列后再统一测试。
-GE 绝不参与 `GE`/`LT` 条件码（后者仍比较 `N == V`）。
+折半 `SH*`/`UH*` 组不写任何标志；饱和形式只置保持型 Q；乘加类
+（`SMLAxy`、`SMLAWy`、`SMLAD`/`SMLSD`/`SMUAD`/`SMUSD`）在 32 位上溢时置 Q；
+`SEL` 只读 GE。`Q` 为累积位，饱和/上溢指令只会置位，因此软件需先用
+`MSR APSR_nzcvq` 显式清除，执行完序列后再统一测试。
+GE 绝不参与 `GE`/`LT` 条件码（后者仍比较 `N == V`）。累加后再判断的规则对
+`SMLAD` 尤其重要：乘积 `0x4000_0000 + 0x4000_0000 - 1` **不会**置 `Q`，
+因为架构检查的是最终那一个无限精度和 `0x7FFF_FFFF`。
+
+仍未实现：`SMLALxy`（`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`，即 64 位累加的
+半字乘积）。DSP 加/减、折半、饱和与乘法章节中 ARMv8-M 为 Cortex-M33 定义的
+其余编码均已解码。
 
 `APSR.GE` 存放于 `xpsr[19:16]`（`apsr_ge`/`set_apsr_ge`），
 `set_apsr_nzcv` 与异常压栈都会保留它，并可通过 `MRS APSR` /

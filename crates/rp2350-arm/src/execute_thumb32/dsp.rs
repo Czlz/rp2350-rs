@@ -2,27 +2,31 @@
 //! Thumb-32 DSP 打包 SIMD 算术
 //!
 //! Covers the ARMv8-M DSP parallel byte/halfword add/subtract family
-//! (`SADD8` … `USAX`), their saturating `Q`/`UQ` forms, the 32-bit saturating
-//! `QADD`/`QSUB`/`QDADD`/`QDSUB`, `SEL`, and the `SSAT`/`USAT`/`SSAT16`/
-//! `USAT16` saturation instructions.
+//! (`SADD8` … `USAX`), their halving (`SH*`/`UH*`) forms, the saturating
+//! `Q`/`UQ` forms, the 32-bit saturating `QADD`/`QSUB`/`QDADD`/`QDSUB`, `SEL`,
+//! and the `SSAT`/`USAT`/`SSAT16`/`USAT16` saturation instructions.
 //!
 //! Flag rules (ARM ARM):
 //!
 //! * parallel add/subtract (`S*`/`U*`) update `APSR.GE` — one flag per byte
 //!   lane, or a duplicated pair per halfword lane — and never touch `Q`/`NZCV`;
+//! * halving forms (`SH*`/`UH*`) write only the destination register and leave
+//!   every flag (`GE`, `Q`, `NZCV`) unchanged;
 //! * saturating forms (parallel `Q*`/`UQ*`, `QADD`/`QSUB`/`QDADD`/`QDSUB`,
 //!   `SSAT`/`USAT`) update only `APSR.Q`, which is sticky, and never touch
 //!   `GE`/`NZCV`;
 //! * `SEL` reads `GE` and updates no flag at all.
 //!
-//! 覆盖 ARMv8-M DSP 并行字节/半字加/减指令族（`SADD8` … `USAX`）、其饱和
-//! `Q`/`UQ` 形式、32 位饱和 `QADD`/`QSUB`/`QDADD`/`QDSUB`、`SEL`，以及
+//! 覆盖 ARMv8-M DSP 并行字节/半字加/减指令族（`SADD8` … `USAX`）、其折半
+//! （`SH*`/`UH*`）形式、饱和 `Q`/`UQ` 形式、32 位饱和
+//! `QADD`/`QSUB`/`QDADD`/`QDSUB`、`SEL`，以及
 //! `SSAT`/`USAT`/`SSAT16`/`USAT16` 饱和指令。
 //!
 //! 标志规则（ARM ARM）：
 //!
 //! * 并行加/减（`S*`/`U*`）更新 `APSR.GE` —— 每个字节通道一个标志，半字通道
 //!   为一对重复标志 —— 不影响 `Q`/`NZCV`；
+//! * 折半形式（`SH*`/`UH*`）只写目标寄存器，`GE`、`Q` 与 `NZCV` 全部不变；
 //! * 饱和形式（并行 `Q*`/`UQ*`、`QADD`/`QSUB`/`QDADD`/`QDSUB`、
 //!   `SSAT`/`USAT`）只更新保持型的 `APSR.Q`，不影响 `GE`/`NZCV`；
 //! * `SEL` 读取 `GE`，不更新任何标志。
@@ -82,24 +86,32 @@ enum Variant {
     WrapSigned,
     /// Signed, saturating (`Q`) / 有符号饱和（`Q`）
     SatSigned,
+    /// Signed, halving (`SH`) / 有符号折半（`SH`）
+    HalfSigned,
     /// Unsigned, wrapping (`U`) / 无符号回绕（`U`）
     WrapUnsigned,
     /// Unsigned, saturating (`UQ`) / 无符号饱和（`UQ`）
     SatUnsigned,
+    /// Unsigned, halving (`UH`) / 无符号折半（`UH`）
+    HalfUnsigned,
 }
 
 impl Variant {
     /// Decode the variant from instruction bits [7:4]
     /// 从指令 bits[7:4] 解码变体
     ///
-    /// `0b0010`/`0b0110` (halving) stay unclaimed and therefore undefined.
-    /// `0b0010`/`0b0110`（折半）不被认领，因此仍视为未定义。
+    /// `0b0010` selects the signed halving forms and `0b0110` the unsigned
+    /// ones; the remaining values are reserved and stay unclaimed.
+    /// `0b0010` 选择有符号折半形式，`0b0110` 选择无符号折半形式；其余取值
+    /// 保留，不被认领。
     fn from_bits(bits: u32) -> Option<Self> {
         match bits {
             0x0 => Some(Self::WrapSigned),
             0x1 => Some(Self::SatSigned),
+            0x2 => Some(Self::HalfSigned),
             0x4 => Some(Self::WrapUnsigned),
             0x5 => Some(Self::SatUnsigned),
+            0x6 => Some(Self::HalfUnsigned),
             _ => None,
         }
     }
@@ -107,13 +119,24 @@ impl Variant {
     /// Whether the lanes are interpreted as signed values
     /// 通道是否按有符号值解释
     fn signed(self) -> bool {
-        matches!(self, Self::WrapSigned | Self::SatSigned)
+        matches!(self, Self::WrapSigned | Self::SatSigned | Self::HalfSigned)
     }
 
     /// Whether the variant updates `APSR.Q` instead of `APSR.GE`
     /// 该变体是否更新 `APSR.Q` 而非 `APSR.GE`
     fn saturating(self) -> bool {
         matches!(self, Self::SatSigned | Self::SatUnsigned)
+    }
+
+    /// Whether the variant halves each lane and leaves all flags alone
+    /// 该变体是否对每个通道折半且不修改任何标志
+    ///
+    /// ARM ARM: the `SH*`/`UH*` group writes no flag at all, unlike the
+    /// wrapping `S*`/`U*` group which writes `APSR.GE`.
+    /// ARM ARM：`SH*`/`UH*` 组不写任何标志，而回绕的 `S*`/`U*` 组会写
+    /// `APSR.GE`。
+    fn halving(self) -> bool {
+        matches!(self, Self::HalfSigned | Self::HalfUnsigned)
     }
 }
 
@@ -122,12 +145,14 @@ impl Variant {
 ///
 /// The Thumb-32 encodings are `1111 1010 10xx Rn 1111 Rd vvvv Rm`: bits[23:20]
 /// select `ADD8` (0x8), `ADD16` (0x9), `ASX` (0xA), `SUB8` (0xC), `SUB16` (0xD)
-/// or `SAX` (0xE), and bits[7:4] select `S` (0), `Q` (1), `U` (4) or `UQ` (5).
+/// or `SAX` (0xE), and bits[7:4] select `S` (0), `Q` (1), `SH` (2), `U` (4),
+/// `UQ` (5) or `UH` (6).
 /// Two encodings share those bits and are claimed first: `QADD/QDADD/QSUB/QDSUB`
 /// (`op == 0x8`, bits[7:4] = 0x8…0xB) and `SEL` (`op == 0xA`, bits[7:4] = 0x8).
 /// Thumb-32 编码为 `1111 1010 10xx Rn 1111 Rd vvvv Rm`：bits[23:20] 选择
 /// `ADD8`（0x8）、`ADD16`（0x9）、`ASX`（0xA）、`SUB8`（0xC）、`SUB16`（0xD）
-/// 或 `SAX`（0xE），bits[7:4] 选择 `S`（0）、`Q`（1）、`U`（4）或 `UQ`（5）。
+/// 或 `SAX`（0xE），bits[7:4] 选择 `S`（0）、`Q`（1）、`SH`（2）、`U`（4）、
+/// `UQ`（5）或 `UH`（6）。
 /// 有两条编码与上述位段重叠，需先认领：`QADD/QDADD/QSUB/QDSUB`
 /// （`op == 0x8`，bits[7:4] = 0x8…0xB）与 `SEL`（`op == 0xA`，bits[7:4] = 0x8）。
 pub(super) fn try_execute(instr: u32, regs: &mut CortexM33Registers) -> Option<StepResult> {
@@ -338,7 +363,9 @@ fn execute_lanes(
         if q {
             regs.set_q_flag();
         }
-    } else {
+    } else if !variant.halving() {
+        // Halving instructions write no flag at all (ARM ARM SHADD8 …).
+        // 折半指令不写任何标志（ARM ARM 的 SHADD8 等）。
         regs.set_apsr_ge(ge);
     }
     StepResult::Ok
@@ -430,6 +457,17 @@ fn compute_lane(a: i64, b: i64, subtract: bool, bits: u32, variant: Variant) -> 
         Variant::SatUnsigned => {
             let (lane, saturated) = clamp_unsigned_lane(exact, bits);
             (lane, false, saturated)
+        }
+        // Halving forms keep the high half of the full-width result, so the
+        // written lane is `exact[bits:1]`. A negative `exact` shifts
+        // arithmetically, which matches the ARM ARM for both the signed and
+        // the unsigned forms; no flag is updated.
+        // 折半形式保留完整宽度结果的高半部分，写入通道为 `exact[bits:1]`。
+        // `exact` 为负时按算术右移，对有符号与无符号形式都与 ARM ARM 一致；
+        // 不更新任何标志。
+        Variant::HalfSigned | Variant::HalfUnsigned => {
+            let half = ((exact >> 1) as u64 & mask as u64) as u32;
+            (half, false, false)
         }
     }
 }
