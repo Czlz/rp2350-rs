@@ -6,8 +6,11 @@
 //! 解析 CLI 参数并分发到模拟器、USB raw REPL、perfbench、GDB 服务器或
 //! MCP 服务器子命令。
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
+mod devices;
 mod gdb_target;
 mod perfbench;
 mod repl;
@@ -163,10 +166,19 @@ enum Commands {
         /// GPIO pin number / GPIO 引脚号
         #[arg(short = 'g', long)]
         gpio: u8,
+
+        /// Plugin directory to scan / 扫描的插件目录
+        #[arg(long, default_value = devices::DEFAULT_PLUGIN_DIR)]
+        plugin_dir: PathBuf,
     },
 
-    /// List all registered devices / 列出所有已注册设备
-    ListDevices,
+    /// List all device plugins found in the plugin directory
+    /// 列出插件目录中发现的全部设备插件
+    ListDevices {
+        /// Plugin directory to scan / 扫描的插件目录
+        #[arg(long, default_value = devices::DEFAULT_PLUGIN_DIR)]
+        plugin_dir: PathBuf,
+    },
 
     /// Start MCP server (`AgentFuse` integration) / 启动 MCP 服务器（`AgentFuse` 集成）
     McpServe {
@@ -201,10 +213,7 @@ fn main() {
                 trace_steps,
                 strict_decode,
             };
-            if let Err(error) = run::run(&options) {
-                log::error!("run failed / 运行失败: {error:#}");
-                std::process::exit(1);
-            }
+            finish(run::run(&options), "run failed / 运行失败");
         }
         Commands::Repl {
             file,
@@ -224,10 +233,7 @@ fn main() {
                 soft_reset: !no_soft_reset,
                 strict_decode,
             };
-            if let Err(error) = repl::run(&options) {
-                log::error!("repl failed / REPL 失败: {error:#}");
-                std::process::exit(1);
-            }
+            finish(repl::run(&options), "repl failed / REPL 失败");
         }
         Commands::Perfbench {
             file,
@@ -251,30 +257,43 @@ fn main() {
                 soft_reset: !no_soft_reset,
                 strict_decode,
             };
-            if let Err(error) = perfbench::run(&options) {
-                log::error!("perfbench failed / 基准测试失败: {error:#}");
-                std::process::exit(1);
-            }
+            finish(perfbench::run(&options), "perfbench failed / 基准测试失败");
         }
         Commands::Gdb { file, port } => {
             let options = gdb_target::GdbOptions {
                 file: file.into(),
                 port,
             };
-            if let Err(error) = gdb_target::run(&options) {
-                log::error!("gdb failed / GDB 失败: {error:#}");
-                std::process::exit(1);
-            }
+            finish(gdb_target::run(&options), "gdb failed / GDB 失败");
         }
-        Commands::Wire { device, port, gpio } => {
-            log::info!("Wiring device '{device}' port {port} to GPIO {gpio} (stub)");
+        Commands::Wire {
+            device,
+            port,
+            gpio,
+            plugin_dir,
+        } => {
+            finish(
+                devices::wire(&plugin_dir, &device, port, gpio),
+                "wire failed / 接线失败",
+            );
         }
-        Commands::ListDevices => {
-            log::info!("No devices registered yet (stub)");
+        Commands::ListDevices { plugin_dir } => {
+            finish(
+                devices::list_devices(&plugin_dir),
+                "list-devices failed / 列出设备失败",
+            );
         }
         Commands::McpServe { port } => {
             log::info!("Starting MCP server on port {port} (stub)");
             log::info!("MCP server not yet implemented (Phase 3)");
         }
+    }
+}
+
+/// Report a subcommand failure and exit with status 1 / 记录子命令失败并以状态码 1 退出
+fn finish(result: anyhow::Result<()>, label: &str) {
+    if let Err(error) = result {
+        log::error!("{label}: {error:#}");
+        std::process::exit(1);
     }
 }

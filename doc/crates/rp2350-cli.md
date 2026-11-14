@@ -8,10 +8,10 @@
 > RISC-V 固件，并按三种模式驱动：带轨迹的 `run`、交互式 USB CDC raw REPL
 > （`repl`）、基准测试（`perfbench`）。
 >
-> **Status**: implemented — `run` / `repl` / `perfbench` / `gdb`. Stubs —
-> `wire`, `list-devices`, `mcp-serve` log their arguments and return.
-> **状态**: 已实现 — `run` / `repl` / `perfbench` / `gdb`。桩 — `wire`、
-> `list-devices`、`mcp-serve` 仅记录参数后返回。
+> **Status**: implemented — `run` / `repl` / `perfbench` / `gdb` /
+> `list-devices` / `wire`. Stub — `mcp-serve` logs its arguments and returns.
+> **状态**: 已实现 — `run` / `repl` / `perfbench` / `gdb` / `list-devices` /
+> `wire`。桩 — `mcp-serve` 仅记录参数后返回。
 
 ---
 
@@ -170,18 +170,80 @@ arm-none-eabi-gdb firmware.elf
 - 打印的监听地址在端口非 0 时即实际地址；端口 `0` 的实际端口由服务器日志给出。
   The printed address is the actual one for non-zero ports; for port `0` the
   assigned port is reported by the server log.
-### Stubs / 桩
+### `list-devices` — enumerate device plugins / 枚举设备插件
 
 ```text
-rp2350 wire --device <ID> --port <P> --gpio <PIN>   # logs and returns
-rp2350 list-devices                         # logs "no devices registered yet"
+rp2350 list-devices [--plugin-dir <DIR>]
+```
+
+| Option / 选项 | Default / 默认 | Meaning / 含义 |
+|---------------|----------------|----------------|
+| `--plugin-dir` | `plugins` | Directory scanned for plugin libraries / 扫描插件库的目录 |
+
+Scans the directory (platform extensions `dll`/`so`/`dylib`, path-sorted),
+instantiates every library through `DeviceManager::scan_and_load`, and prints
+one line per device:
+
+```text
+com.rp2350-rs.led / LED / has_ui=false / ports=[LED]
+```
+
+Format: `id / name / has_ui=<bool> / ports=[<comma-separated port names>]`;
+`ports=[-]` means the device exposes no ports. An empty (but existing)
+directory prints `no device plugins found in <DIR>`; a missing directory is an
+error (exit code 1). Port order is the index order accepted by `wire`.
+扫描目录（平台扩展名 `dll`/`so`/`dylib`，按路径排序），经
+`DeviceManager::scan_and_load` 实例化每个库，并每台设备打印一行，格式为
+`id / name / has_ui=<bool> / ports=[<逗号分隔端口名>]`；`ports=[-]` 表示无端口。
+目录存在但为空时打印 `no device plugins found in <DIR>`；目录不存在则报错
+（退出码 1）。端口顺序即 `wire` 接受的索引顺序。
+
+### `wire` — wire one port and print the table / 接线并打印接线表
+
+```text
+rp2350 wire --plugin-dir <DIR> --device <ID> --port <INDEX> --gpio <PIN>
+```
+
+| Option / 选项 | Default / 默认 | Meaning / 含义 |
+|---------------|----------------|----------------|
+| `--plugin-dir` | `plugins` | Directory scanned for plugin libraries / 扫描插件库的目录 |
+| `--device` (`-d`) | required | Device ID (from `list-devices`) / 设备 ID |
+| `--port` (`-p`) | required | Port index on the device / 设备端口索引 |
+| `--gpio` (`-g`) | required | RP2350 GPIO pin number / GPIO 引脚号 |
+
+Scans the directory, resolves the device ID, calls `DeviceManager::wire` and
+prints the resulting wiring table:
+
+```text
+com.rp2350-rs.led / LED / port 0 / GPIO25
+note: devices and wiring live only in this process and are released on exit / ...
+```
+
+Errors (exit code 1): missing plugin directory, unknown device ID (the message
+lists the IDs that were found), or out-of-bounds port index.
+错误（退出码 1）：插件目录缺失、设备 ID 未找到（错误信息会列出已发现的 ID）、
+端口索引越界。
+
+> **One-shot process / 一次性进程**：`list-devices` and `wire` construct the
+> `DeviceManager`, act, then exit — the devices, their dynamic libraries and the
+> wiring table are released at process exit. Nothing is persisted and no
+> emulator run is attached, so `wire` is currently a wiring/dry-run inspection
+> tool. Wiring persistence and a long-lived host (GUI/MCP) are future work.
+> `list-devices` 与 `wire` 构建管理器、执行动作后立即退出 —— 设备、动态库与
+> 接线表在进程结束时全部释放。当前**不持久化**，也不会挂接到模拟器运行，
+> 因此 `wire` 实际是接线/空跑检查工具。接线持久化与常驻宿主（GUI/MCP）为后续工作。
+
+### Stub / 桩
+
+```text
 rp2350 mcp-serve [--port 8080]              # logs "not yet implemented"
 ```
 
-`mcp-serve` listens on `8080` by default but does not start a server yet.
-`wire` and `list-devices` do not touch the `rp2350-virt-periph` manager yet.
-`mcp-serve` 默认监听 `8080`，但尚未真正启动服务器。`wire` 与 `list-devices`
-尚未接入 `rp2350-virt-periph` 的管理器。
+`mcp-serve` listens on `8080` by default but does not start a server yet; the
+`DeviceManager` MCP query API (`mcp_query_all` / `mcp_query_device` /
+`mcp_list_devices`) is already available for it.
+`mcp-serve` 默认监听 `8080`，但尚未启动服务器；`DeviceManager` 的 MCP 查询
+API（`mcp_query_all` / `mcp_query_device` / `mcp_list_devices`）已可用。
 
 ---
 
@@ -292,7 +354,7 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
 | `rp2350-bootrom` | synthetic ROM + trap dispatch / 合成 ROM 与陷阱分发 |
 | `rp2350-periph` | `BootPeripherals`, `Peripheral` contract / 启动外设 |
 | `rp2350-usb`, `rp2350-usb-host` | controller + CDC/raw-REPL front end / 控制器与前端 |
-| `rp2350-virt-periph` | device manager (linked; not yet driven by stubs) / 设备管理器 |
+| `rp2350-virt-periph` | `DeviceManager` behind `list-devices` / `wire` / 设备管理器 |
 | `rp2350-gdb` | RSP server behind `gdb` / `gdb` 子命令的 RSP 服务器 |
 | `rp2350-egui`, `rp2350-ffi`, `tokio` | linked for the future egui integration / 为后续 egui 集成预留 |
 
@@ -316,4 +378,10 @@ rp2350 perfbench --file firmware.uf2 --bench bm_float.py \
 
 # Serve an ELF to GDB on port 3333
 rp2350 gdb --file firmware.elf --port 3333
+
+# Inspect the device plugins built into target/release
+rp2350 list-devices --plugin-dir target/release
+
+# Wire the LED plugin's port 0 to GPIO25 and print the wiring table
+rp2350 wire --plugin-dir target/release --device com.rp2350-rs.led --port 0 --gpio 25
 ```

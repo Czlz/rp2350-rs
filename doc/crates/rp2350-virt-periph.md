@@ -6,9 +6,9 @@
 > **不包含**设备实现 —— 设备本体位于插件中。
 >
 > **Status**: 已实现 / implemented — `DeviceManager`（无参构造）、`register` /
-> `load_plugin` / `unregister` / `wire` / `sync_gpio` / `tick_all` /
-> `shutdown_all` / `mcp_query_all` / `mcp_query_device` / `mcp_list_devices` /
-> `apply_config`、`PluginLoader`（目录扫描 + ABI 校验）、
+> `load_plugin` / `scan_and_load` / `unregister` / `wire` / `sync_gpio` /
+> `tick_all` / `shutdown_all` / `mcp_query_all` / `mcp_query_device` /
+> `mcp_list_devices` / `apply_config`、`PluginLoader`（目录扫描 + ABI 校验）、
 > `WiringTable`、`DevicePlugin`/`DevicePort`、`ConfigSchema`。见文末“规划中”。
 
 ---
@@ -85,6 +85,15 @@ impl DeviceManager {
     pub fn load_plugin(&mut self, id: DeviceId, path: impl AsRef<Path>)
         -> Result<(), DeviceError>;
 
+    /// Scan a directory, instantiate every device plugin and register it.
+    /// ID = `metadata().id`, falling back to the library file stem; duplicate
+    /// IDs and load failures are skipped with `log::warn!`.
+    /// Returns `(device_id, library_path)` for each registered device.
+    /// 扫描目录、实例化并注册其中所有设备插件。ID 取 `metadata().id`，为空时
+    /// 退回库文件名主干；重复 ID 与加载失败仅 `log::warn!` 后跳过。
+    /// 返回每个已注册设备的 `(设备 ID, 库路径)`。
+    pub fn scan_and_load(&mut self, dir: impl AsRef<Path>) -> Vec<(DeviceId, PathBuf)>;
+
     /// Remove a device: calls `shutdown()` and drops its wiring entries.
     /// 移除设备：调用 shutdown() 并清除其接线。
     pub fn unregister(&mut self, id: &DeviceId) -> Result<(), DeviceError>;
@@ -118,8 +127,9 @@ impl DeviceManager {
     /// MCP API：单个设备状态，未注册时返回 None。
     pub fn mcp_query_device(&self, id: &str) -> Option<serde_json::Value>;
 
-    /// MCP API: `[{id, name, has_ui, tags}]`, sorted by id.
-    /// MCP API：设备清单（按 id 排序）。
+    /// MCP API: `[{id, name, has_ui, tags, ports}]`, sorted by id.
+    /// `ports` 按接线顺序（即 `wire` 使用的索引顺序）列出端口名。
+    /// MCP API：设备清单（按 id 排序），`ports` 为接线顺序的端口名。
     pub fn mcp_list_devices(&self) -> Vec<serde_json::Value>;
 
     /// MCP API: apply JSON config through `DevicePlugin::apply_config`.
@@ -152,6 +162,12 @@ pub struct PluginLoader { /* search_paths: Vec<PathBuf> */ }
 impl PluginLoader {
     pub fn new() -> Self;
     pub fn add_search_path(&mut self, path: impl AsRef<Path>);
+    /// Platform plugin library extensions / 平台插件库扩展名
+    /// (Windows `dll`; Linux `so`; macOS `dylib`+`so`).
+    pub fn platform_extensions() -> &'static [&'static str];
+    /// Scan one directory for platform plugin files, sorted by path.
+    /// 扫描单个目录中的平台插件文件，结果按路径排序。
+    pub fn scan_dir(dir: impl AsRef<Path>) -> Vec<PathBuf>;
     /// Scan search paths for platform plugin files (*.dll / *.so / *.dylib).
     /// 扫描搜索路径中的平台插件文件。
     pub fn scan(&self) -> Vec<PathBuf>;
@@ -160,8 +176,10 @@ impl PluginLoader {
     /// Load + ABI check + instantiate a device plugin.
     /// 加载、校验 ABI 并实例化设备插件。
     pub fn load_device(&self, path: &Path) -> Result<LoadedPlugin, DeviceError>;
-    /// Scan + load every library found (best effort; failures logged).
-    /// 扫描并加载找到的所有库（尽力而为；失败仅记录日志）。
+    /// Scan + load every library found (best effort; failures logged, no
+    /// instantiation — use `DeviceManager::scan_and_load` for devices).
+    /// 扫描并加载找到的所有库（尽力而为；失败记录日志；**不实例化设备** ——
+    /// 设备级加载请用 `DeviceManager::scan_and_load`）。
     pub fn scan_and_load(&self) -> Vec<(PathBuf, SafeLibrary)>;
 }
 impl Default for PluginLoader { /* search path: "plugins" */ }
@@ -179,6 +197,37 @@ match), `rp2350_plugin_is_device` (must return 1) and
 `load_device` 要求导出 `rp2350_plugin_version`（匹配 `ABI_VERSION`）、
 `rp2350_plugin_is_device`（返回 1）与 `rp2350_device_plugin_create`（非空设备工厂）。
 ABI 细节见 [rp2350-plugin.md](rp2350-plugin.md)。
+
+### Directory Scan Flow / 目录扫描流程
+
+```
+DeviceManager::scan_and_load(dir)
+  ├─ PluginLoader::scan_dir(dir)          # platform extensions, sorted by path
+  └─ for each library path:
+       loader.load_device(path)
+         ├─ Ok(LoadedPlugin) → id = metadata().id || file stem
+         │     ├─ id already registered → log::warn! + skip (library closed)
+         │     └─ else insert ManagedDevice { plugin, library, source_path }
+         └─ Err(e) → log::warn!("Failed to load device plugin …")
+```
+
+- A dedicated `PluginLoader` is used for the scan, so `DeviceManager::loader()`'s
+  configured search paths are never mutated. The `DeviceManager`-internal loader
+  is only used by `load_plugin`; `scan_and_load` takes an explicit directory.
+  扫描使用独立的 `PluginLoader`，不会改动 `DeviceManager::loader()` 中已配置的
+  搜索路径；`load_plugin` 才使用内部加载器，`scan_and_load` 接收显式目录。
+- Load order is deterministic (path-sorted), and one broken library never aborts
+  the scan — it is logged and skipped.
+  加载顺序确定（按路径排序），单个坏库不会中断扫描 —— 仅记录日志后跳过。
+- The `SafeLibrary` stays inside `ManagedDevice` (declared after the plugin box)
+  and is only closed when the device is dropped or unregistered.
+  `SafeLibrary` 保存在 `ManagedDevice` 内（声明在插件 box 之后），仅在设备被
+  释放或注销时关闭。
+- No persistence: a CLI process releases every device on exit. See
+  [rp2350-cli.md](rp2350-cli.md) for the one-shot `list-devices` / `wire`
+  subcommands built on this method.
+  无持久化：CLI 进程退出即释放所有设备。基于本方法的一次性 `list-devices` /
+  `wire` 子命令见 [rp2350-cli.md](rp2350-cli.md)。
 
 ---
 
@@ -274,12 +323,14 @@ dm.unregister("led-1")?;                       // shutdown + unwire
 
 ## 规划中 / Not yet implemented
 
-- ⬜ `DeviceManager` 层的自动扫描与一键加载（`scan_and_load` 目前只在
-  `PluginLoader` 上，且不实例化设备）；目录约定 `plugins/`、
-  `plugins/third-party/` 及 first-party/third-party 来源标记。
+- ⬜ 目录约定扩展：`plugins/third-party/` 及 first-party/third-party 来源标记；
+  当前 `scan_and_load` 只扫描单个显式目录（按平台扩展名）。
+  Source tagging (first-party vs third-party) and nested `plugins/third-party/`
+  discovery are not implemented; `scan_and_load` scans one explicit directory.
 - ⬜ 接线 JSON 持久化（`WiringTable` 已可序列化，但没有保存/加载文件入口）。
-- ⬜ CLI `wire` / `list-devices` / `mcp-serve` 子命令仍为桩（见
-  [rp2350-cli.md](rp2350-cli.md)）。
-- ⬜ Manager-level auto scan-and-load, wiring-file persistence, and the CLI
-  wiring subcommands are planned; the `PluginLoader` scan/loading and in-process
-  registration above are what exists today.
+  Wiring persistence — the table is serializable but no file I/O entry point.
+- ⬜ 插件热替换 / 守护进程化（无 reload 或 watch 机制）。
+  No hot reload or long-lived device daemon.
+- ⬜ `mcp-serve` 子命令仍为桩（`mcp_query_all` / `mcp_query_device` /
+  `mcp_list_devices` 已可用于未来的 MCP 服务器）。
+  `mcp-serve` remains a stub; the MCP query API is ready for a future server.

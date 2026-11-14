@@ -122,6 +122,69 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Scan a directory and register every device plugin it contains
+    /// 扫描目录并注册其中所有的设备插件
+    ///
+    /// Libraries are enumerated with [`PluginLoader::scan_dir`] (platform
+    /// extensions, sorted by path) and instantiated through
+    /// [`PluginLoader::load_device`]. The device ID is the plugin's
+    /// `metadata().id` when non-empty, otherwise the library file stem.
+    /// Duplicate IDs and libraries that fail to load are skipped with a
+    /// `log::warn!` entry — one bad plugin never aborts the scan.
+    ///
+    /// 库由 [`PluginLoader::scan_dir`] 枚举（按平台扩展名，路径排序），并通过
+    /// [`PluginLoader::load_device`] 实例化。设备 ID 优先取插件的
+    /// `metadata().id`，为空时退回库文件名主干。重复 ID 与加载失败的库会被
+    /// 跳过并记录 `log::warn!` —— 单个坏插件不会中断整个扫描。
+    ///
+    /// Returns `(device_id, library_path)` for every registered device.
+    /// 返回每个已注册设备的 `(设备 ID, 库路径)`。
+    #[must_use]
+    pub fn scan_and_load(&mut self, dir: impl AsRef<Path>) -> Vec<(DeviceId, PathBuf)> {
+        let dir = dir.as_ref();
+        let mut registered = Vec::new();
+        // 使用独立加载器扫描目标目录，避免污染 `self.loader` 的搜索路径。
+        // Use a dedicated loader so `self.loader`'s search paths stay untouched.
+        let loader = PluginLoader::new();
+
+        for path in PluginLoader::scan_dir(dir) {
+            match loader.load_device(&path) {
+                // 模式绑定按声明逆序析构：library 先声明，plugin 后声明，
+                // 因此提前 continue 时会先释放插件（vtable 持有者）再关闭库。
+                // Bindings drop in reverse declaration order: `library` is declared
+                // first, so `plugin` (vtable owner) drops before the library closes.
+                Ok(LoadedPlugin { library, plugin }) => {
+                    let id = device_id_for(plugin.metadata().id.as_str(), &path);
+                    if self.devices.contains_key(&id) {
+                        log::warn!(
+                            "Skipping duplicate device plugin '{}' from {} / 跳过重复设备插件",
+                            id,
+                            path.display()
+                        );
+                        continue;
+                    }
+                    self.devices.insert(
+                        id.clone(),
+                        ManagedDevice {
+                            plugin,
+                            source_path: Some(path.clone()),
+                            library: Some(library),
+                        },
+                    );
+                    registered.push((id, path));
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Failed to load device plugin {}: {} / 设备插件加载失败",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+        }
+        registered
+    }
+
     /// Remove a registered device / 移除已注册的设备
     pub fn unregister(&mut self, id: &DeviceId) -> Result<(), DeviceError> {
         let mut device = self
@@ -240,8 +303,12 @@ impl DeviceManager {
             .map(|managed| managed.plugin.state_snapshot())
     }
 
-    /// MCP API: list devices as `[{id, name, has_ui, tags}]`, sorted by ID
-    /// MCP API：列出设备（id/name/has_ui/tags），按 ID 排序
+    /// MCP API: list devices as `[{id, name, has_ui, tags, ports}]`, sorted by ID
+    /// MCP API：列出设备（id/name/has_ui/tags/ports），按 ID 排序
+    ///
+    /// `ports` holds the port names in wiring order, i.e. the index accepted by
+    /// [`DeviceManager::wire`]. `ports` 为按接线顺序排列的端口名，即
+    /// [`DeviceManager::wire`] 使用的索引顺序。
     #[must_use]
     pub fn mcp_list_devices(&self) -> Vec<serde_json::Value> {
         let mut entries: Vec<serde_json::Value> = self
@@ -249,11 +316,18 @@ impl DeviceManager {
             .iter()
             .map(|(id, managed)| {
                 let metadata = managed.plugin.metadata();
+                let ports: Vec<&str> = managed
+                    .plugin
+                    .ports()
+                    .iter()
+                    .map(|port| port.name.as_str())
+                    .collect();
                 serde_json::json!({
                     "id": id,
                     "name": metadata.name,
                     "has_ui": managed.plugin.has_ui(),
                     "tags": metadata.tags,
+                    "ports": ports,
                 })
             })
             .collect();
@@ -312,6 +386,19 @@ impl DeviceManager {
 impl Default for DeviceManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Resolve the device ID: plugin metadata first, library file stem as fallback
+/// 解析设备 ID：优先插件元数据，退回库文件名主干
+fn device_id_for(metadata_id: &str, path: &Path) -> DeviceId {
+    if metadata_id.is_empty() {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        metadata_id.to_string()
     }
 }
 
@@ -436,6 +523,93 @@ mod tests {
         assert_eq!(devices[0]["name"], "Test LED");
         assert_eq!(devices[0]["has_ui"], false);
         assert_eq!(devices[0]["tags"], serde_json::json!(["led", "test"]));
+        assert_eq!(devices[0]["ports"], serde_json::json!(["LED"]));
+    }
+
+    /// Create a fresh temporary directory for scan tests
+    /// 为扫描测试创建全新的临时目录
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("rp2350-virt-periph-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn scan_and_load_empty_dir_returns_empty() {
+        let dir = temp_dir("scan-empty");
+        let mut dm = DeviceManager::new();
+        assert_eq!(dm.scan_and_load(&dir), Vec::<(DeviceId, PathBuf)>::new());
+        assert_eq!(dm.device_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_and_load_missing_dir_returns_empty() {
+        let dir = temp_dir("scan-missing");
+        let missing = dir.join("does-not-exist");
+        let mut dm = DeviceManager::new();
+        assert_eq!(dm.scan_and_load(missing), Vec::<(DeviceId, PathBuf)>::new());
+        assert_eq!(dm.device_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn device_id_prefers_metadata_then_file_stem() {
+        let path = Path::new("/tmp/plugins/rp2350_led_plugin.dll");
+        assert_eq!(
+            device_id_for("com.rp2350-rs.led", path),
+            "com.rp2350-rs.led"
+        );
+        assert_eq!(device_id_for("", path), "rp2350_led_plugin");
+    }
+
+    /// Locate the built LED plugin library in the workspace target directory
+    /// 在工作区 target 目录中定位已构建的 LED 插件库
+    fn locate_led_plugin() -> Option<PathBuf> {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let name = if cfg!(target_os = "windows") {
+            "rp2350_led_plugin.dll"
+        } else if cfg!(target_os = "macos") {
+            "librp2350_led_plugin.dylib"
+        } else {
+            "librp2350_led_plugin.so"
+        };
+        ["debug", "release", "debug/deps"]
+            .into_iter()
+            .map(|profile| target.join(profile).join(name))
+            .find(|path| path.is_file())
+    }
+
+    #[test]
+    fn scan_and_load_skips_duplicate_plugin() {
+        let Some(source) = locate_led_plugin() else {
+            eprintln!(
+                "SKIP: LED plugin library not built; run `cargo build -p rp2350-led-plugin` \
+                 / 未构建 LED 插件，跳过"
+            );
+            return;
+        };
+        let dir = temp_dir("scan-duplicate");
+        let file_name = source.file_name().expect("library file name");
+        std::fs::copy(&source, dir.join(file_name)).expect("copy plugin library");
+
+        let mut dm = DeviceManager::new();
+        let first = dm.scan_and_load(&dir);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "com.rp2350-rs.led");
+        assert_eq!(dm.device_count(), 1);
+
+        // 第二次扫描必须跳过重复 ID，且不影响已注册设备。
+        // A second scan must skip the duplicate ID without disturbing the device.
+        let second = dm.scan_and_load(&dir);
+        assert_eq!(second, Vec::<(DeviceId, PathBuf)>::new());
+        assert_eq!(dm.device_count(), 1);
+        dm.wire("com.rp2350-rs.led", 0, 25).expect("wire LED port");
+        assert_eq!(dm.wiring().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

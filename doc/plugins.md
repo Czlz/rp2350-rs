@@ -371,22 +371,54 @@ cargo build --release -p rp2350-led-plugin
 # → target/release/rp2350_led_plugin.dll (Windows) / librp2350_led_plugin.so / .dylib
 ```
 
-Loading today / 当前的加载方式（程序化 API）：
+Loading today / 当前的加载方式：
+
+**A. Directory scan (CLI) / 目录扫描（CLI）**
+
+```bash
+cargo build --release -p rp2350-led-plugin
+cargo run --release -p rp2350-cli -- list-devices --plugin-dir target/release
+# com.rp2350-rs.led / LED / has_ui=false / ports=[LED]
+cargo run --release -p rp2350-cli -- wire --plugin-dir target/release \
+      --device com.rp2350-rs.led --port 0 --gpio 25
+# com.rp2350-rs.led / LED / port 0 / GPIO25
+```
+
+`list-devices` / `wire` call `DeviceManager::scan_and_load(dir)`: the directory is
+enumerated by platform extension (`dll` / `so` / `dylib`), each library is
+instantiated through `PluginLoader::load_device`, and the device ID becomes
+`metadata().id` (falling back to the library file stem). Duplicate IDs and
+libraries that fail to load are logged with `log::warn!` and skipped.
+`list-devices` / `wire` 调用 `DeviceManager::scan_and_load(dir)`：按平台扩展名
+（`dll` / `so` / `dylib`）枚举目录，经 `PluginLoader::load_device` 实例化每个库，
+设备 ID 取 `metadata().id`（退回库文件名主干）。重复 ID 与加载失败的库会被
+`log::warn!` 记录后跳过。
+
+> **One-shot / 一次性**：these subcommands exit immediately after printing, so
+> the devices, `SafeLibrary` handles and wiring are released at process exit.
+> There is no wiring persistence and no emulator attach yet.
+> 这些子命令打印后立即退出，设备、`SafeLibrary` 句柄与接线在进程结束时释放；
+> 目前没有接线持久化，也不会挂接模拟器运行。
+
+**B. Programmatic API / 程序化 API**
 
 ```rust
 let mut dm = DeviceManager::new();                       // 默认搜索路径 "plugins"
 dm.load_plugin("led0".to_string(),                       // id → DeviceError::AlreadyExists 重复即报错
                "target/release/rp2350_led_plugin.dll")?; // 内部走 PluginLoader::load_device
 dm.wire("led0", 0, 25)?;                                 // 端口 0 → GPIO25
+
+// 或整目录加载：ID 取自 metadata().id / or scan a whole directory (ID from metadata)
+let loaded = dm.scan_and_load("target/release");         // Vec<(DeviceId, PathBuf)>
 ```
 
-- `PluginLoader::scan()` / `scan_and_load()` can enumerate candidate libraries in the
-  search paths, but **device instantiation + auto-registration into the CLI/emulator
-  startup is planned** (CLI `wire` / `list-devices` wiring, P1).
-  `PluginLoader::scan()` / `scan_and_load()` 可枚举搜索路径中的候选库，但
-  **设备实例化 + CLI/模拟器启动时自动注册为规划项**（CLI `wire` / `list-devices` 接线，P1）。
-- Until then, plugins are loaded explicitly (tests, examples, or host code).
-  在此之前，插件通过显式调用加载（测试、示例或主机代码）。
+- `PluginLoader::scan()` / `scan_and_load()` enumerate candidate libraries without
+  instantiating devices; `DeviceManager::scan_and_load` is the device-level entry
+  point used by the CLI.
+  `PluginLoader::scan()` / `scan_and_load()` 只枚举/加载库而**不实例化设备**；
+  设备级入口是 `DeviceManager::scan_and_load`，CLI 即使用该入口。
+- Hot reload, a persistent daemon, and MCP wiring remain planned.
+  热替换、常驻守护进程与 MCP 接线仍为规划项。
 
 ---
 

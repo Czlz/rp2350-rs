@@ -60,33 +60,64 @@ impl PluginLoader {
         self.search_paths.push(path.as_ref().to_path_buf());
     }
 
-    /// Scan the default plugin directory for compatible libraries
-    /// 扫描默认插件目录以查找兼容的库
+    /// Platform-specific loadable library extensions
+    /// 平台相关的可加载库扩展名
+    ///
+    /// Windows uses `dll`, Linux `so`, macOS both `dylib` and `so`.
+    /// Windows 使用 `dll`，Linux 使用 `so`，macOS 使用 `dylib` 与 `so`。
     #[must_use]
-    pub fn scan(&self) -> Vec<PathBuf> {
-        let mut found = Vec::new();
-
-        // Default extensions per platform
+    pub fn platform_extensions() -> &'static [&'static str] {
         #[cfg(target_os = "windows")]
-        let exts = ["dll"];
+        {
+            &["dll"]
+        }
         #[cfg(target_os = "linux")]
-        let exts = ["so"];
+        {
+            &["so"]
+        }
         #[cfg(target_os = "macos")]
-        let exts = ["dylib", "so"];
+        {
+            &["dylib", "so"]
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        {
+            &["dylib", "so", "dll"]
+        }
+    }
 
-        for search_path in &self.search_paths {
-            if let Ok(entries) = std::fs::read_dir(search_path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if exts.contains(&ext) {
-                            found.push(path);
-                        }
+    /// Scan one directory for compatible libraries, sorted by path
+    /// 扫描单个目录以查找兼容的库，结果按路径排序
+    ///
+    /// A missing or unreadable directory yields an empty list.
+    /// 目录不存在或不可读时返回空列表。
+    #[must_use]
+    pub fn scan_dir(dir: impl AsRef<Path>) -> Vec<PathBuf> {
+        let exts = Self::platform_extensions();
+        let mut found = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if exts.contains(&ext) {
+                        found.push(path);
                     }
                 }
             }
         }
+        // 目录迭代顺序不稳定，排序保证扫描与加载顺序可复现。
+        // Directory iteration order is unstable; sorting keeps scan and load order reproducible.
+        found.sort();
+        found
+    }
 
+    /// Scan the configured search paths for compatible libraries
+    /// 扫描已配置的搜索路径以查找兼容的库
+    #[must_use]
+    pub fn scan(&self) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for search_path in &self.search_paths {
+            found.extend(Self::scan_dir(search_path));
+        }
         found
     }
 
