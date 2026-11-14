@@ -10,13 +10,13 @@
 | Item | Detail |
 |------|--------|
 | **Chip** | RP2350 (Raspberry Pi Pico 2) |
-| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU + NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP 并行 SIMD（core1 常驻 WFE，双核调度脚手架开发中） |
+| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU（单精度算术/比较/转换、FPCCR 惰性压栈）+ NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP 并行 SIMD（core1 常驻 WFE，`DualCoreM33` 脚手架已落地） |
 | **RISC-V** | Hazard3 RV32IMAC + C（已实现，CLI `--arch riscv` 可用） |
-| **USB** | 设备控制器模型 + 主机桥 + raw REPL：真实 MicroPython UF2 → `perfbench` 全链路可跑 |
-| **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）；引脚/side-set/DMA 待补 |
+| **USB** | 设备控制器模型 + 主机桥 + raw REPL：真实 MicroPython UF2 → 官方 `run-perfbench.py` 全链路可跑（Arm/RISC-V 各 24/24） |
+| **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）+ 引脚/side-set/delay/CLKDIV/FIFO join；DMA/IRQ 路由待补 |
 | **GUI** | egui 0.37 (eframe + wgpu) — 寄存器面板（Virtual Electronics Lab 规划中） |
 | **Debug** | GDB RSP：协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、内存、断点、resume）；watchpoint/多核 vCont 规划中 |
-| **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` |
+| **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权 |
 | **Plugins** | libloading + abi_stable — 目录扫描 + CLI `list-devices`/`wire`；LED 与 UART Terminal 插件已就绪 |
 | **Platform** | Windows / Linux / macOS / Web (WASM planned) |
 | **Performance** | Target 200+ MCPS (single core, release build) |
@@ -127,3 +127,5 @@ cargo doc --no-deps --document-private-items
 | [crates/rp2350-bootrom.md](crates/rp2350-bootrom.md) | Synthetic boot ROM crate public API |
 | [crates/rp2350-usb.md](crates/rp2350-usb.md) | USB device controller crate public API |
 | [crates/rp2350-usb-host.md](crates/rp2350-usb-host.md) | USB host bridge / raw REPL crate public API |
+| [crates/rp2350-cli.md](crates/rp2350-cli.md) | CLI subcommands (`run`/`repl`/`perfbench`/`gdb`/`mcp-serve`) |
+| [crates/rp2350-mcp.md](crates/rp2350-mcp.md) | MCP JSON-RPC methods + HTTP transport / Bearer auth |

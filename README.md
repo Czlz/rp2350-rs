@@ -15,16 +15,16 @@
 
 > 状态标注 / Status: ✅ 已实现 implemented · 🚧 部分 partial · ⏳ 规划 planned（阶段计划见 [implementation-plan](doc/implementation-plan.md) 与 [reference-gap-analysis](doc/reference-gap-analysis.md)）
 
-- ✅ **ARM Cortex-M33** — Thumb-16/32 解码器、FPv5-SP FPU、NVIC/异常/SysTick、GPIO(CP0)/DCP(CP4) 协处理器、DSP 并行 SIMD（SADD/SSUB/UADD/USUB、SXTB16/UXTB16、USAD8/USADA8）
+- ✅ **ARM Cortex-M33** — Thumb-16/32 解码器、FPv5-SP FPU（单精度算术/比较/转换/VSEL/VRINT、FPCCR 惰性压栈）、NVIC/异常/SysTick、GPIO(CP0)/DCP(CP4) 协处理器、DSP 并行 SIMD（SADD/SSUB/UADD/USUB、SXTB16/UXTB16、USAD8/USADA8）
 - ✅ **RISC-V Hazard3** — RV32IMAC + C 压缩指令、machine CSRs、Xh3irq 外部中断、picobin 启动
-- ✅ **USB 全链路** — 设备控制器模型 + 主机桥枚举 + raw REPL：真实 MicroPython UF2 可启动、进入 REPL 并跑通 `perfbench` 基准
+- ✅ **USB 全链路** — 设备控制器模型 + 主机桥枚举 + raw REPL：真实 MicroPython UF2 可启动、进入 REPL 并跑通官方 `run-perfbench.py`（Arm/RISC-V 各 24/24）
 - ✅ **合成 bootrom + XIP Flash** — 32 KB 合成 ROM（`rom_table_lookup`/flash 擦写/sysinfo/reboot）、16 MB Flash XIP、非缓存别名与维护窗口
 - ✅ **启动外设桩** — RESETS/CLOCKS/XOSC/PLL/TIMER/SIO/IO_BANK0/PADS/UART0/PPB/BOOTRAM/TICKS/POWMAN/IO_QSPI/XIP_QMI
-- 🚧 **PIO** — 3 blocks × 4 SMs 寄存器块 + 状态机执行（JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET、autopush/autopull、wrap、stall）；引脚映射/side-set/DMA 握手待补
+- 🚧 **PIO** — 3 blocks × 4 SMs 寄存器块 + 状态机执行（JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET、autopush/autopull、wrap、stall）；PINCTRL 引脚映射、side-set、delay、CLKDIV、FIFO join 已接入；DMA 握手/IRQ 路由/主循环 tick 待补
 - ✅ **GDB RSP** — 协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、总线内存、PC 断点、resume）；watchpoint/多核 `vCont`/`target.xml` 待补
-- ✅ **MCP** — JSON-RPC 方法层 + HTTP/1.1 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve`
+- ✅ **MCP** — JSON-RPC 方法层 + HTTP/1.1 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权
 - ✅ **插件系统** — libloading 动态加载 `.dll`/`.so`/`.dylib`，目录扫描 + CLI `list-devices`/`wire`，LED 与 UART Terminal 插件
-- 🚧 **双核** — core1 常驻 WFE（SIO FIFO/门铃语义保留），双核调度脚手架开发中
+- 🚧 **双核** — core1 常驻 WFE（SIO FIFO/门铃语义保留），`DualCoreM33` 调度脚手架已落地；PSM/SIO/CLI 接线待补
 - ⏳ **DMA**（16 通道链式 + DREQ）、**HSTX** 视频输出、**Virtual Electronics Lab**（egui 拖线连线）、**PSRAM** — 规划中
 
 ---
