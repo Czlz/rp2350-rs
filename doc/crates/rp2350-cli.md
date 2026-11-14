@@ -49,7 +49,7 @@ PC 轨迹、模拟时间、最多 8 条已记录的中断投递以及缓冲的 U
 ### `repl` — USB CDC raw REPL / USB CDC raw REPL
 
 ```text
-rp2350 repl --file <FIRMWARE> [--exec "CODE"] [--max-cycles N]
+rp2350 repl --file <FIRMWARE> [--exec "CODE" | --stdio] [--max-cycles N]
             [--enum-cycles N] [--no-soft-reset] [--strict-decode]
             [--arch arm|riscv]
 ```
@@ -57,10 +57,11 @@ rp2350 repl --file <FIRMWARE> [--exec "CODE"] [--max-cycles N]
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
 |---------------|----------------|----------------|
 | `--file` | required | Firmware (MicroPython/CircuitPython UF2 or ELF) / 固件 |
-| `--exec` | interactive | Python source to run once / 只执行一次的 Python 源码 |
-| `--max-cycles` | `300_000_000` | Total simulated instruction budget / 总指令预算 |
+| `--exec` | interactive | Python source to run once; conflicts with `--stdio` / 只执行一次的 Python 源码；与 `--stdio` 冲突 |
+| `--stdio` | off | Transparent stdin/stdout bridge to the CDC bulk endpoints; conflicts with `--exec` / 在 stdin/stdout 与 CDC 批量端点之间透明桥接；与 `--exec` 冲突 |
+| `--max-cycles` | `300_000_000` | Total simulated instruction budget; `0` means unlimited for `repl` / 总指令预算；`repl` 中 `0` 表示不限制 |
 | `--enum-cycles` | `100_000_000` | Budget before USB enumeration must finish / USB 枚举需在此预算内完成 |
-| `--no-soft-reset` | off | Skip the Ctrl-D soft reset on entry / 进入时跳过 Ctrl-D 软复位 |
+| `--no-soft-reset` | off | Skip the Ctrl-D soft reset on entry (ignored by `--stdio`) / 进入时跳过 Ctrl-D 软复位（`--stdio` 下忽略） |
 | `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
 | `--arch` | from UF2 family | Override the core architecture / 覆盖核心架构（`riscv` 为别名） |
 
@@ -73,6 +74,75 @@ interactive line-based session. Enumeration failures print the host bridge's
 `HostProgress::Configured`（须在 `--enum-cycles` 内），进入 raw REPL，随后
 要么执行 `--exec` 并打印 stdout/stderr，要么进入交互式按行会话。枚举失败
 会打印主机桥的 `progress_line` 快照与故障尾部诊断。
+
+#### `--stdio` transparent bridge / 透明桥接
+
+With `--stdio` the CLI stops driving the raw REPL protocol after enumeration:
+stdin bytes are forwarded verbatim to the CDC OUT endpoint and CDC IN bytes are
+written verbatim to stdout. The CLI never sends Ctrl-C/Ctrl-A/Ctrl-B/Ctrl-D on
+its own, so the peer (`pyboard.py`, `run-perfbench.py`, or a script) owns the
+whole protocol.
+使用 `--stdio` 时，CLI 在枚举完成后不再驱动 raw REPL 协议：stdin 字节原样
+送到 CDC OUT 端点，CDC IN 字节原样写到 stdout。CLI 不会自行发送
+Ctrl-C/Ctrl-A/Ctrl-B/Ctrl-D，协议完全由对端（`pyboard.py`、
+`run-perfbench.py` 或脚本）掌控。
+
+- **stdout purity / stdout 纯净性**：every `[repl]` diagnostic (image/core
+  summary, endpoint line, final state, fault dumps) goes to stderr. stdout
+  carries only guest bytes, so it can be piped into a serial-protocol client
+  without filtering.
+  所有 `[repl]` 诊断（映像/核心摘要、端点行、最终状态、故障转储）都走
+  stderr；stdout 只有客户机字节，可直接接入串口协议客户端而无需过滤。
+- **Transport / 传输**：a background thread performs blocking stdin reads and
+  feeds a bounded queue (16 slots × 4 KiB = 64 KiB in flight); the main loop
+  sends queued bytes, drains CDC IN to stdout and flushes, then advances the
+  simulation by `STDIO_CHUNK_MICROS` (500 µs, i.e. 75 000 guest cycles at
+  150 MHz). Smaller steps lower latency but add host loop overhead; 100–1000 µs
+  is the useful range.
+  后台线程阻塞读取 stdin，并送入有界队列（16 槽 × 4 KiB = 64 KiB 在途）；
+  主循环发送队列字节、把 CDC IN 排空到 stdout 并 flush，然后按
+  `STDIO_CHUNK_MICROS`（500 微秒，150 MHz 下 75 000 个客户机周期）推进模拟。
+  更小的步长降低延迟但增加宿主循环开销；100–1000 微秒是有效范围。
+- **EOF and budget / EOF 与预算**：after stdin EOF the bridge sends every
+  queued byte and keeps simulating for a 50 ms (simulated) drain window so a
+  late banner/prompt is not truncated, then exits with a stdin-byte count on
+  stderr. The default `--max-cycles 300_000_000` is about two simulated seconds
+  and may be too small for long benchmark sessions; pass `--max-cycles 0` for
+  an unlimited budget (`u64::MAX`). This `0` interpretation applies to `repl`
+  (both `--exec` and `--stdio`); `repl --exec` keeps its historical default of
+  `300_000_000`.
+  stdin EOF 后桥接会把队列字节全部送出，并继续模拟 50 毫秒（模拟时间）的
+  排空窗口，避免截断迟到的 banner/提示符，然后在 stderr 打印已处理的 stdin
+  字节数并退出。默认 `--max-cycles 300_000_000` 约等于两秒模拟时间，长时间
+  基准可能不够；传 `--max-cycles 0` 表示不限制预算（`u64::MAX`）。该 `0`
+  语义仅适用于 `repl`（`--exec` 与 `--stdio`）；`repl --exec` 的默认值仍为
+  `300_000_000`。
+- **Limitations / 限制**：no PTY, no real serial port, no hardware flow
+  control (only the 64 KiB bounded queue and OS pipe backpressure), no TLS and
+  no multi-client. `--stdio` expects a byte-oriented pipe/file; interactive
+  console line editing and Ctrl-C signal handling are the caller's job, and
+  Windows terminal compatibility is not emulated (use a pipe or a wrapper that
+  redirects stdin/stdout). `--no-soft-reset` is ignored because the CLI does
+  not enter raw mode.
+  无 PTY、无真实串口、无硬件流控（只有 64 KiB 有界队列与操作系统管道背压）、
+  无 TLS、无多客户端。`--stdio` 期望面向字节的管道/文件；交互式控制台的行
+  编辑与 Ctrl-C 信号处理由调用方负责，不模拟 Windows 终端兼容性（请使用管道
+  或重定向 stdin/stdout 的包装器）。`--no-soft-reset` 会被忽略，因为 CLI 不
+  进入 raw 模式。
+
+```powershell
+# Windows PowerShell: drive pyboard.py through the stdio bridge
+python tools\pyboard.py --device "exec:E:\Source\mcu\pico\rp2350-rs\target\release\rp2350-cli.exe repl --file E:\Source\mcu\pico\python\micropython\RPI_PICO2-20260824-v1.29.0.uf2 --stdio --max-cycles 0" -c "print(6 * 7)"
+
+# run-perfbench.py with the same target / 用同一目标运行 run-perfbench.py
+python tests\run-perfbench.py -t "exec:E:\...\rp2350-cli.exe repl --file firmware.uf2 --stdio --max-cycles 0" tests\perf_bench\bm_float.py
+```
+
+> **Note / 注意**：`exec:` support and its quoting rules depend on the
+> `pyboard.py` version and host shell; any wrapper that pipes this process's
+> stdin/stdout works, including a small `.cmd`/shell script.
+> `exec:` 支持与引号规则取决于 `pyboard.py` 版本与宿主 shell；任何把本进程
+> stdin/stdout 接成管道的包装器也可用（包括小型 `.cmd`/shell 脚本）。
 
 ### `perfbench` — MicroPython benchmarks / MicroPython 基准
 
@@ -89,7 +159,7 @@ rp2350 perfbench --file <FIRMWARE> --bench bm_xxx.py --benchrun benchrun.py
 | `--benchrun` | required | Shared `benchrun.py` helper / 共享辅助文件 |
 | `--n` | `1` | `N` in `bm_run(N, M)` / `bm_run(N, M)` 的 N |
 | `--m` | `1` | `M` in `bm_run(N, M)` / `bm_run(N, M)` 的 M |
-| `--max-cycles` / `--enum-cycles` / `--no-soft-reset` / `--strict-decode` | as `repl` | same semantics / 语义同 `repl` |
+| `--max-cycles` / `--enum-cycles` / `--no-soft-reset` / `--strict-decode` | as `repl` | same semantics (`--max-cycles 0` is not remapped here) / 语义同 `repl`（此处不把 `--max-cycles 0` 重映射为不限制） |
 
 The script is assembled by
 `rp2350_usb_host::assemble_bench_script` (benchmark + benchrun +
@@ -413,6 +483,10 @@ rp2350 run --file firmware.elf --arch riscv
 
 # Execute one snippet over the MicroPython raw REPL
 rp2350 repl --file firmware.uf2 --exec "print(6 * 7)"
+
+# Transparent stdin/stdout bridge for pyboard.py / run-perfbench.py
+# (stdout carries guest bytes only; use --max-cycles 0 for long sessions)
+rp2350 repl --file firmware.uf2 --stdio --max-cycles 0 < input.bin > output.bin
 
 # Benchmark, 4x64 repetitions
 rp2350 perfbench --file firmware.uf2 --bench bm_float.py \

@@ -77,10 +77,16 @@ enum Commands {
 
         /// Python source to execute after entering raw REPL
         /// 进入 raw REPL 后执行的 Python 源码
-        #[arg(long)]
+        #[arg(long, conflicts_with = "stdio")]
         exec: Option<String>,
 
-        /// Total simulated instruction budget / 总模拟指令预算
+        /// Transparent stdin/stdout bridge to the USB CDC endpoints
+        /// 在 stdin/stdout 与 USB CDC 端点之间透明桥接
+        #[arg(long)]
+        stdio: bool,
+
+        /// Total simulated instruction budget (0 = unlimited)
+        /// 总模拟指令预算（0 表示不限制）
         #[arg(long, default_value_t = repl::DEFAULT_MAX_CYCLES)]
         max_cycles: u64,
 
@@ -220,6 +226,7 @@ fn main() {
             file,
             arch,
             exec,
+            stdio,
             max_cycles,
             enum_cycles,
             no_soft_reset,
@@ -229,6 +236,7 @@ fn main() {
                 file: file.into(),
                 arch,
                 exec,
+                stdio,
                 max_cycles,
                 enum_cycles,
                 soft_reset: !no_soft_reset,
@@ -296,5 +304,32 @@ fn finish(result: anyhow::Result<()>, label: &str) {
     if let Err(error) = result {
         log::error!("{label}: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("rp2350").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn repl_stdio_conflicts_with_exec() {
+        let error = parse(&["repl", "--file", "fw.uf2", "--stdio", "--exec", "print(1)"])
+            .expect_err("--stdio must conflict with --exec");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn repl_stdio_parses_into_options() {
+        let cli = parse(&["repl", "--file", "fw.uf2", "--stdio"]).expect("parse repl");
+        let Commands::Repl { stdio, exec, .. } = cli.command else {
+            panic!("expected the repl subcommand");
+        };
+        assert!(stdio);
+        assert!(exec.is_none());
     }
 }
