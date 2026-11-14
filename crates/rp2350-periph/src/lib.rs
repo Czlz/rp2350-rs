@@ -18,6 +18,7 @@
 // and device names are always string literals, so these pedantic lints are relaxed.
 #![allow(clippy::doc_markdown, clippy::unnecessary_literal_bound)]
 
+pub mod adc;
 pub mod boot;
 pub mod bootram;
 pub mod clocks;
@@ -27,14 +28,20 @@ pub mod io_qspi;
 pub mod irq;
 pub mod map;
 pub mod pads_bank0;
+pub mod pads_qspi;
 pub mod pll;
 pub mod powman;
 pub mod ppb;
+pub mod psm;
+pub mod pwm;
 pub mod resets;
+pub mod rosc;
+pub mod sha256;
 pub mod sio;
 pub mod ticks;
 pub mod timer;
 pub mod traits;
+pub mod trng;
 pub mod uart;
 pub mod watchdog;
 pub mod xip_qmi;

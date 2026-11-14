@@ -25,6 +25,16 @@ use super::map;
 /// Size of the scratch RAM in front of the registers / 寄存器之前暂存 RAM 的大小
 const DATA_SIZE: u32 = 0x800;
 
+/// Minimal boot2 copy-out stub: `bx lr` / 最小 boot2 拷出桩：`bx lr`
+///
+/// The RP2350 boot ROM leaves a second-stage flash helper in BOOTRAM. The
+/// emulator keeps flash XIP readable during erase/program, so a single `bx lr`
+/// is enough for `flash_init_boot2_copyout` to return after copying the block.
+/// RP2350 boot ROM 会在 BOOTRAM 中留下第二级 Flash 辅助程序。本模拟器在擦除/
+/// 编程期间仍保持 Flash XIP 可读，因此 `flash_init_boot2_copyout` 拷出该块后
+/// 只需一条 `bx lr` 即可返回。
+const BOOT2_STUB: u32 = 0x4770;
+
 /// `WRITE_ONCE0` offset / `WRITE_ONCE0` 偏移
 const WRITE_ONCE0: u32 = 0x800;
 
@@ -57,8 +67,10 @@ impl BootRam {
     /// Create the block / 创建寄存器块
     #[must_use]
     pub fn new() -> Self {
+        let mut data = [0; DATA_SIZE as usize];
+        data[0..4].copy_from_slice(&BOOT2_STUB.to_le_bytes());
         Self {
-            data: [0; DATA_SIZE as usize],
+            data,
             write_once: [0; 2],
             claimed: 0,
         }
@@ -249,9 +261,20 @@ mod tests {
         assert!(ram.write32(WRITE_ONCE0, 3));
         assert_eq!(read(&mut ram, BOOTLOCK0), 1);
         ram.reset();
-        assert_eq!(read(&mut ram, 0x0000), 0);
+        assert_eq!(read(&mut ram, 0x0000), BOOT2_STUB);
+        assert_eq!(read(&mut ram, 0x0004), 0);
         assert_eq!(read(&mut ram, WRITE_ONCE0), 0);
         assert_eq!(read(&mut ram, BOOTLOCK_STAT), 0xFF);
         assert_eq!(read(&mut ram, BOOTLOCK0), 1);
+    }
+
+    #[test]
+    fn boot2_stub_returns_immediately() {
+        // The copied boot2 block starts with `bx lr`, so the flash helper can
+        // exit without a real XIP switch (flash stays readable in this model).
+        // 被拷出的 boot2 块以 `bx lr` 开头，因此 Flash 辅助程序无需真实 XIP
+        // 切换即可返回（本模型中 Flash 始终可读）。
+        let mut ram = BootRam::new();
+        assert_eq!(read(&mut ram, 0x0000), 0x4770);
     }
 }

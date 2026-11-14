@@ -243,6 +243,35 @@ pub struct RpSio {
 
 ---
 
+## PSM and BOOTRAM / 电源状态机与 BOOTRAM
+
+```rust
+pub struct Psm { /* FRCE_ON, FRCE_OFF, WDSEL, DONE */ }
+impl Psm {
+    pub fn new() -> Self;
+    pub fn with_core1_release(flag: Arc<AtomicBool>) -> Self;
+}
+
+impl BootPeripherals {
+    pub fn service_core1_peer(&self); // FIFO echo + core-1 boot-ROM ack
+    pub fn sio(&self) -> &Sio;
+}
+```
+
+`Psm` models `PSM_FRCE_ON`, `PSM_FRCE_OFF`, `PSM_WDSEL` and the derived
+`PSM_DONE` status; clearing `FRCE_OFF.PROC1` latches a core-1 release event
+that the simulation driver turns into the boot ROM's drain-and-`0` handshake.
+`BootRam` exposes the scratch RAM at `0x400E_0000`; its first word is a
+`bx lr` boot2 copy-out stub so pico-sdk `flash_init_boot2_copyout` can return
+while this model keeps flash XIP readable.
+PSM 模型实现 `PSM_FRCE_ON`、`PSM_FRCE_OFF`、`PSM_WDSEL` 与派生的 `PSM_DONE`
+状态；清除 `FRCE_OFF.PROC1` 会置位 core1 释放事件，仿真驱动器据此执行
+boot ROM 的“清空信箱并回送 0”握手。`BootRam` 暴露 `0x400E_0000` 的暂存
+RAM；首字为 `bx lr` boot2 拷出桩，使 pico-sdk 的
+`flash_init_boot2_copyout` 能立即返回，而本模型保持 Flash XIP 可读。
+
+---
+
 ## USB Controller
 
 ```rust

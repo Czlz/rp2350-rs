@@ -11,11 +11,13 @@
 //! 到核中的 PPB 系统写入日志。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use rp2350_core::bus::{AddressBus, BusResult};
 use rp2350_core::mmio::{MMIO_BLOCK_SIZE, MmioRouter, MmioWindow, mount_device};
 
+use super::adc::Adc;
 use super::bootram::BootRam;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
@@ -24,13 +26,19 @@ use super::io_qspi::IoQspi;
 use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
+use super::pads_qspi::PadsQspi;
 use super::pll::Pll;
 use super::powman::Powman;
 use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
+use super::psm::Psm;
+use super::pwm::Pwm;
 use super::resets::Resets;
+use super::rosc::Rosc;
+use super::sha256::Sha256;
 use super::sio::Sio;
 use super::ticks::Ticks;
 use super::timer::Timer0;
+use super::trng::Trng;
 use super::uart::{Uart0, UartSink};
 use super::watchdog::Watchdog;
 use super::xip_qmi::XipQmi;
@@ -88,6 +96,7 @@ pub struct BootPeripherals {
     sio: Sio,
     irq: IrqAssert,
     system_writes: SystemWriteLog,
+    core1_release: Arc<AtomicBool>,
 }
 
 impl BootPeripherals {
@@ -113,21 +122,31 @@ impl BootPeripherals {
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
         let sio = Sio::new(irq.clone());
+        let core1_release = Arc::new(AtomicBool::new(false));
 
         let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
         apb.mount(Box::new(Clocks::new()))?;
         apb.mount(Box::new(Resets::new()))?;
+        apb.mount(Box::new(Psm::with_core1_release(Arc::clone(
+            &core1_release,
+        ))))?;
         apb.mount(Box::new(IoBank0::new()))?;
         apb.mount(Box::new(IoQspi::new()))?;
         apb.mount(Box::new(PadsBank0::new()))?;
+        apb.mount(Box::new(PadsQspi::new()))?;
         apb.mount(Box::new(Xosc::new()))?;
         apb.mount(Box::new(Pll::sys()))?;
         apb.mount(Box::new(Pll::usb()))?;
         apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
+        apb.mount(Box::new(Adc::new()))?;
+        apb.mount(Box::new(Pwm::new()))?;
         apb.mount(Box::new(timer.clone()))?;
         apb.mount(Box::new(Watchdog::new()))?;
         apb.mount(Box::new(XipQmi::new()))?;
         apb.mount(Box::new(BootRam::new()))?;
+        apb.mount(Box::new(Rosc::new()))?;
+        apb.mount(Box::new(Trng::new()))?;
+        apb.mount(Box::new(Sha256::new()))?;
         bus.register_region(Box::new(apb))?;
 
         // TICKS 位于 APB 路由器跨度之上，独立挂载；写 CYCLES 会推进共享时基。
@@ -155,7 +174,33 @@ impl BootPeripherals {
             sio,
             irq,
             system_writes,
+            core1_release,
         })
+    }
+
+    /// Emulate the resident core-1 peer once per driver pump
+    /// 每次驱动器泵送时模拟常驻 core1 对端
+    ///
+    /// When `PSM_FRCE_OFF.PROC1` is released, the core-1 boot ROM drains its
+    /// mailbox and pushes `0` to core 0. For ordinary FIFO writes the resident
+    /// peer echoes the frame back, which is what the SDK launch and lockout
+    /// handshakes expect. Core-1 code execution itself is not modelled.
+    /// 当 `PSM_FRCE_OFF.PROC1` 释放时，core1 boot ROM 清空信箱并向 core0 压入
+    /// `0`。普通 FIFO 写入由常驻对端回显，这符合 SDK 启动与锁定握手的预期。
+    /// core1 的指令执行本身未建模。
+    pub fn service_core1_peer(&self) {
+        if self.core1_release.swap(false, Ordering::AcqRel) {
+            let _ = self.sio.take_from_core();
+            self.sio.post_to_core(0);
+        }
+        for frame in self.sio.take_from_core() {
+            // 排查核间启动/锁定握手时打印收到的字。
+            // Log received words when debugging inter-core launch/lockout.
+            if std::env::var_os("RP2350_TRACE_CORE1").is_some() {
+                eprintln!("[core1] echo {frame:#010X}");
+            }
+            self.sio.post_to_core(frame);
+        }
     }
 
     /// Advance the shared timebase and refresh TIMER0 interrupt lines
@@ -214,6 +259,47 @@ mod tests {
     use super::BootPeripherals;
 
     #[test]
+    fn core1_release_pushes_a_zero_to_the_mailbox() {
+        // `multicore_reset_core1` clears `PSM_FRCE_OFF.PROC1` and then waits
+        // for `multicore_fifo_pop_blocking()` to return the core-1 boot ROM's
+        // acknowledgement. The resident peer must provide that zero.
+        // `multicore_reset_core1` 清除 `PSM_FRCE_OFF.PROC1` 后等待
+        // `multicore_fifo_pop_blocking()` 取得 core1 boot ROM 的确认；常驻
+        // 对端必须提供该 `0`。
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        bus.write_u32(0x4001_A004, 0x0100_0000, &mut cycles)
+            .expect("set alias");
+        bus.write_u32(0x4001_B004, 0x0100_0000, &mut cycles)
+            .expect("clr alias");
+        peripherals.service_core1_peer();
+        assert_eq!(
+            bus.read_u32(0xD000_0058, &mut cycles).expect("fifo rd"),
+            0,
+            "core-1 ack"
+        );
+    }
+
+    #[test]
+    fn core1_peer_echoes_fifo_frames() {
+        // The SDK launch/lockout handshakes push a word and expect the peer to
+        // echo it. The resident peer models that boot-ROM behaviour.
+        // SDK 的启动/锁定握手会压入一个字并期望对端回显；常驻对端模拟该
+        // boot ROM 行为。
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        bus.write_u32(0xD000_0054, 0x1234_5678, &mut cycles)
+            .expect("FIFO_WR");
+        peripherals.service_core1_peer();
+        assert_eq!(
+            bus.read_u32(0xD000_0058, &mut cycles).expect("fifo rd"),
+            0x1234_5678
+        );
+    }
+
+    #[test]
     fn powman_set_alias_updates_the_timer_register() {
         // 0x4010_2088 是 TIMER（0x88）的 SET 别名，写口令后应能直接读回数据位。
         // 0x4010_2088 is the SET alias of TIMER (0x88); after the password write
@@ -224,5 +310,48 @@ mod tests {
         bus.write_u32(0x4010_2088, 0x5AFE_0002, &mut cycles)
             .expect("alias write");
         assert_eq!(bus.read_u32(0x4010_0088, &mut cycles).expect("read"), 2);
+    }
+
+    #[test]
+    fn previously_unmodelled_boot_blocks_are_mounted() {
+        // 这些地址在 CircuitPython 启动时曾落入 APB 路由器的“未实现”兜底路径。
+        // These addresses used to fall through the APB router's unimplemented path
+        // during CircuitPython boot.
+        let mut bus = SimpleBus::new();
+        let _peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+
+        assert_eq!(
+            bus.read_u32(0x4004_0004, &mut cycles).expect("qspi pad"),
+            0x156
+        );
+        assert_eq!(
+            bus.read_u32(0x400E_801C, &mut cycles).expect("rosc status") & (1 << 31),
+            1 << 31
+        );
+        assert_eq!(
+            bus.read_u32(0x400F_01B8, &mut cycles).expect("trng busy"),
+            0
+        );
+        assert_eq!(
+            bus.read_u32(0x400F_8000, &mut cycles).expect("sha csr"),
+            0x1206
+        );
+        assert_eq!(
+            bus.read_u32(0x400A_0000, &mut cycles).expect("adc cs") & 0x100,
+            0x100
+        );
+        assert_eq!(
+            bus.read_u32(0x400A_8004, &mut cycles).expect("pwm div"),
+            0x10
+        );
+
+        // PWM1_BASE 是 PWM0 的 XOR 别名窗口，读回底层 CH0_CSR。
+        // PWM1_BASE is PWM0's XOR alias window; it reads back the underlying CH0_CSR.
+        bus.write_u32(0x400A_8000, 1, &mut cycles).expect("pwm en");
+        assert_eq!(
+            bus.read_u32(0x400A_9000, &mut cycles).expect("pwm1 alias"),
+            1
+        );
     }
 }

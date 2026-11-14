@@ -18,6 +18,15 @@ pub const APB_SIZE: usize = 0x0010_0000;
 /// CLOCKS block base / CLOCKS 块基地址
 pub const CLOCKS_BASE: Address = 0x4001_0000;
 
+/// PSM (power state machine) base / PSM（电源状态机）基地址
+///
+/// Firmware programs `FRCE_ON`/`FRCE_OFF` here to control core and peripheral
+/// power domains; the block is part of the APB span and uses the standard
+/// XOR/SET/CLR alias windows.
+/// 固件在这里写 `FRCE_ON`/`FRCE_OFF` 控制核心与外设电源域；该块属于 APB
+/// 跨度，并使用标准的 XOR/SET/CLR 别名窗口。
+pub const PSM_BASE: Address = 0x4001_8000;
+
 /// RESETS block base / RESETS 块基地址
 pub const RESETS_BASE: Address = 0x4002_0000;
 
@@ -30,6 +39,9 @@ pub const IO_QSPI_BASE: Address = 0x4003_0000;
 /// PADS_BANK0 base / PADS_BANK0 基地址
 pub const PADS_BANK0_BASE: Address = 0x4003_8000;
 
+/// PADS_QSPI base / PADS_QSPI 基地址
+pub const PADS_QSPI_BASE: Address = 0x4004_0000;
+
 /// XOSC block base / XOSC 块基地址
 pub const XOSC_BASE: Address = 0x4004_8000;
 
@@ -41,6 +53,26 @@ pub const PLL_USB_BASE: Address = 0x4005_8000;
 
 /// UART0 (PL011) base / UART0（PL011）基地址
 pub const UART0_BASE: Address = 0x4007_0000;
+
+/// ADC base / ADC 基地址
+///
+/// The ADC block resets to all-zero registers; `CS.READY` is modelled as
+/// always set. ADC 块寄存器复位为零；`CS.READY` 建模为始终置位。
+pub const ADC_BASE: Address = 0x400A_0000;
+
+/// PWM register block base / PWM 寄存器块基地址
+///
+/// RP2350 has one 12-channel PWM register block, not separate PWM0/PWM1
+/// instances. RP2350 只有一个 12 通道 PWM 寄存器块，没有独立的 PWM0/PWM1 实例。
+pub const PWM0_BASE: Address = 0x400A_8000;
+
+/// Address reported as "PWM1" in firmware logs / 固件日志中报告的“PWM1”地址
+///
+/// This is the XOR alias window of [`PWM0_BASE`] (`+0x1000`), not a second
+/// register block. The APB router folds it onto the PWM device.
+/// 这是 [`PWM0_BASE`] 的 XOR 别名窗口（`+0x1000`），并非第二个寄存器块；
+/// APB 路由器会把它折叠到 PWM 设备上。
+pub const PWM1_BASE: Address = 0x400A_9000;
 
 /// TIMER0 base / TIMER0 基地址
 pub const TIMER0_BASE: Address = 0x400B_0000;
@@ -69,6 +101,21 @@ pub const TICKS_BASE: Address = 0x4010_8000;
 /// The boot ROM scratch RAM and the boot locks share one 4 KB window.
 /// boot ROM 暂存 RAM 与 boot 锁共用同一个 4 KB 窗口。
 pub const BOOTRAM_BASE: Address = 0x400E_0000;
+
+/// ROSC base / ROSC 基地址
+///
+/// `STATUS` reports `STABLE`, `DIV_RUNNING` and `ENABLED` in this model.
+/// 本模型中 `STATUS` 报告 `STABLE`、`DIV_RUNNING` 与 `ENABLED`。
+pub const ROSC_BASE: Address = 0x400E_8000;
+
+/// TRNG base / TRNG 基地址
+///
+/// The block keeps its Synopsys register layout starting at `+0x100`.
+/// 该块从 `+0x100` 开始保留 Synopsys 寄存器布局。
+pub const TRNG_BASE: Address = 0x400F_0000;
+
+/// SHA-256 accelerator base / SHA-256 加速器基地址
+pub const SHA256_BASE: Address = 0x400F_8000;
 
 /// SIO base / SIO 基地址
 pub const SIO_BASE: Address = 0xD000_0000;
