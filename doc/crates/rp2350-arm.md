@@ -19,10 +19,10 @@
 | `execute_thumb32` | Thumb-32 decoder + executor (60+ ALU / Load-Store / system instructions) |
 | `execute_thumb32::dsp` | Packed SIMD parallel add/subtract with APSR.GE (`SADD8` … `USUB16`) |
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
-| `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, CPACR fields |
+| `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
-| `exceptions` | Exception entry/exit, EXC_RETURN decoding, stacking/unstacking |
+| `exceptions` | Exception entry/exit, EXC_RETURN decoding, standard and extended (lazy FP) stack frames |
 
 ---
 
@@ -425,6 +425,11 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   leaves CP10/CP11 enabled. A power-on register file still has CPACR
   cleared, and writing CPACR to 0 is fully honored, so the NOCP path is
   reachable and tested.
+- **Lazy / extended exception frames** (see the dedicated section below):
+  `FPCCR`, `FPCAR` and `FPDSCR` are modeled at `0xE000EF34`, `0xE000EF38`
+  and `0xE000EF3C`; exception entry reserves or stacks the 17-word FP
+  context according to `FPCCR.ASPEN`/`LSPEN`, and exception return reclaims
+  or restores it.
 
 - **状态**：S0-S31，`D0-D15` 为 S 对别名；`FPSCR`、`FPEXC`；`CPACR`
   CP0-CP7 与 CP10-CP11 读写。
@@ -464,6 +469,154 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   启动时复现 boot ROM 交付状态，使 CP10/CP11 保持使能。上电寄存器文件
   的 CPACR 仍为清零状态；把 CPACR 写 0 也会被完全遵守，因此 NOCP
   通路可达且已被测试覆盖。
+- **惰性 / 扩展异常帧**（详见下一节）：在 `0xE000EF34`、`0xE000EF38`、
+  `0xE000EF3C` 建模 `FPCCR`、`FPCAR`、`FPDSCR`；异常进入按
+  `FPCCR.ASPEN`/`LSPEN` 预留或立即压入 17 字浮点上下文，异常返回按需
+  回收或恢复。
+
+### Lazy FP Stacking and Extended Frames / 惰性浮点压栈与扩展帧
+
+**System registers / 系统寄存器** — all accessed through `CpuCore::system_read`
+and `system_write` / 全部通过 `CpuCore::system_read` 与 `system_write` 访问：
+
+| Address | Register | Modeled bits | Reset |
+|---------|----------|--------------|-------|
+| `0xE000EF34` | `FPCCR` | `ASPEN`[31], `LSPEN`[30], `LSPACT`[0] (read-only) | `0xC000_0000` |
+| `0xE000EF38` | `FPCAR` | `[31:3]` address; `[2:0]` reserved, forced to 0 on write | `0` |
+| `0xE000EF3C` | `FPDSCR` | `AHP`[26], `DN`[25], `FZ`[24], `RMode`[23:22] | `0` |
+
+`FPCCR` bits other than `ASPEN`/`LSPEN`/`LSPACT` read as zero, and `LSPACT`
+is hardware-managed (software writes to it are ignored). `FPDSCR` is plain
+storage: no arithmetic path reads it, so the rounding mode always stays
+round-to-nearest-even. `FPCAR` keeps the reserved FP context area 8-byte
+aligned.
+
+`FPCCR` 中除 `ASPEN`/`LSPEN`/`LSPACT` 之外的位读为 0，`LSPACT` 由硬件管理
+（软件写入被忽略）。`FPDSCR` 为纯存储：没有任何算术路径读取它，舍入模式
+恒为就近偶数。`FPCAR` 保证预留的浮点上下文区按 8 字节对齐。
+
+**"FP is active" / 「浮点活跃」判据**: ARMv8-M uses `CONTROL.FPCA`, but this
+core does not track that bit (`MSR CONTROL` only stores `bits[1:0]`). It uses
+`FPEXC.EN` instead — every FPU instruction executed after the CPACR check
+sets it — through `CortexM33Registers::fp_context_active`. The two are
+equivalent for firmware that never writes `CONTROL.FPCA` directly, which is
+true for the supported images.
+
+ARMv8-M 用 `CONTROL.FPCA` 判定，但本核心不跟踪该位（`MSR CONTROL` 只保存
+`bits[1:0]`），改用 `FPEXC.EN`（每条通过 CPACR 检查的浮点指令都会置位），
+通过 `CortexM33Registers::fp_context_active` 暴露。对于从不直接写
+`CONTROL.FPCA` 的固件（当前支持的映像均如此）二者等价。
+
+**Exception entry / 异常进入** (`exceptions::enter_exception`):
+
+- FP inactive → standard 8-word frame (R0-R3, R12, LR, PC, xPSR), `EXC_RETURN`
+  bit 4 = 1, no FP space reserved, `FPCAR` untouched.
+- FP active and `FPCCR.LSPEN = 1` → extended frame. `FPCAR` = entry SP − 0x48,
+  i.e. the S0 slot right above the state frame; 17 words of FP context plus
+  one architectural padding word are reserved (0x48), `LSPACT = 1`,
+  `EXC_RETURN` bit 4 = 0, and **nothing is written** to the reserved area.
+  If the interrupted SP is not 8-byte aligned it is rounded down, a 4-byte
+  aligner word is inserted above the frame and stacked xPSR bit 9 records it,
+  so the return path restores the exact SP.
+- FP active and `FPCCR.LSPEN = 0` (covers `ASPEN = 1`, and eager-only
+  configurations) → immediate save of S0-S15 and FPSCR into the same area,
+  `LSPACT = 0`, `EXC_RETURN` bit 4 = 0.
+- When both `ASPEN` and `LSPEN` are set (the reset value), lazy preservation
+  takes precedence and nothing is written at entry.
+
+Resulting extended frame (SP after entry, 26 words = 104 bytes):
+
+```
+SP + 0x64  padding (keeps the frame size a multiple of 8)
+SP + 0x60  FPSCR
+SP + 0x5C  S15
+   ...     ...
+SP + 0x20  S0            <- FPCAR == SP + 0x20 == entry SP - 0x48
+SP + 0x1C  xPSR
+SP + 0x18  PC
+SP + 0x14  LR
+SP + 0x10  R12
+SP + 0x0C  R3
+SP + 0x08  R2
+SP + 0x04  R1
+SP + 0x00  R0
+```
+
+- 浮点不活跃 → 标准 8 字帧，`EXC_RETURN` bit4 = 1，不预留空间，`FPCAR` 不变。
+- 浮点活跃且 `FPCCR.LSPEN = 1` → 扩展帧：`FPCAR` = 进入时 SP − 0x48
+  （状态帧上方的 S0 槽）；预留 17 字浮点上下文 + 1 字架构填充（0x48），
+  `LSPACT = 1`，`EXC_RETURN` bit4 = 0，预留区**不写入任何内容**。
+  若被打断的 SP 未按 8 字节对齐，则先向下对齐，并在帧上方插入 4 字节对齐字、
+  记录到压栈 xPSR 的 bit 9，返回时恢复精确的 SP。
+- 浮点活跃且 `FPCCR.LSPEN = 0`（覆盖 `ASPEN = 1` 与仅立即压栈的配置）→
+  立即把 S0-S15 与 FPSCR 写入同一区域，`LSPACT = 0`，bit4 = 0。
+- `ASPEN` 与 `LSPEN` 同时置位（复位值）时惰性保存优先，进入时不写内存。
+
+**Deferred save trigger / 延迟保存触发**: before executing any Thumb-32
+encoding that belongs to the FPU (CP10/CP11 — arithmetic, transfers,
+load/store, `VMRS`/`VMSR`), the core calls
+`exceptions::commit_lazy_fp_context` when `LSPACT = 1`: S0-S15 and FPSCR are
+written to `FPCAR` (+0x40 for FPSCR) and `LSPACT` is cleared. The commit
+happens exactly once per frame and before the CPACR access check, so a
+handler whose first VFP instruction faults with NOCP still preserves the
+interrupted context. Non-FPU coprocessor accesses (CP0 GPIO, CP4 DCP) never
+trigger it; `fpu::is_fpu_encoding` is the predicate.
+
+执行任何属于浮点单元（CP10/CP11：算术、搬移、加载/存储、`VMRS`/`VMSR`）的
+Thumb-32 编码前，若 `LSPACT = 1`，核心调用
+`exceptions::commit_lazy_fp_context`：把 S0-S15 与 FPSCR（位于 `FPCAR+0x40`）
+写入预留区并清除 `LSPACT`。每个栈帧只提交一次，且发生在 CPACR 权限检查
+之前，因此处理程序第一条浮点指令触发 NOCP 时被中断的上下文仍已保存。
+CP0 GPIO / CP4 DCP 等非浮点协处理器访问不会触发；判据为
+`fpu::is_fpu_encoding`。
+
+**Exception return / 异常返回** (`exceptions::exit_exception`):
+
+- `EXC_RETURN` bit 4 = 0 and `LSPACT = 1` → the handler never used the FPU;
+  only the 0x48-byte reservation is reclaimed, `LSPACT` is cleared and no FP
+  register is written.
+- `EXC_RETURN` bit 4 = 0 and `LSPACT = 0` → S0-S15 and FPSCR are restored
+  from this frame's FP area (`frame base + 0x20`), then the reservation is
+  reclaimed (plus the 4-byte aligner word when stacked xPSR bit 9 is set).
+- `EXC_RETURN` bit 4 = 1 → standard frame: only the 8-word state frame is
+  reclaimed and the FP registers are untouched.
+- MSP/PSP selection and `EXC_RETURN` validation are unchanged. The
+  `EXC_RETURN` encodings therefore become `0xFFFF_FFF1`/`0xFFFF_FFE1`
+  (handler), `0xFFFF_FFF9`/`0xFFFF_FFE9` (thread MSP) and
+  `0xFFFF_FFFD`/`0xFFFF_FFED` (thread PSP), with bit 4 = 0 meaning extended.
+
+- `EXC_RETURN` bit4 = 0 且 `LSPACT = 1` → 处理程序从未使用浮点单元：仅回收
+  0x48 字节预留区、清除 `LSPACT`，不写任何浮点寄存器。
+- bit4 = 0 且 `LSPACT = 0` → 从本帧浮点区（帧底 + 0x20）恢复 S0-S15 与
+  FPSCR，然后回收预留区（若压栈 xPSR 的 bit 9 置位，再补回 4 字节对齐字）。
+- bit4 = 1 → 标准帧：只回收 8 字状态帧，浮点寄存器不动。
+- MSP/PSP 选择与 `EXC_RETURN` 校验逻辑保持不变。因此 `EXC_RETURN` 取值为
+  `0xFFFF_FFF1`/`0xFFFF_FFE1`（Handler）、`0xFFFF_FFF9`/`0xFFFF_FFE9`
+  （Thread MSP）、`0xFFFF_FFFD`/`0xFFFF_FFED`（Thread PSP），bit4 = 0 表示
+  扩展帧。
+
+**Nested exceptions / 嵌套异常**: if a lazy frame is still pending
+(`LSPACT = 1`) when another exception is taken, the pending context is
+committed to its own `FPCAR` first, then the new frame reserves a fresh lazy
+area. Restores are derived from each frame's own stack slot
+(`frame base + 0x20`), so an inner return cannot corrupt the outer frame.
+`FPCAR` and `LSPACT` describe only the innermost frame, exactly like the
+single architectural register pair.
+
+若另一异常到来时仍有惰性帧待保存（`LSPACT = 1`），先把该上下文提交到它自己的
+`FPCAR`，再由新帧预留新的惰性区。恢复地址始终由各帧自己的栈槽
+（帧底 + 0x20）推导，因此内层返回不会破坏外层帧。`FPCAR` 与 `LSPACT` 只描述
+最内层帧，与架构中唯一的一对寄存器一致。
+
+**Not modeled / 未建模**: `FPCCR.LSPENS`/`CLRONRET`/`CLRONRETS`/`TS`/
+`USER`/`THREAD`, `FPDSCR` influencing arithmetic, `CONTROL.FPCA` tracking,
+double precision and FPSCR traps. The secure/non-secure FP banks of the
+TrustZone configuration are not modeled; the register values above are the
+non-secure reset values.
+
+未建模：`FPCCR.LSPENS`/`CLRONRET`/`CLRONRETS`/`TS`/`USER`/`THREAD`、
+`FPDSCR` 对算术的影响、`CONTROL.FPCA` 跟踪、双精度与 FPSCR 陷阱。
+TrustZone 的安全/非安全浮点寄存器组未建模；上述复位值为非安全复位值。
 
 ### Not implemented / 未实现清单
 
@@ -486,12 +639,7 @@ firmware relying on them can be identified immediately.
    as IEEE-754 binary32 round-to-nearest-even and `VCVTR` always rounds ties
    to even. No FP trap or exception entry is generated; only the cumulative
    status bits are updated.
-4. Lazy FP context stacking: `LSPACT` / `FPCAR` / `FPCCR` are **not modeled**.
-   Exception entry always stacks the standard 8-word frame immediately;
-   there is no extended (26-word) FP frame. If an exception is entered while
-   the FPU is active, the core reports this unsupported condition explicitly
-   (one warning per core) instead of pretending FP context was preserved.
-5. `CPACR` fields outside CP0-CP7 and CP10-CP11 (CP8/CP9, CP12/CP13)
+4. `CPACR` fields outside CP0-CP7 and CP10-CP11 (CP8/CP9, CP12/CP13)
    always read zero.
 
 1. 双精度算术与转换（`VADD.F64` 等、`VCVT.F64.F32`、`VCVT.F32.F64`）——
@@ -503,11 +651,7 @@ firmware relying on them can be identified immediately.
    非就近舍入模式：算术恒按 IEEE-754 binary32 就近舍入、偶数优先执行，
    `VCVTR` 恒按就近偶数舍入。不产生浮点陷阱或异常进入，只更新累积
    状态位。
-4. 惰性浮点上下文压栈：**不建模** `LSPACT` / `FPCAR` / `FPCCR`。异常进入
-   始终立即压入标准 8 字帧，不存在 26 字扩展帧；若浮点单元处于活跃状态时
-   进入异常，核心会显式报告这一未支持条件（每个核仅告警一次），而不是
-   假装已经保存了浮点上下文。
-5. CP0-CP7 与 CP10-CP11 之外的 CPACR 字段（CP8/CP9、CP12/CP13）恒读为 0。
+4. CP0-CP7 与 CP10-CP11 之外的 CPACR 字段（CP8/CP9、CP12/CP13）恒读为 0。
 
 ---
 
@@ -624,7 +768,19 @@ DCP 被建模为永远空闲。`MRC`/`MRRC` 将目标寄存器置零，`MCR`/`MC
 | 16+ | IRQ(n) | configurable | External interrupts |
 
 **Stack frame on exception entry** (8 words): R0-R3, R12, LR, PC, XPSR.
-**EXC_RETURN** values: `0xFFFFFFF1` (return to handler), `0xFFFFFFF9` (thread MSP), `0xFFFFFFFD` (thread PSP).
+When the FPU is active the frame is **extended** with the 17-word FP context
+(S0-S15, FPSCR) plus one padding word; see
+[Lazy FP Stacking and Extended Frames](#lazy-fp-stacking-and-extended-frames--惰性浮点压栈与扩展帧).
+**EXC_RETURN** values: `0xFFFFFFF1` (return to handler), `0xFFFFFFF9` (thread MSP),
+`0xFFFFFFFD` (thread PSP). With an extended frame bit 4 is cleared, giving
+`0xFFFFFFE1` / `0xFFFFFFE9` / `0xFFFFFFED`.
+
+**异常进入栈帧**（8 字）：R0-R3、R12、LR、PC、XPSR。浮点单元活跃时栈帧为**扩展帧**，
+额外包含 17 字浮点上下文（S0-S15、FPSCR）与 1 字填充；详见
+[惰性浮点压栈与扩展帧](#lazy-fp-stacking-and-extended-frames--惰性浮点压栈与扩展帧)。
+**EXC_RETURN** 取值：`0xFFFFFFF1`（返回 Handler）、`0xFFFFFFF9`（Thread MSP）、
+`0xFFFFFFFD`（Thread PSP）。扩展帧会清除 bit4，得到 `0xFFFFFFE1` / `0xFFFFFFE9` /
+`0xFFFFFFED`。
 
 ---
 

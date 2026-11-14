@@ -23,6 +23,7 @@ use rp2350_core::error::CoreError;
 use rp2350_core::types::Address;
 
 use super::conditions::ITBlockState;
+use super::fpu::{FpuRegisters, fpccr};
 use super::nvic::Nvic;
 use super::registers::CortexM33Registers;
 
@@ -45,9 +46,43 @@ pub fn xpsr_bits_to_it_state(xpsr: u32) -> u8 {
 /// ARMv8-M 异常进入时的标准栈帧（8 字 / 32 字节）
 pub const EXCEPTION_STACK_FRAME_SIZE: u32 = 32;
 
-/// Exception frame with floating point context (26 words / 104 bytes)
-/// 带浮点上下文的异常帧（26 字 / 104 字节）
+/// Architectural ARMv8-M extended frame with FP context (26 words / 104 bytes)
+/// ARMv8-M 带浮点上下文的架构扩展帧（26 字 / 104 字节）
+///
+/// The 8-word state frame plus the 17-word FP context (S0-S15 and FPSCR) plus
+/// one padding word above the context, which keeps the total a multiple of 8
+/// bytes so that `FPCAR` (pointing at S0) stays 8-byte aligned. This equals
+/// [`EXCEPTION_STACK_FRAME_WITH_FP_SIZE`].
+/// 即 8 字状态帧 + 17 字浮点上下文（S0-S15 与 FPSCR）+ 上下文上方 1 字填充；
+/// 填充使总长为 8 的倍数，从而让指向 S0 的 `FPCAR` 保持 8 字节对齐。该值与
+/// [`EXCEPTION_STACK_FRAME_WITH_FP_SIZE`] 相同。
 pub const EXCEPTION_STACK_FRAME_EXTENDED_SIZE: u32 = 104;
+
+/// Floating-point context written by the lazy/eager stacking path (17 words)
+/// 惰性/立即压栈路径写入的浮点上下文（17 字）
+///
+/// S0-S15 occupy the first 16 words and FPSCR the last one.
+/// 前 16 字为 S0-S15，最后一字为 FPSCR。
+pub const FP_CONTEXT_SIZE: u32 = 17 * 4;
+
+/// Architectural padding word above the FP context / 浮点上下文上方的架构填充字
+///
+/// The padding keeps the extended frame a multiple of 8 bytes so `FPCAR`, which
+/// points at S0, stays 8-byte aligned.
+/// 该填充字使扩展帧长度为 8 的倍数，从而让指向 S0 的 `FPCAR` 保持 8 字节对齐。
+pub const FP_CONTEXT_PADDING_SIZE: u32 = 4;
+
+/// Space reserved below the interrupted SP for the floating-point context
+/// 在被打断的 SP 下方为浮点上下文预留的空间
+pub const FP_CONTEXT_RESERVED_SIZE: u32 = FP_CONTEXT_SIZE + FP_CONTEXT_PADDING_SIZE;
+
+/// Offset of `FPSCR` inside the FP context area / 浮点上下文区内 `FPSCR` 的偏移
+pub const FP_CONTEXT_FPSCR_OFFSET: u32 = 16 * 4;
+
+/// Full size of the modeled extended frame (state frame + FP reservation)
+/// 本模型扩展帧的总大小（状态帧 + 浮点预留区）
+pub const EXCEPTION_STACK_FRAME_WITH_FP_SIZE: u32 =
+    EXCEPTION_STACK_FRAME_SIZE + FP_CONTEXT_RESERVED_SIZE;
 
 /// CFSR.UFSR.NOCP: coprocessor access denied (bit 19 of CFSR)
 /// CFSR.UFSR.NOCP：协处理器访问被拒绝（CFSR 位 19）
@@ -77,6 +112,11 @@ pub struct ExcReturnInfo {
     pub to_non_secure: bool,
     /// Stack frame type: standard (false) or extended with FP (true)
     /// 栈帧类型：标准（false）或带 FP 扩展（true）
+    ///
+    /// Derived from `EXC_RETURN` bit 4, which the architecture defines as 1 for
+    /// the standard frame and 0 for the extended (floating-point) frame.
+    /// 由 `EXC_RETURN` bit 4 推出：架构规定该位为 1 表示标准帧，为 0 表示扩展
+    /// （带浮点）帧。
     pub has_fp: bool,
 }
 
@@ -94,7 +134,9 @@ pub fn decode_exc_return(lr: u32) -> Option<ExcReturnInfo> {
         to_handler: (lr & 0x8) == 0,
         use_psp: (lr & 0x4) != 0,
         to_non_secure: (lr & 0x1) != 0,
-        has_fp: (lr & 0x10) != 0,
+        // Bit 4 is 1 for the standard frame and 0 for the extended FP frame.
+        // bit 4 为 1 表示标准帧，为 0 表示带浮点的扩展帧。
+        has_fp: (lr & 0x10) == 0,
     })
 }
 
@@ -137,6 +179,10 @@ pub fn write_pc(regs: &mut CortexM33Registers, value: u32) -> bool {
 /// * `bus` - Address bus for memory access
 /// * `sp` - Stack pointer (will be decremented by frame size)
 /// * `regs` - Current CPU registers
+/// * `stack_aligner` - A 4-byte aligner word sits above the frame; recorded in
+///   stacked xPSR bit 9 so the return path restores the unaligned SP
+/// * `stack_aligner` - 帧上方存在 4 字节对齐字；记录在压栈 xPSR 的 bit 9，
+///   使返回路径能恢复未对齐的 SP
 ///
 /// # Returns
 /// Updated stack pointer value
@@ -146,6 +192,7 @@ pub fn exception_entry_stacking(
     regs: &CortexM33Registers,
     it: &ITBlockState,
     cycles: &mut u64,
+    stack_aligner: bool,
 ) -> Result<u32, CoreError> {
     let frame_sp = sp - EXCEPTION_STACK_FRAME_SIZE;
 
@@ -165,7 +212,15 @@ pub fn exception_entry_stacking(
     // the remaining conditional instructions after the exception return.
     // EPSR.IT 不在 APSR 标志中；按架构 xPSR 位段压栈，使在 IT 块中间被打断的
     // 线程能在异常返回后继续执行剩余的条件指令。
-    let stacked_xpsr = (regs.xpsr & !XPSR_IT_MASK) | it_state_to_xpsr_bits(it.arch_state());
+    //
+    // xPSR bit 9 records the 4-byte stack aligner inserted by exception entry.
+    // xPSR bit 9 记录异常进入时插入的 4 字节栈对齐字。
+    let mut stacked_xpsr = (regs.xpsr & !XPSR_IT_MASK) | it_state_to_xpsr_bits(it.arch_state());
+    if stack_aligner {
+        stacked_xpsr |= 1 << 9;
+    } else {
+        stacked_xpsr &= !(1 << 9);
+    }
 
     bus.write_u32(frame_sp, regs.r[0], cycles)?; // R0
     bus.write_u32(frame_sp + 4, regs.r[1], cycles)?; // R1
@@ -178,6 +233,86 @@ pub fn exception_entry_stacking(
 
     *cycles += 12; // Exception entry takes 12 cycles
     Ok(frame_sp)
+}
+
+/// Write S0-S15 and FPSCR into a reserved FP context area
+/// 将 S0-S15 与 FPSCR 写入预留的浮点上下文区
+///
+/// `fpcar` is the address of the S0 slot; S15 follows at `fpcar + 0x3C` and
+/// FPSCR at `fpcar + 0x40`. The padding word at `fpcar + 0x44` is left
+/// untouched.
+/// `fpcar` 为 S0 槽地址；S15 位于 `fpcar + 0x3C`，FPSCR 位于 `fpcar + 0x40`。
+/// `fpcar + 0x44` 处的填充字不被写入。
+///
+/// # Errors
+/// Returns a bus error if the stack region is not writable.
+/// 若栈区域不可写则返回总线错误。
+pub fn store_fp_context(
+    bus: &mut dyn AddressBus,
+    fpcar: u32,
+    fpu: &FpuRegisters,
+    cycles: &mut u64,
+) -> Result<(), CoreError> {
+    for index in 0..16u8 {
+        bus.write_u32(fpcar + u32::from(index) * 4, fpu.read_s(index), cycles)?;
+    }
+    bus.write_u32(fpcar + FP_CONTEXT_FPSCR_OFFSET, fpu.fpscr, cycles)?;
+    *cycles += 17; // Saving 17 words / 保存 17 字
+    Ok(())
+}
+
+/// Restore S0-S15 and FPSCR from a reserved FP context area
+/// 从预留的浮点上下文区恢复 S0-S15 与 FPSCR
+///
+/// Inverse of [`store_fp_context`]. / [`store_fp_context`] 的逆操作。
+///
+/// # Errors
+/// Returns a bus error if the stack region is not readable.
+/// 若栈区域不可读则返回总线错误。
+pub fn load_fp_context(
+    bus: &mut dyn AddressBus,
+    fpcar: u32,
+    fpu: &mut FpuRegisters,
+    cycles: &mut u64,
+) -> Result<(), CoreError> {
+    for index in 0..16u8 {
+        let value = bus.read_u32(fpcar + u32::from(index) * 4, cycles)?;
+        fpu.write_s(index, value);
+    }
+    fpu.fpscr = bus.read_u32(fpcar + FP_CONTEXT_FPSCR_OFFSET, cycles)?;
+    *cycles += 17; // Restoring 17 words / 恢复 17 字
+    Ok(())
+}
+
+/// Commit a deferred (lazy) FP context to `FPCAR` and clear `LSPACT`
+/// 将延迟（惰性）的浮点上下文提交到 `FPCAR` 并清除 `LSPACT`
+///
+/// Called before a VFP instruction executes while `FPCCR.LSPACT` is set: the
+/// interrupted context's S0-S15 and FPSCR are written to the area reserved at
+/// exception entry, then lazy state preservation is deactivated so the save
+/// happens exactly once per frame.
+/// 当 `FPCCR.LSPACT` 置位时，在执行 VFP 指令前调用：把被中断上下文的
+/// S0-S15 与 FPSCR 写入异常进入时预留的区域，然后关闭惰性状态保存，保证每个
+/// 栈帧只提交一次。
+///
+/// Returns `true` when a context was committed.
+/// 提交了上下文时返回 `true`。
+///
+/// # Errors
+/// Returns a bus error if the reserved stack area is not writable.
+/// 若预留的栈区域不可写则返回总线错误。
+pub fn commit_lazy_fp_context(
+    bus: &mut dyn AddressBus,
+    regs: &mut CortexM33Registers,
+    cycles: &mut u64,
+) -> Result<bool, CoreError> {
+    if !regs.fpu.lspact() {
+        return Ok(false);
+    }
+    let fpcar = regs.fpu.fpcar;
+    store_fp_context(bus, fpcar, &regs.fpu, cycles)?;
+    regs.fpu.set_lspact(false);
+    Ok(true)
 }
 
 /// Pop a standard exception stack frame from the stack to restore registers
@@ -215,11 +350,12 @@ pub fn exception_return_unstacking(
     // padding bit (9) and keep ITSTATE in the separate IT block state.
     // 恢复架构 xPSR：强制 T 位、去掉对齐填充位（9），ITSTATE 保留在独立的
     // IT 块状态中。
+    let aligner = if xpsr & (1 << 9) != 0 { 4 } else { 0 };
     regs.xpsr = (xpsr | 0x0100_0000) & !(1 << 9) & !XPSR_IT_MASK;
     let it_state = xpsr_bits_to_it_state(xpsr);
 
     *cycles += 12; // Exception return takes 12 cycles
-    Ok((sp + EXCEPTION_STACK_FRAME_SIZE, pc, it_state))
+    Ok((sp + EXCEPTION_STACK_FRAME_SIZE + aligner, pc, it_state))
 }
 
 /// Fetch the exception vector from the vector table
@@ -263,9 +399,63 @@ pub fn enter_exception(
         regs.msp
     };
 
+    // ---- Floating-point context reservation ----
+    // 浮点上下文预留：
+    // 若浮点单元已被使用（模型以 FPEXC.EN 代替 CONTROL.FPCA），异常帧为扩展帧
+    // （EXC_RETURN bit4 = 0）。FPCCR.LSPEN=1 时只预留 17 字上下文区并置
+    // LSPACT，S0-S15/FPSCR 推迟到处理程序的第一条 VFP 指令；LSPEN=0 时立即
+    // 写入。FPU 未使用时保持标准 8 字帧且不预留空间。
+    // If the FPU has been used (the model uses FPEXC.EN instead of
+    // CONTROL.FPCA) the frame is extended (EXC_RETURN bit 4 = 0). With
+    // FPCCR.LSPEN set, only the 17-word context area is reserved and LSPACT is
+    // raised; S0-S15/FPSCR are deferred to the handler's first VFP instruction.
+    // With LSPEN clear the context is stored immediately. An unused FPU keeps
+    // the standard 8-word frame with no reservation.
+    //
+    // A pending lazy frame (nested entry) is committed first so the new frame
+    // cannot overwrite its FPCAR. / 若已有待保存的惰性帧（嵌套进入），先提交
+    // 该帧，避免新帧覆盖它的 FPCAR。
+    if regs.fp_context_active() && regs.fpu.lspact() {
+        commit_lazy_fp_context(bus, regs, cycles)?;
+    }
+
+    let extended_frame = regs.fp_context_active();
+    // 扩展帧要求 FPCAR 8 字节对齐：SP 未对齐时先向下对齐，并在压栈 xPSR
+    // 的 bit 9 记录 4 字节对齐字，返回时再补回。
+    // An extended frame requires an 8-byte aligned FPCAR: an unaligned SP is
+    // rounded down and the 4-byte aligner is recorded in stacked xPSR bit 9 so
+    // the return path can restore the exact SP.
+    let (frame_top, stack_aligner) = if extended_frame {
+        let aligned = sp & !0x7;
+        (aligned, aligned != sp)
+    } else {
+        (sp, false)
+    };
+    let frame_base = if extended_frame {
+        // FPCAR points at S0 and must stay 8-byte aligned; the padding word
+        // sits right above the 17-word context.
+        // FPCAR 指向 S0 且必须保持 8 字节对齐；填充字紧邻 17 字上下文上方。
+        regs.fpu.write_fpcar(frame_top - FP_CONTEXT_RESERVED_SIZE);
+        let fpcar = regs.fpu.fpcar;
+        if regs.fpu.fpccr & fpccr::LSPEN != 0 {
+            regs.fpu.set_lspact(true);
+        } else {
+            store_fp_context(bus, fpcar, &regs.fpu, cycles)?;
+            regs.fpu.set_lspact(false);
+        }
+        // `exception_entry_stacking` subtracts the 8-word state frame from the
+        // value passed in, so it receives the top of the state frame, which is
+        // exactly where the FP context starts.
+        // `exception_entry_stacking` 会从传入值减去 8 字状态帧，因此这里传入
+        // 状态帧顶端——也就是浮点上下文的起始地址。
+        fpcar
+    } else {
+        frame_top
+    };
+
     // Stack the current context
     // 压栈当前上下文
-    let new_sp = exception_entry_stacking(bus, sp, regs, it, cycles)?;
+    let new_sp = exception_entry_stacking(bus, frame_base, regs, it, cycles, stack_aligner)?;
     // The handler starts with no active IT block; the interrupted thread's
     // IT state was saved in the stacked xPSR.
     // 处理程序开始时没有活跃的 IT 块；被打断线程的 IT 状态已保存在栈中 xPSR。
@@ -294,13 +484,23 @@ pub fn enter_exception(
         // Return to Thread mode, use MSP or PSP depending on the interrupted context
         // 返回 Thread 模式，按被打断的上下文选择 MSP 或 PSP
         if thread_used_psp {
-            regs.lr = 0xFFFF_FFED; // Return to Thread, PSP
+            // 0xFFFF_FFFD = standard frame; bit 4 is cleared below when the
+            // entry allocated an extended frame (0xFFFF_FFED).
+            // 0xFFFF_FFFD 为标准帧；若本次进入分配了扩展帧，下方会清除 bit 4
+            // （变为 0xFFFF_FFED）。
+            regs.lr = 0xFFFF_FFFD; // Return to Thread, PSP
         } else {
             regs.lr = 0xFFFF_FFF9; // Return to Thread, MSP
         }
     } else {
         // System exception / 系统异常
         regs.lr = 0xFFFF_FFF1; // Return to Handler mode
+    }
+
+    // EXC_RETURN bit 4 records the frame type: 1 = standard, 0 = extended.
+    // EXC_RETURN bit 4 记录帧类型：1 = 标准帧，0 = 扩展帧。
+    if extended_frame {
+        regs.lr &= !0x10;
     }
 
     // Fetch exception vector and set PC
@@ -349,7 +549,39 @@ pub fn exit_exception(
         regs.msp
     };
 
-    let (new_sp, _pc, it_state) = exception_return_unstacking(bus, sp, regs, cycles)?;
+    // ---- Floating-point context recovery ----
+    // 浮点上下文恢复：
+    // EXC_RETURN bit4 = 0 表示扩展帧。LSPACT 仍为 1 说明处理程序从未执行 VFP
+    // 指令，被中断的浮点寄存器仍是活跃值，只需回收预留区；否则从该帧的浮点
+    // 上下文区（S0 位于帧底 + 0x20）恢复 S0-S15 与 FPSCR。
+    // EXC_RETURN bit 4 = 0 selects the extended frame. LSPACT still set means
+    // the handler never executed a VFP instruction, so the interrupted FP
+    // registers are still live and only the reservation is reclaimed; otherwise
+    // S0-S15 and FPSCR are restored from the FP context area of this frame
+    // (S0 sits at frame base + 0x20).
+    let extended_frame = exc_return_info.has_fp;
+    if extended_frame {
+        if regs.fpu.lspact() {
+            // Nothing was written to the reserved area; discard it.
+            // 预留区未写入任何内容，直接丢弃。
+            regs.fpu.set_lspact(false);
+        } else {
+            let fpcar = sp + EXCEPTION_STACK_FRAME_SIZE;
+            load_fp_context(bus, fpcar, &mut regs.fpu, cycles)?;
+        }
+    }
+
+    let (state_sp, _pc, it_state) = exception_return_unstacking(bus, sp, regs, cycles)?;
+    // An extended frame also reclaims the 17-word FP context and its padding
+    // word above the state frame (`state_sp` already includes any 4-byte
+    // aligner recorded in stacked xPSR bit 9).
+    // 扩展帧还需回收状态帧上方的 17 字浮点上下文与其填充字
+    // （`state_sp` 已包含压栈 xPSR bit 9 记录的 4 字节对齐字）。
+    let new_sp = if extended_frame {
+        state_sp + FP_CONTEXT_RESERVED_SIZE
+    } else {
+        state_sp
+    };
     *it = ITBlockState::from_arch_state(it_state);
 
     // Update the correct SP
@@ -458,8 +690,9 @@ mod tests {
         };
         let it = ITBlockState::from_arch_state(0x0B);
         let mut cycles = 0u64;
-        let frame_sp = exception_entry_stacking(&mut bus, 0x2000_0080, &regs, &it, &mut cycles)
-            .expect("stacking");
+        let frame_sp =
+            exception_entry_stacking(&mut bus, 0x2000_0080, &regs, &it, &mut cycles, false)
+                .expect("stacking");
         let stacked = bus.read_u32(frame_sp + 28, &mut cycles).expect("xpsr");
         assert_eq!(xpsr_bits_to_it_state(stacked), 0x0B);
         assert_eq!(stacked & (1 << 24), 1 << 24, "T bit remains set");

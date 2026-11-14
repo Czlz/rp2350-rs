@@ -114,9 +114,6 @@ pub struct CortexM33Core {
     /// Distinct undefined opcodes already reported, keyed by (width, opcode)
     /// 已报告过的未定义操作码，按（宽度, 操作码）去重
     undefined_seen: BTreeSet<(u8, u32)>,
-    /// Whether the unmodeled lazy FP stacking condition has been reported
-    /// 是否已报告过未建模的惰性浮点压栈条件
-    fp_stack_warned: bool,
 }
 
 impl CortexM33Core {
@@ -140,7 +137,6 @@ impl CortexM33Core {
             total_cycles: 0,
             strict_decode: false,
             undefined_seen: BTreeSet::new(),
-            fp_stack_warned: false,
         }
     }
 
@@ -253,7 +249,6 @@ impl CortexM33Core {
         self.active_exceptions.clear();
         self.total_cycles = 0;
         self.undefined_seen.clear();
-        self.fp_stack_warned = false;
     }
 
     /// Apply cached boot vectors, entering Running only if they exist
@@ -359,6 +354,12 @@ impl CortexM33Core {
                 self.cfsr = value;
             }
             Some(self.cfsr)
+        } else if let Some(value) = self.registers.fpu.system_access(addr, write, value) {
+            // FPCCR / FPCAR / FPDSCR：LSPACT 只读，FPCAR 低 3 位保留，
+            // FPDSCR 只保存 AHP/DN/FZ/RMode 字段。
+            // FPCCR / FPCAR / FPDSCR: LSPACT is read-only, FPCAR keeps its low
+            // three bits clear and FPDSCR stores only AHP/DN/FZ/RMode.
+            Some(value)
         } else if (NVIC_BASE..NVIC_BASE + 0x400).contains(&addr) {
             self.handle_nvic_access(addr - NVIC_BASE, write, value)
         } else if (SYSTICK_BASE..SYSTICK_BASE + 0x10).contains(&addr) {
@@ -488,6 +489,18 @@ impl CortexM33Core {
             raw_opcode = instr32;
             width = 4;
             self.registers.pc = old_pc.wrapping_add(4);
+            // 惰性浮点压栈：处理程序第一次执行任何 VFP 指令（算术、搬移、
+            // 加载/存储、系统寄存器访问）之前，把被中断上下文的 S0-S15 与
+            // FPSCR 写入异常进入时由 FPCAR 预留的区域并清除 LSPACT，保证每个
+            // 栈帧只提交一次。FPU 未活跃时该分支不生效。
+            // Lazy FP stacking: before the first VFP instruction in a handler
+            // (arithmetic, transfers, loads/stores, system registers), commit
+            // the interrupted context's S0-S15 and FPSCR to the area reserved
+            // by FPCAR at exception entry and clear LSPACT, so each frame is
+            // saved exactly once. Inactive when no lazy frame is pending.
+            if self.registers.fpu.lspact() && fpu::is_fpu_encoding(instr32) {
+                exceptions::commit_lazy_fp_context(bus, &mut self.registers, cycles)?;
+            }
             execute_thumb32(
                 instr32,
                 &mut self.registers,
@@ -528,10 +541,16 @@ impl CortexM33Core {
             )?;
             if !in_handler {
                 // 系统异常默认写入 0xFFFF_FFF1；从 Thread 模式进入时按
-                // MSP/PSP 选择正确的 EXC_RETURN。
+                // MSP/PSP 选择正确的 EXC_RETURN，并保留 enter_exception 根据
+                // 帧类型写入的 bit 4（0 = 扩展帧）。
                 // System exceptions default to 0xFFFF_FFF1; entering from
-                // Thread mode selects the MSP/PSP-specific EXC_RETURN.
+                // Thread mode selects the MSP/PSP-specific EXC_RETURN while
+                // preserving the frame-type bit 4 written by enter_exception.
+                let extended = self.registers.lr & 0x10 == 0;
                 self.registers.lr = if thread_psp { 0xFFFF_FFFD } else { 0xFFFF_FFF9 };
+                if extended {
+                    self.registers.lr &= !0x10;
+                }
             }
             self.active_exceptions.push(exceptions::EXC_USAGE_FAULT);
             return Ok(StepResult::Ok);
@@ -554,25 +573,6 @@ impl CortexM33Core {
         // Only check if PRIMASK is 0 / 仅在 PRIMASK 为 0 时检查
         if self.registers.primask & 1 != 0 {
             return Ok(());
-        }
-
-        // 惰性浮点压栈未建模（FPCCR/LSPACT/FPCAR）。若中断到来时浮点单元
-        // 已激活，真实硬件会按 FPCCR 压入 26 字扩展帧或推迟保存 S0-S15/FPSCR；
-        // 本模拟器始终只压标准 8 字帧。此处显式报告一次未支持，不假装已保存
-        // 浮点上下文（完整处理留待 Stage 5）。
-        // Lazy FP stacking is unmodeled (FPCCR/LSPACT/FPCAR). If an interrupt
-        // arrives while the FPU is active, real hardware stacks the 26-word
-        // extended frame (or defers it). This emulator stacks only the standard
-        // 8-word frame, so it reports the unsupported condition once instead
-        // of pretending FP context was preserved (full handling is Stage 5).
-        if self.registers.fpu.fpexc & fpu::fpexc::EN != 0 && !self.fp_stack_warned {
-            self.fp_stack_warned = true;
-            log::warn!(
-                "exception entry with live FP context: lazy FP stacking \
-                 (LSPACT/FPCAR/FPCCR) is not modeled; S0-S15 and FPSCR are not stacked / \
-                 异常进入时浮点上下文活跃：未建模惰性压栈（LSPACT/FPCAR/FPCCR），\
-                 S0-S15 与 FPSCR 不会被压栈"
-            );
         }
 
         if let Some(irq) = self.nvic.find_highest_priority() {

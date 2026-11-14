@@ -16,12 +16,16 @@
 //!   单精度与双精度之间的 `VCVT`（按未定义指令上报）
 //! - Double-precision arithmetic (`VADD.F64` …) — the D view is storage only
 //!   双精度算术（`VADD.F64` 等）—— D 视图仅作存储
-//! - Half-precision `VCVTB`/`VCVTT`, 16-bit integer `VCVT` and `VRINT*`
-//!   半精度 `VCVTB`/`VCVTT`、16 位整数 `VCVT` 与 `VRINT*`
-//! - Lazy FP context stacking (`LSPACT`/`FPCAR`/`FPCCR` are not modeled; an
-//!   exception taken with live FP state logs an explicit unsupported warning)
-//!   惰性浮点上下文压栈（不建模 `LSPACT`/`FPCAR`/`FPCCR`；浮点活跃时进入
-//!   异常会显式告警未支持）
+//! - Half-precision `VCVTB`/`VCVTT`, the 16-bit integer `VCVT` forms and the
+//!   directed `VCVTA`/`VCVTN`/`VCVTP`/`VCVTM` conversions
+//!   半精度 `VCVTB`/`VCVTT`、16 位整数 `VCVT` 形式以及定向
+//!   `VCVTA`/`VCVTN`/`VCVTP`/`VCVTM` 转换
+//!
+//! Lazy FP context stacking (`FPCCR`/`LSPACT`/`FPCAR`) is modelled by the
+//! exception path; see `doc/crates/rp2350-arm.md` for the exact semantics and
+//! the unmodelled `CLRONRET`/`CONTROL.FPCA` tracking.
+//! 惰性浮点上下文压栈（`FPCCR`/`LSPACT`/`FPCAR`）由异常路径建模；精确语义及
+//! 未建模的 `CLRONRET`/`CONTROL.FPCA` 跟踪见 `doc/crates/rp2350-arm.md`。
 
 // 位域解码与寄存器索引转换是 ARM 仿真固有特征。
 // Bitfield decoding and register index conversions are inherent to ARM emulation.
