@@ -52,6 +52,9 @@
 - `rp2350-cli`: `repl --arch arm|riscv` override plus UF2-family architecture detection, so the RISC-V MicroPython image reaches the raw REPL
 - `rp2350-periph`: PIO state-machine execution — `JMP`/`WAIT`/`IN`/`OUT`/`PUSH`/`PULL`/`MOV`/`IRQ`/`SET`, shift registers with autopush/autopull thresholds, wrap and `EXEC_STALLED`/`FDEBUG` stall reporting, plus a `pio/{mod,regs,sm,shift}` module split (16 new tests)
 - `rp2350-gdb`: TCP session loop — listener/accept, byte-level RSP framing with `+`/`-` acknowledgement, `QStartNoAckMode` negotiation, `Session::reset_transport()` per connection and six real TCP end-to-end tests
+- `rp2350-cli`: `gdb` subcommand now starts the RSP server — a `MachineTarget` adapter exposes registers (R0-R15 + XPSR), bus memory, PC-compare breakpoints and `resume` through `Machine::step` (boot ROM traps, interrupt pumping and the peripheral timebase stay active), with a 1,000,000-instruction continue budget
+- `rp2350-mcp`: JSON-RPC method layer — `initialize`, `tools/list` and `tools/call` (`list_devices`, `query_all`, `query_device`, `configure`) delegated to `DeviceManager`, with JSON-RPC error codes for parse/method/parameter/device/config failures
+- `rp2350-virt-periph`: `mcp_query_device`, `mcp_list_devices` and `apply_config` on `DeviceManager` (plus `ConfigApplyError`) backing the MCP method layer
 
 ### Fixed / 修复
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window

@@ -225,6 +225,14 @@ Supports both GUI and headless/MCP mode.
 - PSRAM / QSPI Flash 可通过 QSPI 命令正常访问
 - 插件 ABI 设计验证通过：所有设备作为独立 `.dll` 加载/卸载/热替换
 
+> **P1 进度 / P1 progress（2026-11-14）**：MCP 方法层已落地 —— `McpServer` 的
+> `initialize`/`tools/list`/`tools/call`（`list_devices`/`query_all`/`query_device`/
+> `configure`）委托 `DeviceManager`；`mcp_query_device`/`apply_config` 已加入 Manager。
+> HTTP/TCP 传输与 CLI `mcp-serve` 接线待办。
+> The MCP method layer has landed: McpServer implements initialize/tools/list/tools/call
+> (list_devices, query_all, query_device, configure) on top of DeviceManager, which gained
+> mcp_query_device and apply_config. HTTP/TCP transport and CLI mcp-serve wiring remain.
+
 ---
 
 ## Phase 4 · PIO + DMA (Week 6-7)
@@ -329,10 +337,12 @@ Supports both GUI and headless/MCP mode.
 | 8.8 | ITM trace output via GDB (optional) | trace.rs |
 | 8.9 | GDB server integration test (connect → bp → step → registers → detach) | tests/ |
 
-> **P1 进度 / P1 progress（2026-11-14）**：8.1 的 RSP 协议层与 TCP 会话循环已落地
-> （`rsp.rs`/`server.rs`，37 条测试，含 6 条真实 TCP 端到端）；CLI `gdb` 接线、8.2–8.9 待办。
-> 8.1's RSP protocol layer and TCP session loop have landed (`rsp.rs`/`server.rs`, 37 tests,
-> including six real TCP end-to-end cases); CLI `gdb` wiring and 8.2-8.9 remain.
+> **P1 进度 / P1 progress（2026-11-14）**：8.1 的 RSP 协议层、TCP 会话循环与 CLI
+> `gdb` 接线（`MachineTarget`，端到端验证）已落地（`rsp.rs`/`server.rs`/`gdb_target.rs`，
+> 37 + 21 条测试）；8.2–8.9 待办。
+> 8.1's RSP protocol layer, TCP session loop and the CLI `gdb` wiring (`MachineTarget`,
+> end-to-end verified) have landed (`rsp.rs`/`server.rs`/`gdb_target.rs`, 37 + 21 tests);
+> 8.2-8.9 remain.
 
 ### Milestone M8 / 里程碑 M8
 
