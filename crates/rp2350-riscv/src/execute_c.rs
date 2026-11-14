@@ -2,7 +2,109 @@
 //!
 //! Compressed instructions are expanded into their 32-bit equivalents, then the
 //! normal decoder executes them. This keeps one source of truth for semantics.
-//! 压缩指令先展开为等价的 32 位指令，再由常规译码器执行，从而保证语义只有一份实现。
+//! The Zcmp push/pop macros are decoded separately because one 16-bit macro
+//! performs several memory accesses and cannot be expressed as a single 32-bit
+//! instruction. / 压缩指令先展开为等价的 32 位指令，再由常规译码器执行，从而
+//! 保证语义只有一份实现。Zcmp push/pop 宏单独译码，因为一条 16 位宏指令会执行
+//! 多次内存访问，无法表示为单条 32 位指令。
+
+/// Zcmp stack-adjustment base for each register-list index / Zcmp 每个寄存器列表的栈调整基准
+const ZCMP_STACK_ADJ: [u32; 16] = [0, 0, 0, 0, 16, 16, 16, 16, 32, 32, 32, 32, 48, 48, 48, 64];
+
+/// Zcmp register lists, highest register first (higher address first)
+/// Zcmp 寄存器列表，高编号寄存器在前（对应更高地址）
+const ZCMP_REG_LISTS: [&[u8]; 16] = [
+    &[],
+    &[],
+    &[],
+    &[],
+    &[1],
+    &[8, 1],
+    &[9, 8, 1],
+    &[18, 9, 8, 1],
+    &[19, 18, 9, 8, 1],
+    &[20, 19, 18, 9, 8, 1],
+    &[21, 20, 19, 18, 9, 8, 1],
+    &[22, 21, 20, 19, 18, 9, 8, 1],
+    &[23, 22, 21, 20, 19, 18, 9, 8, 1],
+    &[24, 23, 22, 21, 20, 19, 18, 9, 8, 1],
+    &[25, 24, 23, 22, 21, 20, 19, 18, 9, 8, 1],
+    &[27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 9, 8, 1],
+];
+
+/// Decoded Zcmp push/pop macro / 已译码的 Zcmp push/pop 宏
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZcmpOp {
+    /// `cm.push {reg_list}, -stack_adj` / 建立栈帧
+    Push { rlist: u8, spimm: u8 },
+    /// `cm.pop {reg_list}, stack_adj` / 销毁栈帧
+    Pop { rlist: u8, spimm: u8 },
+    /// `cm.popret {reg_list}, stack_adj` / 销毁栈帧并返回
+    PopRet { rlist: u8, spimm: u8 },
+    /// `cm.popretz {reg_list}, stack_adj` / 销毁栈帧、清零 a0 并返回
+    PopRetZ { rlist: u8, spimm: u8 },
+}
+
+impl ZcmpOp {
+    /// Registers saved or restored, highest address first
+    /// 保存或恢复的寄存器，最高地址在前
+    pub(crate) fn registers(self) -> &'static [u8] {
+        let rlist = match self {
+            Self::Push { rlist, .. }
+            | Self::Pop { rlist, .. }
+            | Self::PopRet { rlist, .. }
+            | Self::PopRetZ { rlist, .. } => rlist,
+        };
+        ZCMP_REG_LISTS[usize::from(rlist) & 0xF]
+    }
+
+    /// Total stack frame size in bytes / 栈帧总字节数
+    ///
+    /// The base adjustment depends on the register list; the two `spimm` bits
+    /// add a multiple of 16 bytes for larger frames. / 基准调整取决于寄存器
+    /// 列表；两位 `spimm` 以 16 字节为单位追加更大的栈帧。
+    pub(crate) fn stack_adj(self) -> u32 {
+        let (rlist, spimm) = match self {
+            Self::Push { rlist, spimm }
+            | Self::Pop { rlist, spimm }
+            | Self::PopRet { rlist, spimm }
+            | Self::PopRetZ { rlist, spimm } => (rlist, spimm),
+        };
+        ZCMP_STACK_ADJ[usize::from(rlist) & 0xF] + u32::from(spimm) * 16
+    }
+
+    /// Whether the macro returns to `ra` / 宏是否返回到 `ra`
+    pub(crate) fn returns(self) -> bool {
+        matches!(self, Self::PopRet { .. } | Self::PopRetZ { .. })
+    }
+
+    /// Whether the macro moves zero into `a0` / 宏是否把 0 写入 `a0`
+    pub(crate) fn zeroes_a0(self) -> bool {
+        matches!(self, Self::PopRetZ { .. })
+    }
+}
+
+/// Decode a Zcmp push/pop macro / 译码一条 Zcmp push/pop 宏
+///
+/// Zcmp reuses the `c.j` encoding space (quadrant 2, funct3 = 5). Register
+/// lists 0..3 are reserved, so they are left to the illegal-instruction path.
+/// Zcmp 复用 `c.j` 的编码空间（quadrant 2，funct3 = 5）。寄存器列表 0..3 为
+/// 保留值，交由非法指令路径处理。
+pub(crate) fn zcmp_op(half: u16) -> Option<ZcmpOp> {
+    let masked = half & 0xFF03;
+    let rlist = u8::try_from((half >> 4) & 0xF).unwrap();
+    if rlist < 4 {
+        return None;
+    }
+    let spimm = u8::try_from((half >> 2) & 0x3).unwrap();
+    match masked {
+        0xB802 => Some(ZcmpOp::Push { rlist, spimm }),
+        0xBA02 => Some(ZcmpOp::Pop { rlist, spimm }),
+        0xBC02 => Some(ZcmpOp::PopRetZ { rlist, spimm }),
+        0xBE02 => Some(ZcmpOp::PopRet { rlist, spimm }),
+        _ => None,
+    }
+}
 
 /// Expand a 16-bit compressed instruction to its 32-bit equivalent
 /// 将 16 位压缩指令展开为等价的 32 位指令
@@ -130,10 +232,26 @@ fn arithmetic(half: u16) -> Option<u32> {
             (0b10_0011, 1) => Some(encode_r(0x33, rd, 4, rd, rs2, 0)),
             (0b10_0011, 2) => Some(encode_r(0x33, rd, 6, rd, rs2, 0)),
             (0b10_0011, 3) => Some(encode_r(0x33, rd, 7, rd, rs2, 0)),
-            (0b10_0111, 0) => Some(encode_r(0x3B, rd, 0, rd, rs2, 0x20)),
-            (0b10_0111, 1) => Some(encode_r(0x3B, rd, 0, rd, rs2, 0)),
+            // Zcb: C.MUL and the C.ZEXT.B/H / C.SEXT.B/H / C.NOT group.
+            // Zcb：C.MUL 以及 C.ZEXT.B/H、C.SEXT.B/H、C.NOT 组。
+            (0b10_0111, 2) => Some(encode_r(0x33, rd, 0, rd, rs2, 0x01)),
+            (0b10_0111, 3) => zcb_zext(half),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// Expand the Zcb C.ZEXT.B/H, C.SEXT.B/H and C.NOT subgroup
+/// 展开 Zcb 的 C.ZEXT.B/H、C.SEXT.B/H 与 C.NOT 子组
+fn zcb_zext(half: u16) -> Option<u32> {
+    let rd = reg(((half >> 7) & 0b111) + 8);
+    match (half >> 2) & 0b111 {
+        0 => Some(encode_i(0x13, rd, 7, rd, 0xFF)),
+        1 => Some(encode_shift_i(0x13, rd, 1, rd, 4, 0x30)),
+        2 => Some(encode_r(0x33, rd, 4, rd, 0, 0x04)),
+        3 => Some(encode_shift_i(0x13, rd, 1, rd, 5, 0x30)),
+        5 => Some(encode_i(0x13, rd, 4, rd, -1)),
         _ => None,
     }
 }
@@ -231,10 +349,19 @@ fn addi16sp_imm(half: u16) -> i32 {
     sign_extend(u32::from(value), 10)
 }
 
-/// Decode the C.LUI immediate (already positioned at bits 17:12)
-/// 解码 C.LUI 立即数（已放置在位 17:12）
+/// Decode the sign-extended C.LUI immediate positioned at bits 31:12
+/// 解码 C.LUI 立即数，符号扩展到 32 位并放置在位 31:12
+///
+/// C.LUI carries a signed 6-bit immediate: bit 17 is the sign bit, so a
+/// negative immediate must fill bits 31:18 with ones before the 12-bit
+/// shift. Otherwise `c.lui rd, -16` would load `0x0003_0000` instead of
+/// `0xFFFF_0000`.
+/// C.LUI 携带 6 位有符号立即数：位 17 是符号位，负立即数在左移 12 位前
+/// 必须把位 31:18 填为 1。否则 `c.lui rd, -16` 会装入 `0x0003_0000`
+/// 而不是 `0xFFFF_0000`。
 fn lui_imm(half: u16) -> u32 {
-    u32::from((half >> 12) & 1) << 17 | u32::from((half >> 2) & 0x1F) << 12
+    let raw = u32::from(((half >> 12) & 1) << 5 | ((half >> 2) & 0x1F));
+    (sign_extend(raw, 6) as u32) << 12
 }
 
 /// Decode the C.J / C.JAL offset / 解码 C.J / C.JAL 偏移

@@ -6,39 +6,43 @@
 > Hazard3 RISC-V（RV32IMAC）核心仿真。实现 `CpuCore` trait，包含机器模式整数
 > 子集、压缩指令与最小的外部中断通路。
 >
-> **Status**: implemented — RV32I/M/A/C + Zcb, machine CSRs, vectored traps,
-> `lr.w`/`sc.w` reservation. Not implemented: Zb* bit-manipulation extensions
-> (illegal-instruction trap), F/D floating point, PMP enforcement.
-> **状态**: 已实现 — RV32I/M/A/C + Zcb、机器模式 CSR、向量陷阱、
-> `lr.w`/`sc.w` 保留区。未实现：Zb* 位操作扩展（按非法指令陷阱）、
-> F/D 浮点、PMP 强制访问检查。
+> **Status**: implemented — RV32I/M/A/C + Zb\* (Zba/Zbb/Zbs) + Zcb, machine
+> CSRs, Xh3irq external interrupts, exception/interrupt trap entry, picobin
+> `IMAGE_DEF` boot, `lr.w`/`sc.w` reservation. Not implemented: F/D floating
+> point, PMP enforcement.
+> **状态**: 已实现 — RV32I/M/A/C + Zb\*（Zba/Zbb/Zbs）+ Zcb、机器模式 CSR、
+> Xh3irq 外部中断、异常/中断陷阱入口、picobin `IMAGE_DEF` 启动、
+> `lr.w`/`sc.w` 保留区。未实现：F/D 浮点、PMP 强制访问检查。
 
 ---
 
 ## Boot handoff / 启动交接
 
 Arm images start with a vector table at flash address zero; RISC-V images
-start with a picobin `IMAGE_DEF` header. The default RISC-V handoff validates
-only the magic word and then reads the two vector words:
-
-Arm 映像以 Flash 起始处的向量表开头；RISC-V 映像以 picobin `IMAGE_DEF` 头开头。
-默认的 RISC-V 交接只校验魔数，然后读取两个向量字：
+start with a picobin `IMAGE_DEF` block. `boot` scans the first flash page for
+the block marker `0xFFFF_DED3` and the `0x44` entry-point item, then loads the
+boot2 entry and initial stack pointer from that item. For the target
+`RPI_PICO2-RISCV` image the block lives at `0x1000_0014`, the boot2 entry is
+`0x1000_0036` and the initial SP is `0x2008_2000`.
+Arm 映像以 Flash 起始处的向量表开头；RISC-V 映像以 picobin `IMAGE_DEF` 块开头。
+`boot` 会扫描 Flash 首页的块标记 `0xFFFF_DED3` 与 `0x44` 入口点条目，再从该
+条目加载 boot2 入口与初始栈指针。目标 `RPI_PICO2-RISCV` 映像的块位于
+`0x1000_0014`，boot2 入口为 `0x1000_0036`，初始 SP 为 `0x2008_2000`。
 
 ```rust
-pub const RISCV_BOOT_MAGIC_ADDR: u32 = 0x1000_0000; // picobin magic / picobin 魔数
+pub const RISCV_BOOT_MAGIC_ADDR: u32 = 0x1000_0000; // boot2 header magic / boot2 头魔数
 pub const RISCV_BOOT_MAGIC: u32 = 0x7188_EBF2;
-pub const RISCV_BOOT_ENTRY_ADDR: u32 = 0x1000_0004; // entry PC / 入口 PC
-pub const RISCV_BOOT_SP_ADDR: u32 = 0x1000_0020;    // initial SP / 初始栈指针
+pub const RISCV_PICOBIN_MARKER_START: u32 = 0xFFFF_DED3;
+pub const RISCV_PICOBIN_ENTRY_POINT_ITEM: u32 = 0x44;
+pub const RISCV_BOOT_ENTRY_ADDR: u32 = 0x1000_0004; // legacy fallback / 旧式回退
+pub const RISCV_BOOT_SP_ADDR: u32 = 0x1000_0024;    // legacy fallback / 旧式回退
 ```
 
-If the magic does not match, `boot` returns `CoreError::FirmwareError`. The
-rest of the `IMAGE_DEF` block (chunks, extension words) is **not** parsed; the
-emulator simply enters at the header's entry point. Hosts can bypass the
-header entirely with `set_boot_vectors`.
-
-魔数不匹配时 `boot` 返回 `CoreError::FirmwareError`。`IMAGE_DEF` 块的其余部分
-（chunk、扩展字）**不**做解析；模拟器只是从头部给出的入口点开始执行。宿主可
-用 `set_boot_vectors` 完全绕过该头部。
+If no `IMAGE_DEF` item is found, `boot` falls back to the legacy boot2 header
+fields above and requires the `0x7188_EBF2` magic. Hosts can bypass the header
+entirely with `set_boot_vectors`.
+若未找到 `IMAGE_DEF` 条目，`boot` 回退到上述旧式 boot2 头字段，并要求
+`0x7188_EBF2` 魔数。宿主可用 `set_boot_vectors` 完全绕过该头部。
 
 ---
 
@@ -163,15 +167,16 @@ mret() -> restored PC                       // trap return
 
 `take_trap` saves `mepc = epc & !3`, `mcause`, `mtval`; moves `MIE` into
 `MPIE`, clears `MIE`, sets `MPP = Machine`, clears `mip.MEIP` and resolves the
-handler address through `trap_pc`. `trap_pc` implements vectored mode: with
-`mtvec & 3 == 1` the handler is `mtvec + 4 * (cause & 0x7FFF_FFFF)`, otherwise
-the direct base. `mret` restores `PC = mepc & !3` and copies `MPIE` back into
+handler address through `trap_pc`. Hazard3 vectors only **interrupts**: when
+`mtvec & 3 == 1` and the cause has bit 31 set, the handler is
+`mtvec + 4 * (cause & 0x7FFF_FFFF)`; synchronous exceptions always use the
+`mtvec` base. `mret` restores `PC = mepc & !3` and copies `MPIE` back into
 `MIE`/`MPIE`, clearing `MPP`.
 `take_trap` 保存 `mepc = epc & !3`、`mcause`、`mtval`；把 `MIE` 移入 `MPIE`、
 清零 `MIE`、置 `MPP = Machine`、清除 `mip.MEIP`，并通过 `trap_pc` 解析处理程序
-地址。`trap_pc` 实现向量模式：`mtvec & 3 == 1` 时处理程序为
-`mtvec + 4 * (cause & 0x7FFF_FFFF)`，否则为直接基址。`mret` 恢复
-`PC = mepc & !3`，并把 `MPIE` 复制回 `MIE`/`MPIE`，同时清零 `MPP`。
+地址。Hazard3 只对**中断**做向量化：`mtvec & 3 == 1` 且 cause 的 bit 31 置位时
+处理程序为 `mtvec + 4 * (cause & 0x7FFF_FFFF)`；同步异常一律使用 `mtvec` 基址。
+`mret` 恢复 `PC = mepc & !3`，并把 `MPIE` 复制回 `MIE`/`MPIE`，同时清零 `MPP`。
 
 Typical `mcause` values produced by the core / 核心产生的典型 `mcause`：
 
@@ -201,15 +206,22 @@ from `pending_irqs` (and `mip.MEIP` when nothing else is pending),
 `pending_irqs` 清除该中断位（无其他挂起时同时清 `mip.MEIP`），`meipa` 记录
 IRQ 编号，然后以 `mcause = 0x8000_000B` 进入陷阱。
 
-Note on Xh3irq fidelity: `meiea`/`meifa`/`meipra` are stored and readable, but
-interrupt routing is gated only by `mstatus.MIE` && `mie.MEIE`, and `meipa` is
-written rather than derived from the priority scheme. This is sufficient for
-the vector-table-plus-NVIC-style bring-up used by the test suite, but it is
-not a full `Xh3irq` controller model.
-关于 Xh3irq 保真度：`meiea`/`meifa`/`meipra` 有存储且可读，但中断路由仅由
-`mstatus.MIE` 与 `mie.MEIE` 控制，`meipa` 是直接写入而不是按优先级方案推导。
-这足以支撑测试套件使用的「向量表 + NVIC 风格」的启动流程，但并非完整的
-`Xh3irq` 控制器模型。
+Xh3irq model: 16-bit `meiea` windows gate external IRQs on top of
+`mstatus.MIE` && `mie.MEIE`; `meipa` derives from pending/force state and
+`meinext.update` claims the pending bit for a given priority. Interrupt entry
+selects the highest-priority pending IRQ and records it in `meipa`/`meinext`;
+same-priority interrupts do not preempt (higher priority does), and `mret`
+restores `ppreempt`/`pppreempt` while preserving NOIRQ so the pico-sdk handler
+bookkeeping stays consistent. This is sufficient for the MicroPython RISC-V
+interrupt chain, but not a complete Xh3irq controller (no external
+interrupt-array block or latency counters).
+Xh3irq 模型：16 位 `meiea` 窗口在 `mstatus.MIE` 与 `mie.MEIE` 之上再对
+外部中断做三级屏蔽；`meipa` 由挂起/强制状态推导，`meinext.update` 按优先级
+认领挂起位。中断入口选择最高优先级的挂起 IRQ 并记录到 `meipa`/`meinext`；
+同优先级中断不再抢占（更高优先级可以），`mret` 恢复 `ppreempt`/`pppreempt`
+并保留 NOIRQ，使 pico-sdk 的处理程序记账保持一致。该模型足以支撑
+MicroPython RISC-V 的中断链，但并非完整 Xh3irq 控制器（缺少外部中断阵列
+与延迟计数器）。
 
 ---
 
@@ -254,16 +266,24 @@ single implementation. Covered quadrants:
   `C.SB`, `C.SH`).
 - **Quadrant 1**: `C.ADDI`, `C.JAL`, `C.LI`, `C.ADDI16SP`, `C.LUI`,
   `C.SRLI`/`C.SRAI`/`C.ANDI`, the sub-register `AND`/`OR`/`XOR`/`SUB`/`ADDW`
-  /`SUBW` group, `C.J`, `C.BEQZ`, `C.BNEZ`.
+  /`SUBW` group (plus Zcb `C.ZEXT.B`/`C.ZEXT.H`, `C.SEXT.B`/`C.SEXT.H`,
+  `C.NOT`, `C.MUL`), `C.J`, `C.BEQZ`, `C.BNEZ`.
 - **Quadrant 2**: `C.SLLI`, `C.LWSP`, `C.JR`/`C.JALR`, `C.MV`, `C.ADD`
   (incl. `EBREAK`/`NOP` encodings), `C.SWSP`.
+- **Zcmp**: `cm.push {reg_list}, -spimm` / `cm.pop {reg_list}, spimm` /
+  `cm.popret`/`cm.popretz` — compressed push/pop with register lists and
+  stack adjustment (used by the pico-sdk RISC-V interrupt chain).
 - **象限 0**：`C.ADDI4SPN`、`C.LW`/`C.SW`，以及 **Zcb**（`C.LBU`、`C.LHU`、
   `C.SB`、`C.SH`）。
 - **象限 1**：`C.ADDI`、`C.JAL`、`C.LI`、`C.ADDI16SP`、`C.LUI`、
   `C.SRLI`/`C.SRAI`/`C.ANDI`、子寄存器组 `AND`/`OR`/`XOR`/`SUB`/`ADDW`/
-  `SUBW`、`C.J`、`C.BEQZ`、`C.BNEZ`。
+  `SUBW`（另含 Zcb `C.ZEXT.B`/`C.ZEXT.H`、`C.SEXT.B`/`C.SEXT.H`、
+  `C.NOT`、`C.MUL`）、`C.J`、`C.BEQZ`、`C.BNEZ`。
 - **象限 2**：`C.SLLI`、`C.LWSP`、`C.JR`/`C.JALR`、`C.MV`、`C.ADD`
   （含 `EBREAK`/`NOP` 编码）、`C.SWSP`。
+- **Zcmp**：`cm.push {reg_list}, -spimm` / `cm.pop {reg_list}, spimm` /
+  `cm.popret`/`cm.popretz` —— 带寄存器列表与栈调整的压缩 push/pop
+  （pico-sdk 的 RISC-V 中断链使用）。
 
 Reserved, floating-point and unsupported compressed encodings return `None`
 from `decompress` and are raised as illegal-instruction traps with the 16-bit
@@ -271,21 +291,42 @@ halfword in `mtval`.
 保留、浮点与未支持的压缩编码会让 `decompress` 返回 `None`，随后按非法指令
 陷阱处理，`mtval` 为 16 位半字。
 
+### Bit manipulation (Zba/Zbb/Zbs) / 位操作扩展
+
+`Zba`: `sh1add`/`sh2add`/`sh3add` address generation.
+`Zbb`: `andn`/`orn`/`xnor`, `pack`/`packh` (`pack` with `rs2 = 0` behaves as
+`zext.h`), `clz`/`ctz`/`cpop`, `sext.b`/`sext.h`, `min`/`max`/`minu`/`maxu`,
+`rol`/`ror`/`rori`, `orc.b`, `rev8`, `brev8`.
+`Zbs`: `bset`/`bclr`/`binv`/`bext` and the immediate forms (`bseti`/`bclri`/
+`binvi`/`bexti`). The target MicroPython image exercises `pack`/`packh`, the
+bit-count group, the immediate bit ops and `orc.b`/`rev8` during startup.
+`Zba`：`sh1add`/`sh2add`/`sh3add` 地址生成。`Zbb`：`andn`/`orn`/`xnor`、
+`pack`/`packh`（`rs2 = 0` 时等价 `zext.h`）、`clz`/`ctz`/`cpop`、
+`sext.b`/`sext.h`、`min`/`max`/`minu`/`maxu`、`rol`/`ror`/`rori`、
+`orc.b`、`rev8`、`brev8`。`Zbs`：`bset`/`bclr`/`binv`/`bext` 及立即数形式
+（`bseti`/`bclri`/`binvi`/`bexti`）。目标 MicroPython 映像在启动阶段实际使用
+`pack`/`packh`、位计数组、立即数位操作与 `orc.b`/`rev8`。
+
 ---
 
 ## Not implemented / 未实现清单
 
-- **Zb\* extensions** (`Zba`/`Zbb`/`Zbs`): no decoder support; these opcodes
-  hit the illegal-instruction trap (cause 2, `mtval` = opcode).
-  **Zb\* 扩展**（`Zba`/`Zbb`/`Zbs`）：译码器未支持；这些操作码命中非法指令
-  陷阱（cause 2，`mtval` = 操作码）。
 - **F/D floating point**: not present; `misa` does not advertise the F/D bits
   and compressed FP encodings are illegal.
   **F/D 浮点**：不存在；`misa` 不宣传 F/D 位，压缩浮点编码视为非法。
-- **Full picobin `IMAGE_DEF` parsing**: only the magic at `0x1000_0000`,
-  entry at `0x1000_0004` and SP at `0x1000_0020` are read.
-  **完整 picobin `IMAGE_DEF` 解析**：只读取 `0x1000_0000` 魔数、
-  `0x1000_0004` 入口与 `0x1000_0020` 栈指针。
+- **Full picobin `IMAGE_DEF` parsing**: the parser locates the `0xFFFF_DED3`
+  marker and the `0x44` entry-point item (boot2 entry + SP). It does not parse
+  load-map, hash, signature, partition-table or hash-value items.
+  **完整 picobin `IMAGE_DEF` 解析**：解析器定位 `0xFFFF_DED3` 标记与 `0x44`
+  入口点条目（boot2 入口 + SP）；不解析 load-map、哈希、签名、分区表或
+  hash-value 条目。
+- **RISC-V boot ROM coverage**: the synthetic ROM implements the data/function
+  lookup slots used by boot2 (`0x7DF8` → `rom_data_lookup` at `0x75FE`,
+  `0x7DFA` → `rom_func_lookup` at `0x75C2`) and the flash helpers; other
+  RISC-V ROM table entries are not modelled.
+  **RISC-V boot ROM 覆盖**：合成 ROM 实现了 boot2 使用的数据/函数查找槽
+  （`0x7DF8` → `0x75FE` 的 `rom_data_lookup`、`0x7DFA` → `0x75C2` 的
+  `rom_func_lookup`）与 flash 辅助函数；其余 RISC-V ROM 表项未建模。
 - **`mstatus`**: only `MIE`/`MPIE`/`MPP` are modeled; other status bits
   (FS, VS, UXL …) do not exist.
   **`mstatus`**：仅建模 `MIE`/`MPIE`/`MPP`；其他状态位（FS、VS、UXL 等）

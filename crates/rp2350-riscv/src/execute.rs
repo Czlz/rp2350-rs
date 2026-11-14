@@ -1,7 +1,7 @@
 //! RV32IMAC instruction fetch, decode and execute / RV32IMAC 指令取指、译码与执行
 
 use super::Hazard3Core;
-use super::execute_c::decompress;
+use super::execute_c::{ZcmpOp, decompress, zcmp_op};
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
@@ -62,13 +62,32 @@ impl Hazard3Core {
     pub(crate) fn execute_one(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
         let pc = self.registers.pc;
         let low = Self::fetch_u16(bus, pc)?;
+        // Zcmp push/pop 宏是多条内存访问的组合，无法展开成单条 32 位指令，
+        // 必须在压缩指令路径之前单独执行。
+        // Zcmp push/pop macros combine several memory accesses and cannot be
+        // expanded into one 32-bit instruction, so they run before the
+        // compressed-instruction path.
+        if low & 0b11 != 0b11 {
+            if let Some(op) = zcmp_op(low) {
+                return match self.execute_zcmp(op, bus, pc.wrapping_add(2)) {
+                    Ok(target) => {
+                        self.registers.pc = target;
+                        Ok(())
+                    }
+                    Err(trap) => {
+                        self.registers.pc = self.enter_trap(trap.cause, trap.tval, pc);
+                        Ok(())
+                    }
+                };
+            }
+        }
         let (instr, length) = if low & 0b11 == 0b11 {
             let high = Self::fetch_u16(bus, pc.wrapping_add(2))?;
             (u32::from(low) | (u32::from(high) << 16), 4)
         } else if let Some(expanded) = decompress(low) {
             (expanded, 2)
         } else {
-            self.registers.pc = self.csr.take_trap(2, u32::from(low), pc);
+            self.registers.pc = self.enter_trap(2, u32::from(low), pc);
             return Ok(());
         };
         let next_pc = pc.wrapping_add(length);
@@ -79,8 +98,56 @@ impl Hazard3Core {
                 Ok(())
             }
             Err(trap) => {
-                self.registers.pc = self.csr.take_trap(trap.cause, trap.tval, pc);
+                self.registers.pc = self.enter_trap(trap.cause, trap.tval, pc);
                 Ok(())
+            }
+        }
+    }
+
+    /// Execute a Zcmp push/pop macro / 执行 Zcmp push/pop 宏
+    ///
+    /// `cm.push` stores the register list just below the old stack pointer and
+    /// then allocates the frame; the pop forms load from the top of the frame
+    /// and release it. `cm.popret`/`cm.popretz` additionally return to `ra`.
+    /// `cm.push` 把寄存器列表保存在旧栈指针下方并分配栈帧；pop 形式从栈帧
+    /// 顶部恢复并释放栈帧。`cm.popret`/`cm.popretz` 还会返回到 `ra`。
+    fn execute_zcmp(&mut self, op: ZcmpOp, bus: &mut dyn AddressBus, next_pc: u32) -> ExecResult {
+        let sp = self.registers.read(2);
+        let stack_adj = op.stack_adj();
+        match op {
+            ZcmpOp::Push { .. } => {
+                let mut addr = sp.wrapping_sub(4);
+                for &reg in op.registers() {
+                    let mut cycles = 0u64;
+                    bus.write_u32(addr, self.registers.read(reg), &mut cycles)
+                        .map_err(|_| Trap {
+                            cause: 7,
+                            tval: addr,
+                        })?;
+                    addr = addr.wrapping_sub(4);
+                }
+                self.registers.write(2, sp.wrapping_sub(stack_adj));
+                Ok(next_pc)
+            }
+            ZcmpOp::Pop { .. } | ZcmpOp::PopRet { .. } | ZcmpOp::PopRetZ { .. } => {
+                let mut addr = sp.wrapping_add(stack_adj).wrapping_sub(4);
+                for &reg in op.registers() {
+                    let mut cycles = 0u64;
+                    let value = bus.read_u32(addr, &mut cycles).map_err(|_| Trap {
+                        cause: 5,
+                        tval: addr,
+                    })?;
+                    self.registers.write(reg, value);
+                    addr = addr.wrapping_sub(4);
+                }
+                self.registers.write(2, sp.wrapping_add(stack_adj));
+                if op.zeroes_a0() {
+                    self.registers.write(10, 0);
+                }
+                if op.returns() {
+                    return Ok(self.registers.read(1));
+                }
+                Ok(next_pc)
             }
         }
     }
@@ -157,6 +224,10 @@ impl Hazard3Core {
             OP_IMM => {
                 let value = imm_i(instr) as u32;
                 let source = self.registers.read(rs1);
+                // Zbb/Zbs place extra funct7 encodings in the shift-immediate
+                // group; only funct7 == 0 is a plain shift.
+                // Zbb/Zbs 在移位立即数组中使用额外 funct7 编码；只有 funct7 == 0
+                // 才是普通移位。
                 let result = match funct3 {
                     0 => source.wrapping_add(value),
                     2 => u32::from((source as i32) < (value as i32)),
@@ -164,8 +235,31 @@ impl Hazard3Core {
                     4 => source ^ value,
                     6 => source | value,
                     7 => source & value,
-                    1 => source << (rs2 & 0x1F),
-                    5 => shift_right(source, u32::from(rs2 & 0x1F), funct7 == 0x20),
+                    1 => match funct7 {
+                        0x00 => source << (rs2 & 0x1F),
+                        0x14 => source | (1 << (rs2 & 0x1F)),
+                        0x24 => source & !(1 << (rs2 & 0x1F)),
+                        0x34 => source ^ (1 << (rs2 & 0x1F)),
+                        0x30 => match rs2 {
+                            0 => source.leading_zeros(),
+                            1 => source.trailing_zeros(),
+                            2 => source.count_ones(),
+                            4 => sign_extend_byte(source),
+                            5 => sign_extend_half(source),
+                            _ => return Err(Trap::illegal(instr)),
+                        },
+                        _ => return Err(Trap::illegal(instr)),
+                    },
+                    5 => match funct7 {
+                        0x00 => shift_right(source, u32::from(rs2 & 0x1F), false),
+                        0x20 => shift_right(source, u32::from(rs2 & 0x1F), true),
+                        0x24 => (source >> (rs2 & 0x1F)) & 1,
+                        0x30 => source.rotate_right(u32::from(rs2 & 0x1F)),
+                        0x14 if rs2 == 7 => orc_b(source),
+                        0x34 if rs2 == 0x18 => source.swap_bytes(),
+                        0x34 if rs2 == 7 => brev8(source),
+                        _ => return Err(Trap::illegal(instr)),
+                    },
                     _ => return Err(Trap::illegal(instr)),
                 };
                 self.registers.write(rd, result);
@@ -180,12 +274,64 @@ impl Hazard3Core {
                     match funct3 {
                         0 if funct7 == 0x20 => a.wrapping_sub(b),
                         0 => a.wrapping_add(b),
+                        // Zbs single-bit operations. Zbs 单位操作。
+                        1 if funct7 == 0x14 => a | (1 << (b & 0x1F)),
+                        1 if funct7 == 0x24 => a & !(1 << (b & 0x1F)),
+                        1 if funct7 == 0x34 => a ^ (1 << (b & 0x1F)),
+                        1 if funct7 == 0x30 => a.rotate_left(b & 0x1F),
                         1 => a << (b & 0x1F),
+                        // Zba address generation. Zba 地址生成。
+                        2 if funct7 == 0x10 => (a << 1).wrapping_add(b),
                         2 => u32::from((a as i32) < (b as i32)),
                         3 => u32::from(a < b),
+                        // Zbb and/or/xor-with-inverted-second-operand, Zba sh2add,
+                        // min/max and PACK share funct3 == 4. PACK with rs2 == 0 is
+                        // the canonical ZEXT.H encoding emitted by GCC.
+                        // Zbb 与第二操作数取反后的 and/or/xor、Zba sh2add、min/max
+                        // 与 PACK 共用 funct3 == 4。rs2 == 0 的 PACK 即 GCC 使用的
+                        // ZEXT.H 规范编码。
+                        4 if funct7 == 0x04 => (a & 0xFFFF) | ((b & 0xFFFF) << 16),
+                        4 if funct7 == 0x10 => (a << 2).wrapping_add(b),
+                        4 if funct7 == 0x05 => {
+                            if (a as i32) < (b as i32) {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        4 if funct7 == 0x20 => a ^ !b,
                         4 => a ^ b,
+                        5 if funct7 == 0x05 => {
+                            if a < b {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        5 if funct7 == 0x24 => (a >> (b & 0x1F)) & 1,
+                        5 if funct7 == 0x30 => a.rotate_right(b & 0x1F),
                         5 => shift_right(a, b & 0x1F, funct7 == 0x20),
+                        // Zba sh3add and min/max share funct3 == 6.
+                        // Zba sh3add 与 min/max 共用 funct3 == 6。
+                        6 if funct7 == 0x10 => (a << 3).wrapping_add(b),
+                        6 if funct7 == 0x05 => {
+                            if (a as i32) > (b as i32) {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        6 if funct7 == 0x20 => a | !b,
                         6 => a | b,
+                        7 if funct7 == 0x04 => (a & 0xFF) | ((b & 0xFF) << 8),
+                        7 if funct7 == 0x05 => {
+                            if a > b {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        7 if funct7 == 0x20 => a & !b,
                         7 => a & b,
                         _ => return Err(Trap::illegal(instr)),
                     }
@@ -310,12 +456,16 @@ impl Hazard3Core {
         }
 
         let csr_addr = instr >> 20;
-        let old = self.csr.read(csr_addr);
         let source = if funct3 >= 5 {
             u32::from(rs1)
         } else {
             self.registers.read(rs1)
         };
+        // Xh3irq array CSRs use the operand's low five bits as a window index
+        // and the upper 16 bits as data, so the read needs the raw operand.
+        // Xh3irq 数组 CSR 使用操作数低 5 位作为窗口索引、高 16 位作为数据，
+        // 因此读取时需要原始操作数。
+        let old = self.csr.read(csr_addr, source);
         let operation = funct3 & 3;
         let new_value = match operation {
             1 => source,
@@ -328,7 +478,7 @@ impl Hazard3Core {
             if (csr_addr >> 10) & 3 == 3 {
                 return Err(Trap::illegal(instr));
             }
-            self.csr.write(csr_addr, new_value);
+            self.csr.write_raw(csr_addr, new_value, source);
         }
         self.registers.write(rd, old);
         Ok(next_pc)
@@ -343,13 +493,15 @@ fn load_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32) -> Result<u32, T
         tval: addr,
     };
     match funct3 {
+        // LB/LH sign-extend to XLEN; LBU/LHU below zero-extend.
+        // LB/LH 符号扩展到 XLEN；下面的 LBU/LHU 做零扩展。
         0 => bus
             .read_u8(addr, &mut cycles)
-            .map(|v| u32::from(v as i8 as u8))
+            .map(|v| v as i8 as u32)
             .map_err(|_| fault),
         1 => bus
             .read_u16(addr, &mut cycles)
-            .map(|v| u32::from(v as i16 as u16))
+            .map(|v| v as i16 as u32)
             .map_err(|_| fault),
         2 => bus.read_u32(addr, &mut cycles).map_err(|_| fault),
         4 => bus
@@ -419,6 +571,37 @@ fn shift_right(value: u32, shift: u32, arithmetic: bool) -> u32 {
 /// Sign-extend the low 32 bits / 将低 32 位符号扩展
 fn sign_extend_word(value: u32) -> u32 {
     value as i32 as u32
+}
+
+/// Sign-extend the low byte / 将低字节符号扩展
+fn sign_extend_byte(value: u32) -> u32 {
+    value as i8 as u32
+}
+
+/// Sign-extend the low halfword / 将低半字符号扩展
+fn sign_extend_half(value: u32) -> u32 {
+    value as i16 as u32
+}
+
+/// OR-combine the sign bit of every byte / 将每字节符号位扩展为整字节掩码
+fn orc_b(value: u32) -> u32 {
+    let mut result = 0u32;
+    for shift in (0..32).step_by(8) {
+        if value & (0x80 << shift) != 0 {
+            result |= 0xFF << shift;
+        }
+    }
+    result
+}
+
+/// Reverse the bit order within every byte / 反转每字节内的位序
+fn brev8(value: u32) -> u32 {
+    let mut result = 0u32;
+    for shift in (0..32).step_by(8) {
+        let byte = ((value >> shift) & 0xFF) as u8;
+        result |= u32::from(byte.reverse_bits()) << shift;
+    }
+    result
 }
 
 /// Execute an M-extension operation / 执行 M 扩展运算

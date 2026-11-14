@@ -59,6 +59,17 @@ pub trait CpuCore: Send + Sync {
     /// Read the program counter (PC) / 读取程序计数器
     fn pc(&self) -> u32;
 
+    /// Write the program counter / 写入程序计数器
+    ///
+    /// The default implementation routes through register 15, which is the PC
+    /// on the Cortex-M register file. Architectures whose link register holds
+    /// the return address (such as RISC-V) override this method.
+    /// 默认实现经由寄存器 15 写入，在 Cortex-M 寄存器组中该索引即 PC。链接
+    /// 寄存器保存返回地址的架构（例如 RISC-V）会覆盖此方法。
+    fn set_pc(&mut self, pc: u32) {
+        self.write_register(15, pc);
+    }
+
     /// Read a general-purpose register / 读取通用寄存器
     fn read_register(&self, index: u8) -> u32;
 
@@ -105,6 +116,16 @@ pub trait CpuCore: Send + Sync {
     /// 对于没有 XPSR 的核心（例如 RISC-V），默认返回 `0`。
     #[must_use]
     fn xpsr(&self) -> u32 {
+        0
+    }
+
+    /// Read an architecture-specific control/status register for diagnostics
+    /// 为诊断读取架构相关的控制/状态寄存器
+    ///
+    /// Defaults to `0` for cores that do not expose a CSR window.
+    /// 不提供 CSR 窗口的核心默认返回 `0`。
+    #[must_use]
+    fn csr_read(&self, _addr: u32) -> u32 {
         0
     }
 

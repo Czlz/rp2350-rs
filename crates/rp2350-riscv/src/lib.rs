@@ -60,16 +60,28 @@ use csr::CsrFile;
 /// RP2350 RISC-V 映像起始处的 picobin 头魔数
 pub const RISCV_BOOT_MAGIC_ADDR: u32 = 0x1000_0000;
 
-/// Expected picobin magic word / 期望的 picobin 魔数字
+/// Expected picobin/boot2 header magic word / 期望的 picobin/boot2 头魔数字
 pub const RISCV_BOOT_MAGIC: u32 = 0x7188_EBF2;
 
-/// Address of the entry point word in the picobin header
-/// picobin 头中入口点字的地址
+/// Address of the legacy entry point word in the boot2 header
+/// boot2 头中旧式入口点字的地址
 pub const RISCV_BOOT_ENTRY_ADDR: u32 = 0x1000_0004;
 
-/// Address of the initial stack pointer word in the picobin header
-/// picobin 头中初始栈指针字的地址
-pub const RISCV_BOOT_SP_ADDR: u32 = 0x1000_0020;
+/// Address of the initial stack pointer word in the boot2 header
+/// boot2 头中初始栈指针字的地址
+pub const RISCV_BOOT_SP_ADDR: u32 = 0x1000_0024;
+
+/// Start marker of a picobin `IMAGE_DEF` block / picobin `IMAGE_DEF` 块起始标记
+pub const RISCV_PICOBIN_MARKER_START: u32 = 0xFFFF_DED3;
+
+/// End marker of a picobin block / picobin 块结束标记
+pub const RISCV_PICOBIN_MARKER_END: u32 = 0xAB12_3579;
+
+/// `PICOBIN_BLOCK_ITEM_1BS_ENTRY_POINT` item type / 入口点条目类型
+pub const RISCV_PICOBIN_ENTRY_POINT_ITEM: u32 = 0x44;
+
+/// Number of words scanned for a picobin block / 扫描 picobin 块的字数
+const PICOBIN_SCAN_WORDS: u32 = 0x100;
 
 /// Hazard3 RISC-V processor core / Hazard3 RISC-V 处理器核心
 #[derive(Debug)]
@@ -82,14 +94,15 @@ pub struct Hazard3Core {
     csr: CsrFile,
     /// Current execution state / 当前执行状态
     state: CpuState,
-    /// Pending external IRQ mask (bits 0..63) / 待处理外部中断掩码
-    pending_irqs: u64,
     /// Cached boot vectors (SP, PC) / 缓存的启动向量（SP、PC）
     boot_vectors: Option<(u32, u32)>,
     /// Cumulative executed instructions since reset / 复位以来累计执行的指令数
     total_cycles: u64,
     /// Load reservation address for `lr.w`/`sc.w` / `lr.w`/`sc.w` 的保留地址
     reservation: Option<u32>,
+    /// Optional host-installed vector table for fatal exceptions
+    /// 宿主可选安装的致命异常向量表基地址
+    fatal_trap_vector: Option<u32>,
 }
 
 impl Hazard3Core {
@@ -101,11 +114,38 @@ impl Hazard3Core {
             registers: Rv32Registers::new(),
             csr: CsrFile::new(),
             state: CpuState::Reset,
-            pending_irqs: 0,
             boot_vectors: None,
             total_cycles: 0,
             reservation: None,
+            fatal_trap_vector: None,
         }
+    }
+
+    /// Install a host-owned vector table for fatal exceptions
+    /// 为致命异常安装宿主自有的向量表
+    ///
+    /// Causes 2 (illegal instruction) and 5 (load access fault) jump to
+    /// `base + 4 * cause` instead of the guest's `mtvec`, so a host can
+    /// terminate with a diagnostic report rather than loop on a vector slot
+    /// the firmware never populated. Other traps keep the architectural
+    /// `mtvec` behaviour.
+    /// cause 2（非法指令）与 cause 5（加载访问错误）会跳到 `base + 4 * cause`，
+    /// 而不是客户机的 `mtvec`，使宿主能够以诊断报告停机，而不是在固件从未填充
+    /// 的向量槽里循环。其他陷阱保持架构规定的 `mtvec` 行为。
+    pub fn set_fatal_trap_vector(&mut self, base: u32) {
+        self.fatal_trap_vector = Some(base & !3);
+    }
+
+    /// Apply the optional fatal-exception vector to a trap target
+    /// 将可选的致命异常向量应用到陷阱目标
+    fn enter_trap(&mut self, cause: u32, tval: u32, epc: u32) -> u32 {
+        let target = self.csr.take_trap(cause, tval, epc);
+        if matches!(cause, 2 | 5) {
+            if let Some(base) = self.fatal_trap_vector {
+                return base.wrapping_add(4 * cause);
+            }
+        }
+        target
     }
 
     /// Override the boot vectors used by [`CpuCore::init`] / 覆盖启动向量
@@ -117,23 +157,61 @@ impl Hazard3Core {
         self.boot_vectors = Some((sp, pc & !1));
     }
 
+    /// Scan the first flash page for a picobin `IMAGE_DEF` entry-point item
+    /// 在 Flash 首页扫描 picobin `IMAGE_DEF` 的入口点条目
+    ///
+    /// The RP2350 boot2 header contains an `IMAGE_DEF` block with an item whose
+    /// low byte is 0x44; the following two words are the boot2 entry point and
+    /// initial stack pointer. Returns `None` when no block/item is present.
+    /// RP2350 的 boot2 头包含 `IMAGE_DEF` 块，其中一个条目低字节为 0x44，其后
+    /// 两个字是 boot2 入口点与初始栈指针。没有块/条目时返回 `None`。
+    fn find_picobin_vectors(bus: &mut dyn AddressBus) -> Result<Option<(u32, u32)>, CoreError> {
+        let mut cycles = 0u64;
+        for word_index in 0..PICOBIN_SCAN_WORDS {
+            let addr = RISCV_BOOT_MAGIC_ADDR.wrapping_add(word_index * 4);
+            let word = bus.read_u32(addr, &mut cycles)?;
+            if word != RISCV_PICOBIN_MARKER_START {
+                continue;
+            }
+            let mut item = addr.wrapping_add(8);
+            let end = addr.wrapping_add(0x180);
+            while item < end {
+                let item_word = bus.read_u32(item, &mut cycles)?;
+                if item_word == RISCV_PICOBIN_MARKER_END {
+                    break;
+                }
+                if item_word & 0xFF == RISCV_PICOBIN_ENTRY_POINT_ITEM {
+                    let entry = bus.read_u32(item.wrapping_add(4), &mut cycles)?;
+                    let sp = bus.read_u32(item.wrapping_add(8), &mut cycles)?;
+                    return Ok(Some((sp, entry & !1)));
+                }
+                item = item.wrapping_add(4);
+            }
+        }
+        Ok(None)
+    }
+
     /// Load the boot vectors and enter the running state / 加载启动向量并进入运行状态
     ///
     /// # Errors
     /// Returns `CoreError::FirmwareError` when no explicit vectors were supplied
-    /// and the bus does not contain a valid picobin header at flash base.
-    /// 未显式提供向量且总线在 Flash 起始处没有合法 picobin 头时，返回
+    /// and the bus does not contain a valid picobin block or legacy boot2 header.
+    /// 未显式提供向量且总线既没有合法 picobin 块也没有旧式 boot2 头时，返回
     /// `CoreError::FirmwareError`。
     pub fn boot(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
         let (sp, pc) = if let Some(vectors) = self.boot_vectors {
+            vectors
+        } else if let Some(vectors) = Self::find_picobin_vectors(bus)? {
             vectors
         } else {
             let mut cycles = 0u64;
             let magic = bus.read_u32(RISCV_BOOT_MAGIC_ADDR, &mut cycles)?;
             if magic != RISCV_BOOT_MAGIC {
                 return Err(CoreError::FirmwareError(format!(
-                    "RISC-V boot: picobin magic {magic:#010X} at {RISCV_BOOT_MAGIC_ADDR:#010X}, \
-                     expected {RISCV_BOOT_MAGIC:#010X} / RISC-V 启动头魔数不匹配"
+                    "RISC-V boot: no picobin IMAGE_DEF block or boot2 magic in flash; \
+                     read {magic:#010X} at {RISCV_BOOT_MAGIC_ADDR:#010X}, \
+                     expected boot2 magic {RISCV_BOOT_MAGIC:#010X} / \
+                     RISC-V 启动失败：Flash 中既无 picobin IMAGE_DEF 块也无 boot2 魔数"
                 )));
             }
             let entry = bus.read_u32(RISCV_BOOT_ENTRY_ADDR, &mut cycles)?;
@@ -149,7 +227,6 @@ impl Hazard3Core {
     fn clear_core_state(&mut self) {
         self.registers = Rv32Registers::new();
         self.csr = CsrFile::new();
-        self.pending_irqs = 0;
         self.total_cycles = 0;
         self.reservation = None;
     }
@@ -166,27 +243,34 @@ impl Hazard3Core {
         }
     }
 
-    /// Return the highest pending external IRQ / 返回最高优先级的待处理外部中断
+    /// Return the highest-priority pending external IRQ allowed to trap
+    /// 返回当前允许触发陷阱的最高优先级外部中断
     fn pending_interrupt(&self) -> Option<IrqNumber> {
         let globally_enabled = self.csr.mstatus & csr::MSTATUS_MIE != 0;
         let external_enabled = self.csr.mie & csr::MIE_MEIE != 0;
         if !globally_enabled || !external_enabled {
             return None;
         }
-        (0..64)
-            .find(|bit| self.pending_irqs & (1u64 << bit) != 0)
-            .map(|bit| u16::try_from(bit).unwrap_or(u16::MAX))
+        // Xh3irq 只允许 meiea 使能、优先级不低于当前 preempt 的挂起位触发
+        // 陷阱；meinext 的可见性由 ppreempt 决定，陷阱门控由 preempt 决定。
+        // Xh3irq only traps for pending bits enabled through meiea whose
+        // priority is at least the current preempt level; meinext visibility
+        // uses ppreempt, while trap gating uses preempt.
+        let irq = self.csr.xh3irq.best_visible(self.csr.xh3irq.ppreempt())?;
+        if self.csr.xh3irq.priority_of(irq) >= self.csr.xh3irq.preempt() {
+            Some(irq)
+        } else {
+            None
+        }
     }
 
     /// Enter the external interrupt handler / 进入外部中断处理程序
     fn take_interrupt(&mut self, irq: IrqNumber) {
-        if irq < 64 {
-            self.pending_irqs &= !(1u64 << irq);
-        }
-        if self.pending_irqs == 0 {
-            self.csr.mip &= !csr::MIP_MEIP;
-        }
-        self.csr.meipa = u32::from(irq);
+        self.csr.xh3irq.enter(irq);
+        // 不在此处重算 MEINEXT：处理程序要靠它识别刚进入的 IRQ；下一次
+        // 软件写 MEINEXT.UPDATE 时才会重新选择候选。
+        // Do not recompute MEINEXT here: the handler relies on it to identify
+        // the IRQ just entered; the next MEINEXT.UPDATE write reselects.
         let handler = self.csr.take_trap(0x8000_000B, 0, self.registers.pc);
         self.registers.pc = handler;
     }
@@ -256,8 +340,9 @@ impl CpuCore for Hazard3Core {
 
     fn signal_interrupt(&mut self, irq: IrqNumber) {
         if irq < 64 {
-            self.pending_irqs |= 1u64 << irq;
-            self.csr.mip |= csr::MIP_MEIP;
+            let window = usize::from(irq) / 16;
+            self.csr.xh3irq.pending[window] |= 1u16 << (irq % 16);
+            self.csr.refresh_xh3irq();
         }
         if self.state == CpuState::Sleeping {
             self.state = CpuState::Running;
@@ -270,6 +355,18 @@ impl CpuCore for Hazard3Core {
 
     fn pc(&self) -> u32 {
         self.registers.pc
+    }
+
+    fn set_pc(&mut self, pc: u32) {
+        // RISC-V has no architectural PC register; register 15 is a5, so the
+        // dedicated field must be updated instead.
+        // RISC-V 没有架构层面的 PC 寄存器；寄存器 15 是 a5，因此必须改为更新
+        // 专用的 PC 字段。
+        self.registers.pc = pc;
+    }
+
+    fn csr_read(&self, addr: u32) -> u32 {
+        self.csr.read(addr, 0)
     }
 
     fn read_register(&self, index: u8) -> u32 {
