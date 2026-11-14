@@ -3,17 +3,18 @@
 //! RP2350 has three PIO blocks (`PIO0`/`PIO1`/`PIO2`) at `0x5020_0000`,
 //! `0x5030_0000` and `0x5040_0000`. This module models the register file, the
 //! 32-word instruction memory, the four state-machine register windows, the
-//! 4-deep TX/RX FIFOs and the PIO instruction set (JMP/WAIT/IN/OUT/PUSH/PULL/
-//! MOV/IRQ/SET). GPIO/PINCTRL mapping, side-set output, delay cycles, FIFO
-//! joining, DMA handshakes and interrupt routing are deliberately not modelled
-//! yet; the corresponding offsets follow the project policy (reads return zero,
-//! writes are ignored, one warning per offset).
+//! 4-deep TX/RX FIFOs (joinable into 8-deep FIFOs), the GPIO pin mapping with
+//! side-set and delay cycles, the 16.8 fixed-point clock dividers and the PIO
+//! instruction set (JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET). DMA handshakes and
+//! processor interrupt routing are deliberately not modelled yet; the
+//! corresponding offsets follow the project policy (reads return zero, writes
+//! are ignored, one warning per offset).
 //! RP2350 有三个 PIO 块（`PIO0`/`PIO1`/`PIO2`），分别位于 `0x5020_0000`、
 //! `0x5030_0000` 与 `0x5040_0000`。本模块建模寄存器文件、32 字指令存储、四个
-//! 状态机寄存器窗口、4 深度 TX/RX FIFO 以及 PIO 指令集（JMP/WAIT/IN/OUT/
-//! PUSH/PULL/MOV/IRQ/SET）。GPIO/PINCTRL 映射、side-set 输出、延迟周期、FIFO
-//! 合并、DMA 握手与中断路由暂不建模；对应偏移沿用项目策略（读为 0、写被忽略、
-//! 每个偏移只警告一次）。
+//! 状态机寄存器窗口、4 深度 TX/RX FIFO（可合并为 8 深度）、GPIO 引脚映射与
+//! side-set/延迟周期、16.8 定点分频器以及 PIO 指令集（JMP/WAIT/IN/OUT/PUSH/
+//! PULL/MOV/IRQ/SET）。DMA 握手与处理器中断路由暂不建模；对应偏移沿用项目策略
+//! （读为 0、写被忽略、每个偏移只警告一次）。
 //!
 //! Reset values are taken from the RP2350 register headers (`PIO_*_RESET`):
 //! `FSTAT = 0x0F00_0F00`, `SMx_CLKDIV = 0x0001_0000`,
@@ -24,6 +25,8 @@
 //! `SMx_EXECCTRL = 0x0001_F000`、`SMx_SHIFTCTRL = 0x000C_0000`、
 //! `SMx_PINCTRL = 0x1400_0000`、`DBG_CFGINFO = 0x1020_0404`。
 
+#[cfg(test)]
+mod pin_tests;
 mod regs;
 mod shift;
 mod sm;
@@ -60,6 +63,14 @@ pub struct Pio {
     irq: u32,
     input_sync_bypass: u32,
     gpio_base: u32,
+    /// GPIO input levels sampled by `IN PINS`, `WAIT` and `JMP PIN`
+    /// `IN PINS`、`WAIT` 与 `JMP PIN` 采样的 GPIO 输入电平
+    input_levels: u32,
+    /// Output levels driven by `OUT`/`SET`/side-set / `OUT`/`SET`/side-set 驱动的输出电平
+    output_levels: u32,
+    /// Output enables driven by `OUT PINDIRS`/`SET PINDIRS`/side-set
+    /// `OUT PINDIRS`/`SET PINDIRS`/side-set 驱动的输出使能
+    output_enables: u32,
     imem: [u16; IMEM_WORDS],
     sm: [StateMachine; SM_COUNT],
 }
@@ -86,6 +97,9 @@ impl Pio {
             irq: 0,
             input_sync_bypass: 0,
             gpio_base: 0,
+            input_levels: 0,
+            output_levels: 0,
+            output_enables: 0,
             imem: [0; IMEM_WORDS],
             sm: core::array::from_fn(|slot| StateMachine::new(slot as u8)),
         }
@@ -162,7 +176,7 @@ impl Pio {
                 let stalled = self.sm[index].execctrl & EXECCTRL_EXEC_STALLED;
                 self.sm[index].execctrl = stalled | (value & EXECCTRL_WRITE_MASK);
             }
-            SM_SHIFTCTRL => self.sm[index].shiftctrl = value & SHIFTCTRL_MASK,
+            SM_SHIFTCTRL => self.sm[index].write_shiftctrl(value),
             // `SMx_ADDR` 只读；`SMx_INSTR` 写入立即执行一条指令。
             // `SMx_ADDR` is read-only; writing `SMx_INSTR` executes immediately.
             SM_ADDR => {}
@@ -202,6 +216,57 @@ impl Pio {
         }
         word
     }
+
+    /// Set all 32 GPIO input levels at once / 一次设置全部 32 个 GPIO 输入电平
+    ///
+    /// Bit `n` is the level sampled for PIO pin `n` by `IN PINS`, `WAIT` and
+    /// `JMP PIN`. The default of all-zero keeps the "no pins attached" behaviour.
+    /// 位 `n` 是 `IN PINS`、`WAIT` 与 `JMP PIN` 采样到的 PIO 引脚 `n` 电平。默认全 0，
+    /// 保持“未接引脚”的行为。
+    pub fn set_input_levels(&mut self, levels: u32) {
+        self.input_levels = levels;
+    }
+
+    /// Current GPIO input levels / 当前的 GPIO 输入电平
+    #[must_use]
+    pub fn input_levels(&self) -> u32 {
+        self.input_levels
+    }
+
+    /// Set one GPIO input level; pins `>= 32` are ignored
+    /// 设置单个 GPIO 输入电平；`>= 32` 的引脚被忽略
+    pub fn set_input_level(&mut self, pin: u8, high: bool) {
+        if pin >= 32 {
+            return;
+        }
+        let bit = 1u32 << pin;
+        if high {
+            self.input_levels |= bit;
+        } else {
+            self.input_levels &= !bit;
+        }
+    }
+
+    /// Output levels currently driven by the state machines / 状态机当前驱动的输出电平
+    ///
+    /// Updated by `OUT PINS`, `SET PINS`, `MOV PINS` and side-set, and mirrored
+    /// in `DBG_PADOUT`.
+    /// 由 `OUT PINS`、`SET PINS`、`MOV PINS` 与 side-set 更新，并反映在 `DBG_PADOUT`。
+    #[must_use]
+    pub fn output_levels(&self) -> u32 {
+        self.output_levels
+    }
+
+    /// Output enables currently driven by the state machines / 状态机当前驱动的输出使能
+    ///
+    /// Updated by `OUT PINDIRS`, `SET PINDIRS` and side-set with
+    /// `EXECCTRL.SIDE_PINDIR`, and mirrored in `DBG_PADOE`.
+    /// 由 `OUT PINDIRS`、`SET PINDIRS` 以及带 `EXECCTRL.SIDE_PINDIR` 的 side-set
+    /// 更新，并反映在 `DBG_PADOE`。
+    #[must_use]
+    pub fn output_enables(&self) -> u32 {
+        self.output_enables
+    }
 }
 
 impl MmioDevice for Pio {
@@ -239,10 +304,13 @@ impl MmioDevice for Pio {
             FDEBUG => Some(self.fdebug),
             FLEVEL => Some(self.flevel()),
             IRQ => Some(self.irq),
-            // TXF/IRQ_FORCE/DBG_PADOUT/DBG_PADOE 均为只写或只读采样寄存器，读回 0。
-            // TXF/IRQ_FORCE/DBG_PADOUT/DBG_PADOE are write-only or read-only sample
-            // registers; they read back as zero.
-            TXF0..=TXF3 | IRQ_FORCE | DBG_PADOUT | DBG_PADOE => Some(0),
+            // TXF/IRQ_FORCE 为只写寄存器，读回 0；DBG_PADOUT/DBG_PADOE 回读当前
+            // 引脚输出电平与输出使能。
+            // TXF/IRQ_FORCE are write-only and read as zero; DBG_PADOUT/DBG_PADOE
+            // sample the current output levels and enables.
+            TXF0..=TXF3 | IRQ_FORCE => Some(0),
+            DBG_PADOUT => Some(self.output_levels),
+            DBG_PADOE => Some(self.output_enables),
             INPUT_SYNC_BYPASS => Some(self.input_sync_bypass),
             DBG_CFGINFO => Some(DBG_CFGINFO_VALUE),
             GPIOBASE => Some(self.gpio_base),
@@ -269,13 +337,17 @@ impl MmioDevice for Pio {
         }
         match offset {
             CTRL => {
-                // 复位/时钟重启位为自清零脉冲；本阶段只保留 SM_ENABLE 并处理 SM_RESTART。
-                // Restart/clock-restart bits are self-clearing strokes; only SM_ENABLE
-                // is retained and SM_RESTART is applied.
+                // 复位/时钟重启位为自清零脉冲；本阶段保留 SM_ENABLE，并处理
+                // SM_RESTART 与 CLKDIV_RESTART。
+                // Restart/clock-restart bits are self-clearing strokes; SM_ENABLE is
+                // retained, and SM_RESTART/CLKDIV_RESTART are applied below.
                 self.enabled = (value & SM_ENABLE_MASK) as u8;
                 for index in 0..SM_COUNT {
                     if value & (SM_RESTART << index) != 0 {
                         self.sm[index].restart();
+                    }
+                    if value & (CLKDIV_RESTART << index) != 0 {
+                        self.sm[index].clock_phase = 0;
                     }
                 }
                 true

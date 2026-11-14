@@ -31,13 +31,15 @@ impl StateMachine {
     pub(super) fn exec_in(&mut self, arg: u8, bus: &mut SmBus<'_>) -> Exec {
         let bits = bit_count(arg);
         let value = match (arg >> 5) & 0x07 {
+            // 0 = PINS：从 `IN_BASE` 起采样（回绕 32 位），再按 `IN_COUNT` 掩码。
+            // 0 = PINS samples from `IN_BASE` (wrapping) and is masked by `IN_COUNT`.
+            0 => bus.read_pins(self.in_base(), 32),
             1 => self.x,
             2 => self.y,
             5 => self.status(),
             6 => self.isr,
             7 => self.osr,
-            // 0 = PINS（未接引脚恒为 0）、3 = NULL、4 = 保留。
-            // 0 = PINS (always 0 without pins), 3 = NULL, 4 = reserved.
+            // 3 = NULL、4 = 保留：都读 0。3 = NULL and 4 = reserved both read 0.
             _ => 0,
         } & self.in_count_mask();
         let shifted = (self.isr_bits + bits as u8).min(32);
@@ -73,16 +75,19 @@ impl StateMachine {
         let value = self.shifted_out(bits);
         self.osr_bits = self.osr_bits.saturating_sub(bits as u8);
         match (arg >> 5) & 0x07 {
+            // 0 = PINS：写 `OUT_COUNT` 个引脚。0 = PINS writes `OUT_COUNT` pins.
+            0 => bus.write_pins(self.out_base(), self.out_count(), value),
             1 => self.x = value,
             2 => self.y = value,
-            // 3 = NULL、4 = PINDIRS（未接引脚，写入丢弃）。
-            // 3 = NULL, 4 = PINDIRS (no pins attached, write discarded).
+            // 4 = PINDIRS：写 `OUT_COUNT` 个输出使能。4 = PINDIRS writes enables.
+            4 => bus.write_pin_dirs(self.out_base(), self.out_count(), value),
             5 => return Exec::Branch((value & 0x1F) as u8),
             6 => {
                 self.isr = value;
                 self.isr_bits = bits as u8;
             }
             7 => return self.exec_nested(value, bus, depth),
+            // 3 = NULL 与保留编码丢弃数据。3 = NULL and reserved encodings discard.
             _ => {}
         }
         Exec::Advance
@@ -139,10 +144,13 @@ impl StateMachine {
     /// `MOV destination, (op) source` / `MOV destination, (op) source`
     pub(super) fn exec_mov(&mut self, arg: u8, bus: &mut SmBus<'_>, depth: u8) -> Exec {
         let mut value = match arg & 0x07 {
+            // 0 = PINS：从 `IN_BASE` 起采样全部 32 个引脚。
+            // 0 = PINS samples all 32 pins starting at `IN_BASE`.
+            0 => bus.read_pins(self.in_base(), 32),
             1 => self.x,
             2 => self.y,
-            // 5 = STATUS，其余为 PINS/NULL/保留（读 0）。
-            // 5 = STATUS; PINS/NULL/reserved read 0.
+            // 5 = STATUS，其余为 NULL/保留（读 0）。
+            // 5 = STATUS; NULL/reserved read 0.
             5 => self.status(),
             6 => self.isr,
             7 => self.osr,
@@ -154,6 +162,8 @@ impl StateMachine {
             _ => {}
         }
         match (arg >> 5) & 0x07 {
+            // 0 = PINS：写 `OUT_COUNT` 个引脚。0 = PINS writes `OUT_COUNT` pins.
+            0 => bus.write_pins(self.out_base(), self.out_count(), value),
             1 => self.x = value,
             2 => self.y = value,
             4 => return self.exec_nested(value, bus, depth),

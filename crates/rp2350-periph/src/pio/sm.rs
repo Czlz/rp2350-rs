@@ -1,14 +1,19 @@
-//! PIO state-machine execution: clocking, jumps, waits and IRQs
-//! PIO 状态机执行：时钟驱动、跳转、等待与中断标志
+//! PIO state-machine execution: clocking, pin I/O, jumps, waits and IRQs
+//! PIO 状态机执行：时钟驱动、引脚 I/O、跳转、等待与中断标志
 //!
-//! Only the instruction semantics are modelled here. GPIO/PINCTRL, side-set,
-//! delay cycles, FIFO joining, DMA handshakes and processor interrupt routing
+//! Every call models one PIO clock edge: the per-machine `CLKDIV` accumulator
+//! decides whether the machine emits a cycle, a pending instruction delay is
+//! burned before the next fetch, and side-set is emitted at the start of the
+//! instruction that carries it. DMA handshakes and processor interrupt routing
 //! belong to later tasks.
-//! 此处只建模指令语义。GPIO/PINCTRL、side-set、延迟周期、FIFO 合并、DMA 握手
-//! 与处理器中断路由留待后续任务。
+//! 每次调用建模一个 PIO 时钟边沿：每台状态机的 `CLKDIV` 累加器决定是否产生机器
+//! 周期，指令退休后的延迟在下次取指前消耗，side-set 在携带它的指令起始处输出。
+//! DMA 握手与处理器中断路由留待后续任务。
 
 use super::Pio;
-use super::regs::{EXECCTRL_EXEC_STALLED, SM_COUNT, StateMachine};
+use super::regs::{
+    EXECCTRL_EXEC_STALLED, SM_COUNT, StateMachine, low_bits_mask, read_pin_bits, write_pin_bits,
+};
 
 /// Outcome of executing one instruction / 执行一条指令的结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +33,12 @@ pub(super) struct SmBus<'a> {
     pub(super) irq: &'a mut u32,
     /// Sticky `FDEBUG` flags / 粘滞 `FDEBUG` 标志
     pub(super) fdebug: &'a mut u32,
+    /// GPIO input levels sampled by this cycle / 本周期采样的 GPIO 输入电平
+    pub(super) input: u32,
+    /// GPIO output levels shared by all state machines / 所有状态机共享的 GPIO 输出电平
+    pub(super) output: &'a mut u32,
+    /// GPIO output enables shared by all state machines / 所有状态机共享的 GPIO 输出使能
+    pub(super) output_enable: &'a mut u32,
 }
 
 impl SmBus<'_> {
@@ -35,6 +46,33 @@ impl SmBus<'_> {
     /// 置位本状态机的粘滞 stall 标志
     pub(super) fn set_flag(&mut self, base: u32, index: u8) {
         *self.fdebug |= base << index;
+    }
+
+    /// Drive `count` pins from `base` with the low bits of `value`
+    /// 用 `value` 的低位驱动从 `base` 起的 `count` 个引脚
+    pub(super) fn write_pins(&mut self, base: u8, count: u8, value: u32) {
+        write_pin_bits(self.output, base, count, value);
+    }
+
+    /// Drive `count` pin directions from `base` with the low bits of `value`
+    /// 用 `value` 的低位驱动从 `base` 起的 `count` 个引脚方向
+    pub(super) fn write_pin_dirs(&mut self, base: u8, count: u8, value: u32) {
+        write_pin_bits(self.output_enable, base, count, value);
+    }
+
+    /// Sample `count` pins starting at `base`, right-aligned
+    /// 从 `base` 起采样 `count` 个引脚，结果按低位对齐
+    pub(super) fn read_pins(&self, base: u8, count: u8) -> u32 {
+        if count >= 32 {
+            // 采样全部 32 个引脚等价于按 `base` 右旋。Sampling all 32 pins is a rotation.
+            return self.input.rotate_right(u32::from(base & 31));
+        }
+        read_pin_bits(self.input, base, count)
+    }
+
+    /// Level of a single pin / 单个引脚的电平
+    pub(super) fn pin(&self, pin: u8) -> bool {
+        self.input & (1u32 << (pin & 31)) != 0
     }
 }
 
@@ -58,12 +96,13 @@ impl Pio {
     /// Step one state machine by one PIO clock cycle / 让一个状态机执行一个 PIO 时钟周期
     ///
     /// Returns `true` when an instruction retired, or `false` when the machine
-    /// stalled (`ADDR` and `EXEC_STALLED` are left describing the stall).
-    /// This entry point ignores `CTRL.SM_ENABLE` so tests can drive a single
-    /// machine; [`Pio::tick`] respects it.
-    /// 指令退休时返回 `true`；阻塞（stall）时返回 `false`，此时 `ADDR` 与
-    /// `EXEC_STALLED` 保持阻塞现场。该入口忽略 `CTRL.SM_ENABLE` 以便测试单个
-    /// 状态机；[`Pio::tick`] 则会遵循它。
+    /// stalled, was gated by `CLKDIV`, or is still burning instruction delay.
+    /// `ADDR` and `EXEC_STALLED` are left describing a stall. This entry point
+    /// ignores `CTRL.SM_ENABLE` so tests can drive a single machine;
+    /// [`Pio::tick`] respects it.
+    /// 指令退休时返回 `true`；阻塞（stall）、被 `CLKDIV` 分频拦住或仍在消耗指令
+    /// 延迟时返回 `false`。阻塞时 `ADDR` 与 `EXEC_STALLED` 保持阻塞现场。该入口
+    /// 忽略 `CTRL.SM_ENABLE` 以便测试单个状态机；[`Pio::tick`] 则会遵循它。
     pub fn step_sm(&mut self, index: usize) -> bool {
         if index >= SM_COUNT {
             return false;
@@ -73,20 +112,34 @@ impl Pio {
             imem,
             irq,
             fdebug,
+            input_levels,
+            output_levels,
+            output_enables,
             ..
         } = self;
         let machine = &mut sm[index];
         let instr = imem[usize::from(machine.pc)];
-        let mut bus = SmBus { irq, fdebug };
+        let mut bus = SmBus {
+            irq,
+            fdebug,
+            input: *input_levels,
+            output: output_levels,
+            output_enable: output_enables,
+        };
         machine.step(instr, &mut bus)
     }
 
     /// Advance every enabled state machine by `cycles` PIO clock cycles
     /// 让所有已启用的状态机推进 `cycles` 个 PIO 时钟周期
     ///
-    /// Each cycle runs at most one instruction per machine. `CLKDIV` is treated
-    /// as 1:1 in this stage.
-    /// 每个周期每台状态机最多执行一条指令。本阶段 `CLKDIV` 按 1:1 处理。
+    /// Each cycle gives every enabled machine one clock edge. The machine's
+    /// `CLKDIV` accumulator decides whether it emits a machine cycle, and a
+    /// machine cycle first burns any pending instruction delay before fetching
+    /// one instruction. With the reset `CLKDIV` of 1.0 this stays one
+    /// instruction per cycle and machine.
+    /// 每个周期给所有已启用状态机一个时钟边沿。状态机的 `CLKDIV` 累加器决定是否
+    /// 产生机器周期，机器周期会先消耗待处理的指令延迟再取一条指令。复位值
+    /// `CLKDIV = 1.0` 下仍是每周期每状态机一条指令。
     pub fn tick(&mut self, cycles: u64) {
         for _ in 0..cycles {
             for index in 0..SM_COUNT {
@@ -100,25 +153,57 @@ impl Pio {
     /// Execute `instr` immediately, as a `SMx_INSTR` write does
     /// 立即执行 `instr`，与写入 `SMx_INSTR` 的行为一致
     ///
-    /// The PC only changes when the instruction itself redirects it.
-    /// 仅当指令自身改写 PC 时 PC 才会变化。
+    /// The PC only changes when the instruction itself redirects it. Side-set
+    /// and delay still apply, but the injected instruction bypasses `CLKDIV`
+    /// and any pending delay because the write happens synchronously.
+    /// 仅当指令自身改写 PC 时 PC 才会变化。side-set 与延迟仍然生效，但注入指令
+    /// 绕过 `CLKDIV` 与已有延迟，因为写入是同步发生的。
     pub(super) fn execute_injected(&mut self, index: usize, instr: u16) {
         let Pio {
-            sm, irq, fdebug, ..
+            sm,
+            irq,
+            fdebug,
+            input_levels,
+            output_levels,
+            output_enables,
+            ..
         } = self;
         let machine = &mut sm[index];
-        let mut bus = SmBus { irq, fdebug };
+        let mut bus = SmBus {
+            irq,
+            fdebug,
+            input: *input_levels,
+            output: output_levels,
+            output_enable: output_enables,
+        };
+        let delay = machine.apply_delay_sideset(instr, &mut bus);
         match machine.execute(instr, &mut bus, 0) {
-            Exec::Advance => {}
-            Exec::Branch(target) => machine.pc = target & 0x1F,
             Exec::Stall => machine.execctrl |= EXECCTRL_EXEC_STALLED,
+            other => {
+                if let Exec::Branch(target) = other {
+                    machine.pc = target & 0x1F;
+                }
+                machine.delay_cycles = delay;
+            }
         }
     }
 }
 
 impl StateMachine {
-    /// Execute one instruction and update `PC` / 执行一条指令并更新 `PC`
+    /// Execute one PIO clock edge and update `PC` / 执行一个 PIO 时钟边沿并更新 `PC`
+    ///
+    /// Returns `false` when the edge produced no retired instruction: either the
+    /// clock divider gated this machine or a delay cycle was burned.
+    /// 边沿未退休指令时返回 `false`：要么被分频器拦住，要么消耗了一个延迟周期。
     pub(super) fn step(&mut self, instr: u16, bus: &mut SmBus<'_>) -> bool {
+        if !self.clock_tick() {
+            return false;
+        }
+        if self.delay_cycles > 0 {
+            self.delay_cycles -= 1;
+            return false;
+        }
+        let delay = self.apply_delay_sideset(instr, bus);
         match self.execute(instr, bus, 0) {
             Exec::Stall => {
                 self.execctrl |= EXECCTRL_EXEC_STALLED;
@@ -127,13 +212,52 @@ impl StateMachine {
             Exec::Advance => {
                 self.execctrl &= !EXECCTRL_EXEC_STALLED;
                 self.pc = self.next_pc();
+                self.delay_cycles = delay;
                 true
             }
             Exec::Branch(target) => {
                 self.execctrl &= !EXECCTRL_EXEC_STALLED;
                 self.pc = target & 0x1F;
+                self.delay_cycles = delay;
                 true
             }
+        }
+    }
+
+    /// Emit the side-set field of `instr` and return its delay-cycle count
+    /// 输出 `instr` 的 side-set 字段并返回其延迟周期数
+    ///
+    /// Bits 12:8 are shared: the top `SIDESET_COUNT` bits carry side-set and the
+    /// remaining low bits are the delay. With `EXECCTRL.SIDE_EN` the top bit of
+    /// that field is the side-set enable strobe and one fewer bit is data.
+    /// 位 12:8 为共享字段：高 `SIDESET_COUNT` 位是 side-set，剩余低位是延迟。置位
+    /// `EXECCTRL.SIDE_EN` 时该字段最高位是 side-set 使能脉冲，数据位少一位。
+    fn apply_delay_sideset(&self, instr: u16, bus: &mut SmBus<'_>) -> u8 {
+        let field = (instr >> 8) & 0x1F;
+        let count = self.sideset_count();
+        if count == 0 {
+            // 无 side-set 时整个字段都是延迟。Without side-set the whole field is delay.
+            return field as u8;
+        }
+        let delay_bits = 5 - u32::from(count);
+        let delay = (u32::from(field) & low_bits_mask(delay_bits)) as u8;
+        let value = u32::from(field >> delay_bits);
+        if !self.side_en() {
+            self.drive_sideset(bus, value, count);
+        } else if field & 0x10 != 0 {
+            // 最高位为 1 才执行 side-set；其余 count-1 位为数据。
+            // The MSB enables side-set this cycle; the other count-1 bits are data.
+            self.drive_sideset(bus, value & low_bits_mask(u32::from(count) - 1), count - 1);
+        }
+        delay
+    }
+
+    /// Drive the side-set pins or pin directions / 驱动 side-set 引脚电平或方向
+    fn drive_sideset(&self, bus: &mut SmBus<'_>, value: u32, count: u8) {
+        if self.side_pindir() {
+            bus.write_pin_dirs(self.sideset_base(), count, value);
+        } else {
+            bus.write_pins(self.sideset_base(), count, value);
         }
     }
 
@@ -155,19 +279,19 @@ impl StateMachine {
     pub(super) fn execute(&mut self, instr: u16, bus: &mut SmBus<'_>, depth: u8) -> Exec {
         let arg = (instr & 0xFF) as u8;
         match instr >> 13 {
-            0 => self.exec_jmp(arg),
+            0 => self.exec_jmp(arg, bus),
             1 => self.exec_wait(arg, bus),
             2 => self.exec_in(arg, bus),
             3 => self.exec_out(arg, bus, depth),
             4 => self.exec_push_pull(arg, bus),
             5 => self.exec_mov(arg, bus, depth),
             6 => self.exec_irq(arg, bus),
-            _ => self.exec_set(arg),
+            _ => self.exec_set(arg, bus),
         }
     }
 
     /// `JMP condition, address` / `JMP condition, address`
-    fn exec_jmp(&mut self, arg: u8) -> Exec {
+    fn exec_jmp(&mut self, arg: u8, bus: &SmBus<'_>) -> Exec {
         let take = match (arg >> 5) & 0x07 {
             0 => true,
             1 => self.x == 0,
@@ -183,9 +307,9 @@ impl StateMachine {
                 nonzero
             }
             5 => self.x != self.y,
-            // JMP PIN：引脚模型未接入，输入恒读 0，条件不成立。
-            // JMP PIN: no pin model yet, the sampled pin reads 0 so the branch is not taken.
-            6 => false,
+            // JMP PIN：采样 `EXECCTRL.JMP_PIN` 指定的引脚（不是 `IN_BASE`）。
+            // JMP PIN samples the pin named by `EXECCTRL.JMP_PIN`, not `IN_BASE`.
+            6 => bus.pin(self.jmp_pin()),
             // !OSRE：OSR 仍有数据时为真。!OSRE is true while the OSR still holds data.
             _ => self.osr_bits > self.empty_level(),
         };
@@ -197,14 +321,13 @@ impl StateMachine {
     }
 
     /// `WAIT polarity source, index` / `WAIT polarity source, index`
-    fn exec_wait(&mut self, arg: u8, bus: &mut SmBus<'_>) -> Exec {
+    fn exec_wait(&mut self, arg: u8, bus: &SmBus<'_>) -> Exec {
         let polarity = arg & 0x80 != 0;
         let satisfied = match (arg >> 5) & 0x03 {
-            // GPIO/PIN：未接引脚时输入恒为 0，因此 `WAIT 0` 立即通过、
-            // `WAIT 1` 永久阻塞（引脚模型接入后此语义会改变）。
-            // GPIO/PIN: with no pins attached the sampled level is always 0, so
-            // `WAIT 0` passes immediately and `WAIT 1` blocks forever.
-            0 | 1 => !polarity,
+            // GPIO：索引就是 PIO 引脚号。GPIO: the index is the PIO pin number.
+            0 => bus.pin(arg & 0x1F) == polarity,
+            // PIN：引脚号为 `IN_BASE + index`（回绕）。PIN: `IN_BASE + index`, wrapping.
+            1 => bus.pin((self.in_base() + (arg & 0x1F)) & 31) == polarity,
             // IRQ：等待标志等于极性。IRQ: wait until the flag equals the polarity.
             2 => {
                 let bit = resolve_irq(arg & 0x1F, self.index);
@@ -253,13 +376,15 @@ impl StateMachine {
     }
 
     /// `SET destination, data` / `SET destination, data`
-    fn exec_set(&mut self, arg: u8) -> Exec {
+    fn exec_set(&mut self, arg: u8, bus: &mut SmBus<'_>) -> Exec {
         let data = u32::from(arg & 0x1F);
         match (arg >> 5) & 0x07 {
+            // 0 = PINS：写 `SET_COUNT` 个引脚。0 = PINS writes `SET_COUNT` pins.
+            0 => bus.write_pins(self.set_base(), self.set_count(), data),
             1 => self.x = data,
             2 => self.y = data,
-            // 0 = PINS、4 = PINDIRS：引脚模型未接入，写入被丢弃。
-            // 0 = PINS, 4 = PINDIRS: no pin model yet, the write is discarded.
+            // 4 = PINDIRS：写 `SET_COUNT` 个输出使能。4 = PINDIRS writes enables.
+            4 => bus.write_pin_dirs(self.set_base(), self.set_count(), data),
             _ => {}
         }
         Exec::Advance
