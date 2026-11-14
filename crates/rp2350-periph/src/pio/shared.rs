@@ -38,7 +38,6 @@ use rp2350_core::mmio::{MmioDevice, MmioWindow};
 use super::Pio;
 use super::regs::EXECCTRL_EXEC_STALLED;
 use crate::irq::{IrqAssert, PIO_IRQ_LINES};
-use crate::map;
 
 /// `IRQ` flags routed to the block's `IRQ_0` line / 路由到块 `IRQ_0` 线的 `IRQ` 标志
 pub const IRQ0_FLAGS: u32 = 0x0000_000F;
@@ -184,6 +183,44 @@ impl SharedPio {
         self.inner.lock().sm.get(sm).map(|machine| machine.pc)
     }
 
+    /// Whether state machine `sm`'s TX FIFO is empty / 状态机 `sm` 的 TX FIFO 是否为空
+    ///
+    /// Read-only view of the shared FIFO; joining semantics match [`Pio`] and
+    /// `FSTAT`. Returns `None` for `sm >= 4`.
+    /// 共享 FIFO 的只读视图；合并语义与 [`Pio`] 及 `FSTAT` 一致。`sm >= 4` 时
+    /// 返回 `None`。
+    #[must_use]
+    pub fn tx_fifo_empty(&self, sm: usize) -> Option<bool> {
+        self.inner.lock().tx_fifo_empty(sm)
+    }
+
+    /// Whether state machine `sm`'s TX FIFO is full / 状态机 `sm` 的 TX FIFO 是否已满
+    ///
+    /// Returns `None` for `sm >= 4`.
+    /// `sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn tx_fifo_full(&self, sm: usize) -> Option<bool> {
+        self.inner.lock().tx_fifo_full(sm)
+    }
+
+    /// Whether state machine `sm`'s RX FIFO is empty / 状态机 `sm` 的 RX FIFO 是否为空
+    ///
+    /// Returns `None` for `sm >= 4`.
+    /// `sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn rx_fifo_empty(&self, sm: usize) -> Option<bool> {
+        self.inner.lock().rx_fifo_empty(sm)
+    }
+
+    /// Whether state machine `sm`'s RX FIFO is full / 状态机 `sm` 的 RX FIFO 是否已满
+    ///
+    /// Returns `None` for `sm >= 4`.
+    /// `sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn rx_fifo_full(&self, sm: usize) -> Option<bool> {
+        self.inner.lock().rx_fifo_full(sm)
+    }
+
     /// Output levels currently driven by the block / 本块当前驱动的输出电平
     #[must_use]
     pub fn output_levels(&self) -> u32 {
@@ -215,7 +252,7 @@ impl MmioDevice for PioWindow {
     }
 
     fn window(&self) -> MmioWindow {
-        MmioWindow::new(Pio::block_base(self.index), map::DEVICE_WINDOW_SIZE)
+        MmioWindow::new(Pio::block_base(self.index), super::PIO_WINDOW_SIZE)
     }
 
     fn read32(&mut self, offset: u32) -> Option<u32> {

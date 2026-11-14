@@ -23,10 +23,14 @@
 //! selector reads the host-driven level array exposed by [`Dma::set_dreq`];
 //! unmodelled selectors default to asserted so firmware that never programs a
 //! DREQ still makes progress. Selectors `0x3B..=0x3E` (pacing timers) are
-//! stored but the timers do not pace transfers yet.
+//! stored but the timers do not pace transfers yet. The PIO FIFO selectors
+//! `0..=23` and their level semantics are documented in [`crate::dreq`] and
+//! published by [`crate::BootPeripherals::sync_pio_dreqs`].
 //! `TREQ_SEL = 0x3F` 为永久请求，始终可运行。其它选择读取 [`Dma::set_dreq`]
 //! 暴露的宿主侧电平数组；未建模的选择默认断言，使未编程 DREQ 的固件仍能推进。
-//! `0x3B..=0x3E`（节拍定时器）仅存储寄存器，定时器尚未驱动传输节奏。
+//! `0x3B..=0x3E`（节拍定时器）仅存储寄存器，定时器尚未驱动传输节奏。PIO FIFO
+//! 选择器 `0..=23` 及其电平语义见 [`crate::dreq`]，由
+//! [`crate::BootPeripherals::sync_pio_dreqs`] 发布。
 //!
 //! # Not modelled / 未建模项
 //!
@@ -49,6 +53,7 @@ use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
 use super::irq::IrqAssert;
 use super::map;
+use crate::alias::{apply_alias, split_alias};
 
 /// Number of DMA channels / DMA 通道数量
 pub const CHANNELS: usize = 16;
@@ -370,14 +375,54 @@ impl Dma {
     /// 驱动一个宿主 DREQ 输入；`>= 64` 的选择被忽略
     ///
     /// The level is sampled by [`Self::run`] before every unit. The permanent
-    /// request (`0x3F`) ignores this array entirely.
+    /// request (`0x3F`) ignores this array entirely. The register file lives
+    /// behind a mutex, so this only needs `&self`.
     /// 每次执行数据单元前由 [`Self::run`] 采样该电平。永久请求（`0x3F`）完全
-    /// 忽略该数组。
-    pub fn set_dreq(&mut self, dreq: u8, asserted: bool) {
+    /// 忽略该数组。寄存器文件位于互斥锁之后，因此只需要 `&self`。
+    pub fn set_dreq(&self, dreq: u8, asserted: bool) {
         let mut state = self.state.lock();
         if let Some(level) = state.dreq.get_mut(usize::from(dreq)) {
             *level = asserted;
         }
+    }
+
+    /// Drive eight consecutive DREQ inputs from a bitmask
+    /// 由位掩码驱动连续八个 DREQ 输入
+    ///
+    /// Bit `n` of `levels` becomes the level of selector `first + n`; selectors
+    /// at or above 64 are skipped. One lock covers the whole bank, which is how
+    /// the PIO blocks publish their four TX and four RX levels at once.
+    /// `levels` 的第 `n` 位写入选择器 `first + n` 的电平；`>= 64` 的选择被跳过。
+    /// 整组共用一次加锁，PIO 块据此一次发布四个 TX 与四个 RX 电平。
+    pub fn set_dreq_bank(&self, first: u8, levels: u32) {
+        let mut state = self.state.lock();
+        for bit in 0..8u8 {
+            let Some(level) = state.dreq.get_mut(usize::from(first.saturating_add(bit))) else {
+                continue;
+            };
+            *level = levels & (1 << bit) != 0;
+        }
+    }
+
+    /// Whether a busy channel currently selects a DREQ in `first..=last`
+    /// 当前是否有忙碌通道选择了 `first..=last` 范围内的 DREQ
+    ///
+    /// The host uses this to pick the DREQ refresh granularity: a channel paced
+    /// by a PIO FIFO must be resynchronised per unit, while permanent or
+    /// unmodelled selectors can run a whole batch. The permanent request is
+    /// never reported.
+    /// 宿主据此选择 DREQ 刷新粒度：由 PIO FIFO 节拍的通道必须逐单元重新同步，
+    /// 永久请求或未建模选择器可整批执行。永久请求不计入。
+    #[must_use]
+    pub fn busy_selects_dreq(&self, first: u8, last: u8) -> bool {
+        let state = self.state.lock();
+        state.channels.iter().any(|channel| {
+            if !channel.busy || channel.ctrl & CTRL_EN == 0 {
+                return false;
+            }
+            let selector = ((channel.ctrl & CTRL_TREQ_SEL_MASK) >> CTRL_TREQ_SEL_SHIFT) as u8;
+            selector != TREQ_PERMANENT && selector >= first && selector <= last
+        })
     }
 
     /// Current level of one host DREQ input / 某个宿主 DREQ 输入的当前电平
@@ -637,6 +682,7 @@ impl MmioDevice for Dma {
     }
 
     fn read32(&mut self, offset: u32) -> Option<u32> {
+        let (offset, _alias) = split_alias(offset);
         let state = self.state.lock();
         match offset {
             0x000..CHANNEL_REGION_END => {
@@ -681,6 +727,12 @@ impl MmioDevice for Dma {
     }
 
     fn write32(&mut self, offset: u32, value: u32) -> bool {
+        // The Pico SDK uses hw_set_bits/hw_clear_bits/hw_xor_bits on DMA
+        // registers (e.g. INTE1 via 0x5000_2414), so fold the alias first.
+        // Pico SDK 会对 DMA 寄存器使用 hw_set_bits/hw_clear_bits/hw_xor_bits
+        // （例如经 0x5000_2414 写 INTE1），因此先合并别名。
+        let (offset, alias) = split_alias(offset);
+        let value = apply_alias(self.read32(offset).unwrap_or(0), value, alias);
         let handled;
         {
             let mut state = self.state.lock();

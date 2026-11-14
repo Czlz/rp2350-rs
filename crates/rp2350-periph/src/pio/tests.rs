@@ -13,6 +13,36 @@ use super::regs::*;
 use super::*;
 
 #[test]
+fn xor_alias_updates_clkdiv_and_restarts_the_clock() {
+    let mut pio = Pio::new(2);
+    let clkdiv = SM0_CLKDIV + SM_STRIDE;
+    assert!(pio.write32(clkdiv, 0x0001_0000));
+    pio.sm[1].clock_phase = 7;
+    // `pio_sm_clkdiv_restart` uses hw_xor_bits on SMx_CLKDIV (alias +0x1000).
+    assert!(pio.write32(clkdiv + 0x1000, 0x8000_0000));
+    assert_eq!(pio.read32(clkdiv), Some(0x0001_0000));
+    assert_eq!(pio.sm[1].clock_phase, 0);
+}
+
+#[test]
+fn set_and_clear_aliases_update_pinctrl() {
+    let mut pio = Pio::new(0);
+    let pinctrl = SM0_CLKDIV + SM_PINCTRL;
+    assert_eq!(pio.read32(pinctrl), Some(PINCTRL_RESET));
+    assert!(pio.write32(pinctrl + 0x2000, 0x0000_0020));
+    assert_eq!(pio.read32(pinctrl), Some(PINCTRL_RESET | 0x20));
+    assert!(pio.write32(pinctrl + 0x3000, 0x0000_0020));
+    assert_eq!(pio.read32(pinctrl), Some(PINCTRL_RESET));
+}
+
+#[test]
+fn pio_window_covers_the_alias_regions() {
+    let pio = Pio::new(2);
+    assert_eq!(pio.window().size, PIO_WINDOW_SIZE);
+    assert_eq!(PIO_WINDOW_SIZE, 0x4000);
+}
+
+#[test]
 fn reset_values_match_the_datasheet() {
     let mut pio = Pio::new(0);
     assert_eq!(pio.read32(CTRL), Some(0));

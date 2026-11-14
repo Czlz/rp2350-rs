@@ -590,6 +590,19 @@ transfers happen because the machine pumps them, not because the guest writes
   `Machine::pump_dma_batch` 在一步退役后、**中断投递之前**由 `execute_step`
   调用。普通 `step`、`trace_step`、boot ROM 陷阱步与 GDB `resume` 单步都汇入
   这一处调用，调试器因此无法让 DMA 引擎停摆。
+- **PIO DREQ / PIO DREQ 门控**：the batch runs through
+  `BootPeripherals::pump_dma`, which republishes every PIO FIFO level
+  (`sync_pio_dreqs`) before touching the DMA controller. Channels whose
+  `TREQ_SEL` selects a PIO FIFO (`0..=23`, `PIO0_TX0` … `PIO2_RX3`) advance one
+  unit at a time with a fresh level sample, so `PIOx_TXy` only writes while that
+  TX FIFO is not full and `PIOx_RXy` only reads while the RX FIFO is not empty;
+  joined FIFOs gate at their 8-word depth. Channels using other selectors still
+  consume the whole remaining budget in one `Dma::run` call.
+  该批次经 `BootPeripherals::pump_dma` 执行：访问 DMA 控制器之前先重新发布全部
+  PIO FIFO 电平（`sync_pio_dreqs`）。`TREQ_SEL` 指向 PIO FIFO（`0..=23`，
+  `PIO0_TX0` … `PIO2_RX3`）的通道逐单元推进并重新采样电平，因此 `PIOx_TXy`
+  只在该 TX FIFO 未满时写入、`PIOx_RXy` 只在 RX FIFO 非空时读出；合并 FIFO 按
+  8 深度门控。使用其它选择器的通道仍可在一次 `Dma::run` 中用完整剩余预算。
 - **Budget / 预算**：throttled to one call per `PUMP_INTERVAL` (64) retired
   steps and capped at `DMA_PUMP_TRANSFERS` (16) data units per call. The DMA
   controller visits channels round-robin, so 16 units is at most one unit per
@@ -616,13 +629,17 @@ transfers happen because the machine pumps them, not because the guest writes
   承载客户机字节。
 - **Limitations / 限制**：no cycle-accurate arbitration or `HIGH_PRIORITY`
   scheduling, no DREQ pacing-timer (`TREQ_SEL` `0x3B..=0x3E`) tick driving
-  and no HSTX DMA handshake. Every `Dma::run` unit costs one bus read plus one
-  bus write, but the instruction budget and peripheral timebase only count CPU
-  steps, so DMA traffic is not added to `steps` or `time_us`.
+  and no HSTX DMA handshake. PIO DREQ gating is unit-granular inside a batch
+  but the batch itself is throttled to 64 steps, and PIO pin FUNCSEL routing is
+  not modelled, so a PIO+DMA stream is not cycle-exact. Every `Dma::run` unit
+  costs one bus read plus one bus write, but the instruction budget and
+  peripheral timebase only count CPU steps, so DMA traffic is not added to
+  `steps` or `time_us`.
   不做周期精确仲裁或 `HIGH_PRIORITY` 调度，不驱动 DREQ 节拍定时器
-  （`TREQ_SEL` `0x3B..=0x3E`），也不建模 HSTX DMA 握手。每个 `Dma::run` 单元
-  消耗一次总线读加一次总线写，但指令预算与外设时基只统计 CPU 步数，DMA 流量
-  不计入 `steps` 或 `time_us`。
+  （`TREQ_SEL` `0x3B..=0x3E`），也不建模 HSTX DMA 握手。PIO DREQ 门控在批次内
+  按单元生效，但批次本身按 64 步节流，且未建模 PIO 引脚的 FUNCSEL 路由，因此
+  PIO+DMA 数据流不是周期精确的。每个 `Dma::run` 单元消耗一次总线读加一次总线
+  写，但指令预算与外设时基只统计 CPU 步数，DMA 流量不计入 `steps` 或 `time_us`。
 
 ### PIO pump / PIO 泵送
 
@@ -664,16 +681,27 @@ because the guest writes `CTRL.SM_ENABLE`.
   `Machine::pio_busy_mask()` 以位 `block * 4 + sm` 打包 `CTRL.SM_ENABLE`，
   `Machine::pio_pc(block, sm)`（测试/诊断接口）报告状态机 PC。两者都只属于宿主，
   绝不出现在 `repl --exec` 的 stdout 上，客户机输出保持逐字节一致。
+- **DMA handshake / DMA 握手**：after ticking, the FIFO levels are not pushed
+  by the PIO pump itself; the following DMA batch republishes them via
+  `BootPeripherals::sync_pio_dreqs()`. A PIO TX FIFO drained in this batch is
+  therefore visible to a `PIOx_TXy`-paced DMA channel at the next pump, one
+  `PUMP_INTERVAL` later. This keeps the idle PIO path free of extra locks.
+  推进状态机后，PIO 泵送本身不发布 FIFO 电平；随后的 DMA 批次通过
+  `BootPeripherals::sync_pio_dreqs()` 发布。因此本批次排空的 TX FIFO 会在下一次
+  泵送（一个 `PUMP_INTERVAL` 之后）才对 `PIOx_TXy` 节拍的 DMA 通道可见，从而让
+  空闲 PIO 路径不增加额外加锁。
 - **Limitations / 限制**：the PIO clock is assumed to equal the CPU clock (one
   step = one PIO cycle), so a `CLKDIV` value scales instructions per PIO cycle
-  but not the PIO/CPU clock ratio. There is no PIO DMA handshake, no PINCTRL
+  but not the PIO/CPU clock ratio. PIO DREQ levels reach the DMA controller at
+  pump-batch granularity (see the DMA pump section), there is no PINCTRL
   FUNCSEL crossbar between PIO pins and GPIO pads, and no external GPIO device
   model. The PIO tick is not added to `steps` or `time_us`, exactly like DMA
   traffic.
   假定 PIO 时钟等于 CPU 时钟（一步 = 一个 PIO 周期），因此 `CLKDIV` 只缩放每个
-  PIO 周期的指令数，不改变 PIO/CPU 时钟比。不做 PIO DMA 握手、不做 PIO 引脚与
-  GPIO 焊盘之间的 PINCTRL FUNCSEL 交叉开关，也不模拟外部 GPIO 设备。与 DMA
-  流量一样，PIO tick 不计入 `steps` 或 `time_us`。
+  PIO 周期的指令数，不改变 PIO/CPU 时钟比。PIO DREQ 电平以泵送批次为粒度到达
+  DMA 控制器（见 DMA 泵送一节）；不做 PIO 引脚与 GPIO 焊盘之间的 PINCTRL
+  FUNCSEL 交叉开关，也不模拟外部 GPIO 设备。与 DMA 流量一样，PIO tick 不计入
+  `steps` 或 `time_us`。
 
 ---
 

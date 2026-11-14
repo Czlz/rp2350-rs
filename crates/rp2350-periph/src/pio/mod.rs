@@ -5,18 +5,19 @@
 //! 32-word instruction memory, the four state-machine register windows, the
 //! 4-deep TX/RX FIFOs (joinable into 8-deep FIFOs), the GPIO pin mapping with
 //! side-set and delay cycles, the 16.8 fixed-point clock dividers and the PIO
-//! instruction set (JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET). DMA handshakes are
-//! deliberately not modelled yet; the corresponding offsets follow the project
-//! policy (reads return zero, writes are ignored, one warning per offset).
-//! Processor interrupt routing is provided by [`SharedPio`], which maps the
-//! eight `IRQ` flags onto the block's two shared `PIOx_IRQ_n` lines.
+//! instruction set (JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET). The FIFOs expose
+//! live empty/full queries that the host publishes onto the block's DMA DREQ
+//! selectors ([`crate::BootPeripherals::sync_pio_dreqs`]); no FIFO state is
+//! copied. Processor interrupt routing is provided by [`SharedPio`], which maps
+//! the eight `IRQ` flags onto the block's two shared `PIOx_IRQ_n` lines.
 //! RP2350 有三个 PIO 块（`PIO0`/`PIO1`/`PIO2`），分别位于 `0x5020_0000`、
 //! `0x5030_0000` 与 `0x5040_0000`。本模块建模寄存器文件、32 字指令存储、四个
 //! 状态机寄存器窗口、4 深度 TX/RX FIFO（可合并为 8 深度）、GPIO 引脚映射与
 //! side-set/延迟周期、16.8 定点分频器以及 PIO 指令集（JMP/WAIT/IN/OUT/PUSH/
-//! PULL/MOV/IRQ/SET）。DMA 握手暂不建模；对应偏移沿用项目策略（读为 0、写被
-//! 忽略、每个偏移只警告一次）。处理器中断路由由 [`SharedPio`] 提供，它把八个
-//! `IRQ` 标志映射到本块的两条共享 `PIOx_IRQ_n` 线。
+//! PULL/MOV/IRQ/SET）。FIFO 暴露实时的空/满查询，由宿主发布到本块的 DMA DREQ
+//! 选择器（[`crate::BootPeripherals::sync_pio_dreqs`]），不复制任何 FIFO 状态。
+//! 处理器中断路由由 [`SharedPio`] 提供，它把八个 `IRQ` 标志映射到本块的两条共享
+//! `PIOx_IRQ_n` 线。
 //!
 //! Reset values are taken from the RP2350 register headers (`PIO_*_RESET`):
 //! `FSTAT = 0x0F00_0F00`, `SMx_CLKDIV = 0x0001_0000`,
@@ -27,6 +28,8 @@
 //! `SMx_EXECCTRL = 0x0001_F000`、`SMx_SHIFTCTRL = 0x000C_0000`、
 //! `SMx_PINCTRL = 0x1400_0000`、`DBG_CFGINFO = 0x1020_0404`。
 
+#[cfg(test)]
+mod dreq_tests;
 #[cfg(test)]
 mod pin_tests;
 mod regs;
@@ -43,6 +46,7 @@ mod tests;
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
 use super::map;
+use crate::alias::{apply_alias, split_alias};
 // PIO 寄存器常量沿用数据手册命名并集中平铺，通配导入让寄存器映射保持直观。
 // PIO register constants follow datasheet names and are declared in one place, so
 // a glob import keeps the register map readable.
@@ -53,6 +57,16 @@ pub use shared::SharedPio;
 
 /// Number of RP2350 PIO blocks / RP2350 的 PIO 块数量
 pub const PIO_BLOCKS: usize = 3;
+
+/// PIO register window including the SET/CLR/XOR atomic aliases (16 KB)
+/// PIO 寄存器窗口（含 SET/CLR/XOR 原子别名，共 16 KB）
+pub(super) const PIO_WINDOW_SIZE: usize = 0x4000;
+
+/// `SMx_CLKDIV` clock-restart stroke / `SMx_CLKDIV` 时钟重启脉冲位
+const CLKDIV_RESTART_BIT: u32 = 1 << 31;
+
+/// Number of state machines in one PIO block / 一个 PIO 块中的状态机数量
+pub const PIO_SM_COUNT: usize = regs::SM_COUNT;
 
 /// One RP2350 PIO register block / 一个 RP2350 PIO 寄存器块
 ///
@@ -201,7 +215,14 @@ impl Pio {
     /// Write one state-machine window register / 写入一个状态机窗口寄存器
     fn write_sm(&mut self, index: usize, register: u32, value: u32) -> bool {
         match register {
-            SM_CLKDIV => self.sm[index].clkdiv = value & CLKDIV_MASK,
+            SM_CLKDIV => {
+                // Bit 31 is a self-clearing clock-restart stroke, not storage.
+                // 位 31 是自清零的时钟重启脉冲，不属于存储值。
+                if value & CLKDIV_RESTART_BIT != 0 {
+                    self.sm[index].clock_phase = 0;
+                }
+                self.sm[index].clkdiv = value & CLKDIV_MASK & !CLKDIV_RESTART_BIT;
+            }
             SM_EXECCTRL => {
                 // EXEC_STALLED 为只读状态位，不受写入影响。
                 // EXEC_STALLED is a read-only status bit and survives writes.
@@ -247,6 +268,50 @@ impl Pio {
             self.fdebug |= FDEBUG_TXSTALL << index;
         }
         word
+    }
+
+    /// Whether state machine `sm`'s TX FIFO is empty / 状态机 `sm` 的 TX FIFO 是否为空
+    ///
+    /// Read-only view of the live FIFO, so no state is copied. A direction
+    /// disabled by FIFO joining reports both empty and full, exactly as
+    /// `FSTAT` does. Returns `None` for `sm >= 4`.
+    /// 实时 FIFO 的只读视图，不复制状态。被 FIFO 合并禁用的一侧同时报告为空与满，
+    /// 与 `FSTAT` 一致。`sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn tx_fifo_empty(&self, sm: usize) -> Option<bool> {
+        self.sm.get(sm).map(|machine| machine.tx.is_empty())
+    }
+
+    /// Whether state machine `sm`'s TX FIFO is full / 状态机 `sm` 的 TX FIFO 是否已满
+    ///
+    /// A joined TX FIFO is 8 words deep; a TX FIFO disabled by `FJOIN_RX` always
+    /// reads full. Returns `None` for `sm >= 4`.
+    /// 合并后的 TX FIFO 深度为 8 字；被 `FJOIN_RX` 禁用的 TX FIFO 始终读为满。
+    /// `sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn tx_fifo_full(&self, sm: usize) -> Option<bool> {
+        self.sm.get(sm).map(|machine| machine.tx.is_full())
+    }
+
+    /// Whether state machine `sm`'s RX FIFO is empty / 状态机 `sm` 的 RX FIFO 是否为空
+    ///
+    /// A joined RX FIFO is 8 words deep; an RX FIFO disabled by `FJOIN_TX` always
+    /// reads empty. Returns `None` for `sm >= 4`.
+    /// 合并后的 RX FIFO 深度为 8 字；被 `FJOIN_TX` 禁用的 RX FIFO 始终读为空。
+    /// `sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn rx_fifo_empty(&self, sm: usize) -> Option<bool> {
+        self.sm.get(sm).map(|machine| machine.rx.is_empty())
+    }
+
+    /// Whether state machine `sm`'s RX FIFO is full / 状态机 `sm` 的 RX FIFO 是否已满
+    ///
+    /// A direction disabled by FIFO joining reports both full and empty.
+    /// Returns `None` for `sm >= 4`.
+    /// 被 FIFO 合并禁用的一侧同时报告为满与空。`sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn rx_fifo_full(&self, sm: usize) -> Option<bool> {
+        self.sm.get(sm).map(|machine| machine.rx.is_full())
     }
 
     /// Set all 32 GPIO input levels at once / 一次设置全部 32 个 GPIO 输入电平
@@ -307,10 +372,13 @@ impl MmioDevice for Pio {
     }
 
     fn window(&self) -> MmioWindow {
-        MmioWindow::new(self.base, map::DEVICE_WINDOW_SIZE)
+        MmioWindow::new(self.base, PIO_WINDOW_SIZE)
     }
 
     fn read32(&mut self, offset: u32) -> Option<u32> {
+        // Atomic alias reads observe the underlying register unchanged.
+        // 原子别名读观察底层寄存器，不做修改。
+        let (offset, _alias) = split_alias(offset);
         if let Some((index, register)) = Self::sm_register(offset) {
             return Some(self.read_sm(index, register));
         }
@@ -347,6 +415,12 @@ impl MmioDevice for Pio {
     }
 
     fn write32(&mut self, offset: u32, value: u32) -> bool {
+        // SET/CLR/XOR windows read-modify-write the plain register; the PIO
+        // firmware uses them for `hw_xor_bits` on `SMx_CLKDIV`.
+        // SET/CLR/XOR 窗口对普通寄存器做读-改-写；PIO 固件用它实现
+        // `SMx_CLKDIV` 上的 `hw_xor_bits`。
+        let (offset, alias) = split_alias(offset);
+        let value = apply_alias(self.read32(offset).unwrap_or(0), value, alias);
         if let Some((index, register)) = Self::sm_register(offset) {
             return self.write_sm(index, register, value);
         }

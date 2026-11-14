@@ -22,6 +22,7 @@ use super::bootram::BootRam;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
 use super::dma::Dma;
+use super::dreq;
 use super::hstx::Hstx;
 use super::io_bank0::IoBank0;
 use super::io_qspi::IoQspi;
@@ -29,7 +30,7 @@ use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
 use super::pads_qspi::PadsQspi;
-use super::pio::{PIO_BLOCKS, Pio, SharedPio};
+use super::pio::{PIO_BLOCKS, PIO_SM_COUNT, Pio, SharedPio};
 use super::pll::Pll;
 use super::powman::Powman;
 use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
@@ -339,6 +340,93 @@ impl BootPeripherals {
         for block in &self.pio {
             block.sync_irqs();
         }
+    }
+
+    /// Publish every PIO FIFO level onto its DMA DREQ selector
+    /// 把每个 PIO FIFO 的状态发布到对应的 DMA DREQ 选择器
+    ///
+    /// A PIO DREQ is a level sampled by the DMA controller: the TX request of a
+    /// state machine is asserted while its TX FIFO is **not full** (the channel
+    /// may write), and its RX request while the RX FIFO is **not empty** (the
+    /// channel may read). Joining turns one direction into a single 8-deep FIFO:
+    /// the queries read the live occupancy, so a joined FIFO asserts its DREQ up
+    /// to 8 words and the joined-away direction — which reads as both full and
+    /// empty — stays deasserted. No FIFO state is copied; every call re-reads
+    /// the shared register file. Only selectors `0..=23` are written
+    /// ([`crate::dreq`]); other DREQ inputs keep their current level.
+    /// PIO DREQ 是由 DMA 控制器采样的电平：状态机的 TX 请求在其 TX FIFO
+    /// **未满**时断言（通道可写入），RX 请求在其 RX FIFO **非空**时断言（通道可
+    /// 读出）。合并会把一个方向变成单个 8 深度 FIFO：查询直接读取实时占用，因此
+    /// 合并后的 FIFO 最多 8 字断言其 DREQ，被合并掉的方向同时读为满和空、其 DREQ
+    /// 保持去断言。不复制任何 FIFO 状态，每次调用都重新读取共享寄存器文件。仅写
+    /// `0..=23` 的选择器（[`crate::dreq`]），其它 DREQ 输入保持当前电平。
+    pub fn sync_pio_dreqs(&self) {
+        for (index, block) in self.pio.iter().enumerate() {
+            let (tx, rx) = block.with(|pio| {
+                let mut tx = 0u32;
+                let mut rx = 0u32;
+                for sm in 0..PIO_SM_COUNT {
+                    // TX 请求 = 未满，RX 请求 = 非空；join 时同一存储按 8 深度判定。
+                    // TX request = not full, RX request = not empty; a joined FIFO
+                    // is judged at its 8-word depth by the same queries.
+                    if pio.tx_fifo_full(sm) == Some(false) {
+                        tx |= 1 << sm;
+                    }
+                    if pio.rx_fifo_empty(sm) == Some(false) {
+                        rx |= 1 << sm;
+                    }
+                }
+                (tx, rx)
+            });
+            let Ok(block_index) = u8::try_from(index) else {
+                continue;
+            };
+            let Some(tx_base) = dreq::pio_tx_dreq_base(block_index) else {
+                continue;
+            };
+            self.dma.set_dreq_bank(tx_base, tx);
+            self.dma.set_dreq_bank(tx_base + dreq::PIO_TX_PER_BLOCK, rx);
+        }
+    }
+
+    /// Run one DMA pump, refreshing PIO DREQ levels before every unit batch
+    /// 执行一次 DMA 泵送，在每个单元批次前刷新 PIO DREQ 电平
+    ///
+    /// The PIO levels are republished first, because the FIFO state may have
+    /// changed since the previous pump. Channels paced by a PIO selector
+    /// (`TREQ_SEL` `0..=23`) advance one unit at a time so a FIFO that fills or
+    /// drains inside the batch is noticed; every other channel can consume the
+    /// whole budget in one [`Dma::run`] call. Returns the units attempted.
+    /// 先重新发布 PIO 电平，因为上次泵送后 FIFO 状态可能已改变。由 PIO 选择器
+    /// （`TREQ_SEL` `0..=23`）节拍的通道逐单元推进，从而能发现批次内 FIFO 被填满
+    /// 或排空；其它通道可在一次 [`Dma::run`] 调用中用完整个预算。返回尝试的单元数。
+    pub fn pump_dma(&mut self, bus: &mut dyn AddressBus, max_units: u64) -> u64 {
+        let mut total = 0u64;
+        while total < max_units {
+            self.sync_pio_dreqs();
+            self.sync_hstx_dreq();
+            // PIO/HSTX-paced channels need per-unit resynchronisation; other
+            // selectors run the whole remaining budget in one call.
+            // PIO/HSTX 节拍的通道需要逐单元重新同步；其余选择器整批执行。
+            let per_unit = self
+                .dma
+                .busy_selects_dreq(dreq::PIO_DREQ_FIRST, dreq::PIO_DREQ_LAST)
+                || self.dma.busy_selects_dreq(dreq::HSTX_DREQ, dreq::HSTX_DREQ);
+            let budget = if per_unit { 1 } else { max_units - total };
+            let moved = self.dma.run(bus, budget);
+            if moved == 0 {
+                break;
+            }
+            total += moved;
+        }
+        total
+    }
+
+    /// Publish `DREQ_HSTX`: asserted while the HSTX FIFO has room
+    /// 发布 `DREQ_HSTX`：HSTX FIFO 有空间时断言
+    pub fn sync_hstx_dreq(&self) {
+        self.dma
+            .set_dreq(dreq::HSTX_DREQ, self.hstx.fifo_not_full());
     }
 
     /// Elapsed microseconds since boot / 自启动以来的微秒数

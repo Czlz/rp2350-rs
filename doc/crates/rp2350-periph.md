@@ -27,6 +27,10 @@ impl Pio {
     pub fn new(index: u8) -> Self;
     pub fn push_rx(&mut self, sm: usize, value: u32) -> bool;
     pub fn pop_tx(&mut self, sm: usize) -> Option<u32>;
+    pub fn tx_fifo_empty(&self, sm: usize) -> Option<bool>;
+    pub fn tx_fifo_full(&self, sm: usize) -> Option<bool>;
+    pub fn rx_fifo_empty(&self, sm: usize) -> Option<bool>;
+    pub fn rx_fifo_full(&self, sm: usize) -> Option<bool>;
     pub fn step_sm(&mut self, sm: usize) -> bool;
     pub fn tick(&mut self, cycles: u64);
     pub fn set_input_levels(&mut self, levels: u32);
@@ -48,6 +52,10 @@ impl SharedPio {
     pub fn enabled_mask(&self) -> u8;
     pub fn stalled_mask(&self) -> u8;
     pub fn pc(&self, sm: usize) -> Option<u8>;
+    pub fn tx_fifo_empty(&self, sm: usize) -> Option<bool>;
+    pub fn tx_fifo_full(&self, sm: usize) -> Option<bool>;
+    pub fn rx_fifo_empty(&self, sm: usize) -> Option<bool>;
+    pub fn rx_fifo_full(&self, sm: usize) -> Option<bool>;
     pub fn output_levels(&self) -> u32;
     pub fn output_enables(&self) -> u32;
 }
@@ -246,6 +254,55 @@ state-machine `PUSH`/`PULL`/`OUT` paths all follow the resulting capacity.
 `TXF*`/`RXF*`、`push_rx`/`pop_tx` 以及状态机的 `PUSH`/`PULL`/`OUT` 路径都
 按合并后的容量工作。
 
+### DMA requests / DREQ / DMA 请求
+
+Each state machine exposes one TX and one RX request line. `DMA
+CTRL_TRIG.TREQ_SEL` selects them with the RP2350 table (`rp2350_periph::dreq`),
+which differs from RP2040 because RP2350 adds a third block:
+
+| Selectors | DREQ lines | Selectors | DREQ lines |
+|-----------|------------|-----------|------------|
+| `0..=3` | `PIO0_TX0..TX3` | `4..=7` | `PIO0_RX0..RX3` |
+| `8..=11` | `PIO1_TX0..TX3` | `12..=15` | `PIO1_RX0..RX3` |
+| `16..=19` | `PIO2_TX0..TX3` | `20..=23` | `PIO2_RX0..RX3` |
+
+The level semantics follow the datasheet: `PIOx_TXy` is asserted while state
+machine `y`'s TX FIFO is **not full** (the DMA channel may write a word), and
+`PIOx_RXy` is asserted while its RX FIFO is **not empty** (the channel may read
+a word). A joined FIFO is one 8-deep FIFO: the joined direction asserts its
+request up to 8 words, while the joined-away direction reads as both full and
+empty and therefore keeps its request deasserted. With both join bits set both
+requests stay low.
+
+每个状态机各有一条 TX 与一条 RX 请求线，由 `DMA CTRL_TRIG.TREQ_SEL` 按 RP2350
+表（`rp2350_periph::dreq`）选择；RP2350 比 RP2040 多一个 PIO 块，因此编号不与
+RP2040 兼容。电平语义遵循数据手册：`PIOx_TXy` 在状态机 `y` 的 TX FIFO **未满**
+时断言（DMA 通道可写入一个字），`PIOx_RXy` 在其 RX FIFO **非空**时断言（通道可
+读出一个字）。合并后的 FIFO 是一个 8 深度 FIFO：被合并的方向最多 8 字断言请求，
+被合并掉的方向同时读为满和空，因此其请求保持去断言。两个 join 位同时置位时两条
+请求都为低。
+
+`Pio::tx_fifo_empty`/`tx_fifo_full`/`rx_fifo_empty`/`rx_fifo_full` (and the
+[`SharedPio`] mirrors) are read-only views of the live FIFOs — the same state
+`FSTAT`/`FLEVEL` derive from, so nothing is copied and a joined FIFO is judged
+at its 8-word depth. Out-of-range machine indices return `None`.
+`BootPeripherals::sync_pio_dreqs()` walks the three blocks, reads those four
+queries under one lock per block and publishes a TX and an RX bitmask into the
+DMA level array with `Dma::set_dreq_bank`; only selectors `0..=23` are touched.
+`BootPeripherals::pump_dma(bus, units)` then republishes the levels and runs
+the controller, advancing a channel paced by a PIO selector one unit at a time
+so a FIFO that fills or drains inside the budget is noticed before the next
+unit. `Dma::busy_selects_dreq(first, last)` is the probe that chooses that
+granularity.
+`Pio::tx_fifo_empty`/`tx_fifo_full`/`rx_fifo_empty`/`rx_fifo_full`（以及
+[`SharedPio`] 上的同名方法）是实时 FIFO 的只读视图 —— 与 `FSTAT`/`FLEVEL`
+同源，因此不复制状态，合并后的 FIFO 按 8 深度判定；越界状态机返回 `None`。
+`BootPeripherals::sync_pio_dreqs()` 遍历三个块，每块一次加锁读取上述四个查询，
+并用 `Dma::set_dreq_bank` 把 TX/RX 位掩码发布到 DMA 电平数组，只写选择器
+`0..=23`。`BootPeripherals::pump_dma(bus, units)` 随后重新发布电平并运行控制器，
+对由 PIO 选择器节拍的通道逐单元推进，从而在下一个单元前发现批次内被填满或排空的
+FIFO；`Dma::busy_selects_dreq(first, last)` 是选择该粒度的探测接口。
+
 ### State-machine execution / 状态机执行
 
 `step_sm(sm)` advances one machine by exactly one PIO clock edge. Every edge
@@ -332,7 +389,10 @@ Shift-register semantics / 移位寄存器语义:
 
 ### Not modelled yet / 尚未建模
 
-DMA handshakes (DREQ for TX/RX), the RP2350 `RXFn_PUTGET*` registers and the
+The PIO DREQ levels are modelled (see *DMA requests* above), but not
+cycle-exactly: the DMA controller samples them per data unit and the host
+decides when to republish (`Machine` does so inside each throttled DMA batch).
+The RP2350 `RXFn_PUTGET*` registers and the
 `IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
 interrupt registers at `0x16C..0x184` are not modelled: the shared handle
 asserts a line from the raw flag alone, without per-flag enables or forced
@@ -341,8 +401,10 @@ block sees its own local GPIO 0..31 window, and no PINCTRL FUNCSEL crossbar
 routes PIO pins to real GPIO pads. Cross-block `IRQ` routing (RP2350 index
 modes 1/3) currently falls back to this block's flags.
 
-DMA 握手（TX/RX 的 DREQ）、RP2350 `RXFn_PUTGET*` 寄存器，以及 `0x16C..0x184`
-的 `IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
+PIO DREQ 电平已建模（见上文 *DMA requests*），但不是周期精确的：DMA 控制器按数据
+单元采样，由宿主决定何时重新发布（`Machine` 在每个受节流的 DMA 批次内执行）。
+RP2350 `RXFn_PUTGET*` 寄存器，以及 `0x16C..0x184` 的
+`IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
 中断寄存器尚未建模：共享句柄仅按原始标志断言中断线，没有逐标志使能与强制状态。
 `GPIOBASE` 仅存储、不会加到 PINCTRL 引脚号上，因此每个块看到的是自己局部的
 GPIO 0..31 窗口，也没有 PINCTRL FUNCSEL 交叉开关把 PIO 引脚接到真实 GPIO 焊盘。
@@ -544,8 +606,10 @@ pub struct Dma { /* shared register file + IrqAssert */ }
 impl Dma {
     pub fn new(irq: IrqAssert) -> Self;
     pub fn run(&mut self, bus: &mut dyn AddressBus, max_transfers: u64) -> u64;
-    pub fn set_dreq(&mut self, dreq: u8, asserted: bool);
+    pub fn set_dreq(&self, dreq: u8, asserted: bool);
+    pub fn set_dreq_bank(&self, first: u8, levels: u32);
     pub fn dreq(&self, dreq: u8) -> Option<bool>;
+    pub fn busy_selects_dreq(&self, first: u8, last: u8) -> bool;
     pub fn abort(&mut self, mask: u16);
     pub fn busy_mask(&self) -> u16;
     pub fn channel_state(&self, index: usize) -> Option<DmaChannelState>;
@@ -645,13 +709,32 @@ clears both `EN` and `BUSY`.
 samples the host-driven level array; all 64 inputs reset asserted so firmware
 that never programs a DREQ still progresses. `set_dreq(sel, false)` pauses
 channels using that selector and `set_dreq(sel, true)` resumes them on the next
-`run`. Selectors `>= 64` are ignored. The `TIMER0..3` pacing registers are
-stored but do not gate transfers yet.
+`run`; selectors `>= 64` are ignored. `set_dreq_bank(first, levels)` writes
+eight consecutive inputs from one bitmask and one lock, which is how the PIO
+blocks publish four TX and four RX levels at once. The levels are sampled per
+`Dma::run` call (and per unit inside `BootPeripherals::pump_dma` for PIO-paced
+channels), not continuously. Selectors `0x3B..=0x3E` are the pacing timers and
+are stored but do not gate transfers yet.
 `TREQ_SEL = 0x3F`（`TREQ_PERMANENT`）始终可传输。其他选择器采样宿主驱动的
 电平数组；64 个输入复位时均断言，因此未编程 DREQ 的固件仍能推进。
 `set_dreq(sel, false)` 暂停使用该选择器的通道，`set_dreq(sel, true)` 在下一次
-`run` 时恢复。`>= 64` 的选择被忽略。`TIMER0..3` 节拍寄存器仅存储，尚未
-门控传输。
+`run` 时恢复；`>= 64` 的选择被忽略。`set_dreq_bank(first, levels)` 用一次加锁从
+位掩码写入连续八个输入，PIO 块据此一次发布四个 TX 与四个 RX 电平。电平在每次
+`Dma::run` 调用时采样（PIO 节拍的通道在 `BootPeripherals::pump_dma` 内逐单元
+采样），不是连续采样。`0x3B..=0x3E` 是节拍定时器选择器，仅存储，尚未门控传输。
+
+The RP2350 PIO selectors are `0..=23` (`PIO0_TX0` … `PIO2_RX3`), with
+`PIOx_TXy` asserted while the TX FIFO is not full and `PIOx_RXy` while the RX
+FIFO is not empty; the numbering and join behaviour are documented under
+*PIO → DMA requests*. `BootPeripherals::sync_pio_dreqs()` publishes them and
+`BootPeripherals::pump_dma()` uses `busy_selects_dreq(0, 23)` to refresh the
+levels between single units. Non-PIO selectors are still reset-asserted and are
+not driven by SPI/UART/ADC/HSTX/timers.
+RP2350 的 PIO 选择器为 `0..=23`（`PIO0_TX0` … `PIO2_RX3`）：`PIOx_TXy` 在 TX
+FIFO 未满时断言，`PIOx_RXy` 在 RX FIFO 非空时断言；编号与 join 行为见
+*PIO → DMA requests*。`BootPeripherals::sync_pio_dreqs()` 负责发布，
+`BootPeripherals::pump_dma()` 用 `busy_selects_dreq(0, 23)` 在逐单元之间刷新
+电平。非 PIO 选择器仍为复位断言状态，尚未由 SPI/UART/ADC/HSTX/定时器驱动。
 
 ### Chaining and interrupts / 链式与中断
 
@@ -691,9 +774,17 @@ DMA 设备不拦截 CPU 总线流量：传输只在 `Dma::run` 内部发生。
 
 Program the channel through the MMIO window, then pump `run` from the
 simulation loop. `BootPeripherals::advance` intentionally does not execute DMA
-transfers.
+transfers. For a channel paced by a PIO FIFO, call
+`BootPeripherals::sync_pio_dreqs()` before `Dma::run`, or let
+`BootPeripherals::pump_dma(bus, units)` do both; `rp2350-cli`'s `Machine` uses
+the latter at its throttled DMA pump point, so `TREQ_SEL = PIO0_TX0` only writes
+while the TX FIFO has room.
 通过 MMIO 窗口编程通道，然后在仿真循环中泵送 `run`。
-`BootPeripherals::advance` 有意不执行 DMA 传输。
+`BootPeripherals::advance` 有意不执行 DMA 传输。由 PIO FIFO 节拍的通道应在
+`Dma::run` 之前调用 `BootPeripherals::sync_pio_dreqs()`，或直接使用
+`BootPeripherals::pump_dma(bus, units)` 一并完成；`rp2350-cli` 的 `Machine` 在
+受节流的 DMA 泵送点使用后者，因此 `TREQ_SEL = PIO0_TX0` 只会在 TX FIFO 有空位时
+写入。
 
 ```rust
 use rp2350_core::memory::SimpleBus;

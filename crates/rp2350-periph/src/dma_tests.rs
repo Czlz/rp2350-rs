@@ -8,7 +8,7 @@
 
 use rp2350_core::bus::AddressBus;
 use rp2350_core::memory::{RamRegion, SimpleBus};
-use rp2350_core::mmio::mount_device;
+use rp2350_core::mmio::{MmioDevice, mount_device};
 
 use crate::dma::{
     CTRL_BUSY, CTRL_CHAIN_TO_SHIFT, CTRL_DATA_SIZE_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_INCR_WRITE,
@@ -466,9 +466,33 @@ fn multi_channel_trigger_starts_all_selected_channels() {
 #[test]
 fn dma_irq_numbers_match_the_interrupt_map() {
     assert_eq!(map::DMA_BASE, 0x5000_0000);
-    assert_eq!(map::DMA_SIZE, 0x1000);
+    assert_eq!(map::DMA_SIZE, 0x4000);
     assert_eq!(map::DMA_IRQ_0, 10);
     assert_eq!(map::DMA_IRQ_1, map::DMA_IRQ_0 + 1);
     assert_eq!(map::DMA_IRQ_2, map::DMA_IRQ_0 + 2);
     assert_eq!(map::DMA_IRQ_3, map::DMA_IRQ_0 + 3);
+}
+
+#[test]
+fn set_and_clear_aliases_update_inte1() {
+    let mut fixture = fixture();
+    fixture.reg_write(INTE1 + 0x2000, 1 << 3);
+    assert_eq!(fixture.reg_read(INTE1), 1 << 3);
+    fixture.reg_write(INTE1 + 0x3000, 1 << 3);
+    assert_eq!(fixture.reg_read(INTE1), 0);
+}
+
+#[test]
+fn xor_alias_updates_a_channel_register() {
+    let mut fixture = fixture();
+    fixture.reg_write(0x0000, 0x1000);
+    fixture.reg_write(0x1000, 0x000F);
+    assert_eq!(fixture.reg_read(0x0000), 0x100F);
+}
+
+#[test]
+fn alias_window_is_sixteen_kilobytes() {
+    let fixture = fixture();
+    assert_eq!(fixture.dma.window().size, map::DMA_SIZE);
+    assert_eq!(map::DMA_SIZE, 0x4000);
 }

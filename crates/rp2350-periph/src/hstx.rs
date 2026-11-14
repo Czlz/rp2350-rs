@@ -251,6 +251,8 @@ struct HstxState {
     starving: bool,
     wof: bool,
     underruns: u64,
+    /// FIFO words consumed by the expander / 扩展器已消费的 FIFO 字数
+    produced: u64,
     irq_status: u32,
     irq_enable: u32,
     unknown_commands: u64,
@@ -272,6 +274,7 @@ impl Default for HstxState {
             starving: false,
             wof: false,
             underruns: 0,
+            produced: 0,
             irq_status: 0,
             irq_enable: 0,
             unknown_commands: 0,
@@ -535,6 +538,7 @@ impl HstxState {
                 break;
             }
             self.pump();
+            self.produced = self.produced.saturating_add(1);
             remaining -= 1;
         }
     }
@@ -644,6 +648,28 @@ impl Hstx {
     #[must_use]
     pub fn output_underrun(&self) -> u64 {
         self.state.lock().underruns
+    }
+
+    /// Total FIFO words consumed by the expander / 扩展器累计消费的 FIFO 字数
+    #[must_use]
+    pub fn output_words(&self) -> u64 {
+        self.state.lock().produced
+    }
+
+    /// Drain the host queue and return how many words were discarded
+    /// 清空宿主队列并返回丢弃的字数
+    pub fn take_output_count(&mut self) -> u64 {
+        let mut state = self.state.lock();
+        let count = state.output.len() as u64;
+        state.output.clear();
+        count
+    }
+
+    /// Whether the HSTX FIFO can accept another word (`DREQ_HSTX`)
+    /// HSTX FIFO 是否还能接收一个字（`DREQ_HSTX`）
+    #[must_use]
+    pub fn fifo_not_full(&self) -> bool {
+        self.state.lock().fifo.len() < FIFO_DEPTH
     }
 
     /// Current FIFO occupancy in words / 当前 FIFO 占用字数

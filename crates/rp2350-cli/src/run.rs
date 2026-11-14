@@ -273,6 +273,8 @@ pub struct Machine {
     pio_pumped: u64,
     /// Cumulative DMA data units moved by the host pump / 宿主泵送累计搬运的 DMA 数据单元数
     dma_transfers: u64,
+    /// Cumulative HSTX output words drained by the host pump / 宿主泵送累计排空的 HSTX 输出字数
+    hstx_words: u64,
     /// Non-budget halt reason / 非预算原因的停机原因
     halt: Option<String>,
     /// Whether the peripheral timebase has been finalized / 外设时基是否已收尾
@@ -350,6 +352,16 @@ impl Machine {
             ArchArg::Arm => {
                 let mut arm = CortexM33Core::new(CpuId::Core0);
                 arm.set_strict_decode(options.strict_decode);
+                // The RP2350 boot ROM programs SCB->VTOR to the flash vector
+                // table before entering the image. The core caches VTOR, but
+                // the PPB window has its own register file, so seed it here as
+                // well; otherwise a guest read of 0xE000_ED08 sees zero and
+                // copies an empty vector table into RAM (Pico SDK runtime_init).
+                // RP2350 boot ROM 在进入映像前把 SCB->VTOR 指向 Flash 向量表。
+                // 核心缓存了 VTOR，但 PPB 窗口有自己的寄存器组，因此这里也要
+                // 同步写入；否则客户机读 0xE000_ED08 会得到 0，Pico SDK 的
+                // runtime_init 会把空向量表复制到 RAM。
+                let mut seed_cycles = 0u64;
                 let vectors = if let Some(entry) = elf_entry {
                     // ELF 映像没有 Flash 向量表，使用标准 SRAM 栈顶与 ELF 入口。
                     // ELF images have no flash vector table; use the SRAM top and ELF entry.
@@ -363,6 +375,8 @@ impl Machine {
                         .context("core boot failed / 核心启动失败")?;
                     Some((arm.read_register(13), arm.pc()))
                 };
+                bus.write_u32(0xE000_ED08, FLASH_XIP_BASE, &mut seed_cycles)
+                    .context("seed SCB_VTOR failed / 初始化 SCB_VTOR 失败")?;
                 (CoreHandle::Arm(Box::new(arm)), vectors)
             }
             ArchArg::RiscV => {
@@ -402,6 +416,7 @@ impl Machine {
             dma_pumped: 0,
             pio_pumped: 0,
             dma_transfers: 0,
+            hstx_words: 0,
             halt: None,
             finished: false,
             irqs: Vec::new(),
@@ -485,6 +500,26 @@ impl Machine {
             "dma={} busy={:#06X}",
             self.dma_transfers(),
             self.peripherals.dma().busy_mask()
+        )
+    }
+
+    /// Cumulative HSTX output words drained by the host pump
+    /// 宿主泵送累计排空的 HSTX 输出字数
+    #[must_use]
+    pub fn hstx_words(&self) -> u64 {
+        self.hstx_words
+    }
+
+    /// One-line HSTX diagnostic / 单行 HSTX 诊断
+    #[must_use]
+    pub fn hstx_state(&self) -> String {
+        let hstx = self.peripherals.hstx();
+        format!(
+            "hstx words={} underruns={} fifo={} enabled={}",
+            self.hstx_words(),
+            hstx.output_underrun(),
+            hstx.fifo_level(),
+            hstx.enabled()
         )
     }
 
@@ -918,11 +953,18 @@ impl Machine {
     ///
     /// Throttled to one call per [`PUMP_INTERVAL`] retired steps and capped at
     /// [`DMA_PUMP_TRANSFERS`] data units, so the CPU always executes at least
-    /// that many instructions between batches. The idle path costs a single
-    /// `busy_mask` probe and never touches the bus.
+    /// that many instructions between batches. [`BootPeripherals::pump_dma`]
+    /// republishes the PIO FIFO levels onto the DREQ array before running and
+    /// re-samples them per unit for channels paced by a PIO selector, so a
+    /// `TREQ_SEL` pointing at `PIOx_TXy`/`PIOx_RXy` only advances while the
+    /// selected FIFO has room or data. The idle path costs a single `busy_mask`
+    /// probe and never touches the bus or the PIO blocks.
     /// 按已退役步数每 [`PUMP_INTERVAL`] 步节流一次，每批最多
     /// [`DMA_PUMP_TRANSFERS`] 个数据单元，因此批次之间 CPU 至少执行同样多的
-    /// 指令。空闲路径只做一次 `busy_mask` 探测，不访问总线。
+    /// 指令。[`BootPeripherals::pump_dma`] 在运行前把 PIO FIFO 电平重新发布到
+    /// DREQ 数组，并对由 PIO 选择器节拍的通道逐单元重新采样，因此指向
+    /// `PIOx_TXy`/`PIOx_RXy` 的 `TREQ_SEL` 只会在所选 FIFO 有空间或有数据时推进。
+    /// 空闲路径只做一次 `busy_mask` 探测，不访问总线与 PIO 块。
     fn pump_dma_batch(&mut self) {
         if self.steps - self.dma_pumped < PUMP_INTERVAL {
             return;
@@ -931,16 +973,19 @@ impl Machine {
         // Record the throttle point first: even when idle, the next probe waits
         // a full batch instead of locking on every step.
         self.dma_pumped = self.steps;
+        // HSTX advances independently of DMA: drain the host queue every batch
+        // and publish its FIFO-room DREQ before arbitration.
+        // HSTX 独立于 DMA 推进：每批排空宿主队列，并在仲裁前发布 FIFO 空间 DREQ。
+        let drained = self.peripherals.hstx_mut().take_output_count();
+        self.hstx_words = self.hstx_words.saturating_add(drained);
+        self.peripherals.sync_hstx_dreq();
         if self.peripherals.dma().busy_mask() == 0 {
             return;
         }
         // bus 与外设是不同字段，可直接分开借用，无需 RefCell。
         // `bus` and the peripheral handle are distinct fields, so they borrow
         // separately without a RefCell.
-        let moved = self
-            .peripherals
-            .dma_mut()
-            .run(&mut self.bus, DMA_PUMP_TRANSFERS);
+        let moved = self.peripherals.pump_dma(&mut self.bus, DMA_PUMP_TRANSFERS);
         self.dma_transfers = self.dma_transfers.saturating_add(moved);
     }
 
@@ -1058,6 +1103,22 @@ pub fn run(options: &RunOptions) -> Result<()> {
     // The DMA counters only appear in `run`'s host diagnostics, so `repl --exec`
     // stdout semantics stay unchanged.
     writeln!(stdout, "[run] {}", machine.dma_state())?;
+    writeln!(stdout, "[run] {}", machine.hstx_state())?;
+    for index in 0..3 {
+        if let Some(channel) = machine.peripherals.dma().channel_state(index) {
+            writeln!(
+                stdout,
+                "[run] dma ch{index} rd={:#010X} wr={:#010X} cnt={} ctrl={:#010X} busy={} chain={} treq={}",
+                channel.read_addr,
+                channel.write_addr,
+                channel.trans_count,
+                channel.ctrl,
+                channel.busy,
+                channel.chain_to,
+                channel.treq_sel
+            )?;
+        }
+    }
     writeln!(stdout, "[run] {}", register_snapshot(&machine))?;
     if !machine.irqs().is_empty() {
         writeln!(stdout, "[run] irq deliveries (first {IRQ_LOG_LIMIT}):")?;
@@ -1567,6 +1628,9 @@ mod tests {
     /// PIO `INSTR_MEM0` offset / PIO `INSTR_MEM0` 偏移
     const PIO_INSTR_MEM0: u32 = 0x048;
 
+    /// PIO `TXF0` offset / PIO `TXF0` 偏移
+    const PIO_TXF0: u32 = 0x010;
+
     /// `SM0_EXECCTRL` offset / `SM0_EXECCTRL` 偏移
     const PIO_SM0_EXECCTRL: u32 = 0x0CC;
 
@@ -1650,6 +1714,73 @@ mod tests {
     }
 
     #[test]
+    fn pio_tx_dreq_paces_the_dma_under_the_machine() {
+        // PIO0_TX0 节拍的 DMA 只能填满 4 深度 FIFO，PIO 取走后继续推进。
+        // A DMA channel paced by PIO0_TX0 can only fill the 4-deep FIFO; it
+        // makes progress again after the PIO drains it.
+        let mut machine = machine_with_budget(4_000);
+        let src = SRAM_BASE + 0x1000;
+        let pio_base = rp2350_periph::map::PIO0_BASE;
+        for index in 0..6u32 {
+            write_word(&mut machine, src + index * 4, 0x7000_0000 | index);
+        }
+        let ctrl = CTRL_EN
+            | (DATA_SIZE_WORD << rp2350_periph::dma::CTRL_DATA_SIZE_SHIFT)
+            | CTRL_INCR_READ
+            | (u32::from(rp2350_periph::dreq::PIO0_TX0) << CTRL_TREQ_SEL_SHIFT);
+        write_word(&mut machine, DMA_BASE, src);
+        write_word(&mut machine, DMA_BASE + 0x04, pio_base + PIO_TXF0);
+        write_word(&mut machine, DMA_BASE + 0x08, 6);
+        write_word(&mut machine, DMA_BASE + 0x0C, ctrl);
+
+        // 第一批：SM 关闭，DMA 填满 FIFO 后因 DREQ 变低而停止。
+        // First batch: with the SM disabled the DMA fills the FIFO and stops
+        // when the DREQ drops.
+        machine.run_cycles(PUMP_INTERVAL);
+        assert_eq!(machine.dma_transfers(), 4);
+        assert_eq!(
+            machine.peripherals.pio(0).expect("pio0").tx_fifo_full(0),
+            Some(true)
+        );
+        assert_eq!(
+            machine
+                .peripherals
+                .dma()
+                .channel_state(0)
+                .expect("ch0")
+                .trans_count,
+            2
+        );
+        machine.run_cycles(PUMP_INTERVAL);
+        assert_eq!(machine.dma_transfers(), 4, "full FIFO gates the channel");
+
+        // 启用 `pull block` 循环：PIO 取走两批数据后阻塞在空 FIFO 上。
+        // Enable a `pull block` loop: the PIO drains both batches and finally
+        // stalls on the empty FIFO.
+        write_word(&mut machine, pio_base + PIO_INSTR_MEM0, 0x80A0);
+        write_word(&mut machine, pio_base + PIO_INSTR_MEM0 + 4, 0x0000);
+        write_word(&mut machine, pio_base + PIO_CTRL, 1);
+        machine.run_cycles(PUMP_INTERVAL);
+        machine.run_cycles(PUMP_INTERVAL);
+
+        assert_eq!(machine.dma_transfers(), 6);
+        let state = machine.peripherals.dma().channel_state(0).expect("ch0");
+        assert_eq!(state.trans_count, 0);
+        assert!(!state.busy);
+        let pio0 = machine.peripherals.pio(0).expect("pio0");
+        assert_eq!(pio0.tx_fifo_empty(0), Some(true));
+        assert_ne!(pio0.stalled_mask() & 1, 0, "PULL waits on the empty FIFO");
+        machine.peripherals.sync_pio_dreqs();
+        assert_eq!(
+            machine
+                .peripherals
+                .dma()
+                .dreq(rp2350_periph::dreq::PIO0_TX0),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn unused_pio_blocks_do_not_change_stepping() {
         // 没有任何 PIO 使能时，泵送只做一次状态探测，步数与 PC 行为不变。
         // With no PIO enabled the pump only probes state: step count and PC
@@ -1676,6 +1807,18 @@ mod tests {
             Some((SRAM_BASE + SRAM_SIZE as u32, 0x1000_0000))
         );
         assert_eq!(machine.pc(), 0x1000_0000);
+        // The PPB window must expose the same VTOR that boot_at programmed in
+        // the core; Pico SDK's runtime_init copies the RAM vector table from it.
+        // PPB 窗口必须暴露与 core 相同的 VTOR；Pico SDK runtime_init 依赖它
+        // 复制 RAM 向量表。
+        let mut cycles = 0u64;
+        assert_eq!(
+            machine
+                .bus
+                .read_u32(0xE000_ED08, &mut cycles)
+                .expect("VTOR readable"),
+            0x1000_0000
+        );
 
         machine.run_cycles(3);
         assert_eq!(machine.steps(), 3);

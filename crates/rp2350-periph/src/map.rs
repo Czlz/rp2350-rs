@@ -136,8 +136,9 @@ pub const SHA256_BASE: Address = 0x400F_8000;
 /// （未建模）位于 `+0x800..=0xBFF`。
 pub const DMA_BASE: Address = 0x5000_0000;
 
-/// DMA register window size (4 KB) / DMA 寄存器窗口大小（4 KB）
-pub const DMA_SIZE: usize = 0x1000;
+/// DMA register window including SET/CLR/XOR aliases (16 KB)
+/// DMA 寄存器窗口（含 SET/CLR/XOR 别名，共 16 KB）
+pub const DMA_SIZE: usize = 0x4000;
 
 /// DMA interrupt line 0 / DMA 中断线 0
 ///
