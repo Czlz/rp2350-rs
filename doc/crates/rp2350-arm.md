@@ -387,6 +387,34 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   - `VMOV` core register ↔ S register, `VMOV` two core registers ↔ D register.
   - `VMOV.F32 Sd, #imm` (VFP 8-bit immediate expansion).
   - `VMRS` / `VMSR` (FPSCR, FPEXC) including `VMRS APSR_nzcv, FPSCR`.
+- **Arithmetic** (single precision, Stage 3, `execute_thumb32::fpu_arith`):
+  `VADD`, `VSUB`, `VMUL`, `VNMUL`, `VMLA`/`VMLS`, `VNMLA`/`VNMLS`, `VDIV`,
+  the fused `VFMA`/`VFMS`/`VFNMA`/`VFNMS` family, plus `VMOV.F32 Sd, Sm`,
+  `VABS`, `VNEG` and `VSQRT`. Fused ops use `f32::mul_add`, so the
+  multiply-add has a single rounding like the hardware; `VMLA`/`VMLS` keep
+  the two roundings the architecture specifies. `VABS`/`VNEG` are pure
+  sign-bit operations, so NaN payloads survive unchanged.
+- **Comparison**: `VCMP`/`VCMPE` against a register or `#0.0`. FPSCR
+  `N`/`Z`/`C`/`V` follow ARM semantics (equal: `Z`+`C`; less: `N`;
+  greater: `C`; unordered: `C`+`V`) and reach APSR through the existing
+  `VMRS APSR_nzcv, FPSCR`.
+- **Conversion**: `VCVT.F32.S32`, `VCVT.F32.U32`, `VCVT.S32.F32`,
+  `VCVT.U32.F32` and the `VCVTR` forms. `VCVT` float→integer truncates
+  toward zero as the architecture specifies (`VCVTR` rounds to nearest, ties
+  to even); NaN yields 0, out-of-range values yield the integer indefinite
+  value, and both set `IOC`.
+- **Conditional select**: `VSELEQ`, `VSELVS`, `VSELGE` and `VSELGT` in the
+  `0xFE` encoding space, driven by the FPSCR condition flags. The selected
+  register is copied bit-for-bit. MicroPython's `mp_format_float` relies on
+  this when printing floats.
+- **Round to integral**: `VRINTR`, `VRINTZ`, `VRINTX` and the directed
+  `VRINTA`/`VRINTN`/`VRINTP`/`VRINTM` forms. The result stays in a
+  single-precision register and no cumulative exception bits are updated.
+- **FPSCR modeling**: `IOC` (invalid operation), `DZC` (divide by zero),
+  `OFC | IXC` (overflow to infinity) and `IXC` (inexact conversion) are set.
+  Underflow (`UFC`), flush-to-zero (`FZ`), default NaN (`DN`), `AHP`,
+  `FPSCR.RMode` values other than round-to-nearest-even, and the trap-enable
+  bits are **not** modeled; NaN propagation follows IEEE-754 quiet-NaN rules.
 - **Enable/fault**: every FPU encoding checks CPACR first. Denied access
   raises a synchronous UsageFault through the real exception path:
   `CFSR.UFSR.NOCP` set, exception number 6, standard frame stacked on
@@ -404,6 +432,29 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   `VLDM`/`VSTM`（含 `VPUSH`/`VPOP` 别名，IA/DB，可带写回）、
   `VMOV` 内核↔S、`VMOV` 两个内核↔D、`VMOV.F32 Sd, #imm`、
   `VMRS`/`VMSR`（含 `VMRS APSR_nzcv, FPSCR`）。
+- **算术**（单精度，Stage 3，`execute_thumb32::fpu_arith`）：`VADD`、
+  `VSUB`、`VMUL`、`VNMUL`、`VMLA`/`VMLS`、`VNMLA`/`VNMLS`、`VDIV`、
+  融合乘加 `VFMA`/`VFMS`/`VFNMA`/`VFNMS`，以及 `VMOV.F32 Sd, Sm`、
+  `VABS`、`VNEG`、`VSQRT`。融合指令使用 `f32::mul_add`，乘加只做一次
+  舍入，与硬件一致；`VMLA`/`VMLS` 按架构规定保留两次舍入。
+  `VABS`/`VNEG` 是纯符号位操作，NaN 载荷原样保留。
+- **比较**：`VCMP`/`VCMPE`，操作数可为寄存器或 `#0.0`。FPSCR 的
+  `N`/`Z`/`C`/`V` 遵循 ARM 语义（相等：`Z`+`C`；小于：`N`；大于：`C`；
+  无序：`C`+`V`），并通过现有的 `VMRS APSR_nzcv, FPSCR` 传到 APSR。
+- **转换**：`VCVT.F32.S32`、`VCVT.F32.U32`、`VCVT.S32.F32`、
+  `VCVT.U32.F32` 以及 `VCVTR` 形式。`VCVT` 浮点→整数按架构规定向零
+  截断（`VCVTR` 为就近舍入、偶数优先）；NaN 返回 0，越界返回整数
+  不确定值，两种情况都置 `IOC`。
+- **条件选择**：`0xFE` 编码空间的 `VSELEQ`、`VSELVS`、`VSELGE`、`VSELGT`，
+  由 FPSCR 条件标志驱动，被选中的寄存器按位复制。MicroPython 的
+  `mp_format_float` 打印浮点数时依赖该指令。
+- **取整**：`VRINTR`、`VRINTZ`、`VRINTX` 以及定向取整
+  `VRINTA`/`VRINTN`/`VRINTP`/`VRINTM`。结果仍为单精度浮点，不更新
+  累积异常位。
+- **FPSCR 建模**：置 `IOC`（无效操作）、`DZC`（除零）、`OFC | IXC`
+  （上溢为无穷）与 `IXC`（不精确转换）。**不建模** `UFC`（下溢）、
+  `FZ` 清零模式、`DN` 默认 NaN、`AHP`、`FPSCR.RMode` 除就近偶数之外的
+  取值以及陷阱使能位；NaN 传播遵循 IEEE-754 静默 NaN 规则。
 - **使能与故障**：每条浮点编码先检查 CPACR。拒绝访问时走真实异常通路：
   置 `CFSR.UFSR.NOCP`，异常号 6，按 CONTROL 在 MSP/PSP 上压标准栈帧，
   `EXC_RETURN` 为 0xFFFFFFF9 / 0xFFFFFFFD / 0xFFFFFFF1；压栈 PC 为
@@ -423,33 +474,40 @@ firmware relying on them can be identified immediately.
 以下编码当前按**未定义指令**上报（记录 PC 与 opcode），绝不静默跳过。
 列表用于快速定位依赖这些功能的固件。
 
-1. `VCVT` between single and double precision (`VCVT.F64.F32`,
-   `VCVT.F32.F64`) — deferred; FPv5-SP arithmetic is single precision only.
-2. `VMOV.F32 Sd, Sm` (FP register to FP register copy).
-3. All floating-point arithmetic, comparisons and conversions (Stage 3):
-   `VADD`, `VSUB`, `VMUL`, `VDIV`, `VSQRT`, `VCMP`, `VCVT` (int↔float),
-   `VABS`, `VNEG`, `VMAXNM`, `VMINNM`, `VCVTR`, etc.
-4. Double-precision arithmetic (`VADD.F64` …) — the D view is storage only.
-5. Lazy FP context stacking: `LSPACT` / `FPCAR` / `FPCCR` are **not modeled**.
+1. Double-precision arithmetic and conversions (`VADD.F64` …, `VCVT.F64.F32`,
+   `VCVT.F32.F64`) — the `D0-D15` view is storage only, and the encodings are
+   reported as undefined instructions.
+2. Half-precision `VCVTB`/`VCVTT`, the 16-bit integer conversion forms
+   (`VCVT.F32.S16`, `VCVT.F32.U16`, `VCVT.S16.F32`, `VCVT.U16.F32`) and the
+   directed float→integer `VCVTA`/`VCVTN`/`VCVTP`/`VCVTM` forms — reported as
+   undefined instructions.
+3. FPSCR `FZ` flush-to-zero, `DN` default-NaN, `AHP`, `UFC` underflow
+   tracking and non-round-to-nearest rounding modes: arithmetic always runs
+   as IEEE-754 binary32 round-to-nearest-even and `VCVTR` always rounds ties
+   to even. No FP trap or exception entry is generated; only the cumulative
+   status bits are updated.
+4. Lazy FP context stacking: `LSPACT` / `FPCAR` / `FPCCR` are **not modeled**.
    Exception entry always stacks the standard 8-word frame immediately;
    there is no extended (26-word) FP frame. If an exception is entered while
    the FPU is active, the core reports this unsupported condition explicitly
    (one warning per core) instead of pretending FP context was preserved.
-6. `CPACR` fields outside CP0-CP7 and CP10-CP11 (CP8/CP9, CP12/CP13)
+5. `CPACR` fields outside CP0-CP7 and CP10-CP11 (CP8/CP9, CP12/CP13)
    always read zero.
 
-1. 单双精度之间的 `VCVT`（`VCVT.F64.F32`、`VCVT.F32.F64`）——延后，
-   FPv5-SP 算术仅支持单精度。
-2. `VMOV.F32 Sd, Sm`（浮点寄存器到浮点寄存器的复制）。
-3. 全部浮点算术、比较与转换（Stage 3）：`VADD`、`VSUB`、`VMUL`、
-   `VDIV`、`VSQRT`、`VCMP`、整数↔浮点 `VCVT`、`VABS`、`VNEG`、
-   `VMAXNM`、`VMINNM`、`VCVTR` 等。
-4. 双精度算术（`VADD.F64` 等）——D 视图仅作存储。
-5. 惰性浮点上下文压栈：**不建模** `LSPACT` / `FPCAR` / `FPCCR`。异常进入
+1. 双精度算术与转换（`VADD.F64` 等、`VCVT.F64.F32`、`VCVT.F32.F64`）——
+   `D0-D15` 视图仅作存储，这些编码按未定义指令上报。
+2. 半精度 `VCVTB`/`VCVTT`、16 位整数转换形式（`VCVT.F32.S16`、
+   `VCVT.F32.U16`、`VCVT.S16.F32`、`VCVT.U16.F32`）以及定向浮点→整数
+   `VCVTA`/`VCVTN`/`VCVTP`/`VCVTM`——按未定义指令上报。
+3. FPSCR 的 `FZ` 清零模式、`DN` 默认 NaN、`AHP`、`UFC` 下溢统计以及
+   非就近舍入模式：算术恒按 IEEE-754 binary32 就近舍入、偶数优先执行，
+   `VCVTR` 恒按就近偶数舍入。不产生浮点陷阱或异常进入，只更新累积
+   状态位。
+4. 惰性浮点上下文压栈：**不建模** `LSPACT` / `FPCAR` / `FPCCR`。异常进入
    始终立即压入标准 8 字帧，不存在 26 字扩展帧；若浮点单元处于活跃状态时
    进入异常，核心会显式报告这一未支持条件（每个核仅告警一次），而不是
    假装已经保存了浮点上下文。
-6. CP0-CP7 与 CP10-CP11 之外的 CPACR 字段（CP8/CP9、CP12/CP13）恒读为 0。
+5. CP0-CP7 与 CP10-CP11 之外的 CPACR 字段（CP8/CP9、CP12/CP13）恒读为 0。
 
 ---
 

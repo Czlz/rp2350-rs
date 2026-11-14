@@ -1,24 +1,27 @@
-//! Floating-point data movement instructions (Stage 2)
-//! 浮点数据搬移指令（Stage 2）
+//! Floating-point data movement and dispatch (Stage 2 + Stage 3)
+//! 浮点数据搬移与分派（Stage 2 + Stage 3）
 //!
 //! Implements `VLDR`/`VSTR`, `VLDM`/`VSTM`, `VMOV`, `VMRS` and `VMSR` for
-//! the FPv5-SP unit. Double-precision arithmetic is not implemented; the
-//! `D0-D15` view exists only for block transfers and 64-bit core transfers.
+//! the FPv5-SP unit and dispatches the single-precision data-processing
+//! encodings to [`super::fpu_arith`]. Double-precision arithmetic is not
+//! implemented; the `D0-D15` view exists only for block transfers and 64-bit
+//! core transfers.
 //! 实现 FPv5-SP 单元的 `VLDR`/`VSTR`、`VLDM`/`VSTM`、`VMOV`、`VMRS` 与
-//! `VMSR`。不实现双精度算术；`D0-D15` 视图仅用于块传输和 64 位内核传输。
+//! `VMSR`，并把单精度数据处理编码分派给 [`super::fpu_arith`]。不实现双精度
+//! 算术；`D0-D15` 视图仅用于块传输和 64 位内核传输。
 //!
 //! ## Not implemented / 未实现清单
 //!
 //! - `VCVT` between single and double precision (reported as undefined)
 //!   单精度与双精度之间的 `VCVT`（按未定义指令上报）
-//! - `VMOV` between two FP registers (`VMOV.F32 Sd, Sm`)
-//!   两个浮点寄存器之间的 `VMOV`（`VMOV.F32 Sd, Sm`）
+//! - Double-precision arithmetic (`VADD.F64` …) — the D view is storage only
+//!   双精度算术（`VADD.F64` 等）—— D 视图仅作存储
+//! - Half-precision `VCVTB`/`VCVTT`, 16-bit integer `VCVT` and `VRINT*`
+//!   半精度 `VCVTB`/`VCVTT`、16 位整数 `VCVT` 与 `VRINT*`
 //! - Lazy FP context stacking (`LSPACT`/`FPCAR`/`FPCCR` are not modeled; an
 //!   exception taken with live FP state logs an explicit unsupported warning)
 //!   惰性浮点上下文压栈（不建模 `LSPACT`/`FPCAR`/`FPCCR`；浮点活跃时进入
 //!   异常会显式告警未支持）
-//! - All floating-point arithmetic and comparisons (Stage 3)
-//!   全部浮点算术与比较（Stage 3）
 
 // 位域解码与寄存器索引转换是 ARM 仿真固有特征。
 // Bitfield decoding and register index conversions are inherent to ARM emulation.
@@ -55,6 +58,16 @@ pub(super) fn try_execute(
         return Ok(Some(execute_transfer(instr, kind, regs)));
     }
 
+    // Floating-point arithmetic, comparison, conversion and conditional
+    // select (Stage 3) occupy the `0xEE` data-processing and `0xFE` `VSEL`
+    // encoding spaces, which are disjoint from the extension-register
+    // load/store encodings below.
+    // 浮点算术、比较、转换与条件选择（Stage 3）位于 `0xEE` 数据处理空间与
+    // `0xFE` 的 `VSEL` 空间，与下方的扩展寄存器加载/存储编码互不重叠。
+    if let Some(result) = super::fpu_arith::try_execute(instr, regs) {
+        return Ok(Some(result));
+    }
+
     if is_extension_load_store(instr) {
         if !begin_fp_instruction(regs) {
             return Ok(Some(StepResult::Ok));
@@ -87,7 +100,7 @@ fn is_extension_load_store(instr: u32) -> bool {
 /// pending UsageFault is recorded for the core to enter immediately.
 /// 允许执行时返回 `true`。被拒绝时把 PC 回退到故障指令以保证压栈帧正确，
 /// 并记录待处理的用法故障，由核心立即进入异常。
-fn begin_fp_instruction(regs: &mut CortexM33Registers) -> bool {
+pub(super) fn begin_fp_instruction(regs: &mut CortexM33Registers) -> bool {
     if regs.fp_access_enabled() {
         regs.fpu.fpexc |= fpexc::EN;
         return true;

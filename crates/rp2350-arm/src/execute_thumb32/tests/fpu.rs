@@ -1,5 +1,7 @@
-//! FPU data-movement tests: VLDR/VSTR, VLDM/VSTM, VMOV, VMRS/VMSR, NOCP
-//! 浮点数据搬移测试：VLDR/VSTR、VLDM/VSTM、VMOV、VMRS/VMSR、NOCP
+//! FPU tests: data movement (VLDR/VSTR, VLDM/VSTM, VMOV, VMRS/VMSR), single
+//! precision arithmetic/comparison/conversion (Stage 3) and NOCP
+//! 浮点测试：数据搬移（VLDR/VSTR、VLDM/VSTM、VMOV、VMRS/VMSR）、单精度
+//! 算术/比较/转换（Stage 3）与 NOCP
 
 use crate::execute_thumb16::StepResult;
 use crate::execute_thumb32::test_support::{TestBus, run};
@@ -12,6 +14,18 @@ fn regs_with_fpu() -> CortexM33Registers {
     let mut regs = CortexM33Registers::new();
     regs.cpacr = cpacr::CP10_CP11_MASK;
     regs
+}
+
+/// Write one single-precision register from an `f32` value
+/// 以 `f32` 值写入一个单精度寄存器
+fn write_f32(regs: &mut CortexM33Registers, index: u8, value: f32) {
+    regs.fpu.write_s(index, value.to_bits());
+}
+
+/// Read one single-precision register as an `f32` value
+/// 以 `f32` 值读取一个单精度寄存器
+fn read_f32(regs: &CortexM33Registers, index: u8) -> f32 {
+    f32::from_bits(regs.fpu.read_s(index))
 }
 
 // === VMRS / VMSR ===
@@ -330,3 +344,5 @@ fn fpu_access_without_cpacr_rewinds_pc_and_raises_usage_fault() {
     assert_eq!(r.fpu.fpexc & fpexc::EN, 0, "FPEXC.EN must stay clear");
     assert_eq!(r.fpu.read_s(0), 0, "no data may be transferred");
 }
+
+mod arith;

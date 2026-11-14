@@ -48,6 +48,7 @@ mod coproc;
 mod data_processing;
 mod dsp;
 mod fpu;
+mod fpu_arith;
 mod load_store;
 mod multiple;
 mod multiply;
