@@ -25,7 +25,8 @@
 - ✅ **MCP** — JSON-RPC 方法层 + HTTP/1.1 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权
 - ✅ **插件系统** — libloading 动态加载 `.dll`/`.so`/`.dylib`，目录扫描 + CLI `list-devices`/`wire`，LED 与 UART Terminal 插件
 - 🚧 **双核** — core1 常驻 WFE（SIO FIFO/门铃语义保留），`DualCoreM33` 调度脚手架已落地；PSM/SIO/CLI 接线待补
-- ⏳ **DMA**（16 通道链式 + DREQ）、**HSTX** 视频输出、**Virtual Electronics Lab**（egui 拖线连线）、**PSRAM** — 规划中
+- 🚧 **DMA** — 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ、abort、IRQ（库级 `Dma::run`；CLI pump 待接）
+- ⏳ **HSTX** 视频输出、**Virtual Electronics Lab**（egui 拖线连线）、**PSRAM** — 规划中
 
 ---
 

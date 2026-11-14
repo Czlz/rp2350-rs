@@ -14,6 +14,7 @@
 | **RISC-V** | Hazard3 RV32IMAC + C（已实现，CLI `--arch riscv` 可用） |
 | **USB** | 设备控制器模型 + 主机桥 + raw REPL：真实 MicroPython UF2 → 官方 `run-perfbench.py` 全链路可跑（Arm/RISC-V 各 24/24） |
 | **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）+ 引脚/side-set/delay/CLKDIV/FIFO join；DMA/IRQ 路由待补 |
+| **DMA** | 16 通道模型 + 控制块 + AL 触发 + byte/half/word + RING/CHAIN_TO/DREQ/IRQ（库级 `Dma::run`；CLI pump 待接） |
 | **GUI** | egui 0.37 (eframe + wgpu) — 寄存器面板（Virtual Electronics Lab 规划中） |
 | **Debug** | GDB RSP：协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、内存、断点、resume）；watchpoint/多核 vCont 规划中 |
 | **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权 |

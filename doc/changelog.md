@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `rp2350-periph`: RP2350 DMA controller — 16 channels, control blocks, AL1/AL2/AL3 triggers, byte/half/word copies, address increments, RING wrap, CHAIN_TO, DREQ gating, abort, INTR/INTE/INTF/INTS and `BootPeripherals::dma()`; `Dma::run` is library-driven and the CLI pump is deferred; 20 tests
+- `rp2350-gdb`: write watchpoints — RSP `Z2`/`z2` with 1/2/4/8-byte kinds, idempotent insert/remove, `Z3`/`Z4` fallback, `T05watch:<addr>;` stop replies, and CLI `MachineTarget` value-change detection limited to SRAM (snapshot reads do not advance machine cycles)
+- `rp2350-virt-periph`: plugin hot reload — `Fingerprint`/`ReloadReport`, `DeviceManager::reload` (instance-before-library drop order), added/removed/reloaded/failed reporting, and CLI `list-devices --reload`/`--watch`; 20 new tests
 - `rp2350-arm`: Cortex-M33 lazy FP context stacking — `FPCCR`/`FPCAR`/`FPDSCR`, 17-word FP context plus an alignment word, `LSPACT` deferral, first-FP-instruction commit, extension-frame `EXC_RETURN`, return-time reclaim/restore, nested commits, and corrected PSP thread `EXC_RETURN`; 18 new tests
 - `rp2350-periph`: PIO pin model and timing — 32-bit input/output/output-enable levels, `PINCTRL` OUT/SET/IN/SIDESET base+count mapping, side-set (including optional `SIDE_PINDIR`), instruction delay cycles, 16.8 `CLKDIV` gating, `JMP PIN`/`WAIT PIN`/`WAIT GPIO`, `SET/OUT PINDIRS`, FIFO join (`FJOIN_TX`/`FJOIN_RX`, 4/8/0 depth) and real `DBG_PADOUT`/`DBG_PADOE` readback; 22 new tests
 - `rp2350-mcp`: HTTP Bearer-token authentication — `Auth`/`HttpOptions`, constant-time token comparison, `401` + `WWW-Authenticate: Bearer` for `POST /mcp`, open `GET /health` with `auth` flag, CLI `mcp-serve --auth-token` / `RP2350_MCP_TOKEN`, token-redacting `Debug`; 15 new tests
