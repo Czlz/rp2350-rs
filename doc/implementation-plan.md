@@ -18,17 +18,41 @@
 > **门禁规则 / Gate rule**: 对应内核必须先跑通下列固件，才允许进入下一任务。
 > **Gate rule**: the core owning each firmware must pass its gate command before
 > the next task may start. 参考实现 / reference implementation: `E:\Source\mcu\pico\rp2350js`。
+> 操作手册 / Playbook: `.opencode/skills/firmware-verification/SKILL.md`
+> （验收命令、诊断步骤、子任务拆分模板与已知缺口 / gate commands, diagnostics, task template, known gaps）。
 
 | ID | 固件 / Firmware | 架构 / Core | 验证命令 / Gate command | 状态 / Status |
 |----|-----------------|-------------|--------------------------|---------------|
-| FV-1 | `E:\Source\mcu\pico\python\micropython\RPI_PICO2-RISCV-20260824-v1.29.0.uf2`（MicroPython RISC-V） | Hazard3（`rp2350-riscv`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`；`run --strict-decode` 全程无未定义指令停机 | ⬜ 未通过 / not passed |
-| FV-2 | `E:\Source\mcu\pico\python\micropython\RPI_PICO2-20260824-v1.29.0.uf2`（MicroPython Arm） | Cortex-M33（`rp2350-arm`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`；`perfbench` 至少一个基准出结果（回归项，随每次内核改动复跑） | 🚧 主线已跑通（Stages 0–5），作为回归门禁持续复跑 / mainline passes (Stages 0–5), kept as a recurring regression gate |
-| FV-3 | `E:\Source\mcu\pico\python\circuitpython\adafruit-circuitpython-raspberry_pi_pico2-zh_Latn_pinyin-10.3.1.uf2`（CircuitPython Arm） | Cortex-M33（`rp2350-arm`） | `rp2350 run --file <该文件>` 完成启动（无 strict-decode 停机、有节奏的时钟推进）；目标 `repl` 交互可用 | ⬜ 未通过 / not passed |
+| FV-1 | `E:\Source\mcu\pico\python\micropython\RPI_PICO2-RISCV-20260824-v1.29.0.uf2`（MicroPython RISC-V） | Hazard3（`rp2350-riscv`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`；`run --strict-decode` 全程无未定义指令停机 | ✅ 通过 / passed（2026-11-14）— `[repl] USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`、`[repl] banner`、`stdout: 42`（2,659,500 步 / 17,730 µs）；`run --arch riscv --strict-decode --max-cycles 50000000` 无未定义指令（终态 `PC=0x10046E64`）。根因修复：Zcmp/`C.LUI`/Zb\* 语义、Xh3irq 抢占与 NOIRQ、CSR 数组窗口索引 |
+| FV-2 | `E:\Source\mcu\pico\python\micropython\RPI_PICO2-20260824-v1.29.0.uf2`（MicroPython Arm） | Cortex-M33（`rp2350-arm`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`；`perfbench` 至少一个基准出结果（回归项，随每次内核改动复跑） | ✅ 通过 / passed（2026-11-14）— `stdout: 42`；`bm_nqueens --n 40 --m 10` → `measured: ticks_us=19266 norm=100 result=10` |
+| FV-3 | `E:\Source\mcu\pico\python\circuitpython\adafruit-circuitpython-raspberry_pi_pico2-zh_Latn_pinyin-10.3.1.uf2`（CircuitPython Arm） | Cortex-M33（`rp2350-arm`） | `rp2350 repl --file <该文件> --exec "print(6 * 7)"` 输出 `42`（配置成功 + banner） | ✅ 通过 / passed（2026-11-14）— 根因修复：16 位 `SXTB/SXTH/UXTB/UXTH` 不再更新 APSR（此前误置 Z 导致 TinyUSB 驱动循环提前退出并对 EP0 布防 STALL）。实测 `[repl] USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`、`[repl] banner`、`stdout: 42` |
 
 > 状态标记 / status markers: ✅ 通过 · 🚧 部分通过 · ⬜ 未通过。通过一条门禁后，
 > 将其状态、日期与验证命令输出摘要记录到 [changelog.md](changelog.md)。
 > After a gate passes, record its status, date and command output summary in
 > [changelog.md](changelog.md).
+
+### 门禁备注 / Gate notes
+
+- **FV-2（通过 / passed）**：回归修复了 5 个真实内核缺陷 —— Thumb-16/32 `LDM`
+  基址在加载列表时不写回、USB OUT `BUF_CTRL.LEN` 覆盖旧值、PSM 与 core1
+  bootrom FIFO 握手、异常进入/返回保存 `ITSTATE`、Thumb-16 `ADDS/SUBS`
+  完整 NZCV。命令输出见 changelog。
+- **FV-3（通过 / passed，2026-11-14）**：`run --strict-decode --max-cycles 100000000`
+  已完成 200 ms 首次启动延时、BOOTRAM boot2 拷贝并进入主循环，无未定义指令；
+  时钟推进 100,000,000 步 / 666,666 µs。`repl` 的 `SET_CONFIGURATION` 状态阶段
+  STALL 根因是 ARM 16 位 `SXTB/SXTH/UXTB/UXTH` 错误更新 APSR：CircuitPython
+  的 `process_set_config` 依赖 `UXTB` 不改变 Z 标志，Z 被误置后 `bls` 提前跳出，
+  TinyUSB 随即 `dcd_edpt_stall(EP0_OUT/IN)`。修复后实测
+  `[repl] USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`、
+  `[repl] banner`、`stdout: 42`。同时修正 `rp2350-usb` 的 `EP_ABORT`
+  位解码（`bit = 2*ep + dir`）与 SETUP 时清除 `EP_STALL_ARM`。
+- **FV-1（通过 / passed，2026-11-14）**：启动路径与 USB REPL 全部打通。修复：
+  boot2 `0x7DF8` 数据查找槽、Zb\*/Zcb/C.LUI/Zcmp 语义、Xh3irq 优先级/抢占/
+  NOIRQ/`meinext.update` 认领、CSR 数组窗口改用原始操作数选窗、同步异常只走
+  `mtvec` 基址、`repl --arch` 覆盖。实测 `[repl] USB CDC configured`、
+  `[repl] banner`、`stdout: 42`。遗留改进项（非阻塞）：`repl` 失败路径诊断、
+  `misa` B 位、其余 RISC-V ROM 表项。
 
 ---
 
