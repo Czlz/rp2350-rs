@@ -263,6 +263,8 @@ mod rsp_tests {
     #[test]
     fn thread_and_detach_commands_reply_ok() {
         let mut session = session();
+        assert_eq!(session.handle_packet("qfThreadInfo").as_deref(), Some("m1"));
+        assert_eq!(session.handle_packet("qsThreadInfo").as_deref(), Some("l"));
         assert_eq!(session.handle_packet("qC").as_deref(), Some("QC1"));
         assert_eq!(session.handle_packet("qAttached").as_deref(), Some("1"));
         assert_eq!(session.handle_packet("Hg0").as_deref(), Some("OK"));

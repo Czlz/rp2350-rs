@@ -564,6 +564,15 @@ impl<T: GdbTarget> Session<T> {
         if payload.starts_with("qAttached") {
             return "1".to_string();
         }
+        if payload == "qfThreadInfo" {
+            // One stopped thread; without this GDB declares "Thread 1 exited"
+            // and refuses to continue. / 只有一个线程；缺少该回复时 GDB 会判定
+            // “Thread 1 exited” 并拒绝继续。
+            return "m1".to_string();
+        }
+        if payload == "qsThreadInfo" {
+            return "l".to_string();
+        }
         if payload == "qC" {
             return "QC1".to_string();
         }
