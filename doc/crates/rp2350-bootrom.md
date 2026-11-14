@@ -73,12 +73,13 @@ guest through `lr` or halts with a `HaltReason`.
 `handles(core.pc())`；命中则调用 `dispatch` —— 陷阱步消耗一个周期、增加指令
 计数，随后要么经 `lr` 返回客户机，要么以 `HaltReason` 停机。
 
-Note: in the CLI the boot ROM traps only apply to **Arm** cores
-(`bootrom_applicable` is false for RISC-V); Arm boot vectors are also read
+Both architectures use the synthetic ROM: Arm stubs follow the `udf`/`lr` ABI,
+while RISC-V stubs take arguments in `a0..a3` and return through `ra` (the CLI
+dispatches them with the same `TrapDispatcher`). Arm boot vectors are read
 from the flash XIP base, not from the ROM window.
-注意：CLI 中 boot ROM 陷阱只对 **Arm** 核生效（RISC-V 时
-`bootrom_applicable` 为 false）；Arm 启动向量同样读取自 Flash XIP 基地址，
-而不是 ROM 窗口。
+两种架构都使用合成 ROM：Arm 桩遵循 `udf`/`lr` ABI，RISC-V 桩以 `a0..a3`
+传参并经 `ra` 返回（CLI 用同一个 `TrapDispatcher` 分发）。Arm 启动向量读取自
+Flash XIP 基地址，而不是 ROM 窗口。
 
 ---
 
@@ -95,6 +96,10 @@ Header fields follow the pico-sdk `bootrom_constants.h` offsets:
 | `0x7C00` | Function/data table / 函数数据表 | built by `RomTableBuilder` |
 | `0x7D00` | `FLASH_DEVINFO` word / 设备信息字 | `0x0C00` (CS0 = 16 MB, code 0xC at bits 11:8) |
 | `0x7D04` | `FLASH_DEVINFO` pointer literal / 指针字面量 | `0x0000_7D00` |
+| `0x7DF8` | RISC-V `rom_data_lookup` pointer / 指针 | `0x75FE` |
+| `0x7DFA` | RISC-V `rom_func_lookup` pointer / 指针 | `0x75C2` |
+| `0x7E00` | RISC-V exception vector table / 异常向量表 | cause 2/5 → `0x7F00` |
+| `0x7F00` | RISC-V fatal-trap diagnostic stub / 致命陷阱诊断桩 | prints `mcause`/`mepc`/`mtval`, halts cleanly |
 
 Every callable function lives at a small `udf #id` stub: `rom_table_lookup`
 at `0x74` (trap id 0) and the eight ROM functions at

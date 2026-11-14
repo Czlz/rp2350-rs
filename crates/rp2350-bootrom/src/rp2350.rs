@@ -64,6 +64,65 @@ const DEVINFO_OFFSET: usize = 0x7D00;
 /// `rom_data_lookup` 返回的是指向该字面量的指针，而非字本身：
 /// `flash_devinfo_ptr()` 对它解引用一次才得到 `DEVINFO_OFFSET` 处的 16 位字。
 const DEVINFO_PTR_OFFSET: usize = 0x7D04;
+/// RISC-V slot holding the `rom_func_lookup` entry point / 存放 RISC-V `rom_func_lookup` 入口的槽位
+///
+/// The RP2350 RISC-V boot2 loads a 16-bit pointer from `0x7DFA` and calls it
+/// with `(code, mask)` in `a0`/`a1`. The real ROM stores `0x75C2` there; the
+/// synthetic image mirrors that value so the boot2 finds a host trap stub.
+/// RP2350 的 RISC-V boot2 从 `0x7DFA` 加载 16 位指针，并以 `a0`/`a1` 传入
+/// `(code, mask)` 调用它。真实 ROM 在此存放 `0x75C2`；合成镜像沿用该值，使
+/// boot2 命中宿主陷阱桩。
+const RV_LOOKUP_PTR_OFFSET: usize = 0x7DFA;
+/// Address of the RISC-V `rom_func_lookup` trap stub / RISC-V `rom_func_lookup` 陷阱桩地址
+const RV_LOOKUP_STUB: u32 = 0x75C2;
+/// RISC-V slot holding the `rom_data_lookup` value wrapper
+/// 存放 RISC-V `rom_data_lookup` 取值包装的槽位
+///
+/// The real ROM exposes two adjacent halfword entry points: `0x7DFA` holds
+/// `rom_func_lookup` (`0x75C2`) and `0x7DF8` holds `rom_data_lookup`
+/// (`0x75FE`), which performs the table lookup and then loads the 16-bit
+/// value. `MicroPython`'s SRAM flash helper reads the latter slot.
+/// 真实 ROM 暴露两个相邻半字入口：`0x7DFA` 存放 `rom_func_lookup`
+/// （`0x75C2`），`0x7DF8` 存放 `rom_data_lookup`（`0x75FE`），后者先查表再
+/// 读取 16 位值。MicroPython 的 SRAM flash 辅助代码读取的是后者。
+const RV_DATA_LOOKUP_PTR_OFFSET: usize = 0x7DF8;
+/// Address of the RISC-V `rom_data_lookup` value wrapper
+/// RISC-V `rom_data_lookup` 取值包装的地址
+const RV_DATA_LOOKUP_STUB: u32 = 0x75FE;
+/// First RISC-V function trap stub address / 首个 RISC-V 函数陷阱桩地址
+const RV_STUB_BASE: u32 = 0x7600;
+/// Distance between RISC-V function trap stubs / RISC-V 函数陷阱桩间距
+const RV_STUB_STRIDE: u32 = 0x10;
+
+/// Base of the synthetic RISC-V fatal-exception vector table
+/// 合成 RISC-V 致命异常向量表基地址
+///
+/// The table lives in the unused tail of the 32 KB ROM window. Each slot is a
+/// `jal x0` to [`RISCV_EXCEPTION_HANDLER`], so it is executable both by the
+/// host dispatcher and by a real core when no host intercept is installed.
+/// 该表位于 32 KB ROM 窗口末尾的未使用区域。每个槽位都是跳向
+/// [`RISCV_EXCEPTION_HANDLER`] 的 `jal x0`，既可被宿主分发器拦截，也可在未安装
+/// 宿主拦截时由真实核心直接执行。
+pub const RISCV_EXCEPTION_VECTOR_BASE: Address = 0x0000_7E00;
+/// Common diagnostic handler for the synthetic RISC-V exception vectors
+/// 合成 RISC-V 异常向量的公共诊断处理程序
+pub const RISCV_EXCEPTION_HANDLER: Address = 0x0000_7F00;
+/// Exception causes routed through the synthetic fatal vector
+/// 经由合成致命向量路由的异常原因
+///
+/// At least illegal instruction (2) and load access fault (5); both are fatal
+/// during bring-up and would otherwise loop through an unfilled guest vector.
+/// 至少包含非法指令（2）与加载访问错误（5）；两者在启动阶段都是致命的，否则
+/// 会在固件未填充的向量槽内循环。
+pub const RISCV_FATAL_CAUSES: [u32; 2] = [2, 5];
+/// Number of RISC-V exception vector slots written to the image
+/// 镜像中写入的 RISC-V 异常向量槽数量
+const RV_EXCEPTION_VECTOR_SLOTS: u32 = 16;
+/// Trap identifier of the RISC-V `rom_func_lookup` stub / RISC-V `rom_func_lookup` 占位桩的陷阱标识
+const TRAP_RV_LOOKUP: u16 = 0x0100;
+/// Trap identifier of the RISC-V `rom_data_lookup` value wrapper
+/// RISC-V `rom_data_lookup` 取值包装的陷阱标识
+const TRAP_RV_DATA_LOOKUP: u16 = 0x0101;
 /// Flash device info: CS0 = 16 MB, CS1 absent / Flash 设备信息：CS0 = 16 MB，无 CS1
 ///
 /// pico-sdk `hardware/flash.h` encodes sizes as `4096 << code` with
@@ -113,12 +172,13 @@ const ERROR_BUFFER_TOO_SMALL: u32 = 0xFFFF_FFF3;
 const ERROR_INVALID_ARG: u32 = 0xFFFF_FFEC;
 
 /// Every ROM function this image exposes / 本镜像暴露的所有 ROM 函数
-const ALL_TRAPS: [Trap; 8] = [
+const ALL_TRAPS: [Trap; 9] = [
     Trap::ConnectFlash,
     Trap::ExitXip,
     Trap::RangeErase,
     Trap::RangeProgram,
     Trap::FlushCache,
+    Trap::EnterCmdXip,
     Trap::SysInfo,
     Trap::Reboot,
     Trap::StateReset,
@@ -137,6 +197,8 @@ enum Trap {
     RangeProgram,
     /// `rom_flash_flush_cache` / 刷新缓存
     FlushCache,
+    /// `rom_flash_enter_cmd_xip` / 进入命令模式 XIP
+    EnterCmdXip,
     /// `rom_get_sys_info` / 获取系统信息
     SysInfo,
     /// `rom_reboot` / 重启
@@ -154,9 +216,10 @@ impl Trap {
             Self::RangeErase => 3,
             Self::RangeProgram => 4,
             Self::FlushCache => 5,
-            Self::SysInfo => 6,
-            Self::Reboot => 7,
-            Self::StateReset => 8,
+            Self::EnterCmdXip => 6,
+            Self::SysInfo => 7,
+            Self::Reboot => 8,
+            Self::StateReset => 9,
         }
     }
 
@@ -168,14 +231,20 @@ impl Trap {
             3 => Some(Self::RangeErase),
             4 => Some(Self::RangeProgram),
             5 => Some(Self::FlushCache),
-            6 => Some(Self::SysInfo),
-            7 => Some(Self::Reboot),
-            8 => Some(Self::StateReset),
+            6 => Some(Self::EnterCmdXip),
+            7 => Some(Self::SysInfo),
+            8 => Some(Self::Reboot),
+            9 => Some(Self::StateReset),
             _ => None,
         }
     }
 
     /// Table tag of the function / 函数的表标签
+    ///
+    /// RISC-V boot2 looks up `IX` for `rom_flash_exit_xip` while the Arm SDK
+    /// uses `EX`; [`Self::from_tag`] accepts both.
+    /// RISC-V boot2 用 `IX` 查询 `rom_flash_exit_xip`，而 Arm SDK 使用 `EX`；
+    /// [`Self::from_tag`] 两者都接受。
     const fn tag(self) -> TableCode {
         match self {
             Self::ConnectFlash => code(b'I', b'F'),
@@ -183,15 +252,37 @@ impl Trap {
             Self::RangeErase => code(b'R', b'E'),
             Self::RangeProgram => code(b'R', b'P'),
             Self::FlushCache => code(b'F', b'C'),
+            Self::EnterCmdXip => code(b'C', b'X'),
             Self::SysInfo => code(b'G', b'S'),
             Self::Reboot => code(b'R', b'B'),
             Self::StateReset => code(b'S', b'R'),
         }
     }
 
+    /// Decode a boot ROM function tag / 解码 boot ROM 函数标签
+    const fn from_tag(tag: TableCode) -> Option<Self> {
+        match tag {
+            0x4649 => Some(Self::ConnectFlash),     // IF
+            0x5845 | 0x5849 => Some(Self::ExitXip), // EX / IX
+            0x4552 => Some(Self::RangeErase),       // RE
+            0x5052 => Some(Self::RangeProgram),     // RP
+            0x4346 => Some(Self::FlushCache),       // FC
+            0x5843 => Some(Self::EnterCmdXip),      // CX
+            0x5347 => Some(Self::SysInfo),          // GS
+            0x4252 => Some(Self::Reboot),           // RB
+            0x5253 => Some(Self::StateReset),       // SR
+            _ => None,
+        }
+    }
+
     /// Thumb stub address in the image / 镜像中的 Thumb 占位桩地址
     const fn stub(self) -> u32 {
         STUB_BASE + 2 * (self.id() - 1) as u32
+    }
+
+    /// RISC-V stub address in the image / 镜像中的 RISC-V 占位桩地址
+    const fn rv_stub(self) -> u32 {
+        RV_STUB_BASE + RV_STUB_STRIDE * (self.id() - 1) as u32
     }
 }
 
@@ -219,8 +310,11 @@ impl Rp2350Bootrom {
         });
         let mut dispatcher = TrapDispatcher::new(handler);
         dispatcher.register(LOOKUP_STUB, TrapId(TRAP_LOOKUP));
+        dispatcher.register(RV_LOOKUP_STUB, TrapId(TRAP_RV_LOOKUP));
+        dispatcher.register(RV_DATA_LOOKUP_STUB, TrapId(TRAP_RV_DATA_LOOKUP));
         for trap in ALL_TRAPS {
             dispatcher.register(trap.stub(), TrapId(trap.id()));
+            dispatcher.register(trap.rv_stub(), TrapId(trap.id()));
         }
         Self { image, dispatcher }
     }
@@ -229,6 +323,27 @@ impl Rp2350Bootrom {
     #[must_use]
     pub fn image(&self) -> &[u8] {
         &self.image
+    }
+
+    /// Return the synthetic RISC-V fatal-exception vector base
+    /// 返回合成 RISC-V 致命异常向量基地址
+    ///
+    /// Hosts install this with `Hazard3Core::set_fatal_trap_vector` so causes
+    /// 2 and 5 reach the diagnostic handler instead of a guest vector slot.
+    /// 宿主应通过 `Hazard3Core::set_fatal_trap_vector` 安装该地址，使 cause 2 与
+    /// 5 进入诊断处理程序而非客户机向量槽。
+    #[must_use]
+    pub const fn riscv_exception_vector(&self) -> Address {
+        RISCV_EXCEPTION_VECTOR_BASE
+    }
+
+    /// Report whether `pc` is a synthetic RISC-V fatal-exception vector slot
+    /// 报告 `pc` 是否为合成 RISC-V 致命异常向量槽
+    #[must_use]
+    fn is_riscv_exception_vector(pc: u32) -> bool {
+        RISCV_FATAL_CAUSES
+            .iter()
+            .any(|cause| pc == RISCV_EXCEPTION_VECTOR_BASE.wrapping_add(4 * cause))
     }
 
     /// Register the read-only ROM window on `bus` / 在 `bus` 上注册只读 ROM 窗口
@@ -244,10 +359,11 @@ impl Rp2350Bootrom {
         )))
     }
 
-    /// Report whether `pc` is a trap stub / 报告 `pc` 是否为陷阱占位桩
+    /// Report whether `pc` is a trap stub or a fatal-exception vector slot
+    /// 报告 `pc` 是否为陷阱占位桩或致命异常向量槽
     #[must_use]
     pub fn handles(&self, pc: u32) -> bool {
-        self.dispatcher.handles(pc)
+        Self::is_riscv_exception_vector(pc) || self.dispatcher.handles(pc)
     }
 
     /// Dispatch the trap at the core's current PC / 分发核心当前 PC 处的陷阱
@@ -260,8 +376,39 @@ impl Rp2350Bootrom {
         core: &mut dyn rp2350_cpu::CpuCore,
         bus: &mut dyn AddressBus,
     ) -> Result<Option<TrapOutcome>, CoreError> {
+        let pc = core.pc();
+        if Self::is_riscv_exception_vector(pc)
+            && matches!(core.arch(), rp2350_cpu::CpuArch::RiscVHazard3)
+        {
+            let mcause = core.csr_read(0x342);
+            let mepc = core.csr_read(0x341);
+            let mtval = core.csr_read(0x343);
+            // Keep the post-mortem PC on the faulting instruction so the
+            // final report points into Flash/SRAM rather than the ROM vector.
+            // 把停机 PC 留在出错指令上，使最终报告指向 Flash/SRAM 而不是 ROM 向量。
+            core.set_pc(mepc);
+            return Ok(Some(TrapOutcome {
+                result: 0,
+                cycles: 4,
+                halt: Some(HaltReason::RiscvException {
+                    mcause,
+                    mepc,
+                    mtval,
+                }),
+            }));
+        }
         self.dispatcher.dispatch(core, bus)
     }
+}
+
+/// Encode `jal x0, target` for a RISC-V exception vector slot
+/// 为 RISC-V 异常向量槽编码 `jal x0, target`
+fn riscv_jal_x0(from: u32, to: u32) -> u32 {
+    let value = to.wrapping_sub(from);
+    0x6F | (((value >> 20) & 1) << 31)
+        | (((value >> 1) & 0x3FF) << 21)
+        | (((value >> 11) & 1) << 20)
+        | (((value >> 12) & 0xFF) << 12)
 }
 
 /// Build the 32 KB synthetic image / 构建 32 KB 合成镜像
@@ -271,9 +418,26 @@ fn build_image() -> Vec<u8> {
     image.write_u16(FUNC_TABLE_PTR_OFFSET, TABLE_OFFSET as u16);
     image.write_u16(LOOKUP_PTR_OFFSET, (LOOKUP_STUB as u16) | 1);
     image.trap_stub(LOOKUP_STUB as usize, TRAP_LOOKUP);
+    // RISC-V boot2 reads the lookup entry point from a fixed halfword slot and
+    // calls it directly; expose the same trap through that slot.
+    // RISC-V boot2 从固定半字槽读取查询入口并直接调用；通过该槽暴露同一陷阱。
+    image.write_u16(RV_LOOKUP_PTR_OFFSET, RV_LOOKUP_STUB as u16);
+    image.riscv_trap_stub(RV_LOOKUP_STUB as usize);
+    image.write_u16(RV_DATA_LOOKUP_PTR_OFFSET, RV_DATA_LOOKUP_STUB as u16);
+    image.riscv_trap_stub(RV_DATA_LOOKUP_STUB as usize);
     for trap in ALL_TRAPS {
         image.trap_stub(trap.stub() as usize, trap.id());
+        image.riscv_trap_stub(trap.rv_stub() as usize);
     }
+    // RISC-V fatal-exception vectors: every slot jumps to the common handler,
+    // which is a `ebreak` stub the host dispatcher intercepts.
+    // RISC-V 致命异常向量：每个槽位跳到公共处理程序，后者是宿主分发器拦截的
+    // `ebreak` 占位桩。
+    for cause in 0..RV_EXCEPTION_VECTOR_SLOTS {
+        let slot = RISCV_EXCEPTION_VECTOR_BASE + 4 * cause;
+        image.write_u32(slot as usize, riscv_jal_x0(slot, RISCV_EXCEPTION_HANDLER));
+    }
+    image.riscv_trap_stub(RISCV_EXCEPTION_HANDLER as usize);
 
     let mut table = RomTableBuilder::new();
     for trap in ALL_TRAPS {
@@ -303,6 +467,36 @@ impl Rp2350TrapHandler {
         let code = args[0] as u16;
         let mask = args[1] as u16;
         table::lookup(&self.image[TABLE_OFFSET..], code, mask).map_or(0, u32::from)
+    }
+
+    /// Answer the RISC-V `rom_func_lookup(code, mask)` call
+    /// 应答 RISC-V `rom_func_lookup(code, mask)` 调用
+    ///
+    /// The real RISC-V ROM searches a table of 16-bit tags; only the
+    /// functions used by boot2 and the `MicroPython` runtime are present here.
+    /// They are all host traps, so the returned addresses never execute guest
+    /// instructions.
+    /// 真实 RISC-V ROM 会搜索 16 位标签表；这里仅提供 boot2 与 `MicroPython`
+    /// 运行时使用的函数。它们全部是宿主陷阱，返回地址不会执行客户机指令。
+    fn rv_table_lookup(args: [u32; 4]) -> u32 {
+        let tag = args[0] as u16;
+        Trap::from_tag(tag).map_or(0, Trap::rv_stub)
+    }
+
+    /// Answer the RISC-V `rom_data_lookup` wrapper / 应答 RISC-V `rom_data_lookup` 包装
+    ///
+    /// The real wrapper calls the table lookup and then loads the 16-bit value.
+    /// Function tags return their trap stub directly; `FD` points at the 32-bit
+    /// literal that in turn points at the 16-bit `FLASH_DEVINFO` word, matching
+    /// the two-level indirection used by the Arm API.
+    /// 真实包装先查表再读取 16 位值。函数标签直接返回陷阱桩；`FD` 指向那个再
+    /// 指向 16 位 `FLASH_DEVINFO` 字的 32 位字面量，与 Arm API 的两级间接一致。
+    fn rv_data_lookup(args: [u32; 4]) -> u32 {
+        let tag = args[0] as u16;
+        if tag == code(b'F', b'D') {
+            return DEVINFO_PTR_OFFSET as u32;
+        }
+        Trap::from_tag(tag).map_or(0, Trap::rv_stub)
     }
 
     /// Erase `count` bytes rounded up to `block_size` / 按 `block_size` 上取整擦除 `count` 字节
@@ -387,13 +581,28 @@ impl TrapHandler for Rp2350TrapHandler {
         bus: &mut dyn AddressBus,
         cycles: &mut u64,
     ) -> Result<TrapOutcome, CoreError> {
+        // 设置 `RP2350_TRACE_BOOTROM=1` 可在排查固件调用 ROM API 时打印每次调用。
+        // Set `RP2350_TRACE_BOOTROM=1` to log every ROM API call while debugging
+        // firmware boot flows.
+        if std::env::var_os("RP2350_TRACE_BOOTROM").is_some() {
+            eprintln!(
+                "[bootrom] id={:#06X} args={:#010X} {:#010X} {:#010X} {:#010X}",
+                call.id.0, call.args[0], call.args[1], call.args[2], call.args[3]
+            );
+        }
         if call.id.0 == TRAP_LOOKUP {
             return Ok(TrapOutcome::value(self.table_lookup(call.args), 8));
+        }
+        if call.id.0 == TRAP_RV_LOOKUP {
+            return Ok(TrapOutcome::value(Self::rv_table_lookup(call.args), 8));
+        }
+        if call.id.0 == TRAP_RV_DATA_LOOKUP {
+            return Ok(TrapOutcome::value(Self::rv_data_lookup(call.args), 8));
         }
 
         let [addr, arg1, arg2, arg3] = call.args;
         let outcome = match Trap::from_id(call.id.0) {
-            Some(Trap::ConnectFlash | Trap::ExitXip) => TrapOutcome::void(32),
+            Some(Trap::ConnectFlash | Trap::ExitXip | Trap::EnterCmdXip) => TrapOutcome::void(32),
             Some(Trap::FlushCache) => TrapOutcome::void(16),
             Some(Trap::RangeErase) => {
                 self.range_erase(addr, arg1, arg2)?;
@@ -427,11 +636,7 @@ impl TrapHandler for Rp2350TrapHandler {
 mod tests {
     use super::*;
     use crate::table::flags;
-    use rp2350_core::bus::AddressBus;
-    use rp2350_core::{FLASH_XIP_BASE, FlashRegion, RamRegion, SimpleBus};
-
-    /// Test SRAM base address / 测试用 SRAM 基地址
-    const SRAM_BASE: u32 = 0x2000_0000;
+    use rp2350_core::FlashRegion;
 
     fn bootrom() -> Rp2350Bootrom {
         let flash = FlashRegion::rp2350_xip();
@@ -497,124 +702,12 @@ mod tests {
         }
         assert!(!rom.handles(STUB_BASE + 0x40));
     }
-
-    #[test]
-    fn sys_info_reports_boot_info() {
-        let flash = FlashRegion::rp2350_xip();
-        let handler = Rp2350TrapHandler {
-            image: Arc::new(build_image()),
-            flash: flash.handle(),
-            boot_random: [1, 2, 3, 4],
-        };
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, 0x1000)))
-            .unwrap();
-        let mut cycles = 0u64;
-
-        let outcome = handler
-            .invoke(
-                TrapCall {
-                    id: TrapId(Trap::SysInfo.id()),
-                    args: [SRAM_BASE, 5, SYS_INFO_BOOT_INFO, 0],
-                },
-                &mut bus,
-                &mut cycles,
-            )
-            .unwrap();
-        assert_eq!(outcome.result, 5);
-        assert_eq!(
-            bus.read_u32(SRAM_BASE, &mut cycles).unwrap(),
-            SYS_INFO_BOOT_INFO
-        );
-        assert_eq!(bus.read_u32(SRAM_BASE + 4, &mut cycles).unwrap(), BOOT_WORD);
-    }
-
-    #[test]
-    fn flash_program_and_erase_share_the_guest_store() {
-        let flash = FlashRegion::rp2350_xip();
-        let handle = flash.handle();
-        let handler = Rp2350TrapHandler {
-            image: Arc::new(build_image()),
-            flash: handle.clone(),
-            boot_random: [0; 4],
-        };
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, 0x100)))
-            .unwrap();
-        let mut cycles = 0u64;
-        for (index, byte) in [0xDE_u8, 0xAD, 0xBE, 0xEF].iter().enumerate() {
-            bus.write_u8(SRAM_BASE + index as u32, *byte, &mut cycles)
-                .unwrap();
-        }
-
-        handler
-            .invoke(
-                TrapCall {
-                    id: TrapId(Trap::RangeProgram.id()),
-                    args: [0, SRAM_BASE, 4, 0],
-                },
-                &mut bus,
-                &mut cycles,
-            )
-            .unwrap();
-        assert_eq!(
-            handle.read(FLASH_XIP_BASE, 4).unwrap(),
-            vec![0xDE, 0xAD, 0xBE, 0xEF]
-        );
-
-        handler
-            .invoke(
-                TrapCall {
-                    id: TrapId(Trap::RangeErase.id()),
-                    args: [0, 4, 4, 0xD8],
-                },
-                &mut bus,
-                &mut cycles,
-            )
-            .unwrap();
-        assert_eq!(handle.read(FLASH_XIP_BASE, 4).unwrap(), vec![0xFF; 4]);
-    }
-
-    #[test]
-    fn flash_api_offsets_are_relative_to_the_xip_base() {
-        // pico-sdk `flash_range_erase`/`flash_range_program` take offsets, so
-        // offset 0x1000 must land at FLASH_XIP_BASE + 0x1000, not 0x1000.
-        // pico-sdk 的擦写 API 接受偏移，因此 0x1000 必须落在 XIP 基地址 + 0x1000。
-        let flash = FlashRegion::rp2350_xip();
-        let handle = flash.handle();
-        let handler = Rp2350TrapHandler {
-            image: Arc::new(build_image()),
-            flash: handle.clone(),
-            boot_random: [0; 4],
-        };
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, 0x100)))
-            .unwrap();
-        let mut cycles = 0u64;
-        bus.write_u8(SRAM_BASE, 0x5A, &mut cycles).unwrap();
-
-        handler
-            .invoke(
-                TrapCall {
-                    id: TrapId(Trap::RangeProgram.id()),
-                    args: [0x1000, SRAM_BASE, 1, 0],
-                },
-                &mut bus,
-                &mut cycles,
-            )
-            .unwrap();
-        assert_eq!(handle.read(FLASH_XIP_BASE + 0x1000, 1).unwrap(), vec![0x5A]);
-
-        handler
-            .invoke(
-                TrapCall {
-                    id: TrapId(Trap::RangeErase.id()),
-                    args: [0x1000, 1, 1, 0x20],
-                },
-                &mut bus,
-                &mut cycles,
-            )
-            .unwrap();
-        assert_eq!(handle.read(FLASH_XIP_BASE + 0x1000, 1).unwrap(), vec![0xFF]);
-    }
 }
+
+#[cfg(test)]
+#[path = "tests_flash.rs"]
+mod tests_flash;
+
+#[cfg(test)]
+#[path = "tests_riscv.rs"]
+mod tests_riscv;

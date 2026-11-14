@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
-use rp2350_cpu::CpuCore;
+use rp2350_cpu::{CpuArch, CpuCore};
 
 /// Identifier carried by a `udf` stub / `udf` 占位桩携带的标识
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,16 @@ pub enum HaltReason {
         /// Parameter 1 passed to the boot ROM / 传给 boot ROM 的参数 1
         p1: u32,
     },
+    /// A RISC-V fatal exception reached the synthetic diagnostic vector
+    /// RISC-V 致命异常进入合成诊断向量
+    RiscvException {
+        /// `mcause` value / `mcause` 值
+        mcause: u32,
+        /// Faulting instruction address / 出错指令地址
+        mepc: u32,
+        /// Trap value captured by the core / 核心捕获的陷阱值
+        mtval: u32,
+    },
 }
 
 impl fmt::Display for HaltReason {
@@ -97,6 +107,22 @@ impl fmt::Display for HaltReason {
                 f,
                 "reboot requested (flags={flags:#010X}, delay={delay_ms} ms, p0={p0:#010X}, p1={p1:#010X})"
             ),
+            Self::RiscvException {
+                mcause,
+                mepc,
+                mtval,
+            } => {
+                let name = match mcause {
+                    2 => "illegal instruction / 非法指令",
+                    5 => "load access fault / 加载访问错误",
+                    7 => "store access fault / 存储访问错误",
+                    _ => "exception / 异常",
+                };
+                write!(
+                    f,
+                    "RISC-V {name}: mcause={mcause}, mepc={mepc:#010X}, mtval={mtval:#010X}"
+                )
+            }
         }
     }
 }
@@ -169,21 +195,40 @@ impl TrapDispatcher {
             return Ok(None);
         };
 
-        let call = TrapCall {
-            id,
-            args: [
+        // The two architectures use different call conventions: Cortex-M
+        // passes arguments in r0..r3 and returns through lr, whereas RISC-V
+        // uses a0..a3 (x10..x13) and returns through ra (x1).
+        // 两种架构使用不同的调用约定：Cortex-M 经 r0..r3 传参并经 lr 返回；
+        // RISC-V 使用 a0..a3（x10..x13）传参并经 ra（x1）返回。
+        let is_riscv = matches!(core.arch(), CpuArch::RiscVHazard3);
+        let args = if is_riscv {
+            [
+                core.read_register(10),
+                core.read_register(11),
+                core.read_register(12),
+                core.read_register(13),
+            ]
+        } else {
+            [
                 core.read_register(0),
                 core.read_register(1),
                 core.read_register(2),
                 core.read_register(3),
-            ],
+            ]
         };
+        let call = TrapCall { id, args };
         let mut cycles = 0u64;
         let mut outcome = self.handler.invoke(call, bus, &mut cycles)?;
         outcome.cycles = outcome.cycles.saturating_add(cycles as u32);
 
-        core.write_register(0, outcome.result);
-        core.write_register(15, core.read_register(14) & !1);
+        if is_riscv {
+            core.write_register(10, outcome.result);
+            let return_address = core.read_register(1) & !1;
+            core.set_pc(return_address);
+        } else {
+            core.write_register(0, outcome.result);
+            core.write_register(15, core.read_register(14) & !1);
+        }
         Ok(Some(outcome))
     }
 }

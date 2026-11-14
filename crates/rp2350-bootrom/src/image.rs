@@ -46,6 +46,15 @@ impl RomImageBuilder {
         self.write_u16(offset, 0xDE00 | (id & 0xFF));
     }
 
+    /// Write a RISC-V `ebreak` trap stub / 写入 RISC-V `ebreak` 陷阱桩
+    ///
+    /// Like [`Self::trap_stub`], the host dispatcher keys on the stub address;
+    /// the instruction is only a debugging aid.
+    /// 与 [`Self::trap_stub`] 相同，宿主分发器以桩地址为键，指令仅用于调试。
+    pub fn riscv_trap_stub(&mut self, offset: usize) {
+        self.write_u32(offset, 0x0010_0073);
+    }
+
     /// Consume the builder and return the image bytes / 消耗构建器并返回镜像字节
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
