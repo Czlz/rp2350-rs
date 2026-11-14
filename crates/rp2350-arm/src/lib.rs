@@ -519,6 +519,7 @@ impl CortexM33Core {
                 &mut self.nvic,
                 u32::from(exceptions::EXC_USAGE_FAULT),
                 self.vtor,
+                &mut self.it_state,
                 cycles,
             )?;
             if !in_handler {
@@ -581,6 +582,7 @@ impl CortexM33Core {
                 &mut self.nvic,
                 exception_number,
                 self.vtor,
+                &mut self.it_state,
                 cycles,
             )?;
             self.active_exceptions.push(exception_number as u16);
@@ -608,6 +610,7 @@ impl CortexM33Core {
             &mut self.nvic,
             &info,
             u32::from(active),
+            &mut self.it_state,
             cycles,
         )
     }

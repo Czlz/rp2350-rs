@@ -122,7 +122,7 @@ pub(super) fn execute_register_list(
         addr = addr.wrapping_add(4);
     }
 
-    if write_back {
+    if write_back && (!load || (list & (1 << rn)) == 0) {
         let updated = if decrement_before {
             start
         } else {

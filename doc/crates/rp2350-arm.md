@@ -296,12 +296,15 @@ pub enum StepResult {
 
 The Thumb-32 decoder is fully implemented (see `execute_thumb32`): 60+ ALU,
 load/store and miscellaneous system instructions, plus the FPU and
-coprocessor chapters below. DSP/SIMD encodings (e.g. `SMLA*`, `USADA8`) are
-still treated as undefined instructions, exactly as documented in the
-`execute_thumb32` module header.
+coprocessor chapters below. DSP halfword multiplies are covered for
+`SMULBB/SMULBT/SMULTB/SMULTT`, their `SMLA*` accumulating forms and
+`SMMUL/SMMLA` high-word modular forms. Packed SIMD such as `SADD8`/`USADA8`
+and the `SXTB16/UXTB16` pair remain undefined.
 Thumb-32 解码器已完整实现（见 `execute_thumb32`）：60+ 条 ALU、Load/Store
-与杂项系统指令，以及下文的 FPU 与协处理器章节。DSP/SIMD 编码（如 `SMLA*`、
-`USADA8`）仍按未定义指令处理，与 `execute_thumb32` 模块头的说明一致。
+与杂项系统指令，以及下文的 FPU 与协处理器章节。DSP 半字乘法已覆盖
+`SMULBB/SMULBT/SMULTB/SMULTT`、对应的 `SMLA*` 累加形式与
+`SMMUL/SMMLA` 高字模乘；`SADD8`/`USADA8` 等打包 SIMD 与
+`SXTB16/UXTB16` 仍未实现。
 
 ---
 

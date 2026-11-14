@@ -306,13 +306,29 @@ pub fn execute_thumb16(
             } else {
                 regs.r[((opcode >> 6) & 0x7) as usize]
             };
+            let value = regs.r[rn];
             let result = if subtract {
-                regs.r[rn].wrapping_sub(operand)
+                value.wrapping_sub(operand)
             } else {
-                regs.r[rn].wrapping_add(operand)
+                value.wrapping_add(operand)
+            };
+            // ADDS/SUBS must update all four NZCV flags. The carry chain in
+            // 64-bit arithmetic (for example CircuitPython's delay loops) relies
+            // on the low-word ADDS producing the carry consumed by ADC.
+            // ADDS/SUBS 必须更新全部 NZCV 标志；64 位算术的进位链（例如
+            // CircuitPython 的延时循环）依赖低位 ADDS 产出的进位被 ADC 使用。
+            let carry = if subtract {
+                value >= operand
+            } else {
+                u64::from(value) + u64::from(operand) > u64::from(u32::MAX)
+            };
+            let overflow = if subtract {
+                ((value ^ operand) & (value ^ result) & 0x8000_0000) != 0
+            } else {
+                ((value ^ operand) & !(value ^ result) & 0x8000_0000) != 0
             };
             regs.r[rd] = result;
-            regs.set_nz_flags(result);
+            regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, carry, overflow);
         }
         0b00100 => {
             // MOVS Rd, #imm8 / 立即数移动到 Rd
@@ -727,8 +743,15 @@ pub fn execute_thumb16(
                         2 => value & 0xFFFF,                  // UXTH
                         _ => value & 0xFF,                    // UXTB
                     };
+                    // ARMv8-M: the 16-bit SXTB/SXTH/UXTB/UXTH encodings do
+                    // not affect APSR at all; only the 32-bit register forms
+                    // update N and Z. CircuitPython's SET_CONFIGURATION loop
+                    // relies on `uxtb` preserving the Z flag from `cmp`.
+                    // ARMv8-M：16 位 SXTB/SXTH/UXTB/UXTH 编码完全不改变
+                    // APSR，只有 32 位寄存器形式才更新 N 与 Z。CircuitPython
+                    // 的 SET_CONFIGURATION 循环依赖 `uxtb` 保留 `cmp` 产生的
+                    // Z 标志。
                     regs.r[rd] = result;
-                    regs.set_nz_flags(result);
                 }
                 // CBZ Rn, label (bit9 supplies the high bit of the 7-bit immediate)
                 // CBZ Rn, label（bit9 是 7 位立即数的高位）
@@ -911,7 +934,12 @@ pub fn execute_thumb16(
             regs.r[rb] = addr;
         }
         0b11001 => {
-            // LDMIA Rn!, {reg_list} / 多加载后递增
+            // LDMIA Rn, {reg_list} / 多加载后递增
+            // 若基址寄存器本身在加载列表中，架构规定基址取加载值、不执行写回；
+            // 编译器（例如 MicroPython 的 `ldmia r2,{r0,r1,r2}`）依赖该语义。
+            // If the base register is also loaded, the loaded value wins and the
+            // write-back is not performed; compilers (e.g. MicroPython's
+            // `ldmia r2,{r0,r1,r2}`) rely on this behaviour.
             let rb = ((opcode >> 8) & 0x7) as usize;
             let reg_list = (opcode & 0xFF) as u16;
             let mut addr = regs.r[rb];
@@ -922,7 +950,9 @@ pub fn execute_thumb16(
                     addr = addr.wrapping_add(4);
                 }
             }
-            regs.r[rb] = addr;
+            if (reg_list >> rb) & 1 == 0 {
+                regs.r[rb] = addr;
+            }
         }
         0b11010..=0b11011 => {
             // B<cond> (conditional branch) or SVC (cond == 0xF)
@@ -970,6 +1000,108 @@ pub fn execute_thumb16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ldmia_base_in_list_keeps_the_loaded_value() {
+        // `ldmia r2,{r0,r1,r2}` is the 3-word copy idiom GCC emits (seen in
+        // MicroPython's `mp_lexer_new_from_str_len` reader copy). Armv8-M keeps
+        // the loaded value in the base register instead of writing back the
+        // post-increment address, which is what the caller expects.
+        // `ldmia r2,{r0,r1,r2}` 是 GCC 生成的三字拷贝惯用法（见于 MicroPython
+        // `mp_lexer_new_from_str_len` 的 reader 拷贝）。Armv8-M 规定基址取得
+        // 加载值，而不是写回后递增地址，调用者依赖这一语义。
+        let mut regs = CortexM33Registers::new();
+        regs.r[2] = 0x100;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        bus.register_region(Box::new(rp2350_core::memory::RamRegion::new(
+            "ram", 0x100, 0x100,
+        )))
+        .unwrap();
+        let mut cycles = 0;
+        bus.write_u32(0x100, 0x1111_1111, &mut cycles).unwrap();
+        bus.write_u32(0x104, 0x2222_2222, &mut cycles).unwrap();
+        bus.write_u32(0x108, 0x3333_3333, &mut cycles).unwrap();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let result = execute_thumb16(
+            0xCA07,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(result, StepResult::Ok);
+        assert_eq!(regs.r[0], 0x1111_1111);
+        assert_eq!(regs.r[1], 0x2222_2222);
+        assert_eq!(regs.r[2], 0x3333_3333, "base must hold the loaded value");
+    }
+
+    #[test]
+    fn ldmia_without_base_in_list_writes_back() {
+        // `ldmia r2,{r0,r1}` still updates the base to the post-increment
+        // address because r2 is not part of the loaded register set.
+        // `ldmia r2,{r0,r1}` 的基址不在加载列表中，仍写回后递增地址。
+        let mut regs = CortexM33Registers::new();
+        regs.r[2] = 0x100;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        bus.register_region(Box::new(rp2350_core::memory::RamRegion::new(
+            "ram", 0x100, 0x100,
+        )))
+        .unwrap();
+        let mut cycles = 0;
+        bus.write_u32(0x100, 0xAAAA_AAAA, &mut cycles).unwrap();
+        bus.write_u32(0x104, 0xBBBB_BBBB, &mut cycles).unwrap();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let result = execute_thumb16(
+            0xCA03,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(result, StepResult::Ok);
+        assert_eq!(regs.r[0], 0xAAAA_AAAA);
+        assert_eq!(regs.r[1], 0xBBBB_BBBB);
+        assert_eq!(regs.r[2], 0x108);
+    }
+
+    #[test]
+    fn adds_register_updates_carry_for_wide_arithmetic() {
+        // `adds r0,r0,r1` with 0xFFFF_FFFF + 1 must set C and Z so the
+        // following `adcs.w` sees the carry in a 64-bit addition.
+        // `adds r0,r0,r1` 在 0xFFFF_FFFF + 1 时必须置位 C 与 Z，使后续
+        // `adcs.w` 在 64 位加法中取得进位。
+        let mut regs = CortexM33Registers::new();
+        regs.r[0] = 0xFFFF_FFFF;
+        regs.r[1] = 1;
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut nvic = Nvic::new();
+        let mut systick = SysTick::new();
+        let mut it = ITBlockState::new();
+        let mut cycles = 0;
+        execute_thumb16(
+            0x1840,
+            &mut regs,
+            &mut bus,
+            &mut nvic,
+            &mut systick,
+            &mut it,
+            &mut cycles,
+        )
+        .unwrap();
+        assert_eq!(regs.r[0], 0);
+        assert!(regs.apsr_c(), "carry-out must be visible");
+        assert!(regs.apsr_z(), "zero flag must be visible");
+    }
 
     #[test]
     fn condition_code_from_bits() {
@@ -1120,6 +1252,35 @@ mod tests {
         assert_eq!(run16(0xB260, 4, 0x0000_00FF).r[0], 0xFFFF_FFFF);
         assert_eq!(run16(0xB2A0, 4, 0x1234_5678).r[0], 0x0000_5678);
         assert_eq!(run16(0xB220, 4, 0x0000_8000).r[0], 0xFFFF_8000);
+    }
+
+    #[test]
+    fn thumb16_extend_instructions_leave_apsr_unchanged() {
+        // ARMv8-M: the 16-bit SXTB/SXTH/UXTB/UXTH encodings (0xB2 group) do
+        // not affect APSR, unlike their 32-bit register forms which update
+        // N/Z. Pre-set NZCV in both polarities and check that each extend
+        // instruction leaves XPSR bit-for-bit identical.
+        // ARMv8-M：16 位 SXTB/SXTH/UXTB/UXTH（0xB2 组）不影响 APSR，与更新
+        // N/Z 的 32 位寄存器形式不同。预先以两种极性置位 NZCV，验证每条
+        // 扩展指令执行后 XPSR 逐位不变。
+        for opcode in [0xB260u16, 0xB220, 0xB2E0, 0xB2A0] {
+            for (value, (n, z, c, v)) in [
+                (0x0000_0000u32, (true, false, true, false)),
+                (0x0000_0080u32, (false, true, false, true)),
+            ] {
+                let mut regs = CortexM33Registers::new();
+                regs.r[4] = value;
+                regs.set_apsr_nzcv(n, z, c, v);
+                let expected = regs.xpsr;
+                let mut bus = rp2350_core::memory::SimpleBus::new();
+                let mut it = ITBlockState::new();
+                assert_eq!(step16(opcode, &mut regs, &mut bus, &mut it), StepResult::Ok);
+                assert_eq!(
+                    regs.xpsr, expected,
+                    "opcode {opcode:#06X} must not change APSR for input {value:#010X}"
+                );
+            }
+        }
     }
 
     #[test]

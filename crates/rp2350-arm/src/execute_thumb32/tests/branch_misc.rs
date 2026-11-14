@@ -84,6 +84,28 @@ fn mrs_control() {
 }
 
 #[test]
+fn msr_basepri_max_only_raises_priority() {
+    // CircuitPython uses `msr BASEPRI_MAX, r2` around its critical sections.
+    // A numerically lower priority value raises the mask; zero or a larger
+    // value must leave BASEPRI untouched.
+    // CircuitPython 在其临界区使用 `msr BASEPRI_MAX, r2`。数值更小的优先级
+    // 会提高掩码；零或更大的值必须保持 BASEPRI 不变。
+    let mut r = CortexM33Registers::new();
+    r.write(2, 0x60);
+    assert_eq!(execute(0xF382_8812, &mut r), StepResult::Ok);
+    assert_eq!(r.basepri, 0x60);
+    r.write(2, 0x80);
+    assert_eq!(execute(0xF382_8812, &mut r), StepResult::Ok);
+    assert_eq!(r.basepri, 0x60);
+    r.write(2, 0);
+    assert_eq!(execute(0xF382_8812, &mut r), StepResult::Ok);
+    assert_eq!(r.basepri, 0x60);
+    r.write(2, 0x20);
+    assert_eq!(execute(0xF382_8812, &mut r), StepResult::Ok);
+    assert_eq!(r.basepri, 0x20);
+}
+
+#[test]
 fn msr_apsr() {
     let mut r = CortexM33Registers::new();
     r.write(0, 0x8000_0000);

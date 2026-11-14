@@ -120,18 +120,12 @@ impl Condition {
 /// 跟踪 IT 块执行的当前状态：基础条件、条件交换掩码和块中剩余多少指令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ITBlockState {
-    /// Remaining instructions in IT block (0 = no IT block active)
-    /// IT 块中剩余的指令（0 = 无活跃的 IT 块）
-    pub count: u8,
-    /// Condition for the current instruction in the block
-    /// 块中当前指令的条件
+    /// Architectural ITSTATE byte (0 = no IT block active)
+    /// 架构 ITSTATE 字节（0 = 无活跃 IT 块）
+    pub state: u8,
+    /// Condition for the next instruction in the block
+    /// 块中下一条指令的条件
     pub cond: Condition,
-    /// Base condition (used to derive per-instruction conds)
-    /// 基础条件（用于派生每条指令的条件）
-    pub base_cond: Condition,
-    /// Condition-swap mask (bits 3:0 of IT instruction)
-    /// 条件交换掩码（IT 指令的 bits 3:0）
-    pub mask: u8,
 }
 
 impl ITBlockState {
@@ -140,10 +134,8 @@ impl ITBlockState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            count: 0,
+            state: 0,
             cond: Condition::Al,
-            base_cond: Condition::Al,
-            mask: 0,
         }
     }
 
@@ -156,67 +148,70 @@ impl ITBlockState {
     /// Returns the number of instructions in the block.
     /// 返回块中的指令数。
     pub fn execute_it(&mut self, firstcond: u8, mask: u8) -> u8 {
-        self.base_cond = Condition::from_bits(firstcond);
-        self.mask = mask;
-
-        // Determine block length from trailing zeros in mask
-        // 从 mask 尾部的零确定块长度
-        if mask == 0x0 {
-            // mask == 0 属于 hint 空间，解码器不会以它为 IT 调用；这里防御性
-            // 地不武装任何块，避免把 NOP/SEV 之类的 hint 当成单指令 IT。
-            // A zero mask is hint space, never IT; defensively arm nothing so a
-            // hint such as NOP/SEV cannot be mistaken for a one-instruction IT.
-            self.count = 0;
+        if mask == 0 {
+            // mask == 0 is the hint space, never a real IT block.
+            // mask == 0 属于提示空间，不是真正的 IT 块。
+            self.state = 0;
             self.cond = Condition::Al;
-        } else {
-            // IT{x}{y}{z} — 2, 3, or 4 instructions
-            // Number of instructions = 4 - trailing_zeros(mask)
-            // 指令数 = 4 - mask 尾部零的数量
-            let trailing_zeros = mask.trailing_zeros() as u8;
-            self.count = 4 - trailing_zeros;
-            // First instruction uses base condition
-            self.cond = Condition::from_bits(firstcond);
+            return 0;
         }
-
-        self.count
+        // ITSTATE[7:4] = firstcond, ITSTATE[3:0] = mask.
+        // ITSTATE[7:4] = firstcond，ITSTATE[3:0] = mask。
+        self.state = (firstcond << 4) | (mask & 0x0F);
+        self.cond = Condition::from_bits(firstcond);
+        4 - mask.trailing_zeros() as u8
     }
 
     /// Advance to the next instruction in the IT block
     /// 推进到 IT 块中的下一条指令
     ///
-    /// Returns the condition for the *next* instruction.
-    /// 返回*下一条*指令的条件。
+    /// Returns the condition for the *current* instruction and applies
+    /// `ITAdvance` for the following one, matching ARMv8-M `ITSTATE`
+    /// behaviour.
+    /// 返回*当前*指令的条件，并对下一条指令执行 `ITAdvance`，符合 ARMv8-M
+    /// 的 `ITSTATE` 行为。
     #[must_use]
     pub fn advance(&mut self) -> Condition {
-        if self.count == 0 {
+        if self.state == 0 {
+            self.cond = Condition::Al;
             return Condition::Al;
         }
-
-        let current_cond = self.cond;
-
-        self.count -= 1;
-        if self.count > 0 {
-            // 条件及其反码只差最低位，因此 mask 的对应位直接给出该槽位条件的
-            // bit0，高 3 位沿用 firstcond。若简单按“取反”处理，firstcond 为
-            // 奇条件（NE/LO/PL/VC/LS/LT/LE）时会把第二槽算反：
-            // 实测 `ITE NE` = 0xBF14 的第二槽是 EQ，而 `ITT NE` = 0xBF1C。
-            // A condition and its inverse differ only in bit 0, so the mask bit
-            // supplies that slot's bit 0 directly and the upper bits come from
-            // firstcond. A plain inversion would flip odd conditions (NE/LO/...):
-            // `ITE NE` (0xBF14) has EQ in its second slot, `ITT NE` (0xBF1C) NE.
-            let position = self.mask.trailing_zeros() + u32::from(self.count);
-            let slot_bit = (self.mask >> position) & 1;
-            self.cond = Condition::from_bits((self.base_cond as u8 & 0xE) | slot_bit);
+        let current = Condition::from_bits((self.state >> 4) & 0x0F);
+        if self.state.trailing_zeros() >= 3 {
+            self.state = 0;
+            self.cond = Condition::Al;
+        } else {
+            // ITAdvance: keep the base-condition high bits, shift the
+            // then/else mask left by one.
+            // ITAdvance：保留基础条件的高位，把 then/else 掩码左移一位。
+            self.state = (self.state & 0xE0) | ((self.state << 1) & 0x1F);
+            self.cond = Condition::from_bits((self.state >> 4) & 0x0F);
         }
-
-        current_cond
+        current
     }
 
     /// Check if currently inside an IT block
     /// 检查当前是否在 IT 块内
     #[must_use]
     pub fn in_it_block(&self) -> bool {
-        self.count > 0
+        self.state != 0
+    }
+
+    /// Architectural ITSTATE byte for exception stacking
+    /// 用于异常压栈的架构 ITSTATE 字节
+    #[must_use]
+    pub fn arch_state(&self) -> u8 {
+        self.state
+    }
+
+    /// Rebuild from the ITSTATE byte decoded out of a stacked xPSR
+    /// 从异常栈 xPSR 中解码出的 ITSTATE 字节重建
+    #[must_use]
+    pub fn from_arch_state(state: u8) -> Self {
+        Self {
+            state,
+            cond: Condition::from_bits((state >> 4) & 0x0F),
+        }
     }
 }
 
@@ -310,6 +305,11 @@ impl CortexM33Registers {
             self.xpsr &= !0x1000_0000;
         }
     }
+
+    /// Set the cumulative saturation flag (APSR.Q) / 设置累积饱和标志（APSR.Q）
+    pub fn set_q_flag(&mut self) {
+        self.xpsr |= 1 << 27;
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +396,26 @@ mod tests {
         assert_eq!(it.advance(), Condition::Eq);
         assert_eq!(it.advance(), Condition::Eq);
         assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn set_q_flag_keeps_the_other_condition_flags() {
+        let mut regs = CortexM33Registers::new();
+        regs.set_apsr_nzcv(true, false, true, false);
+        regs.set_q_flag();
+        assert_eq!(regs.xpsr & (1 << 27), 1 << 27);
+        assert!(regs.apsr_n());
+        assert!(!regs.apsr_z());
+        assert!(regs.apsr_c());
+        assert!(!regs.apsr_v());
+    }
+
+    #[test]
+    fn it_state_arch_round_trip() {
+        for state in [0x00, 0x08, 0x0B, 0x16, 0x0C, 0x18, 0x1C, 0xFF] {
+            let restored = ITBlockState::from_arch_state(state);
+            assert_eq!(restored.arch_state(), state);
+        }
     }
 
     #[test]

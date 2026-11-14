@@ -244,22 +244,35 @@ pub(super) fn execute_register_shifted_or_misc(
     // 寄存器控制移位要求 bits[15:12] = 1111。
     let fixed_hi = ((instr >> 12) & 0xF) == 0xF;
 
-    // Extend instructions: Rn = 1111, second-halfword bit 11..8 fixed to 1000.
-    // 扩展指令：Rn = 1111，第二半字位 11..8 固定为 1000。
-    if rn_field == 0xF
-        && fixed_hi
-        && hw2_bits7_4 == 0x8
-        && matches!(bits23_20, 0x0 | 0x1 | 0x4 | 0x5)
+    // Extend instructions: Rn determines the plain or accumulating form and
+    // second-halfword bits[7:4] = 0b10xx carry the rotate amount in bits[5:4].
+    // 扩展指令：Rn 决定普通或累加形式，第二半字 bits[7:4] = 0b10xx 的
+    // bits[5:4] 携带循环移位量。
+    if fixed_hi && (0x8..=0xB).contains(&hw2_bits7_4) && matches!(bits23_20, 0x0 | 0x1 | 0x4 | 0x5)
     {
-        let value = regs.read(rm);
-        let result = match bits23_20 {
-            0x0 => sign_extend(value, 16), // SXTH
-            0x1 => value & 0xFFFF,         // UXTH
-            0x4 => sign_extend(value, 8),  // SXTB
-            _ => value & 0xFF,             // UXTB
+        let rotate = ((instr >> 4) & 0x3) * 8;
+        let value = regs.read(rm).rotate_right(rotate);
+        let extended = match bits23_20 {
+            0x0 => sign_extend(value, 16), // SXTH / SXTAH
+            0x1 => value & 0xFFFF,         // UXTH / UXTAH
+            0x4 => sign_extend(value, 8),  // SXTB / SXTAB
+            _ => value & 0xFF,             // UXTB / UXTAB
+        };
+        let result = if rn_field == 0xF {
+            // Plain SXTB/SXTH/UXTB/UXTH forms update N and Z (C and V are
+            // preserved); the accumulating forms below leave flags unchanged.
+            // ARMv8-M ARM: SXTB (register) T2, SXTH (register) T2,
+            // UXTB (register) T2 and UXTH (register) T2.
+            // 普通 SXTB/SXTH/UXTB/UXTH 形式更新 N 和 Z（C 与 V 保持不变）；
+            // 下面的累加形式不改变标志。
+            // ARMv8-M 架构手册：SXTB（寄存器）T2、SXTH（寄存器）T2、
+            // UXTB（寄存器）T2 与 UXTH（寄存器）T2。
+            regs.set_nz_flags(extended);
+            extended
+        } else {
+            regs.read(rn_field).wrapping_add(extended)
         };
         regs.write(rd, result);
-        regs.set_nz_flags(result);
         return StepResult::Ok;
     }
 

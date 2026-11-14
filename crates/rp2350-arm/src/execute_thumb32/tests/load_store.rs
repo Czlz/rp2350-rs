@@ -298,6 +298,38 @@ fn ldm_without_write_back_keeps_base() {
 }
 
 #[test]
+fn ldm_with_base_in_list_keeps_the_loaded_value() {
+    // Same Armv8-M rule for the Thumb-32 encoding: with W=1 and Rn in the
+    // register list, the load wins over the write-back.
+    // Thumb-32 编码遵循同一 Armv8-M 规则：W=1 且 Rn 在寄存器列表时，
+    // 加载值覆盖写回值。
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    bus.poke_u32(0x100, 0xAAAA_AAAA);
+    bus.poke_u32(0x104, 0xBBBB_BBBB);
+    r.write(1, 0x100);
+    assert_eq!(run(0xE8B1_0006, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(r.read(1), 0xAAAA_AAAA, "base must hold the loaded value");
+    assert_eq!(r.read(2), 0xBBBB_BBBB);
+}
+
+#[test]
+fn stm_with_base_in_list_still_writes_back() {
+    // For stores the write-back is always performed, so the base ends at the
+    // post-increment address. The first register in the list stores the
+    // initial base value.
+    // 存储指令始终执行写回，基址最终为后递增地址；列表首项存入初始基址。
+    let mut r = CortexM33Registers::new();
+    let mut bus = TestBus::new();
+    r.write(0, 0x100);
+    r.write(1, 0xAAAA_AAAA);
+    assert_eq!(run(0xE8A0_0003, &mut r, &mut bus), StepResult::Ok);
+    assert_eq!(bus.peek_u32(0x100), 0x100);
+    assert_eq!(bus.peek_u32(0x104), 0xAAAA_AAAA);
+    assert_eq!(r.read(0), 0x108);
+}
+
+#[test]
 fn push_uses_stmdb() {
     let mut r = CortexM33Registers::new();
     let mut bus = TestBus::new();

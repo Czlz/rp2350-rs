@@ -22,8 +22,24 @@ use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 use rp2350_core::types::Address;
 
+use super::conditions::ITBlockState;
 use super::nvic::Nvic;
 use super::registers::CortexM33Registers;
+
+/// ITSTATE bits inside xPSR (`[26:25,15:10]`) / xPSR 中的 ITSTATE 位
+pub const XPSR_IT_MASK: u32 = 0x0600_FC00;
+
+/// Encode an `ITSTATE` byte into the xPSR layout / 将 `ITSTATE` 字节编码进 xPSR
+#[must_use]
+pub fn it_state_to_xpsr_bits(state: u8) -> u32 {
+    ((u32::from(state) & 0xC0) << 19) | ((u32::from(state) & 0x3F) << 10)
+}
+
+/// Decode an `ITSTATE` byte out of a stacked xPSR / 从异常栈 xPSR 解码 `ITSTATE`
+#[must_use]
+pub fn xpsr_bits_to_it_state(xpsr: u32) -> u8 {
+    ((((xpsr >> 19) & 0xC0) | ((xpsr >> 10) & 0x3F)) & 0xFF) as u8
+}
 
 /// Standard ARMv8-M stack frame on exception entry (8 words / 32 bytes)
 /// ARMv8-M 异常进入时的标准栈帧（8 字 / 32 字节）
@@ -128,6 +144,7 @@ pub fn exception_entry_stacking(
     bus: &mut dyn AddressBus,
     sp: u32,
     regs: &CortexM33Registers,
+    it: &ITBlockState,
     cycles: &mut u64,
 ) -> Result<u32, CoreError> {
     let frame_sp = sp - EXCEPTION_STACK_FRAME_SIZE;
@@ -143,6 +160,13 @@ pub fn exception_entry_stacking(
     // [sp-28] = R1
     // [sp-32] = R0
 
+    // EPSR.IT lives outside the APSR flags; stack it in the architectural
+    // xPSR bit positions so a thread interrupted inside an IT block resumes
+    // the remaining conditional instructions after the exception return.
+    // EPSR.IT 不在 APSR 标志中；按架构 xPSR 位段压栈，使在 IT 块中间被打断的
+    // 线程能在异常返回后继续执行剩余的条件指令。
+    let stacked_xpsr = (regs.xpsr & !XPSR_IT_MASK) | it_state_to_xpsr_bits(it.arch_state());
+
     bus.write_u32(frame_sp, regs.r[0], cycles)?; // R0
     bus.write_u32(frame_sp + 4, regs.r[1], cycles)?; // R1
     bus.write_u32(frame_sp + 8, regs.r[2], cycles)?; // R2
@@ -150,7 +174,7 @@ pub fn exception_entry_stacking(
     bus.write_u32(frame_sp + 16, regs.r[12], cycles)?; // R12
     bus.write_u32(frame_sp + 20, regs.lr, cycles)?; // LR (R14)
     bus.write_u32(frame_sp + 24, regs.pc, cycles)?; // ReturnAddress (PC)
-    bus.write_u32(frame_sp + 28, regs.xpsr, cycles)?; // xPSR
+    bus.write_u32(frame_sp + 28, stacked_xpsr, cycles)?; // xPSR
 
     *cycles += 12; // Exception entry takes 12 cycles
     Ok(frame_sp)
@@ -163,12 +187,14 @@ pub fn exception_entry_stacking(
 /// * `bus` - Address bus for memory access
 /// * `sp` - Stack pointer (points to bottom of frame)
 /// * `regs` - CPU registers to restore into
+///
+/// Returns `(new_sp, return_pc, it_state)`. / 返回 `(新 SP, 返回 PC, ITSTATE)`。
 pub fn exception_return_unstacking(
     bus: &mut dyn AddressBus,
     sp: u32,
     regs: &mut CortexM33Registers,
     cycles: &mut u64,
-) -> Result<(u32, u32), CoreError> {
+) -> Result<(u32, u32, u8), CoreError> {
     let r0 = bus.read_u32(sp, cycles)?;
     let r1 = bus.read_u32(sp + 4, cycles)?;
     let r2 = bus.read_u32(sp + 8, cycles)?;
@@ -185,10 +211,15 @@ pub fn exception_return_unstacking(
     regs.r[12] = r12;
     regs.lr = lr;
     regs.pc = pc & !1u32; // Clear Thumb bit on PC restore
-    regs.xpsr = xpsr & 0xFF0F_FFFF; // Mask reserved bits
+    // Restore the architectural xPSR: force the T bit, drop the alignment
+    // padding bit (9) and keep ITSTATE in the separate IT block state.
+    // 恢复架构 xPSR：强制 T 位、去掉对齐填充位（9），ITSTATE 保留在独立的
+    // IT 块状态中。
+    regs.xpsr = (xpsr | 0x0100_0000) & !(1 << 9) & !XPSR_IT_MASK;
+    let it_state = xpsr_bits_to_it_state(xpsr);
 
     *cycles += 12; // Exception return takes 12 cycles
-    Ok((sp + EXCEPTION_STACK_FRAME_SIZE, pc))
+    Ok((sp + EXCEPTION_STACK_FRAME_SIZE, pc, it_state))
 }
 
 /// Fetch the exception vector from the vector table
@@ -216,6 +247,7 @@ pub fn enter_exception(
     nvic: &mut Nvic,
     exception_number: u32,
     vtor: u32,
+    it: &mut ITBlockState,
     cycles: &mut u64,
 ) -> Result<(), CoreError> {
     // Save current SP
@@ -233,7 +265,12 @@ pub fn enter_exception(
 
     // Stack the current context
     // 压栈当前上下文
-    let new_sp = exception_entry_stacking(bus, sp, regs, cycles)?;
+    let new_sp = exception_entry_stacking(bus, sp, regs, it, cycles)?;
+    // The handler starts with no active IT block; the interrupted thread's
+    // IT state was saved in the stacked xPSR.
+    // 处理程序开始时没有活跃的 IT 块；被打断线程的 IT 状态已保存在栈中 xPSR。
+    *it = ITBlockState::new();
+    regs.xpsr = (regs.xpsr | 0x0100_0000) & !XPSR_IT_MASK;
 
     // Update SP based on mode
     // 根据模式更新 SP
@@ -295,6 +332,7 @@ pub fn exit_exception(
     nvic: &mut Nvic,
     exc_return_info: &ExcReturnInfo,
     active_exception: u32,
+    it: &mut ITBlockState,
     cycles: &mut u64,
 ) -> Result<(), CoreError> {
     // Clear active status
@@ -311,7 +349,8 @@ pub fn exit_exception(
         regs.msp
     };
 
-    let (new_sp, _pc) = exception_return_unstacking(bus, sp, regs, cycles)?;
+    let (new_sp, _pc, it_state) = exception_return_unstacking(bus, sp, regs, cycles)?;
+    *it = ITBlockState::from_arch_state(it_state);
 
     // Update the correct SP
     // 更新正确的 SP
@@ -391,6 +430,39 @@ mod tests {
             "PC must stay until unstacking / 出栈前 PC 不变"
         );
         assert_eq!(regs.lr, 0xFFFF_FFF9);
+    }
+
+    #[test]
+    fn it_state_round_trips_through_stacked_xpsr() {
+        // ITSTATE[7:6] lives in xPSR[26:25] and ITSTATE[5:0] in xPSR[15:10].
+        // ITSTATE[7:6] 位于 xPSR[26:25]，ITSTATE[5:0] 位于 xPSR[15:10]。
+        for state in [0x00, 0x08, 0x0B, 0x16, 0x0C, 0x18, 0x1C, 0xFF] {
+            let encoded = it_state_to_xpsr_bits(state);
+            assert_eq!(xpsr_bits_to_it_state(encoded), state);
+            assert_eq!(encoded & !XPSR_IT_MASK, 0, "only IT bits may be set");
+        }
+    }
+
+    #[test]
+    fn exception_stacking_preserves_it_state_in_xpsr() {
+        use rp2350_core::bus::AddressBus;
+        use rp2350_core::memory::{RamRegion, SimpleBus};
+
+        let mut bus = SimpleBus::new();
+        bus.register_region(Box::new(RamRegion::new("stack", 0x2000_0000, 0x100)))
+            .expect("region");
+        let regs = CortexM33Registers {
+            pc: 0x1000_0100,
+            xpsr: 0x0100_0000,
+            ..Default::default()
+        };
+        let it = ITBlockState::from_arch_state(0x0B);
+        let mut cycles = 0u64;
+        let frame_sp = exception_entry_stacking(&mut bus, 0x2000_0080, &regs, &it, &mut cycles)
+            .expect("stacking");
+        let stacked = bus.read_u32(frame_sp + 28, &mut cycles).expect("xpsr");
+        assert_eq!(xpsr_bits_to_it_state(stacked), 0x0B);
+        assert_eq!(stacked & (1 << 24), 1 << 24, "T bit remains set");
     }
 
     #[test]

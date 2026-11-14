@@ -79,6 +79,48 @@ fn umlal_unsigned_accumulate() {
 }
 
 #[test]
+fn smlabb_accumulates_bottom_halfwords() {
+    // SMLABB r2, ip, r2, lr — the exact instruction CircuitPython executes
+    // while assembling USB descriptors during boot.
+    // SMLABB r2, ip, r2, lr —— CircuitPython 在启动期间组装 USB 描述符时执行
+    // 的指令。
+    let mut r = CortexM33Registers::new();
+    r.write(12, 3);
+    r.write(2, 4);
+    r.write(14, 5);
+    assert_eq!(execute(0xFB1C_E202, &mut r), StepResult::Ok);
+    assert_eq!(r.read(2), 17);
+}
+
+#[test]
+fn smulbb_uses_selected_halfwords() {
+    let mut r = CortexM33Registers::new();
+    r.write(12, 0x0003_0007);
+    r.write(2, 0x0002_0004);
+    assert_eq!(execute(0xFB1C_F202, &mut r), StepResult::Ok);
+    // bits[7:4] = 0 selects the bottom half of both registers: 7 * 4.
+    // bits[7:4] = 0 选择两个寄存器的低半字：7 * 4。
+    assert_eq!(r.read(2), 28);
+    // bits[7:4] = 3 selects the top half of both registers: 3 * 2.
+    // bits[7:4] = 3 选择两个寄存器的高半字：3 * 2。
+    r.write(2, 0x0002_0004);
+    assert_eq!(execute(0xFB1C_F232, &mut r), StepResult::Ok);
+    assert_eq!(r.read(2), 6);
+}
+
+#[test]
+fn smmul_and_smmla_take_the_high_product_word() {
+    let mut r = CortexM33Registers::new();
+    r.write(1, 0x4000_0000);
+    r.write(2, 0x4000_0000);
+    assert_eq!(execute(0xFB51_F002, &mut r), StepResult::Ok);
+    assert_eq!(r.read(0), 0x1000_0000);
+    r.write(3, 1);
+    assert_eq!(execute(0xFB51_3002, &mut r), StepResult::Ok);
+    assert_eq!(r.read(0), 0x1000_0001);
+}
+
+#[test]
 fn sdiv_signed() {
     let mut r = CortexM33Registers::new();
     r.write(1, 0xFFFF_FFF9);

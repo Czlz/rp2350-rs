@@ -42,6 +42,57 @@ pub(super) fn execute(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
             regs.write(rd, result);
             StepResult::Ok
         }
+        // SMULxy/SMLAxy (DSP extension): signed 16x16 multiply of selected
+        // halfwords. `bits7_4` bit 1 selects the high half of Rn, bit 0 the
+        // high half of Rm; Ra = 15 selects the non-accumulating SMULxy form.
+        // SMULxy/SMLAxy（DSP 扩展）：选取半字做有符号 16×16 乘法。
+        // `bits7_4` 位 1 选择 Rn 的高半字，位 0 选择 Rm 的高半字；
+        // Ra = 15 表示非累加的 SMULxy 形式。
+        0x1 => {
+            let n_high = bits7_4 & 0b10 != 0;
+            let m_high = bits7_4 & 0b01 != 0;
+            let n_half = if n_high {
+                i32::from((regs.read(rn) >> 16) as i16)
+            } else {
+                i32::from(regs.read(rn) as i16)
+            };
+            let m_half = if m_high {
+                i32::from((regs.read(rm) >> 16) as i16)
+            } else {
+                i32::from(regs.read(rm) as i16)
+            };
+            let product = n_half.wrapping_mul(m_half);
+            if ra_or_lo == 0xF {
+                regs.write(rd, product as u32);
+            } else {
+                let exact = i64::from(regs.read(ra_or_lo) as i32) + i64::from(product);
+                let accumulated = exact as i32;
+                if exact != i64::from(accumulated) {
+                    regs.set_q_flag();
+                }
+                regs.write(rd, accumulated as u32);
+            }
+            StepResult::Ok
+        }
+        // SMMLA/SMMUL (DSP extension): high 32 bits of a signed 32x32 product,
+        // optionally rounded and accumulated. Ra = 15 selects SMMUL.
+        // SMMLA/SMMUL（DSP 扩展）：有符号 32×32 乘积的高 32 位，可选舍入与
+        // 累加。Ra = 15 表示 SMMUL。
+        0x5 => {
+            let product = i64::from(regs.read(rn) as i32) * i64::from(regs.read(rm) as i32);
+            let low = product as u32;
+            let mut high = (product >> 32) as i32;
+            if bits7_4 & 1 != 0 && low >= 0x8000_0000 {
+                high = high.wrapping_add(1);
+            }
+            let accumulated = if ra_or_lo == 0xF {
+                high
+            } else {
+                high.wrapping_add(regs.read(ra_or_lo) as i32)
+            };
+            regs.write(rd, accumulated as u32);
+            StepResult::Ok
+        }
         // SMULL: signed 64-bit product, low word in bits[15:12], high in [11:8].
         // SMULL：有符号 64 位乘积，低位字写入 bits[15:12]，高位字写入 [11:8]。
         0x8 => {

@@ -113,7 +113,7 @@ fn execute_mrs(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
         0x03 => regs.xpsr & 0xFF00_01FF, // xPSR / PSR
         0x05 => regs.xpsr & 0x0000_01FF, // IPSR
         0x10 => regs.primask & 1,        // PRIMASK
-        0x11 => regs.basepri,            // BASEPRI
+        0x11 | 0x12 => regs.basepri,     // BASEPRI / BASEPRI_MAX (reads current BASEPRI)
         0x13 => regs.faultmask & 1,      // FAULTMASK
         0x14 => regs.control,            // CONTROL
         _ => return StepResult::Undefined,
@@ -147,6 +147,16 @@ fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult 
                 }
                 0x10 => regs.primask = value & 1,
                 0x11 => regs.basepri = value,
+                // BASEPRI_MAX only raises the priority mask: a zero value or a
+                // numerically larger (lower-priority) value leaves BASEPRI
+                // unchanged.
+                // BASEPRI_MAX 只提高优先级掩码：零值或数值更大（优先级更低）的
+                // 值不会改变 BASEPRI。
+                0x12 => {
+                    if value != 0 && (regs.basepri == 0 || value < regs.basepri) {
+                        regs.basepri = value;
+                    }
+                }
                 0x13 => regs.faultmask = value & 1,
                 0x14 => regs.control = value & 0x3,
                 _ => return StepResult::Undefined,
