@@ -185,6 +185,16 @@ enum Commands {
         /// Plugin directory to scan / 扫描的插件目录
         #[arg(long, default_value = devices::DEFAULT_PLUGIN_DIR)]
         plugin_dir: PathBuf,
+
+        /// Rescan once, print the hot-reload report, then exit
+        /// 重新扫描一次、打印热重载报告后退出
+        #[arg(long, conflicts_with = "watch")]
+        reload: bool,
+
+        /// Keep watching the plugin directory until Ctrl-C
+        /// 持续监视插件目录直至 Ctrl-C
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Start MCP server (`AgentFuse` integration) / 启动 MCP 服务器（`AgentFuse` 集成）
@@ -204,11 +214,7 @@ fn main() {
     rp2350_core::watch::init();
     let cli = Cli::parse();
 
-    if cli.verbose {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    } else {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    }
+    init_logging(cli.verbose);
 
     match cli.command {
         Commands::Run {
@@ -291,17 +297,27 @@ fn main() {
                 "wire failed / 接线失败",
             );
         }
-        Commands::ListDevices { plugin_dir } => {
-            finish(
-                devices::list_devices(&plugin_dir),
-                "list-devices failed / 列出设备失败",
-            );
+        Commands::ListDevices {
+            plugin_dir,
+            reload,
+            watch,
+        } => {
+            let result = devices::list_devices_with(&plugin_dir, reload, watch);
+            finish(result, "list-devices failed / 列出设备失败");
         }
         Commands::McpServe { port, auth_token } => {
             let options = mcp_serve::McpServeOptions { port, auth_token };
             finish(mcp_serve::run(&options), "mcp-serve failed / MCP 服务失败");
         }
     }
+}
+
+/// Initialize the logger: `debug` when verbose, `info` otherwise
+/// 初始化日志：详细模式为 `debug`，否则为 `info`
+fn init_logging(verbose: bool) {
+    let default_filter = if verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+        .init();
 }
 
 /// Report a subcommand failure and exit with status 1 / 记录子命令失败并以状态码 1 退出
@@ -358,5 +374,55 @@ mod tests {
         };
         assert_eq!(port, mcp_serve::DEFAULT_PORT);
         assert!(auth_token.is_none());
+    }
+
+    #[test]
+    fn list_devices_defaults_to_no_reload() {
+        let cli = parse(&["list-devices"]).expect("parse list-devices");
+        let Commands::ListDevices {
+            plugin_dir,
+            reload,
+            watch,
+        } = cli.command
+        else {
+            panic!("expected the list-devices subcommand");
+        };
+        assert_eq!(plugin_dir, PathBuf::from(devices::DEFAULT_PLUGIN_DIR));
+        assert!(!reload);
+        assert!(!watch);
+    }
+
+    #[test]
+    fn list_devices_parses_reload_flag() {
+        let cli = parse(&["list-devices", "--reload"]).expect("parse list-devices --reload");
+        let Commands::ListDevices { reload, watch, .. } = cli.command else {
+            panic!("expected the list-devices subcommand");
+        };
+        assert!(reload);
+        assert!(!watch);
+    }
+
+    #[test]
+    fn list_devices_parses_watch_flag() {
+        let cli = parse(&["list-devices", "--watch", "--plugin-dir", "target/release"])
+            .expect("parse list-devices --watch");
+        let Commands::ListDevices {
+            plugin_dir,
+            reload,
+            watch,
+        } = cli.command
+        else {
+            panic!("expected the list-devices subcommand");
+        };
+        assert_eq!(plugin_dir, PathBuf::from("target/release"));
+        assert!(watch);
+        assert!(!reload);
+    }
+
+    #[test]
+    fn list_devices_reload_conflicts_with_watch() {
+        let error = parse(&["list-devices", "--reload", "--watch"])
+            .expect_err("--reload must conflict with --watch");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

@@ -15,6 +15,7 @@ pub mod device;
 pub mod error;
 pub mod loader;
 pub mod manager;
+pub mod reload;
 pub mod wiring;
 
 pub use config::ConfigSchema;
@@ -22,4 +23,5 @@ pub use device::{DevicePlugin, DevicePort};
 pub use error::DeviceError;
 pub use loader::{LoadedPlugin, PluginLoader};
 pub use manager::DeviceManager;
+pub use reload::{Fingerprint, ReloadReport, normalize_path, scan_with_fingerprints};
 pub use wiring::{WiringEntry, WiringTable};

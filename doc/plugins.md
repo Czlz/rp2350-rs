@@ -532,8 +532,94 @@ let loaded = dm.scan_and_load("target/release");         // Vec<(DeviceId, PathB
   point used by the CLI.
   `PluginLoader::scan()` / `scan_and_load()` 只枚举/加载库而**不实例化设备**；
   设备级入口是 `DeviceManager::scan_and_load`，CLI 即使用该入口。
-- Hot reload, a persistent daemon, and MCP wiring remain planned.
-  热替换、常驻守护进程与 MCP 接线仍为规划项。
+- Hot reload landed as a synchronous `DeviceManager::reload` (see below); a
+  persistent daemon and MCP wiring remain planned.
+  热重载已以同步 `DeviceManager::reload` 落地（见下节）；常驻守护进程与 MCP
+  接线仍为规划项。
+
+---
+
+## Hot Reload / 热重载
+
+`DeviceManager::reload(dir)` re-scans the plugin directory and diffs it against
+the libraries the manager already holds. It returns a `ReloadReport`:
+`DeviceManager::reload(dir)` 重新扫描插件目录，并与管理器已持有的库做差异比较，
+返回 `ReloadReport`：
+
+```rust
+pub struct ReloadReport {
+    pub added: Vec<String>,              // newly loaded / 新加载
+    pub removed: Vec<String>,            // file gone, device dropped / 文件消失，设备已移除
+    pub reloaded: Vec<String>,           // changed, unloaded + loaded again / 已变化，卸载后重载
+    pub failed: Vec<(String, String)>,   // path + error message / 路径 + 错误信息
+}
+```
+
+```rust
+let mut dm = DeviceManager::new();
+dm.scan_and_load("target/release");                 // initial scan
+let report = dm.reload(Path::new("target/release")); // rescan + diff
+for line in report.render_lines() {
+    println!("{line}");                             // "[reload] ~ …", "[reload] summary: …"
+}
+```
+
+**How change detection works / 变更检测方式**
+
+- Libraries are keyed by `normalized directory + file name`, so a renamed file
+  legitimately shows up as `removed` + `added`.
+  库以“规范化目录 + 文件名”为键，因此改名会正常表现为 `removed` + `added`。
+- Each library records a `Fingerprint { len, modified }` at load time
+  (`scan_with_fingerprints` exposes the same scanner for tests).
+  每次加载都会记录 `Fingerprint { len, modified }`（`scan_with_fingerprints`
+  对测试暴露同一扫描器）。
+- A file whose length or modification time differs is **reloaded**; a file whose
+  modification time cannot be read is treated as changed (fail-safe).
+  长度或修改时间变化的文件会被**重载**；修改时间不可读时按“已变化”处理
+  （失败安全）。
+- Unchanged libraries keep their instance, device ID and registration order.
+  未变化的库保持原实例、设备 ID 与注册顺序。
+- In-process devices (`register`) and devices loaded from another directory are
+  never touched. 进程内注册的设备以及来自其它目录的设备不受影响。
+
+**Ordering and failure semantics / 顺序与失败语义**
+
+- Removals are processed first, then changed libraries, then new ones.
+  先处理删除，再处理变化，最后处理新增。
+- For a removal or a reload the device instance is shut down and dropped
+  **before** the library is unloaded (`ManagedDevice` drops `plugin` before
+  `library` by field declaration order). 删除或重载时，设备实例先关闭并释放，
+  然后才卸载库（`ManagedDevice` 按字段声明顺序先释放 `plugin` 再释放 `library`）。
+- A library that fails to load is reported in `failed`; the manager stays usable
+  and every other device keeps running. The failed library's device is *not*
+  restored (it was already unloaded), and the next `reload` retries it.
+  加载失败的库记入 `failed`；管理器继续可用，其它设备照常运行。失败库对应的
+  设备**不会**恢复（库已卸载），下一次 `reload` 会重试。
+
+**Constraints / 限制**
+
+| Constraint / 限制 | Reason / 原因 |
+|-------------------|---------------|
+| Windows locks loaded DLLs / Windows 锁定已加载 DLL | The host cannot overwrite a plugin in place; rebuild to a new name, or drop the device first. 宿主无法原地覆盖插件；请重新构建为新文件名，或先释放设备。 |
+| Drop before load / 必须先 drop 再 load | `libloading` refuses to map a second copy from a locked path; reload unloads the old library first. `libloading` 不会从被锁路径再映射一份；重载会先卸载旧库。 |
+| Synchronous, no concurrency / 同步、无并发 | The host must not run `tick` / `on_gpio_change` / queries while `reload` runs; there is no lock inside the manager. 执行 `reload` 时宿主不得并发运行 `tick`、`on_gpio_change` 或查询；管理器内部没有锁。 |
+| No state migration / 无状态迁移 | A reloaded plugin starts from a fresh instance; wiring is kept only when the device ID is unchanged. 重载后的插件是全新实例；仅当设备 ID 不变时接线才保留。 |
+| File-level only / 仅文件级 | No cross-process replacement and no ABI change are detected beyond the existing ABI version check. 不做跨进程替换；ABI 变化仍只由现有 ABI 版本检查发现。 |
+
+Wiring note: the wiring table is keyed by device ID, so a reloaded library that
+keeps its `metadata().id` keeps its wiring; a library that changes its ID loses it.
+接线说明：接线表以设备 ID 为键，因此重载后保持 `metadata().id` 的库会保留接线；
+改变 ID 的库会丢失接线。
+
+CLI usage / CLI 用法:
+
+```bash
+# One reload pass, print the report, exit / 执行一次重载，打印报告后退出
+rp2350 list-devices --plugin-dir target/release --reload
+
+# Keep polling (once per second) until Ctrl-C / 每秒轮询直到 Ctrl-C
+rp2350 list-devices --plugin-dir target/release --watch
+```
 
 ---
 

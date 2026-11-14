@@ -24,23 +24,32 @@ use rp2350_plugin::PluginContext;
 use super::device::DevicePlugin;
 use super::error::{ConfigError, DeviceError};
 use super::loader::{LoadedPlugin, PluginLoader};
+use super::reload::{Fingerprint, scan_with_fingerprints};
 use super::wiring::WiringTable;
 
 /// Identifier type for registered devices / 注册设备的标识类型
 pub type DeviceId = String;
 
 /// A managed device instance / 受管理的设备实例
-#[allow(dead_code)]
-struct ManagedDevice {
+///
+/// `pub(crate)` so the [`super::reload`] module can move instances in and out
+/// during a hot reload. 对 crate 内可见，使 [`super::reload`] 模块能在热重载时
+/// 增删实例。
+pub(crate) struct ManagedDevice {
     /// The device plugin / 设备插件
-    plugin: Box<dyn DevicePlugin>,
+    pub(crate) plugin: Box<dyn DevicePlugin>,
     /// Source path if loaded from disk / 从磁盘加载时的源路径
-    source_path: Option<PathBuf>,
+    pub(crate) source_path: Option<PathBuf>,
     /// Library backing a dynamically loaded plugin / 动态加载插件背后的库
     ///
     /// Declared after `plugin` so the plugin (and its vtable) drops first.
+    /// Only kept alive for RAII: it is never read, dropping it unloads the DLL.
     /// 声明在 `plugin` 之后，确保插件（及其 vtable）先于库被释放。
-    library: Option<rp2350_ffi::SafeLibrary>,
+    /// 仅用于 RAII：不会被读取，释放它即卸载 DLL。
+    #[allow(dead_code)]
+    pub(crate) library: Option<rp2350_ffi::SafeLibrary>,
+    /// Fingerprint recorded when the library was loaded / 加载库时记录的指纹
+    pub(crate) fingerprint: Option<Fingerprint>,
 }
 
 /// Error returned by [`DeviceManager::apply_config`]
@@ -60,13 +69,13 @@ pub enum ConfigApplyError {
 /// 设备管理器 — 所有虚拟外设插件的中央枢纽
 pub struct DeviceManager {
     /// All registered devices keyed by ID / 所有已注册设备（按 ID 索引）
-    devices: HashMap<DeviceId, ManagedDevice>,
+    pub(crate) devices: HashMap<DeviceId, ManagedDevice>,
     /// Wiring table mapping (device, port) ↔ GPIO pin
     /// 接线表映射 (设备, 端口) ↔ GPIO 引脚
-    wiring: WiringTable,
+    pub(crate) wiring: WiringTable,
     /// Plugin loader for dynamic library scanning
     /// 用于动态库扫描的插件加载器
-    loader: PluginLoader,
+    pub(crate) loader: PluginLoader,
 }
 
 impl DeviceManager {
@@ -96,6 +105,7 @@ impl DeviceManager {
                 plugin: device,
                 source_path: None,
                 library: None,
+                fingerprint: None,
             },
         );
         Ok(())
@@ -106,17 +116,26 @@ impl DeviceManager {
     ///
     /// The library is kept alive for as long as the device remains registered.
     /// 只要设备保持注册状态，库就会保持存活。
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceError::AlreadyExists`] for a duplicate ID and
+    /// [`DeviceError::PluginLoadFailed`] when the library cannot be loaded.
+    /// 重复 ID 返回 [`DeviceError::AlreadyExists`]，库无法加载时返回
+    /// [`DeviceError::PluginLoadFailed`]。
     pub fn load_plugin(&mut self, id: DeviceId, path: impl AsRef<Path>) -> Result<(), DeviceError> {
         if self.devices.contains_key(&id) {
             return Err(DeviceError::AlreadyExists(id));
         }
-        let LoadedPlugin { library, plugin } = self.loader.load_device(path.as_ref())?;
+        let path = path.as_ref();
+        let LoadedPlugin { library, plugin } = self.loader.load_device(path)?;
         self.devices.insert(
             id,
             ManagedDevice {
                 plugin,
-                source_path: Some(path.as_ref().to_path_buf()),
+                source_path: Some(path.to_path_buf()),
                 library: Some(library),
+                fingerprint: Fingerprint::read(path),
             },
         );
         Ok(())
@@ -125,7 +144,7 @@ impl DeviceManager {
     /// Scan a directory and register every device plugin it contains
     /// 扫描目录并注册其中所有的设备插件
     ///
-    /// Libraries are enumerated with [`PluginLoader::scan_dir`] (platform
+    /// Libraries are enumerated by [`PluginLoader::scan_dir`] (platform
     /// extensions, sorted by path) and instantiated through
     /// [`PluginLoader::load_device`]. The device ID is the plugin's
     /// `metadata().id` when non-empty, otherwise the library file stem.
@@ -143,43 +162,14 @@ impl DeviceManager {
     pub fn scan_and_load(&mut self, dir: impl AsRef<Path>) -> Vec<(DeviceId, PathBuf)> {
         let dir = dir.as_ref();
         let mut registered = Vec::new();
-        // 使用独立加载器扫描目标目录，避免污染 `self.loader` 的搜索路径。
-        // Use a dedicated loader so `self.loader`'s search paths stay untouched.
-        let loader = PluginLoader::new();
-
-        for path in PluginLoader::scan_dir(dir) {
-            match loader.load_device(&path) {
-                // 模式绑定按声明逆序析构：library 先声明，plugin 后声明，
-                // 因此提前 continue 时会先释放插件（vtable 持有者）再关闭库。
-                // Bindings drop in reverse declaration order: `library` is declared
-                // first, so `plugin` (vtable owner) drops before the library closes.
-                Ok(LoadedPlugin { library, plugin }) => {
-                    let id = device_id_for(plugin.metadata().id.as_str(), &path);
-                    if self.devices.contains_key(&id) {
-                        log::warn!(
-                            "Skipping duplicate device plugin '{}' from {} / 跳过重复设备插件",
-                            id,
-                            path.display()
-                        );
-                        continue;
-                    }
-                    self.devices.insert(
-                        id.clone(),
-                        ManagedDevice {
-                            plugin,
-                            source_path: Some(path.clone()),
-                            library: Some(library),
-                        },
-                    );
-                    registered.push((id, path));
-                }
-                Err(error) => {
-                    log::warn!(
-                        "Failed to load device plugin {}: {} / 设备插件加载失败",
-                        path.display(),
-                        error
-                    );
-                }
+        for (path, fingerprint) in scan_with_fingerprints(dir) {
+            match self.insert_loaded(&path, Some(fingerprint)) {
+                Ok(id) => registered.push((id, path)),
+                Err(error) => log::warn!(
+                    "Failed to load device plugin {}: {} / 设备插件加载失败",
+                    path.display(),
+                    error
+                ),
             }
         }
         registered
@@ -187,13 +177,11 @@ impl DeviceManager {
 
     /// Remove a registered device / 移除已注册的设备
     pub fn unregister(&mut self, id: &DeviceId) -> Result<(), DeviceError> {
-        let mut device = self
-            .devices
-            .remove(id)
-            .ok_or_else(|| DeviceError::NotFound(id.clone()))?;
-        device.plugin.shutdown();
-        self.wiring.remove_device(id);
-        Ok(())
+        if self.drop_device_instance(id) {
+            Ok(())
+        } else {
+            Err(DeviceError::NotFound(id.clone()))
+        }
     }
 
     /// Wire a device port to a GPIO pin / 将设备端口连接到 GPIO 引脚
@@ -391,7 +379,7 @@ impl Default for DeviceManager {
 
 /// Resolve the device ID: plugin metadata first, library file stem as fallback
 /// 解析设备 ID：优先插件元数据，退回库文件名主干
-fn device_id_for(metadata_id: &str, path: &Path) -> DeviceId {
+pub(crate) fn device_id_for(metadata_id: &str, path: &Path) -> DeviceId {
     if metadata_id.is_empty() {
         path.file_stem()
             .and_then(|stem| stem.to_str())

@@ -187,12 +187,21 @@ core description and start vectors, then hands the machine to
 register numbers `0..=15` to the core register file and `16` to XPSR; memory
 packets go through `Machine::bus` byte accesses. Breakpoints are PC comparisons
 (no `BKPT` patching), and `Continue` runs at most 1 000 000 instructions per
-request so an accidental infinite loop cannot block the server.
+request so an accidental infinite loop cannot block the server. Write
+watchpoints (`watch`, RSP `Z2`) are sampled after every executed instruction:
+`MachineTarget` keeps a byte snapshot per watchpoint and stops with
+`T05watch:<addr>;` as soon as any covered byte changes. Only SRAM
+(`0x2000_0000..0x2008_2000`) is accepted — peripheral/USB windows are rejected
+with `E01` because sampling them would pop FIFOs or advance device state.
 `gdb` 读取 ELF、构建与 `run` 相同的 `Machine`，打印映像摘要、核心描述与启动
 向量，然后把机器交给 `GdbServer`/`MachineTarget` 并阻塞在 `serve`。适配器把
 GDB 寄存器号 `0..=15` 转发到核心寄存器组、`16` 转发到 XPSR；内存包通过
 `Machine::bus` 的字节访问完成。断点按 PC 比较（不写入 `BKPT`），单次
-`Continue` 最多执行 1 000 000 条指令，避免意外死循环阻塞服务器。
+`Continue` 最多执行 1 000 000 条指令，避免意外死循环阻塞服务器。写监视点
+（`watch`，RSP `Z2`）在每条指令执行后采样：`MachineTarget` 为每个监视点保存
+字节快照，任一被覆盖字节变化即返回 `T05watch:<addr>;` 停止。仅接受 SRAM
+（`0x2000_0000..0x2008_2000`）；外设/USB 窗口会以 `E01` 拒绝，因为采样它们会
+弹出 FIFO 或推进设备状态。
 
 ```bash
 cargo run -p rp2350-cli -- gdb --file firmware.elf --port 3333
@@ -202,25 +211,35 @@ arm-none-eabi-gdb firmware.elf
 (gdb) break main
 (gdb) continue
 (gdb) info registers
+(gdb) watch counter        # 写监视点：仅 SRAM 变量
+(gdb) continue             # 命中：T05watch:20000000;
+(gdb) delete               # 移除监视点后不再触发
+(gdb) continue
 ```
 
 **Behaviour / 行为**
 
 - `resume` 通过 `Machine::step` 执行，因此 boot ROM 陷阱、中断泵送、PPB 系统
   写入回放与外设时基都保持有效；`StopReply` 的 `Breakpoint`/`SingleStep`/
-  `Fault`/`Sleeping`/`Halted`/`Reset`/`InstructionLimit` 映射为对应 GDB 信号
-  （`S05` / `S0b` / `S02`）。
+  `Watchpoint`/`Fault`/`Sleeping`/`Halted`/`Reset`/`InstructionLimit` 映射为
+  对应 GDB 信号（`S05` / `T05watch:<addr>;` / `S0b` / `S02`）。
   `resume` uses `Machine::step`, so boot ROM traps, interrupt pumping, PPB
   replay and the peripheral timebase stay active; stop reasons map to GDB
-  signals (`S05` / `S0b` / `S02`).
+  signals (`S05` / `T05watch:<addr>;` / `S0b` / `S02`).
+- 写监视点比较的是**值变化**而非“发生写入”：写入相同字节不会停止。快照读取
+  使用局部周期计数器，不推进 `Machine::steps` 或外设时基。
+  Watchpoints compare **values**, not the act of writing: storing identical
+  bytes does not stop. Snapshot reads use a local cycle counter and never
+  advance `Machine::steps` or the peripheral timebase.
 - 机器自身预算固定为 `u64::MAX`，停机时机完全由 GDB 的 `c`/`s` 与断点决定；
   `--max-cycles` 未暴露。
   The machine budget is pinned to `u64::MAX`; stopping is driven only by GDB
   `c`/`s` requests and breakpoints (no `--max-cycles` flag).
-- 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点）保留，
-  仅无应答模式协商会被重置。
+- 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点、
+  监视点）保留，仅无应答模式协商会被重置。
   After a client disconnects `serve` keeps accepting; target state (memory,
-  registers, breakpoints) survives and only the no-ack negotiation is reset.
+  registers, breakpoints, watchpoints) survives and only the no-ack negotiation
+  is reset.
 
 **Limitations / 限制**
 
@@ -228,11 +247,19 @@ arm-none-eabi-gdb firmware.elf
   `p10`/`P10`（寄存器 16）会回复 `E01`。
   No `--arch` override: ELF boots as Cortex-M33. RISC-V has no XPSR, so
   `p10`/`P10` (register 16) replies `E01`.
-- 单客户端串行、无 TLS、无 `target.xml`（`qXfer:features:read`）、无 watchpoint
-  （`Z2`-`Z4`）、无多核 `vCont`、无 `qRcmd` monitor 命令；细节见
-  `doc/crates/rp2350-gdb.md`。
-  Single sequential client, no TLS, no `target.xml`, no watchpoints
-  (`Z2`-`Z4`), no multi-core `vCont`, no `qRcmd` monitor commands.
+- 监视点仅支持**写**监视点（`watch` / `Z2`）：`rwatch`（`Z3`）与 `awatch`
+  （`Z4`）返回空包，GDB 会报告不支持。仅接受 SRAM（`0x2000_0000`–
+  `0x2008_2000`）地址；外设、USB、PPB 与 Flash 窗口返回 `E01`。不使用 DWT
+  数据断点寄存器，检测由模拟器在每条指令后比较快照完成。
+  Only **write** watchpoints are supported (`watch` / `Z2`); `rwatch` (`Z3`) and
+  `awatch` (`Z4`) return an empty packet, which GDB reports as unsupported.
+  Only SRAM (`0x2000_0000`–`0x2008_2000`) is accepted; peripheral, USB, PPB and
+  flash windows reply `E01`. No DWT data-breakpoint registers are used: the
+  simulator compares snapshots after each instruction.
+- 单客户端串行、无 TLS、无 `target.xml`（`qXfer:features:read`）、无多核
+  `vCont`、无 `qRcmd` monitor 命令；细节见 `doc/crates/rp2350-gdb.md`。
+  Single sequential client, no TLS, no `target.xml`, no multi-core `vCont`, no
+  `qRcmd` monitor commands; see `doc/crates/rp2350-gdb.md`.
 - 不做 Flash 编程：Flash 窗口对客户机写保护，`M`/`load` 写 Flash 会以 `E01`
   失败；SRAM 与已映射的可写 MMIO 可正常写入。
   No flash programming: the flash window rejects guest writes, so `M`/`load`
@@ -243,12 +270,18 @@ arm-none-eabi-gdb firmware.elf
 ### `list-devices` — enumerate device plugins / 枚举设备插件
 
 ```text
-rp2350 list-devices [--plugin-dir <DIR>]
+rp2350 list-devices [--plugin-dir <DIR>] [--reload | --watch]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
 |---------------|----------------|----------------|
 | `--plugin-dir` | `plugins` | Directory scanned for plugin libraries / 扫描插件库的目录 |
+| `--reload` | off | Rescan once, print the hot-reload report, exit / 重新扫描一次，打印热重载报告后退出 |
+| `--watch` | off | Poll the directory (1 s) and reload until Ctrl-C / 每秒轮询目录并热重载，直到 Ctrl-C |
+
+`--reload` and `--watch` are mutually exclusive and both are off by default, so
+the plain invocation behaves exactly as before.
+`--reload` 与 `--watch` 互斥，默认均关闭，因此不带参数的调用行为完全不变。
 
 Scans the directory (platform extensions `dll`/`so`/`dylib`, path-sorted),
 instantiates every library through `DeviceManager::scan_and_load`, and prints
@@ -267,6 +300,48 @@ error (exit code 1). Port order is the index order accepted by `wire`.
 `id / name / has_ui=<bool> / ports=[<逗号分隔端口名>]`；`ports=[-]` 表示无端口。
 目录存在但为空时打印 `no device plugins found in <DIR>`；目录不存在则报错
 （退出码 1）。端口顺序即 `wire` 接受的索引顺序。
+
+#### Hot reload: `--reload` / `--watch` / 热重载
+
+`--reload` scans once, prints the device list, then calls
+`DeviceManager::reload(dir)` and prints the returned `ReloadReport` before
+exiting:
+`--reload` 扫描一次、打印设备列表，然后调用 `DeviceManager::reload(dir)` 并打印
+返回的 `ReloadReport` 后退出：
+
+```text
+com.rp2350-rs.uart-terminal / UART_TERMINAL / has_ui=false / ports=[TX,RX]
+[reload] + target/release/rp2350_uart_terminal.dll
+[reload] summary: added=1 removed=0 reloaded=0 failed=0
+```
+
+`--watch` does the same initial scan and then sleeps `WATCH_INTERVAL` (1 s) and
+reloads in a loop; a non-empty report prints the `[reload] …` lines plus the
+refreshed device list, an unchanged poll stays silent. Ctrl-C terminates the
+process (there is no custom signal handler).
+`--watch` 同样先做一次初始扫描，然后每 `WATCH_INTERVAL`（1 秒）循环重载；有变更时
+打印 `[reload] …` 行与刷新后的设备列表，无变更的轮询保持静默。Ctrl-C 直接终止
+进程（未安装自定义信号处理器）。
+
+Report line prefixes / 报告行前缀：
+
+| Prefix | Meaning / 含义 |
+|--------|----------------|
+| `+` | newly loaded library / 新加载的库 |
+| `-` | library file gone, device dropped / 文件消失，设备已移除 |
+| `~` | same path, size/mtime changed → unloaded and loaded again / 同路径但大小或修改时间变化 → 卸载后重新加载 |
+| `!` | load failed, followed by the error / 加载失败后跟错误信息 |
+| `summary:` | `added=… removed=… reloaded=… failed=…` counts / 各类计数 |
+
+Hot reload only changes files on disk; wiring is not persisted and the devices
+still live only in this process. A reloaded plugin starts as a fresh instance,
+and a library that keeps its `metadata().id` keeps its wiring. Windows locks
+loaded DLLs, so a plugin must be rebuilt to a new file name (or removed) before
+the host can pick it up; see `doc/plugins.md` → *Hot Reload*.
+热重载只影响磁盘文件；接线不持久化，设备仍只存在于本进程。重载后的插件是全新
+实例；保持 `metadata().id` 的库会保留接线。Windows 会锁定已加载 DLL，因此插件
+必须重新构建为新文件名（或先删除）宿主才能拾取；详见 `doc/plugins.md` →
+*Hot Reload*。
 
 ### `wire` — wire one port and print the table / 接线并打印接线表
 
@@ -298,10 +373,13 @@ lists the IDs that were found), or out-of-bounds port index.
 > `DeviceManager`, act, then exit — the devices, their dynamic libraries and the
 > wiring table are released at process exit. Nothing is persisted and no
 > emulator run is attached, so `wire` is currently a wiring/dry-run inspection
-> tool. Wiring persistence and a long-lived host (GUI/MCP) are future work.
+> tool. `list-devices --watch` is the only long-lived mode and it still holds
+> devices only in memory. Wiring persistence and a long-lived host (GUI/MCP) are
+> future work.
 > `list-devices` 与 `wire` 构建管理器、执行动作后立即退出 —— 设备、动态库与
 > 接线表在进程结束时全部释放。当前**不持久化**，也不会挂接到模拟器运行，
-> 因此 `wire` 实际是接线/空跑检查工具。接线持久化与常驻宿主（GUI/MCP）为后续工作。
+> 因此 `wire` 实际是接线/空跑检查工具。`list-devices --watch` 是唯一的常驻模式，
+> 其设备同样只存在于内存。接线持久化与常驻宿主（GUI/MCP）为后续工作。
 
 ### `mcp-serve` — MCP server over HTTP / HTTP 上的 MCP 服务器
 
@@ -539,6 +617,12 @@ rp2350 gdb --file firmware.elf --port 3333
 
 # Inspect the device plugins built into target/release
 rp2350 list-devices --plugin-dir target/release
+
+# One hot-reload pass over the plugin directory, then exit
+rp2350 list-devices --plugin-dir target/release --reload
+
+# Keep polling for rebuilt plugins (Ctrl-C to stop)
+rp2350 list-devices --plugin-dir target/release --watch
 
 # Wire the LED plugin's port 0 to GPIO25 and print the wiring table
 rp2350 wire --plugin-dir target/release --device com.rp2350-rs.led --port 0 --gpio 25
