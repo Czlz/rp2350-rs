@@ -153,7 +153,7 @@ impl UsbCore {
             self.write_dpram_u8(buffer + i, *byte);
         }
         let last = len < MAX_PACKET_SIZE || ctrl & BUF_CTRL_LAST != 0;
-        let mut updated = ctrl & !BUF_CTRL_AVAIL;
+        let mut updated = ctrl & !(BUF_CTRL_AVAIL | BUF_CTRL_FULL | BUF_CTRL_LEN_MASK);
         updated |= BUF_CTRL_FULL | (len as u32 & BUF_CTRL_LEN_MASK);
         let updated = buf_ctrl_set_half(value, half, updated);
         self.set_buf_ctrl(offset, updated);
@@ -165,10 +165,13 @@ impl UsbCore {
     /// Deliver a SETUP packet to endpoint 0.
     /// 向端点 0 送达 SETUP 包。
     ///
-    /// Writes the 8 packet bytes to DPSRAM `0x000`, aborts pending EP0 buffers
-    /// and raises `SETUP_REQ`. Returns `false` when the device is not attached.
-    /// 将 8 字节包写入 DPSRAM `0x000`，中止未完成的 EP0 缓冲并置位
-    /// `SETUP_REQ`。设备未附着时返回 `false`。
+    /// Writes the 8 packet bytes to DPSRAM `0x000`, aborts pending EP0 buffers,
+    /// clears the defined `EP_STALL_ARM` bits (USB 2.0 requires a SETUP to
+    /// clear an EP0 STALL) and raises `SETUP_REQ`. Returns `false` when the
+    /// device is not attached.
+    /// 将 8 字节包写入 DPSRAM `0x000`，中止未完成的 EP0 缓冲，清除
+    /// `EP_STALL_ARM` 的已定义位（USB 2.0 要求 SETUP 清除 EP0 的 STALL）
+    /// 并置位 `SETUP_REQ`。设备未附着时返回 `false`。
     pub fn host_setup(&mut self, packet: &SetupPacket) -> bool {
         if !self.transaction_ready() {
             return false;
@@ -295,6 +298,45 @@ mod tests {
         assert_eq!(stored & BUF_CTRL_AVAIL, 0);
         assert_eq!(core.read_dpram_u8(0x1C0), 0xAA);
         assert_eq!(core.read_dpram_u8(0x1C2), 0xCC);
+    }
+
+    #[test]
+    fn out_transaction_replaces_stale_length_bits() {
+        // The DCD arms an OUT endpoint with a transfer size in LEN (for
+        // example 64); real hardware overwrites that field with the received
+        // byte count. Leaving the old bits OR-ed in makes every short packet
+        // look full-sized, and the guest reads trailing DPRAM zeros as data.
+        // DCD 会用 LEN 字段表示 OUT 传输大小（例如 64）；真实硬件收包后会
+        // 用实际字节数覆盖该字段。若保留旧位做 OR，短包会被当成满长度包，
+        // 客户机就会把 DPRAM 尾部的零读成数据。
+        let mut core = ready_core();
+        let ctrl = EP_CTRL_ENABLE | (0x1C0 & EP_CTRL_BUFFER_OFFSET_MASK);
+        core.write_dpram_u32(regs::ep_ctrl_offset(1, Direction::Out), ctrl);
+        core.write_dpram_u32(
+            regs::ep_buf_ctrl_offset(1, Direction::Out),
+            BUF_CTRL_AVAIL | 64,
+        );
+        let response = core.host_out(1, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(response, OutResponse::Ack { last: true });
+        let stored = core.read_dpram_u32(regs::ep_buf_ctrl_offset(1, Direction::Out));
+        assert_ne!(stored & BUF_CTRL_FULL, 0);
+        assert_eq!(stored & BUF_CTRL_LEN_MASK, 3);
+    }
+
+    #[test]
+    fn setup_clears_only_defined_ep0_stall_arm_bits() {
+        // Datasheet 12.7.3.8.1: the controller clears EP_STALL_ARM on SETUP
+        // because USB 2.0 requires a SETUP to clear an EP0 STALL condition.
+        // 数据手册 12.7.3.8.1：SETUP 到达时控制器清除 EP_STALL_ARM，因为
+        // USB 2.0 要求 SETUP 清除 EP0 的 STALL 条件。
+        let mut core = ready_core();
+        core.write_reg(regs::EP_STALL_ARM, Alias::Rw, 0b111);
+        let packet = SetupPacket::standard_in(0x06, 0x0100, 0, 18);
+        assert!(core.host_setup(&packet));
+        assert_eq!(core.read_reg(regs::EP_STALL_ARM) & 0b11, 0);
+        // Bits 31:2 are reserved and outside the model's clear mask.
+        // 31:2 为保留位，不在模型的清除掩码内。
+        assert_ne!(core.read_reg(regs::EP_STALL_ARM) & 0b100, 0);
     }
 
     #[test]

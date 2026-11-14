@@ -291,6 +291,32 @@ pub const fn ep_buf_ctrl_offset(ep: usize, dir: Direction) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint abort / stall-arm bits / 端点中止与 STALL 预置位
+// ---------------------------------------------------------------------------
+
+/// `EP_ABORT` / `EP_ABORT_DONE` bit for endpoint `ep` and direction.
+/// 端点 `ep` 与方向对应的 `EP_ABORT` / `EP_ABORT_DONE` 位。
+///
+/// Datasheet Table 1317 / 1318 define bit `2*ep + dir`, where the even bit of
+/// a pair is the IN direction and the odd bit is OUT. Bit 0 is `EP0_IN`, bit 1
+/// is `EP0_OUT` and bit 15 is `EP7_OUT`; there is no separate direction flag.
+/// 数据手册表 1317 / 1318 定义位 `2*ep + dir`：每组偶数为 IN 方向、奇数为
+/// OUT；位 0 是 `EP0_IN`，位 1 是 `EP0_OUT`，位 15 是 `EP7_OUT`，不存在
+/// 独立的方向标志位。
+#[must_use]
+pub const fn ep_abort_bit(ep: usize, dir: Direction) -> u32 {
+    1 << (ep * 2 + dir.index())
+}
+
+/// `EP_STALL_ARM` bit arming a STALL on EP0 IN / 为 EP0 IN 布防 STALL 的位
+pub const EP_STALL_ARM_EP0_IN: u32 = 1 << 0;
+/// `EP_STALL_ARM` bit arming a STALL on EP0 OUT / 为 EP0 OUT 布防 STALL 的位
+pub const EP_STALL_ARM_EP0_OUT: u32 = 1 << 1;
+/// Defined bits of `EP_STALL_ARM` (bits 31:2 are reserved)
+/// `EP_STALL_ARM` 的已定义位（31:2 为保留位）
+pub const EP_STALL_ARM_EP0_MASK: u32 = EP_STALL_ARM_EP0_IN | EP_STALL_ARM_EP0_OUT;
+
+// ---------------------------------------------------------------------------
 // Endpoint control bits / 端点控制位
 // ---------------------------------------------------------------------------
 /// Endpoint enable / 端点使能
