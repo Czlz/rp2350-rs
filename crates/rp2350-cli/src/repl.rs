@@ -18,7 +18,7 @@ use rp2350_usb_host::{
     CdcChannel, CdcEndpoints, CdcLink, HostError, HostProgress, RawReplSession, UsbHostBridge,
 };
 
-use crate::run::{Machine, MachineOptions, fault_tail_lines};
+use crate::run::{ArchArg, Machine, MachineOptions, fault_tail_lines};
 
 /// Default total instruction budget for `repl` / `repl` 的默认总指令预算
 pub const DEFAULT_MAX_CYCLES: u64 = 300_000_000;
@@ -31,6 +31,9 @@ pub const DEFAULT_ENUM_CYCLES: u64 = 100_000_000;
 pub struct ReplOptions {
     /// Firmware file (UF2 or ELF) / 固件文件（UF2 或 ELF）
     pub file: PathBuf,
+    /// Architecture override; UF2 family auto-detection is used when absent
+    /// 架构覆盖；缺省时使用 UF2 family 自动识别
+    pub arch: Option<ArchArg>,
     /// Optional Python source executed after entering raw REPL
     /// 进入 raw REPL 后可选执行的 Python 源码
     pub exec: Option<String>,
@@ -259,7 +262,7 @@ pub fn run(options: &ReplOptions) -> Result<()> {
         )
     })?;
     let machine_options = MachineOptions {
-        arch: None,
+        arch: options.arch,
         max_cycles: options.max_cycles,
         strict_decode: options.strict_decode,
     };
@@ -341,6 +344,23 @@ pub fn run(options: &ReplOptions) -> Result<()> {
             for line in machine.irqs() {
                 eprintln!("[repl] {line}");
             }
+            for line in machine.traps() {
+                eprintln!("[repl] {line}");
+            }
+            // 控制器中断聚合状态区分「客户机未布防端点」与「中断未送达」。
+            // The aggregated controller interrupt state distinguishes "guest
+            // never armed EP0" from "IRQ was not delivered".
+            let usb = machine.usb().clone();
+            usb.with_core(|core| {
+                eprintln!(
+                    "[repl] usb INTR={:#010X} INTE={:#010X} INTS={:#010X} SIE={:#010X} BUFF={:#010X}",
+                    core.read_reg(rp2350_usb::regs::INTR),
+                    core.read_reg(rp2350_usb::regs::INTE),
+                    core.read_reg(rp2350_usb::regs::INTS),
+                    core.read_reg(rp2350_usb::regs::SIE_STATUS),
+                    core.read_reg(rp2350_usb::regs::BUFF_STATUS),
+                );
+            });
             Err(error.context(state))
         }
     }
@@ -395,7 +415,6 @@ fn machine_state(machine: &Machine) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::ArchArg;
     use crate::test_support::infinite_loop_elf;
 
     #[test]

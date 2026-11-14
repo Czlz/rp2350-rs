@@ -68,6 +68,10 @@ pub enum ArchArg {
     /// Arm Cortex-M33 / Arm Cortex-M33
     Arm,
     /// Hazard3 RISC-V / Hazard3 RISC-V
+    ///
+    /// `riscv` is accepted as an alias so the documented FV-1 command works.
+    /// 接受 `riscv` 别名，使文档中的 FV-1 命令可直接运行。
+    #[value(alias = "riscv")]
     RiscV,
 }
 
@@ -149,6 +153,10 @@ pub struct Machine {
     finished: bool,
     /// Logged interrupt deliveries / 已记录的中断投递
     irqs: Vec<String>,
+    /// Synchronous trap history (first entries) / 同步陷阱历史（前若干条）
+    traps: Vec<String>,
+    /// Last recorded synchronous `mcause` / 上次记录的同步 `mcause`
+    last_trap_cause: u32,
     /// Buffered UART0 output / 已缓冲的 UART0 输出
     uart: Vec<u8>,
     /// Live notices (trace lines and spin warnings) / 实时通知（轨迹行与自旋告警）
@@ -236,6 +244,12 @@ impl Machine {
                 riscv
                     .init(&mut bus)
                     .context("core boot failed / 核心启动失败")?;
+                // 同步安装合成 boot ROM 的致命异常向量：cause 2/5 进入宿主
+                // 诊断桩，而不是客户机未填充的向量槽。
+                // Install the synthetic boot ROM fatal-exception vectors so
+                // causes 2/5 reach the host diagnostic stub instead of an
+                // unfilled guest vector slot.
+                riscv.set_fatal_trap_vector(bootrom.riscv_exception_vector());
                 (Box::new(riscv), None)
             }
         };
@@ -247,7 +261,12 @@ impl Machine {
             core,
             peripherals,
             usb,
-            bootrom_applicable: arch == ArchArg::Arm,
+            // 两种架构都使用合成 boot ROM：Arm 走表查询桩，RISC-V 走
+            // 0x7DFA 槽位暴露的 rom_func_lookup 桩。
+            // Both architectures use the synthetic boot ROM: Arm goes through
+            // the table lookup stub, RISC-V through the rom_func_lookup stub
+            // exposed at the 0x7DFA slot.
+            bootrom_applicable: true,
             image_description,
             boot_vectors,
             steps: 0,
@@ -257,6 +276,11 @@ impl Machine {
             halt: None,
             finished: false,
             irqs: Vec::new(),
+            traps: Vec::new(),
+            // 复位后 mcause 为 0；用 0 作为初值可避免把复位值误记为陷阱。
+            // mcause resets to 0; seeding with 0 avoids logging the reset value
+            // as a trap.
+            last_trap_cause: 0,
             uart: Vec::new(),
             notices: Vec::new(),
             spin_base,
@@ -357,6 +381,12 @@ impl Machine {
         &self.irqs
     }
 
+    /// Synchronous trap history / 同步陷阱历史
+    #[must_use]
+    pub fn traps(&self) -> &[String] {
+        &self.traps
+    }
+
     /// Take buffered UART0 output / 取走已缓冲的 UART0 输出
     pub fn take_uart_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.uart)
@@ -422,6 +452,42 @@ impl Machine {
             self.recent.pop_front();
         }
         self.recent.push_back((self.steps, pc));
+    }
+
+    /// Record the first synchronous traps for post-mortem diagnostics
+    /// 记录最先出现的同步陷阱供停机后诊断
+    ///
+    /// Interrupts (`mcause[31] == 1`) are excluded: they are normal traffic
+    /// during enumeration. Only the first synchronous fault of each cause is
+    /// kept, which is enough to locate a silent `ebreak` halt loop.
+    /// 中断（`mcause[31] == 1`）被排除：枚举期间属于正常流量。每种原因只保留
+    /// 首个同步故障，足以定位静默的 `ebreak` 停机循环。
+    fn record_sync_trap(&mut self) {
+        let cause = self.core.csr_read(0x342);
+        if cause & 0x8000_0000 != 0 || cause == self.last_trap_cause {
+            return;
+        }
+        self.last_trap_cause = cause;
+        if self.traps.len() < IRQ_LOG_LIMIT {
+            // 最近 PC 序列给出进入故障前的调用链，单看 mepc 无法区分「直接执行
+            // ebreak」还是「某个断言函数跳到 ebreak」。
+            // The recent PC sequence shows the call chain into the fault; mepc
+            // alone cannot distinguish a direct ebreak from a panic helper.
+            let history = self
+                .recent
+                .iter()
+                .rev()
+                .take(TAIL_TRACE_STEPS)
+                .map(|(_, pc)| format!("{pc:#010X}"))
+                .collect::<Vec<_>>()
+                .join(" <- ");
+            self.traps.push(format!(
+                "[trap] step={} cause={cause:#X} mepc={:#010X} mtval={:#010X} hist={history}",
+                self.steps,
+                self.core.csr_read(0x341),
+                self.core.csr_read(0x343)
+            ));
+        }
     }
 
     /// Execute one instruction (or one boot ROM trap)
@@ -494,6 +560,7 @@ impl Machine {
             }
             if let Some(outcome) = self.bootrom.dispatch(&mut *self.core, &mut self.bus)? {
                 self.steps += 1;
+                self.record_sync_trap();
                 if let Some(halt) = outcome.halt {
                     self.halt = Some(format!("bootrom halt: {halt}"));
                     self.finalize();
@@ -520,6 +587,7 @@ impl Machine {
         match self.core.step(&mut self.bus) {
             Ok(CpuState::Running) => {
                 self.steps += 1;
+                self.record_sync_trap();
                 if trace.is_some() {
                     // 轨迹步与原 run 路径一致：每步泵送中断，不做自旋统计或时基推进。
                     // Trace steps mirror the original run path: pump every step and
@@ -561,9 +629,34 @@ impl Machine {
             self.spin_steps += 1;
             if self.spin_steps == SPIN_REPORT_STEPS && self.spin_reports < SPIN_REPORT_LIMIT {
                 self.spin_reports += 1;
+                let registers = match self.core.arch() {
+                    rp2350_cpu::CpuArch::RiscVHazard3 => format!(
+                        "ra={:#010X} sp={:#010X} s0={:#010X} s1={:#010X} \
+                         a0={:#010X} a1={:#010X} a2={:#010X} a3={:#010X} \
+                         a4={:#010X} a5={:#010X}",
+                        self.core.read_register(1),
+                        self.core.read_register(2),
+                        self.core.read_register(8),
+                        self.core.read_register(9),
+                        self.core.read_register(10),
+                        self.core.read_register(11),
+                        self.core.read_register(12),
+                        self.core.read_register(13),
+                        self.core.read_register(14),
+                        self.core.read_register(15),
+                    ),
+                    rp2350_cpu::CpuArch::ArmCortexM33 => format!(
+                        "r0={:#010X} r1={:#010X} r2={:#010X} r3={:#010X} sp={:#010X}",
+                        self.core.read_register(0),
+                        self.core.read_register(1),
+                        self.core.read_register(2),
+                        self.core.read_register(3),
+                        self.core.read_register(13),
+                    ),
+                };
                 self.notices.push(format!(
                     "[run] tight spin: PC stayed in {:#010X}..{:#010X} for {} steps, \
-                     likely polling a value that never changes / 疑似轮询等待",
+                     likely polling a value that never changes / 疑似轮询等待; {registers}",
                     self.spin_base,
                     self.spin_base + SPIN_WINDOW_BYTES,
                     self.spin_steps
@@ -582,6 +675,7 @@ impl Machine {
         // IRQ lines stay throttled to avoid re-asserting a level IRQ each step.
         replay_system_writes(&mut *self.core, &self.peripherals);
         if self.steps - self.pumped >= PUMP_INTERVAL {
+            self.peripherals.service_core1_peer();
             deliver_irqs(
                 &mut *self.core,
                 &self.peripherals,
@@ -666,6 +760,7 @@ pub fn run(options: &RunOptions) -> Result<()> {
         us = machine.time_us(),
         pc = machine.pc()
     )?;
+    writeln!(stdout, "[run] {}", register_snapshot(&machine))?;
     if !machine.irqs().is_empty() {
         writeln!(stdout, "[run] irq deliveries (first {IRQ_LOG_LIMIT}):")?;
         for line in machine.irqs() {
@@ -697,16 +792,35 @@ pub fn run(options: &RunOptions) -> Result<()> {
 /// 只有寄存器现场才能区分内存故障与 INVSTATE。
 #[must_use]
 pub fn register_snapshot(machine: &Machine) -> String {
-    let mut parts = Vec::with_capacity(16);
-    for index in 0..13u8 {
-        parts.push(format!(
-            "R{index}={:#010X}",
-            machine.core.read_register(index)
-        ));
+    let mut parts = Vec::with_capacity(18);
+    match machine.core.arch() {
+        rp2350_cpu::CpuArch::RiscVHazard3 => {
+            for index in 0..16u8 {
+                parts.push(format!(
+                    "X{index}={:#010X}",
+                    machine.core.read_register(index)
+                ));
+            }
+            parts.push(format!("SP={:#010X}", machine.core.read_register(2)));
+            parts.push(format!("RA={:#010X}", machine.core.read_register(1)));
+            parts.push(format!("PC={:#010X}", machine.core.pc()));
+            parts.push(format!("MTVEC={:#010X}", machine.core.csr_read(0x305)));
+            parts.push(format!("MCAUSE={:#010X}", machine.core.csr_read(0x342)));
+            parts.push(format!("MEPC={:#010X}", machine.core.csr_read(0x341)));
+            parts.push(format!("MTVAL={:#010X}", machine.core.csr_read(0x343)));
+        }
+        rp2350_cpu::CpuArch::ArmCortexM33 => {
+            for index in 0..13u8 {
+                parts.push(format!(
+                    "R{index}={:#010X}",
+                    machine.core.read_register(index)
+                ));
+            }
+            parts.push(format!("SP={:#010X}", machine.core.read_register(13)));
+            parts.push(format!("LR={:#010X}", machine.core.read_register(14)));
+            parts.push(format!("PC={:#010X}", machine.core.pc()));
+        }
     }
-    parts.push(format!("SP={:#010X}", machine.core.read_register(13)));
-    parts.push(format!("LR={:#010X}", machine.core.read_register(14)));
-    parts.push(format!("PC={:#010X}", machine.core.read_register(15)));
     format!("[regs] {}", parts.join(" "))
 }
 
@@ -741,11 +855,37 @@ fn memory_line(machine: &mut Machine, label: &str, addr: u32, count: usize) -> S
 /// 打印停机前 [`TAIL_TRACE_STEPS`] 条指令即可定位罪魁分支，寄存器快照说明
 /// 操作数从何而来，`R4`/`SP` 的内存转储则暴露被破坏的结构体。
 pub fn fault_tail_lines(machine: &mut Machine) -> Vec<String> {
-    let object = machine.core.read_register(4);
-    let stack = machine.core.read_register(13);
+    let (object, stack, object_label) = match machine.core.arch() {
+        // RISC-V has no r4 frame pointer; s0 (x8) is the usual object base
+        // saved across calls, and x2 is the stack pointer.
+        // RISC-V 没有 r4 帧指针；跨调用保存的对象基址通常是 s0（x8），
+        // 栈指针是 x2。
+        rp2350_cpu::CpuArch::RiscVHazard3 => (
+            machine.core.read_register(8),
+            machine.core.read_register(2),
+            "S0",
+        ),
+        rp2350_cpu::CpuArch::ArmCortexM33 => (
+            machine.core.read_register(4),
+            machine.core.read_register(13),
+            "R4",
+        ),
+    };
     let mut lines = vec![register_snapshot(machine)];
-    lines.push(memory_line(machine, "R4", object, 12));
+    lines.push(memory_line(machine, object_label, object, 12));
     lines.push(memory_line(machine, "SP", stack, 12));
+    // 若对象首字是 SRAM 指针，再转储它指向的锁/状态字。
+    // If the object's first word is an SRAM pointer, dump the lock/state word
+    // it points at.
+    let mut cycles = 0u64;
+    let pointer = machine
+        .bus
+        .read_u32(object, &mut cycles)
+        .unwrap_or(0xFFFF_FFFF);
+    let target = pointer & !3;
+    if target & 0xFFF0_0000 == 0x2000_0000 {
+        lines.push(memory_line(machine, "OBJ>", target, 8));
+    }
     lines.extend(
         machine
             .recent_steps()
@@ -821,6 +961,7 @@ fn pump(
     usb: &Controller,
     irq_log: &mut Vec<String>,
 ) {
+    peripherals.service_core1_peer();
     replay_system_writes(core, peripherals);
     deliver_irqs(core, peripherals, usb, irq_log);
 }
@@ -846,22 +987,24 @@ fn deliver_irqs(
             continue;
         }
         core.signal_interrupt(irq);
-        if irq_log.len() < IRQ_LOG_LIMIT {
-            irq_log.push(format!("[irq] signal {irq} at PC={:#010X}", core.pc()));
-        }
+        log_irq(irq_log, irq, core.pc());
     }
     // USB 控制器把 INTR & INTE 聚合到 INTS；固件清 INTS 后条件自然撤销。
     // The USB controller aggregates INTR & INTE into INTS; the condition
     // disappears when firmware clears INTS.
     if usb.irq_asserted() {
         core.signal_interrupt(USBCTRL_IRQ);
-        if irq_log.len() < IRQ_LOG_LIMIT {
-            irq_log.push(format!(
-                "[irq] signal {USBCTRL_IRQ} at PC={:#010X}",
-                core.pc()
-            ));
-        }
+        log_irq(irq_log, USBCTRL_IRQ, core.pc());
     }
+}
+
+/// Record the latest interrupt deliveries in a bounded ring
+/// 在有界环形缓冲中记录最近的中断投递
+fn log_irq(irq_log: &mut Vec<String>, irq: u16, pc: u32) {
+    if irq_log.len() == IRQ_LOG_LIMIT {
+        irq_log.remove(0);
+    }
+    irq_log.push(format!("[irq] signal {irq} at PC={pc:#010X}"));
 }
 
 #[cfg(test)]
@@ -929,8 +1072,14 @@ mod tests {
         let mut machine = Machine::new(&elf, &options).expect("machine");
         machine.run_cycles(40);
         let tail = machine.recent_steps();
-        assert_eq!(tail.len(), TAIL_TRACE_STEPS);
-        assert_eq!(tail[0].0, 40 - TAIL_TRACE_STEPS as u64);
+        // 预算小于回溯窗口时，缓冲只保留实际执行过的步数。
+        // When the budget is smaller than the trace window, the ring buffer
+        // only holds the steps that actually ran.
+        let expected = usize::try_from(machine.steps())
+            .unwrap()
+            .min(TAIL_TRACE_STEPS);
+        assert_eq!(tail.len(), expected);
+        assert_eq!(tail[0].0, machine.steps() - expected as u64);
         assert!(
             tail.iter()
                 .all(|&(_, pc, opcode)| pc == 0x1000_0000 && opcode == 0xE7FE)
@@ -1004,5 +1153,42 @@ mod tests {
                 .starts_with("elf: entry=0x10000001")
         );
         assert_eq!(machine.boot_vectors().map(|(_, pc)| pc), Some(0x1000_0000));
+    }
+
+    /// Build one 512-byte UF2 block with a family ID / 构造一个带 family ID 的 UF2 块
+    fn uf2_block(family: u32, address: u32, payload: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; 512];
+        block[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes());
+        block[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes());
+        // Family-ID-present flag. / 置位 family ID 存在标志。
+        block[8..12].copy_from_slice(&0x0000_2000u32.to_le_bytes());
+        block[12..16].copy_from_slice(&address.to_le_bytes());
+        block[16..20].copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        block[20..24].copy_from_slice(&0u32.to_le_bytes());
+        block[24..28].copy_from_slice(&1u32.to_le_bytes());
+        block[28..32].copy_from_slice(&family.to_le_bytes());
+        block[32..32 + payload.len()].copy_from_slice(payload);
+        block[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn uf2_family_selects_the_cpu_architecture() {
+        // RISC-V family must auto-select Hazard3; the explicit override wins.
+        // RISC-V family 必须自动选择 Hazard3；显式覆盖优先。
+        let riscv = uf2_block(0xE48B_FF5A, FLASH_XIP_BASE, &[0u8; 4]);
+        let mut bus = SimpleBus::new();
+        bus.register_region(Box::new(RamRegion::new("flash", FLASH_XIP_BASE, 0x1000)))
+            .expect("flash region");
+        let (arch, entry, description) = load_image(&riscv, &mut bus, None).expect("load");
+        assert_eq!(arch, ArchArg::RiscV);
+        assert_eq!(entry, None);
+        assert!(description.contains("RISC-V"));
+        let (arch, _, _) = load_image(&riscv, &mut bus, Some(ArchArg::Arm)).expect("load override");
+        assert_eq!(arch, ArchArg::Arm);
+
+        let arm = uf2_block(0xE48B_FF59, FLASH_XIP_BASE, &[0u8; 4]);
+        let (arch, _, _) = load_image(&arm, &mut bus, None).expect("load arm");
+        assert_eq!(arch, ArchArg::Arm);
     }
 }

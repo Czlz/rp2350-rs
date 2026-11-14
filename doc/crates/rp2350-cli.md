@@ -51,16 +51,18 @@ PC 轨迹、模拟时间、最多 8 条已记录的中断投递以及缓冲的 U
 ```text
 rp2350 repl --file <FIRMWARE> [--exec "CODE"] [--max-cycles N]
             [--enum-cycles N] [--no-soft-reset] [--strict-decode]
+            [--arch arm|riscv]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
 |---------------|----------------|----------------|
-| `--file` | required | Firmware (MicroPython UF2 or ELF) / 固件 |
+| `--file` | required | Firmware (MicroPython/CircuitPython UF2 or ELF) / 固件 |
 | `--exec` | interactive | Python source to run once / 只执行一次的 Python 源码 |
 | `--max-cycles` | `300_000_000` | Total simulated instruction budget / 总指令预算 |
 | `--enum-cycles` | `100_000_000` | Budget before USB enumeration must finish / USB 枚举需在此预算内完成 |
 | `--no-soft-reset` | off | Skip the Ctrl-D soft reset on entry / 进入时跳过 Ctrl-D 软复位 |
 | `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
+| `--arch` | from UF2 family | Override the core architecture / 覆盖核心架构（`riscv` 为别名） |
 
 The subcommand boots the machine, runs the guest under the USB host bridge
 until `HostProgress::Configured` (within `--enum-cycles`), enters the raw
@@ -167,11 +169,14 @@ XIP 维护窗口、`0x2000_0000` 的 520 KB SRAM、`BootPeripherals`（GPIO、UA
 `load_image` 按魔数检测容器：
 
 - **UF2** (`"UF2\n\x0A"` prefix): parsed and loaded through `Uf2Image`; the
-  family selects the default architecture (`Arm` when unknown), and boot
-  uses the reset vector table at the flash XIP base (VTOR follows).
+  family selects the default architecture (`Arm` when unknown). Arm boots from
+  the reset vector table at the flash XIP base (VTOR follows); RISC-V lets
+  `Hazard3Core` locate the picobin `IMAGE_DEF` entry-point item and load the
+  boot2 entry/SP. `--arch` overrides the detected architecture.
   **UF2**（`"UF2\n\x0A"` 前缀）：经 `Uf2Image` 解析并加载；family 决定默认
-  架构（未知则为 `Arm`），启动使用 Flash XIP 基地址处的复位向量表（VTOR
-  随之指向那里）。
+  架构（未知则为 `Arm`）。Arm 从 Flash XIP 基地址的复位向量表启动（VTOR
+  随之指向那里）；RISC-V 由 `Hazard3Core` 定位 picobin `IMAGE_DEF` 入口点
+  条目并加载 boot2 入口/SP。`--arch` 覆盖检测到的架构。
 - **ELF**: parsed and loaded through `FirmwareImage`; the entry point comes
   from the image, the stack pointer is SRAM top, and
   `CortexM33Core::boot_at` is used (Arm) or `Hazard3Core` boots from its own

@@ -65,6 +65,11 @@ enum Commands {
         #[arg(short, long)]
         file: String,
 
+        /// CPU architecture override (UF2 family is auto-detected by default)
+        /// CPU 架构覆盖（默认由 UF2 family 自动识别）
+        #[arg(long, value_enum)]
+        arch: Option<run::ArchArg>,
+
         /// Python source to execute after entering raw REPL
         /// 进入 raw REPL 后执行的 Python 源码
         #[arg(long)]
@@ -202,6 +207,7 @@ fn main() {
         }
         Commands::Repl {
             file,
+            arch,
             exec,
             max_cycles,
             enum_cycles,
@@ -210,6 +216,7 @@ fn main() {
         } => {
             let options = repl::ReplOptions {
                 file: file.into(),
+                arch,
                 exec,
                 max_cycles,
                 enum_cycles,
