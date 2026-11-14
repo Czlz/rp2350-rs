@@ -55,6 +55,9 @@
 - `rp2350-cli`: `gdb` subcommand now starts the RSP server — a `MachineTarget` adapter exposes registers (R0-R15 + XPSR), bus memory, PC-compare breakpoints and `resume` through `Machine::step` (boot ROM traps, interrupt pumping and the peripheral timebase stay active), with a 1,000,000-instruction continue budget
 - `rp2350-mcp`: JSON-RPC method layer — `initialize`, `tools/list` and `tools/call` (`list_devices`, `query_all`, `query_device`, `configure`) delegated to `DeviceManager`, with JSON-RPC error codes for parse/method/parameter/device/config failures
 - `rp2350-virt-periph`: `mcp_query_device`, `mcp_list_devices` and `apply_config` on `DeviceManager` (plus `ConfigApplyError`) backing the MCP method layer
+- `rp2350-arm`: DSP packed SIMD — `SADD8`/`SSUB8`/`SADD16`/`SSUB16` and the `UADD`/`USUB` variants with per-lane GE flags in `APSR[19:16]`, `SXTB16`/`UXTB16` with the rotate field, and `USAD8`/`USADA8`; `MRS APSR` / `MSR APSR_g|nzcvqg` expose GE
+- `rp2350-virt-periph`: `DeviceManager::scan_and_load(dir)` — instantiates every device plugin in a directory (metadata ID or file stem, duplicate/failure skipped with a warning) and `PluginLoader::scan_dir` helper
+- `rp2350-cli`: `list-devices` and `wire` subcommands now scan a plugin directory, build a real `DeviceManager` and print device/wiring tables (one-shot process semantics)
 
 ### Fixed / 修复
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window

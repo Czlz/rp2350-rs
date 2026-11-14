@@ -101,7 +101,7 @@
 |----|------|--------|--------|
 | 2.1 | `CortexM33Registers`: R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK | registers.rs | ✅ |
 | 2.2 | Thumb-16 decoder + executor (~90 instructions) | execute_thumb16.rs | ✅ |
-| 2.3 | Thumb-32 decoder（~60 ALU + Load/Store；另含 FPv5-SP FPU 与 GPIO(CP0)/DCP(CP4) 协处理器，DSP/SIMD 编码未实现） | execute_thumb32.rs | ✅ |
+| 2.3 | Thumb-32 decoder（~60 ALU + Load/Store；另含 FPv5-SP FPU 与 GPIO(CP0)/DCP(CP4) 协处理器；DSP/SIMD 已补 SMUL/SMLA/SMMUL、并行加减、SXTB16/UXTB16 与 USAD8/USADA8） | execute_thumb32.rs | ✅ |
 | 2.4 | Condition flags (NZCVQ) + IT block execution | conditions.rs | ✅ |
 | 2.5 | NVIC: ISER/ICER/ISPR/ICPR/IPR/STIR, priority grouping | nvic.rs | ✅ |
 | 2.6 | Exception entry/exit (stacking/unstacking, EXC_RETURN) | exceptions.rs | ✅ |
@@ -232,6 +232,16 @@ Supports both GUI and headless/MCP mode.
 > The MCP method layer has landed: McpServer implements initialize/tools/list/tools/call
 > (list_devices, query_all, query_device, configure) on top of DeviceManager, which gained
 > mcp_query_device and apply_config. HTTP/TCP transport and CLI mcp-serve wiring remain.
+
+> **P1 进度 / P1 progress（2026-11-14）**：插件系统端到端已打通 ——
+> `DeviceManager::scan_and_load(dir)` 自动实例化目录内设备插件，CLI `list-devices`
+> 与 `wire` 已接入真实设备管理器（一次性进程语义，已写入文档）；`mcp_list_devices`
+> 补充端口信息。剩余：GUI 调色板/连线、接线持久化、热替换。
+> The plugin system is now wired end to end: DeviceManager::scan_and_load(dir)
+> instantiates device plugins from a directory, and the CLI list-devices / wire
+> subcommands drive a real manager (one-shot process semantics documented);
+> mcp_list_devices now includes port information. GUI palette/wiring, wiring
+> persistence and hot replacement remain.
 
 ---
 
