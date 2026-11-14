@@ -7,13 +7,13 @@
 > Stages 0–5 已落地（含 `rp2350-usb`/`rp2350-usb-host` 两个 crate 与 CLI `repl`/`perfbench`
 > 子命令，超出本计划原始 Phase 1 清单）；Stage 6 的官方 `run-perfbench.py` 结果见
 > [perfbench-report.md](perfbench-report.md)。另一条端到端验收主线是
-> [gba-bringup-report.md](gba-bringup-report.md)：`emerald.uf2`（pokeemerald-rp2350）
+> [example/gba/doc/gba-bringup-report.md](../../example/gba/doc/gba-bringup-report.md)：`emerald.uf2`（pokeemerald-rp2350）
 > 双核运行、HSTX 扫描输出真实游戏画面。
 > The acceptance mainline runs through reference-gap-analysis Stages 0–6; stages 0–5
 > have landed (including the `rp2350-usb` / `rp2350-usb-host` crates and the CLI
 > `repl` / `perfbench` subcommands, beyond the original Phase 1 list), and the Stage 6
 > official `run-perfbench.py` results are in [perfbench-report.md](perfbench-report.md).
-> A second end-to-end mainline is [gba-bringup-report.md](gba-bringup-report.md):
+> A second end-to-end mainline is [example/gba/doc/gba-bringup-report.md](../../example/gba/doc/gba-bringup-report.md):
 > `emerald.uf2` (pokeemerald-rp2350) on two cores with HSTX scanout of real game frames.
 
 > **P1 功能进度 / P1 feature progress（2026-11-14）**

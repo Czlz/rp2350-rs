@@ -29,7 +29,11 @@ plugins/**/*.dylib
 HANDOFF.md
 
 # Trae workspace documents (session-specific design plans, not shipped)
-.trae/
+# Project rules are shipped so agents and humans read the same contract.
+.trae/*
+!.trae/rules/
+.trae/rules/*
+!.trae/rules/project.md
 
 # Cargo lock for libraries (keep for workspace root)
 # Cargo.lock — committed for workspace root only

@@ -68,12 +68,13 @@ busy=… chain=… treq=…` 通道快照，最后是 core1 行。`Machine` 按 
 
 Each `--dump` request then writes its bytes and prints
 `[run] dump 0x<addr>+0x<len> -> <path> (<n> bytes)`. This is the fastest way to
-capture a GBA framebuffer (`--dump 0x20063DF4:0x12C00:fb.bin` for
-pokeemerald-rp2350) without attaching GDB.
+capture a firmware framebuffer without attaching GDB; the concrete address of a
+target's framebuffer belongs to that example's README (see
+`example/gba/README.md` for `emerald.uf2`).
 每条 `--dump` 请求随后写入字节并打印
-`[run] dump 0x<addr>+0x<len> -> <path> (<n> bytes)`。这是不挂 GDB 也能抓取
-GBA 帧缓冲（pokeemerald-rp2350 为 `--dump 0x20063DF4:0x12C00:fb.bin`）的最快
-方式。
+`[run] dump 0x<addr>+0x<len> -> <path> (<n> bytes)`。这是不挂 GDB 也能抓取固件
+帧缓冲的最快方式；具体目标帧缓冲地址属于该示例的 README（`emerald.uf2` 见
+`example/gba/README.md`）。
 
 ### `repl` — USB CDC raw REPL / USB CDC raw REPL
 
@@ -180,22 +181,21 @@ python tools\pyboard.py --device "exec:E:\Source\mcu\pico\rp2350-rs\target\relea
 # run-perfbench.py with the same target / 用同一目标运行 run-perfbench.py
 python tests\run-perfbench.py -t "exec:E:\...\rp2350-cli.exe repl --file firmware.uf2 --stdio --max-cycles 0" tests\perf_bench\bm_float.py
 
-# pokeemerald-rp2350: banner after the firmware's 1500 ms sleep. Keep stdin
-# open until it appears; `--max-cycles 0` avoids the 2 s default cap.
-py hold_stdin.py | rp2350-cli.exe repl --file emerald.uf2 --stdio --max-cycles 0
+# Firmware that sleeps before printing: keep stdin open until the log appears.
+# `--max-cycles 0` removes the default budget cap. The example tool is at
+# example/gba/tools/hold_stdin.py.
+py example\gba\tools\hold_stdin.py 600 | rp2350-cli.exe repl --file emerald.uf2 --stdio --max-cycles 0
 ```
 
-Measured on `emerald.uf2`: enumeration reaches
-`USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1` after ~1.8 M steps
-(~12 ms simulated), and the banner `=== Pokemon Emerald on RP2350 ===` arrives
-after ~297 M steps (~1.98 s) because the firmware sleeps 1500 ms. A stdin EOF
-only drains 50 ms after the last byte, so a plain `< nul` run stops before the
-banner.
-`emerald.uf2` 实测：枚举在约 180 万步（模拟 12 毫秒）后到达
-`USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`；由于固件休眠
-1500 毫秒，横幅 `=== Pokemon Emerald on RP2350 ===` 在约 2.97 亿步
-（模拟 1.98 秒）后出现。stdin EOF 后仅排空 50 毫秒，因此直接 `< nul` 的运行
-会在横幅前结束。
+A stdin EOF drains only 50 ms after the last byte, so firmware that sleeps
+before its first `printf` (for example `emerald.uf2`: 1500 ms) ends the bridge
+before printing anything. Pipe a long-lived stdin into the process instead; the
+measured step counts for that firmware are in
+[example/gba/doc/gba-bringup-report.md](../../example/gba/doc/gba-bringup-report.md).
+stdin EOF 后仅排空 50 毫秒，因此首次 `printf` 之前会休眠的固件（例如
+`emerald.uf2` 的 1500 毫秒）会在打印前就结束桥接。请改为向进程管道一个长期
+存活的 stdin；该固件的实测步数见
+[example/gba/doc/gba-bringup-report.md](../../example/gba/doc/gba-bringup-report.md)。
 
 > **Note / 注意**：`exec:` support and its quoting rules depend on the
 > `pyboard.py` version and host shell; any wrapper that pipes this process's

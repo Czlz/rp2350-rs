@@ -90,6 +90,11 @@
 - `rp2350-cli`: `mcp-serve` starts the MCP HTTP transport (default port 8080) and prints both endpoints
 - `plugins/uart-terminal`: second-party UART terminal plugin — `TX` (input) is sampled at the configured baud to decode start/data/stop bits LSB-first, `RX` (output) shifts bytes out with the same bit timing; `baud`/`data_bits`/`stop_bits`/`rx_line`/`clock_hz` configuration, framing-error accounting and a state snapshot (11 tests)
 
+### Changed / 变更
+- 文档结构：**示例项目专用内容迁出主 `doc/`**。`gba-bringup-report.md` 与游戏帧截图移到 `example/gba/doc/`，示例的固件信息、运行命令、引脚表、外设/插件依赖移到 `example/gba/README.md`，帧缓冲转 PNG 工具移到 `example/gba/tools/fb2png.py`；`.trae/rules/project.md` 新增「示例项目目录（example/，强制）」规则，主 `doc/` 只保留跨示例的通用文档并用相对路径链接
+- `doc/implementation-plan.md`：P1 进度表同步 —— PIO（DMA DREQ）、DMA（`TRANS_COUNT` 重载、3 通道环）、HSTX（像素时钟节拍、`DREQ_HSTX`）、ARM ISA（`MSPLIM`/`PSPLIM`、折半/双乘/宽乘）、双核（真实 core1 执行）状态更新；验收主线增加 GBA 示例链接
+- `doc/changelog.md`：更新「Planned」列表（双核/HSTX/egui 画布/DSP/GDB 已完成，改为 PIO FUNCSEL、WFI/WFE 调度、PSRAM XIP、MCP TLS、多核 GDB `vCont`、TMDS 串行化）
+
 ### Fixed / 修复
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
 - `rp2350-arm`: external interrupts used the IRQ number as the exception number and fetched the vector from `VTOR + irq * 4`; they now use exception number `16 + irq`
@@ -110,6 +115,12 @@
 - `rp2350-riscv`: `LB`/`LH` now sign-extend to XLEN (the previous implementation effectively zero-extended); `RESET_DONE` reports the implemented bit mask and tracks reset-register state
 - `rp2350-usb`: `EP_ABORT`/`EP_ABORT_DONE` bits decode as `2*ep + dir` (there is no separate direction bit), so aborting EP0 IN no longer clears EP0 OUT; `EP_STALL_ARM` EP0 bits are cleared when a SETUP packet arrives
 
+### Verified / 验证（2026-11-15）
+
+- **GBA 示例 ✅**：`emerald.uf2`（SHA-256 `5BEE593F…A9B4C4`）双核运行 2 G 步（13.3 s 模拟时间），`hstx words=128386654 underruns=0 wof=false unknown=0`、`core1 state=Running`、无总线错误；`g_fb` 为 32 色真实画面（Game Freak 标志）。详见 [example/gba/doc/gba-bringup-report.md](../../example/gba/doc/gba-bringup-report.md)。
+- **FV-1/2/3 ✅**：三个固件 `repl --exec "print(6 * 7)"` 均输出 `42`。
+- **perfbench ✅**：官方 `run-perfbench.py` Arm 与 RISC-V 各 24/24 通过 CPython 真值（[报告](perfbench-report.md)）。
+
 ### Verified / 验证（2026-11-14）
 
 - **FV-2 ✅**：`cargo run --release -p rp2350-cli -- repl --file RPI_PICO2-20260824-v1.29.0.uf2 --exec "print(6 * 7)"` → `stdout: 42`（2,224,500 步 / 14,830 µs）；`perfbench --bench bm_nqueens.py --benchrun benchrun.py --n 40 --m 10` → `measured: ticks_us=19266 norm=100 result=10`。
@@ -117,15 +128,15 @@
 - **FV-1 ✅（2026-11-14）**：`cargo run --release -p rp2350-cli -- repl --file RPI_PICO2-RISCV-...uf2 --exec "print(6 * 7)"` → `[repl] USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`、`[repl] banner`、`stdout: 42`（2,659,500 步 / 17,730 µs）；`run --arch riscv --strict-decode --max-cycles 50000000` 无未定义指令。修复 Zcmp、Xh3irq 抢占/NOIRQ、CSR 窗口索引与 boot2 数据查找槽。
 
 ### Planned / 计划中
-- ARM Cortex-M33 dual-core simulation
-- PIO (3 blocks, 4 SM each) complete instruction set
-- HSTX pixel capture + egui video output
+- PIO pin function select (`IO_BANK0` `GPIOx_FUNC`) so PIO/UART pins share the pad matrix
+- `WFI`/`WFE`/`SEV` sleep and event semantics wired into the dual-core driver
+- SIO hardware spinlocks and per-core exclusive monitors (multicore correctness)
+- HSTX TMDS serialiser and DVI bit timing; pixel-capture API for hosts
 - QSPI Flash XIP + PSRAM XIP
-- egui Virtual Electronics Lab with drag-wire GPIO connection
-- Virtual peripherals: LED, TF Card (SPI+SDIO), UART Terminal, Debug Probe, PSRAM, QSPI Flash
-- Plugin system (libloading + abi_stable)
-- GDB RSP Server (multi-core, vCont, breakpoints, watchpoints)
-- DSP extension (ARMv8-M)
+- egui: wiring persistence and a device palette for the Virtual Lab
+- MCP TLS transport
+- GDB: read/access watchpoints (`rwatch`/`awatch`), `monitor` commands, multi-core `vCont`
+- DMA: `BSWAP`, `SNIFF`/checksum, timer DREQ pacing, high-priority arbitration
 
 ---
 

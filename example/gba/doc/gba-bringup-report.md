@@ -1,5 +1,11 @@
 # GBA bring-up report / GBA 启动验证报告
 
+> 本文件属于**示例项目**材料（`example/gba/`）；通用的模拟器设计文档在仓库根
+> `doc/`。示例的运行命令、引脚表与外设依赖见 [../README.md](../README.md)。
+> This document belongs to the **example project** (`example/gba/`); generic
+> emulator design documents live in the repository `doc/`. Run instructions, the
+> pin map and peripheral dependencies are in [../README.md](../README.md).
+
 Target: `pokeemerald-rp2350` (Pokémon Emerald on RP2350) driven by this
 emulator instead of real hardware. The goal was to boot the shipped firmware,
 get a real game picture into the HSTX scanout ring, and keep it running without
@@ -180,9 +186,9 @@ pixels=38400 nonzero=38396 unique=32
 
 ![Game Freak logo rendered by the emulated PPU and scanned out over HSTX](gba-frame-gamefreak.png)
 
-*`doc/gba-frame-gamefreak.png` — the frame the HSTX ring is scanning out after
+*`example/gba/doc/gba-frame-gamefreak.png` — the frame the HSTX ring is scanning out after
 1.2 G steps, captured with `run --dump 0x20063DF4:0x12C00:fb.bin`.*
-*`doc/gba-frame-gamefreak.png` —— 1.2 G 步时 HSTX 环扫描输出的帧，用
+*`example/gba/doc/gba-frame-gamefreak.png` —— 1.2 G 步时 HSTX 环扫描输出的帧，用
 `run --dump 0x20063DF4:0x12C00:fb.bin` 抓取。*
 
 ### Regression gates / 回归门禁
