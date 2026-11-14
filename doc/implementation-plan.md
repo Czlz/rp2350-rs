@@ -1,15 +1,16 @@
 # Implementation Plan / 实施计划
 
-> **Version**: 3.1 | **Date**: 2026-11-14 | **Phase 1: ✅ COMPLETE** | **Phase 2: ✅ COMPLETE** | **验收主线 Stages 0–5: ✅ / Stage 6: 🔄**
+> **Version**: 3.1 | **Date**: 2026-11-14 | **Phase 1: ✅ COMPLETE** | **Phase 2: ✅ COMPLETE** | **验收主线 Stages 0–6: ✅**
 
 > **当前验收主线 / Current acceptance mainline**: [reference-gap-analysis.md](reference-gap-analysis.md) 的
 > Stages 0–6 —— 真实 MicroPython `RPI_PICO2-*.uf2` → USB CDC → raw REPL → `perfbench`。
 > Stages 0–5 已落地（含 `rp2350-usb`/`rp2350-usb-host` 两个 crate 与 CLI `repl`/`perfbench`
-> 子命令，超出本计划原始 Phase 1 清单）；Stage 6（perfbench 对比报告）进行中。
+> 子命令，超出本计划原始 Phase 1 清单）；Stage 6 的官方 `run-perfbench.py` 结果见
+> [perfbench-report.md](perfbench-report.md)。
 > The acceptance mainline runs through reference-gap-analysis Stages 0–6; stages 0–5
 > have landed (including the `rp2350-usb` / `rp2350-usb-host` crates and the CLI
-> `repl` / `perfbench` subcommands, beyond the original Phase 1 list), and Stage 6
-> (the perfbench comparison report) is in progress.
+> `repl` / `perfbench` subcommands, beyond the original Phase 1 list), and the Stage 6
+> official `run-perfbench.py` results are in [perfbench-report.md](perfbench-report.md).
 
 > **P1 功能进度 / P1 feature progress（2026-11-14）**
 >
@@ -19,8 +20,9 @@
 > | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`） | watchpoint、多核 `vCont`、`target.xml`、monitor 命令 |
 > | MCP | ✅ | JSON-RPC 方法层（`initialize`/`tools/list`/`tools/call`）、HTTP 传输、CLI `mcp-serve` | TLS/鉴权、插件热加载 |
 > | 插件 / Plugins | ✅ | ABI、`DeviceManager::scan_and_load`、CLI `list-devices`/`wire`、LED 与 UART Terminal 插件 | GUI 调色板/连线、接线持久化、热替换 |
-> | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、DSP 并行 SIMD/GE 标志 | VFP 惰性压栈、饱和指令 |
-> | 双核 / Dual-core | 🚧 | core1 WFE + SIO FIFO 桩；双核调度脚手架（本波） | PSM 释放接线、SIO 门铃、CLI 双核模式、GDB 多核 |
+> | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、FPv5-SP 单精度算术/比较/转换/VSEL/VRINT、DSP 并行 SIMD/GE 标志 | VFP 惰性压栈、双精度算术、饱和指令 |
+> | 官方 perfbench | ✅ | `repl --stdio` + 本地 pyboard shim；Arm 与 RISC-V 各 24/24 通过 CPython 真值（[报告](perfbench-report.md)） | 可选：`-a 8` 方差、更大 N/M、外设类基准 |
+> | 双核 / Dual-core | 🚧 | core1 WFE + SIO FIFO 桩；`DualCoreM33` 双核调度脚手架（释放门、交替步进、预算、独立 NVIC，10 测试） | PSM 释放接线、SIO 门铃、CLI 双核模式、GDB 多核 |
 >
 > 状态标记：✅ 完成（P1 范围） · 🚧 部分完成 · ⏳ 未开始。
 > Status markers: ✅ done for P1 scope · 🚧 partial · ⏳ not started.

@@ -8,6 +8,10 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `doc/perfbench-report.md`: official `run-perfbench.py` results for the stock MicroPython Arm and RISC-V UF2s — 24/24 benchmarks pass the CPython truth check on both, driven through the new `repl --stdio` bridge; the run exposed and fixed the FPv5-SP arithmetic gap (Arm `bm_float`/`bm_fft`/`bm_chaos`)
+- `rp2350-arm`: FPv5-SP single-precision arithmetic, comparison, conversion, `VSEL` and `VRINT` instructions — `VADD`/`VSUB`/`VMUL`/`VNMUL`/`VMLA`/`VMLS`/`VNMLA`/`VNMLS`/`VDIV`/`VSQRT`/`VABS`/`VNEG`, fused `VFMA`/`VFMS`/`VFNMA`/`VFNMS`, `VCMP`/`VCMPE`, integer↔float `VCVT`/`VCVTR`, `VMOV.F32 Sd,Sm`, condition selects and directed rounding; `VCMP` writes FPSCR N/Z/C/V and the cumulative exception bits are modelled
+- `rp2350-arm`: `DualCoreM33` dual-core scheduling scaffold — owns core0/core1, gates core1 behind `release_core1` (vector-table probe + `boot_at`), steps each running core once per call, honours `run_cycles` budgets with early exit when both cores stop, and routes interrupts to each core's independent NVIC
+- `rp2350-cli`: `repl --stdio` transparent USB CDC bridge — stdin → CDC OUT, CDC IN → stdout, `[repl]` diagnostics on stderr, bounded 64 KiB reader queue, 500 µs simulation steps, unlimited budget via `--max-cycles 0`, so the official `pyboard.py` / `run-perfbench.py` can drive the emulator through `exec:`
 - `rp2350-bootrom`: synthetic 32 KB boot ROM for RP2350 — documented header fields (`0x10` magic/version, `0x14` table pointer, `0x16` `rom_table_lookup`), ARM-secure/non-secure table entries and `udf` stubs dispatched on the host before each instruction step; `rom_table_lookup`, `rom_get_sys_info`, `rom_reboot`, `rom_bootrom_state_reset` and the flash erase/program functions operate on the shared flash backing store
 - `rp2350-core`: `FlashHandle` host-only programming handle sharing the `FlashRegion` bytes (guest writes still return `AccessDenied`)
 - `rp2350-arm`: `boot_from(vector_base)` and `boot_at(sp, pc, vector_base)` — boot vectors and VTOR can come from the flash XIP base instead of address 0
