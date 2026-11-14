@@ -14,6 +14,7 @@ pub mod cortex_m33;
 pub mod rsp;
 pub mod server;
 pub mod target;
+pub mod target_xml;
 
 // 监视点测试放在独立子模块，保持 `lib.rs` 与 `rsp.rs` 在单文件代码行数上限内。
 // Watchpoint tests live in a submodule so `lib.rs` and `rsp.rs` stay within the
@@ -29,6 +30,7 @@ pub use rsp::{
 };
 pub use server::GdbServer;
 pub use target::{GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus};
+pub use target_xml::{ANNEX as TARGET_XML_ANNEX, ANNEX_ERROR as TARGET_XML_ERROR, TARGET_XML};
 
 // 协议测试放在 lib.rs，使 rsp.rs 的实现保持在单文件 500 行代码上限内；
 // 它们仍是同一 crate 的单元测试。
@@ -46,6 +48,7 @@ mod rsp_tests {
         encode_packet, escape_binary, parse_ack, unescape_binary,
     };
     use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus};
+    use crate::target_xml::{ANNEX_ERROR, TARGET_XML};
 
     const MEMORY_BASE: u32 = 0x2000_0000;
 
@@ -419,14 +422,126 @@ mod rsp_tests {
             session.handle_packet("vMustReplyEmpty").as_deref(),
             Some("")
         );
+        // A `qXfer` object other than the target description is unsupported.
+        // 目标描述之外的 `qXfer` 对象不受支持。
         assert_eq!(
-            session
-                .handle_packet("qXfer:features:read:target.xml:0,1")
-                .as_deref(),
+            session.handle_packet("qXfer:auxv:read::0,1").as_deref(),
             Some("")
         );
         assert_eq!(session.handle_packet("!").as_deref(), Some(""));
         assert_eq!(session.handle_packet("").as_deref(), Some(""));
+    }
+
+    /// Split a `qXfer` reply into its marker and chunk data
+    /// 将 `qXfer` 回复拆分为标记与分块数据
+    fn split_xfer(reply: &str) -> (char, &str) {
+        let mut chars = reply.chars();
+        let marker = chars.next().expect("qXfer reply has a marker");
+        assert!(matches!(marker, 'm' | 'l'), "unexpected marker {marker:?}");
+        (marker, chars.as_str())
+    }
+
+    #[test]
+    fn qxfer_full_target_xml_is_a_single_last_chunk() {
+        let mut session = session();
+        let reply = session
+            .handle_packet("qXfer:features:read:target.xml:0,fff")
+            .expect("reply");
+        let (marker, data) = split_xfer(&reply);
+        assert_eq!(marker, 'l');
+        assert!(data.contains("<architecture>armv8-m.main</architecture>"));
+        assert!(data.contains("org.gnu.gdb.arm.m-profile"));
+        assert_eq!(data, TARGET_XML);
+    }
+
+    #[test]
+    fn qxfer_chunked_reads_reassemble_target_xml() {
+        for chunk in [16usize, 32] {
+            let mut session = session();
+            let mut offset = 0usize;
+            let mut assembled = String::new();
+            loop {
+                let request = format!("qXfer:features:read:target.xml:{offset:x},{chunk:x}");
+                let reply = session.handle_packet(&request).expect("reply");
+                let (marker, data) = split_xfer(&reply);
+                if offset == 0 {
+                    assert_eq!(marker, 'm', "first {chunk}-byte chunk has a successor");
+                }
+                assembled.push_str(data);
+                offset += data.len();
+                if marker == 'l' {
+                    break;
+                }
+                assert_eq!(data.len(), chunk, "non-final chunks are full");
+            }
+            assert_eq!(assembled, TARGET_XML);
+        }
+    }
+
+    #[test]
+    fn qxfer_offset_at_end_returns_an_empty_last_chunk() {
+        let mut session = session();
+        let request = format!("qXfer:features:read:target.xml:{:x},10", TARGET_XML.len());
+        assert_eq!(session.handle_packet(&request).as_deref(), Some("l"));
+    }
+
+    #[test]
+    fn qxfer_offset_past_end_returns_an_empty_last_chunk() {
+        let mut session = session();
+        let request = format!(
+            "qXfer:features:read:target.xml:{:x},10",
+            TARGET_XML.len() + 1
+        );
+        assert_eq!(session.handle_packet(&request).as_deref(), Some("l"));
+    }
+
+    #[test]
+    fn qxfer_zero_length_returns_an_empty_last_chunk() {
+        let mut session = session();
+        assert_eq!(
+            session
+                .handle_packet("qXfer:features:read:target.xml:0,0")
+                .as_deref(),
+            Some("l")
+        );
+    }
+
+    #[test]
+    fn qxfer_unknown_annex_replies_e00() {
+        let mut session = session();
+        assert_eq!(
+            session
+                .handle_packet("qXfer:features:read:foo.xml:0,10")
+                .as_deref(),
+            Some(ANNEX_ERROR)
+        );
+        assert_eq!(
+            session
+                .handle_packet("qXfer:features:read::0,10")
+                .as_deref(),
+            Some(ANNEX_ERROR)
+        );
+    }
+
+    #[test]
+    fn qxfer_malformed_range_replies_e00_and_session_survives() {
+        let mut session = session();
+        for packet in [
+            "qXfer:features:read:target.xml:0",
+            "qXfer:features:read:target.xml:zz,10",
+            "qXfer:features:read:target.xml:0,zz",
+        ] {
+            assert_eq!(session.handle_packet(packet).as_deref(), Some(ANNEX_ERROR));
+        }
+        // The session is still usable after a malformed transfer request.
+        // 非法传输请求后会话仍可用。
+        assert_eq!(session.handle_packet("?").as_deref(), Some("S05"));
+    }
+
+    #[test]
+    fn q_supported_advertises_target_xml_transfers() {
+        let reply = session().handle_packet("qSupported").expect("reply");
+        assert!(reply.contains("qXfer:features:read+"));
     }
 
     #[test]

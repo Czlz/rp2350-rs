@@ -17,9 +17,9 @@ use rp2350_cpu::CpuState;
 ///
 /// GDB's `g`/`p`/`P` packets address registers numerically. The ARM target
 /// description used here exposes R0-R15 plus XPSR, which matches the
-/// `org.gnu.gdb.arm.m-system` feature set.
+/// `org.gnu.gdb.arm.m-profile` feature set.
 /// GDB 的 `g`/`p`/`P` 包按编号访问寄存器。这里使用的 ARM 目标描述暴露
-/// R0-R15 加 XPSR，与 `org.gnu.gdb.arm.m-system` 特性集一致。
+/// R0-R15 加 XPSR，与 `org.gnu.gdb.arm.m-profile` 特性集一致。
 pub mod regs {
     /// Register R0 / 寄存器 R0
     pub const R0: u32 = 0;
@@ -190,6 +190,22 @@ pub trait GdbTarget: Send {
     #[must_use]
     fn register_count(&self) -> u32 {
         regs::COUNT
+    }
+
+    /// Static XML target description served by `qXfer:features:read`
+    /// 由 `qXfer:features:read` 提供的静态 XML 目标描述
+    ///
+    /// The default returns [`crate::target_xml::TARGET_XML`], the ARMv8-M
+    /// description that matches [`regs`]. Targets with a different register
+    /// file (for example a RISC-V core) may return `None`; the RSP layer then
+    /// answers the transfer with `E00` instead of advertising a wrong layout.
+    /// 默认返回与 [`regs`] 匹配的 ARMv8-M 描述
+    /// [`crate::target_xml::TARGET_XML`]。寄存器文件不同的目标（例如 RISC-V
+    /// 核心）可返回 `None`，RSP 层随后以 `E00` 应答该传输，而不会声明错误的
+    /// 寄存器布局。
+    #[must_use]
+    fn target_description(&self) -> Option<&'static str> {
+        Some(crate::target_xml::TARGET_XML)
     }
 
     /// Read a register by GDB register number / 按 GDB 寄存器编号读取寄存器

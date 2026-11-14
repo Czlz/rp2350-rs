@@ -6,16 +6,19 @@
 > **Status**: 协议层、TCP 服务与 CLI 接线均已实现 — `rsp.rs` 提供包编解码（`$<payload>#<checksum>`、
 > `+`/`-` 应答、`}` 二进制转义、十六进制工具）与无 socket 的命令分发器
 > `Session<T>`；`CortexM33Target<B>` 与 CLI 的 `MachineTarget` 为两种目标适配器。
-> `GdbServer`（`server.rs`）提供阻塞式 TCP 监听、顺序接受客户端与字节级 RSP 帧循环；
-> `rp2350 gdb --file <ELF> --port <N>` 直接启动服务。
+> `target_xml.rs` 提供静态 ARMv8-M `target.xml`，经 `qXfer:features:read` 按字节
+> 分块提供给 GDB；`GdbServer`（`server.rs`）提供阻塞式 TCP 监听、顺序接受客户端
+> 与字节级 RSP 帧循环；`rp2350 gdb --file <ELF> --port <N>` 直接启动服务。
 >
 > **Status** (EN): the protocol layer, the TCP server and the CLI wiring are
 > implemented — `rsp.rs` provides packet framing (`$<payload>#<checksum>`),
 > `+`/`-` acknowledgements, `}` binary escaping, hex helpers, and a socket-free
 > dispatcher `Session<T>`. `CortexM33Target<B>` and the CLI `MachineTarget` are
-> the two target adapters. `GdbServer` (`server.rs`) provides a blocking TCP
-> listener, sequential client accept, and the byte-level RSP frame loop;
-> `rp2350 gdb --file <ELF> --port <N>` starts the server directly.
+> the two target adapters. `target_xml.rs` supplies the static ARMv8-M
+> `target.xml`, chunked byte-wise over `qXfer:features:read`. `GdbServer`
+> (`server.rs`) provides a blocking TCP listener, sequential client accept, and
+> the byte-level RSP frame loop; `rp2350 gdb --file <ELF> --port <N>` starts the
+> server directly.
 
 ---
 
@@ -26,6 +29,7 @@
 ```rust
 pub trait GdbTarget: Send {
     fn register_count(&self) -> u32;               // default: 17 (R0-R15 + XPSR)
+    fn target_description(&self) -> Option<&'static str>; // default: ARMv8-M target.xml
     fn read_register(&mut self, register: u32) -> Result<u32, GdbError>;
     fn write_register(&mut self, register: u32, value: u32) -> Result<(), GdbError>;
     fn read_memory(&mut self, address: u32, length: usize) -> Result<Vec<u8>, GdbError>;
@@ -43,7 +47,6 @@ pub trait GdbTarget: Send {
 ```
 
 支持类型 / Supporting types：
-
 - `ResumeMode`：`Continue` / `Step`
 - `StopReply { reason: StopReason, pc: u32 }`；`signal()` 返回 GDB 信号号
 - `StopReason`：`Breakpoint`、`SingleStep`、`Fault`、`Sleeping`、`Halted`、
@@ -60,6 +63,12 @@ The watchpoint hooks default to `GdbError::Unsupported` with
 `supports_watchpoints() == false`, so targets without watchpoint support (such as
 `CortexM33Target`) need no changes and the RSP layer never advertises the
 capability for them.
+
+`target_description()` 默认返回静态 ARMv8-M `target.xml`（见下文）；寄存器文件
+不同的目标可返回 `None`，此时 `qXfer:features:read` 回复 `E00`。
+`target_description()` defaults to the static ARMv8-M `target.xml` described
+below; targets with a different register file may return `None`, which makes
+`qXfer:features:read` answer `E00`.
 
 ### `CortexM33Target<B>`
 
@@ -130,7 +139,7 @@ impl<T: GdbTarget> RspSession<T> {
 
 | Packet | Reply / 回复 | Notes |
 |--------|--------------|-------|
-| `qSupported[:features]` | `PacketSize=fff;QStartNoAckMode+;vContSupported+;hwbreak+[;watchpoint+]` | 特性协商；`watchpoint+` 仅在目标支持写监视点时追加 |
+| `qSupported[:features]` | `PacketSize=fff;qXfer:features:read+;QStartNoAckMode+;vContSupported+;hwbreak+[;watchpoint+]` | 特性协商；`watchpoint+` 仅在目标支持写监视点时追加；声明 `qXfer:features:read` 后 GDB 会主动读取 `target.xml` |
 | `?` | `S05` | 附加查询（SIGTRAP） |
 | `g` | 每寄存器 4 字节小端 hex | 寄存器批量读 |
 | `G<hex>` | `OK` | 批量写；长度须为 4 的倍数且不超出寄存器数 |
@@ -152,6 +161,8 @@ impl<T: GdbTarget> RspSession<T> {
 | `vCont?` | `vCont;c;s` | 最小单线程能力 |
 | `vCont;c[:id]` / `vCont;s[:id]` | `S05` 或 `T05watch:<addr>;` | 单动作；多动作返回空包（多核待实现） |
 | `QStartNoAckMode` | `OK` | 置位 `no_ack_mode()`，状态化 |
+| `qXfer:features:read:target.xml:<off>,<len>` | `m<chunk>` / `l<chunk>` | 按字节切片的目标描述；`len=0`、`off` 到界或越界均返回空 `l` |
+| `qXfer:features:read:<其他 annex>:...` | `E00` | 未提供的 annex；参数非法同样 `E00` |
 | 未知 / 不支持的 `q`、`Q`、`v` | 空包 `""` | 符合 RSP 探测约定 |
 
 写监视点命中时停止回复为 `T05watch:<hex-addr>;`；目标无法给出命中地址时退化为
@@ -172,6 +183,104 @@ commands return an empty packet.
 记录协商状态。
 `QStartNoAckMode` note: the transport must enter no-ack mode only after sending
 `OK`; the dispatcher only records the negotiated flag.
+
+---
+
+## Target Description / 目标描述
+
+`target_xml.rs` 持有静态 `target.xml`（纯 ASCII），`Session` 负责解析
+`qXfer:features:read`。GDB 在 `qSupported` 看到 `qXfer:features:read+` 后会
+自动读取该文档，无需 `set architecture`。
+`target_xml.rs` owns the static, pure-ASCII `target.xml`; `Session` parses
+`qXfer:features:read`. Once `qSupported` advertises
+`qXfer:features:read+`, GDB fetches the document automatically and no
+`set architecture` is required.
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target>
+  <architecture>armv8-m.main</architecture>
+  <feature name="org.gnu.gdb.arm.m-profile">
+    <reg name="r0" bitsize="32" regnum="0" type="data_ptr"/>
+    <!-- r1-r12 同形 / same shape for r1-r12 -->
+    <reg name="sp" bitsize="32" regnum="13" type="data_ptr"/>
+    <reg name="lr" bitsize="32" regnum="14" type="int"/>
+    <reg name="pc" bitsize="32" regnum="15" type="code_ptr"/>
+    <reg name="xpsr" bitsize="32" regnum="16" type="int"/>
+  </feature>
+</target>
+```
+
+### Register Numbers / 寄存器编号
+
+| regnum | XML name | `regs` | 说明 / Notes |
+|--------|----------|--------|--------------|
+| 0-12 | `r0`-`r12` | `R0`-`R12` | 通用寄存器，`data_ptr` / general purpose, `data_ptr` |
+| 13 | `sp` | `SP` | 当前栈指针（MSP/PSP 由 CONTROL 选择）/ active stack pointer |
+| 14 | `lr` | `LR` | 链接寄存器 / link register |
+| 15 | `pc` | `PC` | 程序计数器，`code_ptr` / program counter |
+| 16 | `xpsr` | `XPSR` | 组合状态寄存器 / combined status register |
+
+### Chunking Semantics / 分块语义
+
+请求格式 `qXfer:features:read:target.xml:<offset>,<length>`，偏移与长度均为
+十六进制、以**字节**计。回复前缀 `m` 表示还有后续数据，`l` 表示这是最后一块
+（数据可能为空）。XML 为纯 ASCII，因此字节偏移与字符偏移一致。
+The request is `qXfer:features:read:target.xml:<offset>,<length>`; both numbers
+are hexadecimal **byte** counts. The `m` prefix means more data follows, `l`
+means this is the final chunk (possibly empty). The document is pure ASCII, so
+byte and character offsets coincide.
+
+| 情况 / Case | 回复 / Reply |
+|-------------|--------------|
+| `offset + length < len` | `m<length 字节>` |
+| `offset + length >= len` | `l<剩余字节>` |
+| `offset == len` | `l`（空 / empty） |
+| `offset > len` | `l`（空 / empty，按协议选择而非 `E00`） |
+| `length == 0` | `l`（空；`m` + 空数据会让客户端死循环） |
+| 未知 annex / 参数非法 | `E00` |
+| 目标 `target_description() == None` | `E00` |
+
+越界偏移返回空 `l` 而不是 `E00`：GDB 把 `E00` 当作传输错误并可能重试，空 `l`
+则干净地表示文档结束。Over-long offsets return an empty `l` rather than
+`E00`: GDB treats `E00` as a transfer error and may retry, while an empty `l`
+cleanly terminates the document.
+
+### GDB Usage / GDB 用法
+
+```bash
+cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf
+arm-none-eabi-gdb -ex "target remote :3333" -ex "info registers"
+# 手工验证 / manual check:
+(gdb) maintenance packet qXfer:features:read:target.xml:0,fff
+# -> l<?xml version="1.0"?>...
+```
+
+The description uses `<architecture>armv8-m.main</architecture>` and the
+`org.gnu.gdb.arm.m-profile` feature. This combination was validated with
+`arm-none-eabi-gdb 16.3`; the earlier `armv8-m` / `m-system` pair was rejected
+by GDB (`unknown architecture`, then `Architecture rejected target-supplied
+description`), so the names above are the ones GDB actually accepts. The
+`m-profile` feature normally also carries `msp`/`psp`/`control`/`primask`/
+`basepri`/`faultmask`; those are omitted because the target cannot read them by
+register number yet.
+描述使用 `<architecture>armv8-m.main</architecture>` 与
+`org.gnu.gdb.arm.m-profile` 特性。该组合已用 `arm-none-eabi-gdb 16.3` 实测；
+此前的 `armv8-m`/`m-system` 组合会被 GDB 拒绝（先报 `unknown architecture`，
+再报 `Architecture rejected target-supplied description`），因此以上名称是 GDB
+真正接受的组合。`m-profile` 通常还包含 `msp`/`psp`/`control`/`primask`/
+`basepri`/`faultmask`，这些寄存器暂不声明，因为目标还不能按编号读取它们。
+
+### Not Exposed / 未暴露
+
+- `msp` / `psp` / `control`（`org.gnu.gdb.arm.m-profile`）：目标目前无法按编号
+  读取，因此不声明；GDB 不会尝试访问不存在的寄存器。
+  `msp` / `psp` / `control` (`org.gnu.gdb.arm.m-profile`) are omitted because
+  the target cannot read them by number; GDB will not probe registers that the
+  description does not list.
+- FPU（`s0`-`s31`、`fpscr`）、DWT 比较器、ETM 寄存器均不在描述中。
+  No FPU (`s0`-`s31`, `fpscr`), DWT comparator, or ETM registers are described.
 
 ---
 
@@ -236,7 +345,9 @@ survives because one `Session` is shared for the whole `serve` call.
 
 - CLI `gdb` 已接线（`--file <ELF>`、默认端口 3333）；无 `--arch` 覆盖，RISC-V 目标读数 16（XPSR）返回 `E01`。
 - 单客户端串行：`serve` 在 `serve_connection` 返回前不接受新连接；无并发/多客户端。
-- 无 TLS、无 `qXfer:features:read` / `target.xml`，无 multiprocess。
+- 无 TLS、无 multiprocess。
+- `qXfer:features:read` 仅提供静态 `target.xml`；无动态 XML 生成，无 FPU/DWT/ETM
+  寄存器，也未声明 `msp`/`psp`/`control`（目标无法按编号读取）。
 - 仅写监视点（`Z2`/`z2`）：读监视点 `rwatch`（`Z3`）与访问监视点 `awatch`
   （`Z4`）未实现并返回空包；库层 `CortexM33Target` 未实现监视点，只有 CLI
   `MachineTarget` 提供（且仅限 SRAM）。不使用 DWT 数据断点寄存器。
@@ -249,7 +360,10 @@ survives because one `Session` is shared for the whole `serve` call.
   targets.
 - One client at a time: `serve` does not accept the next connection until the
   current `serve_connection` returns; no concurrency.
-- No TLS, no `qXfer:features:read` / `target.xml`, no multiprocess.
+- No TLS, no multiprocess.
+- `qXfer:features:read` serves only the static `target.xml`; there is no dynamic
+  XML generation, no FPU/DWT/ETM registers, and no `msp`/`psp`/`control`
+  (the target cannot read them by number).
 - Write watchpoints only (`Z2`/`z2`): read watchpoints (`Z3`) and access
   watchpoints (`Z4`) are unimplemented and answer with an empty packet. The
   library `CortexM33Target` implements no watchpoints; only the CLI

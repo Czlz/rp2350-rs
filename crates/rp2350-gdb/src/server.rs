@@ -143,6 +143,10 @@ impl GdbTarget for Box<dyn GdbTarget + Send> {
         (**self).register_count()
     }
 
+    fn target_description(&self) -> Option<&'static str> {
+        (**self).target_description()
+    }
+
     fn read_register(&mut self, register: u32) -> Result<u32, GdbError> {
         (**self).read_register(register)
     }

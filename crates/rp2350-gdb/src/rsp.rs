@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 
 use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason};
+use crate::target_xml::{ANNEX, ANNEX_ERROR};
 
 /// Positive acknowledgement byte sent by GDB / GDB 发送的肯定应答字节
 pub const ACK: u8 = b'+';
@@ -539,9 +540,17 @@ impl<T: GdbTarget> Session<T> {
 
     /// Reply to `q...` queries / 回复 `q...` 查询
     fn query_reply(&self, payload: &str) -> String {
+        // `qXfer:features:read:<annex>:<offset>,<length>` is the only `qXfer`
+        // object served today; everything else falls through to the empty
+        // reply that tells GDB the object is unsupported.
+        // `qXfer:features:read:<annex>:<偏移>,<长度>` 是目前唯一提供的 `qXfer`
+        // 对象；其余请求落到空回复，告知 GDB 该对象不受支持。
+        if let Some(args) = payload.strip_prefix("qXfer:features:read:") {
+            return self.read_features(args);
+        }
         if payload.starts_with("qSupported") {
             let mut reply = format!(
-                "PacketSize={MAX_PACKET_SIZE:03x};QStartNoAckMode+;vContSupported+;hwbreak+"
+                "PacketSize={MAX_PACKET_SIZE:03x};qXfer:features:read+;QStartNoAckMode+;vContSupported+;hwbreak+"
             );
             // `watchpoint+` is an extension hint: it is only advertised when the
             // target really implements `Z2`/`z2`, so GDB can fall back cleanly.
@@ -559,6 +568,38 @@ impl<T: GdbTarget> Session<T> {
             return "QC1".to_string();
         }
         String::new()
+    }
+
+    /// Serve one `qXfer:features:read` transfer for `target.xml`
+    /// 为 `target.xml` 提供一个 `qXfer:features:read` 传输
+    ///
+    /// The argument layout is `<annex>:<offset>,<length>` with hexadecimal
+    /// numbers. Unknown annexes, malformed numbers, and targets without a
+    /// description answer [`ANNEX_ERROR`] (`E00`); a valid annex is sliced as
+    /// `m<chunk>` (more follows) or `l<chunk>` (last chunk, possibly empty).
+    /// 参数格式为 `<annex>:<偏移>,<长度>`，数字为十六进制。未知 annex、非法
+    /// 数字以及无目标描述的目标均回复 [`ANNEX_ERROR`]（`E00`）；合法 annex 按
+    /// `m<块>`（还有后续）或 `l<块>`（最后一块，可为空）切片。
+    fn read_features(&self, args: &str) -> String {
+        // Split from the right: annex names of other `qXfer` objects may
+        // contain colons, while the range is always the final field.
+        // 从右侧分割：其他 `qXfer` 对象的 annex 名可能含冒号，而范围字段总在末尾。
+        let Some((annex, range)) = args.rsplit_once(':') else {
+            return ANNEX_ERROR.to_string();
+        };
+        let Some((offset, length)) = range.split_once(',') else {
+            return ANNEX_ERROR.to_string();
+        };
+        let (Ok(offset), Ok(length)) = (parse_usize_hex(offset), parse_usize_hex(length)) else {
+            return ANNEX_ERROR.to_string();
+        };
+        if annex != ANNEX {
+            return ANNEX_ERROR.to_string();
+        }
+        let Some(xml) = self.target.target_description() else {
+            return ANNEX_ERROR.to_string();
+        };
+        crate::target_xml::read_chunk(xml.as_bytes(), offset, length)
     }
 }
 
