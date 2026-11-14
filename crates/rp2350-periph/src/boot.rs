@@ -27,6 +27,7 @@ use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
 use super::pads_qspi::PadsQspi;
+use super::pio::Pio;
 use super::pll::Pll;
 use super::powman::Powman;
 use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
@@ -164,6 +165,14 @@ impl BootPeripherals {
         );
         aon.mount(Box::new(Powman::new()))?;
         bus.register_region(Box::new(aon))?;
+        // RP2350 的三个 PIO 块位于 AHB 空间，按基地址顺序独立挂载；
+        // 本阶段仅建模寄存器、FIFO 与指令存储。
+        // The three RP2350 PIO blocks live in AHB space and are mounted
+        // standalone in base-address order; this stage models registers,
+        // FIFOs and instruction memory only.
+        mount_device(bus, Box::new(Pio::new(0)))?;
+        mount_device(bus, Box::new(Pio::new(1)))?;
+        mount_device(bus, Box::new(Pio::new(2)))?;
         mount_device(bus, Box::new(sio.clone()))?;
         mount_device(bus, Box::new(Ppb::with_log(Arc::clone(&system_writes))))?;
 
@@ -353,5 +362,39 @@ mod tests {
             bus.read_u32(0x400A_9000, &mut cycles).expect("pwm1 alias"),
             1
         );
+    }
+
+    #[test]
+    fn pio_blocks_are_mounted_at_their_ahb_bases() {
+        // PIO0/PIO1/PIO2 位于 AHB 空间的 0x5020_0000、0x5030_0000、
+        // 0x5040_0000；三个块各自独立挂载且可读写。
+        // PIO0/PIO1/PIO2 sit at 0x5020_0000, 0x5030_0000 and 0x5040_0000 in
+        // AHB space; each block is mounted independently and is readable.
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let _peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        for (index, base) in [
+            (0u8, map::PIO0_BASE),
+            (1, map::PIO1_BASE),
+            (2, map::PIO2_BASE),
+        ] {
+            assert_eq!(
+                bus.read_u32(base + 0x044, &mut cycles)
+                    .expect("dbg_cfginfo"),
+                0x1020_0404,
+                "PIO{index} DBG_CFGINFO"
+            );
+            for word in 1..=4u32 {
+                bus.write_u32(base + 0x010, word, &mut cycles)
+                    .expect("txf0 push");
+            }
+            assert_eq!(
+                bus.read_u32(base + 0x004, &mut cycles).expect("fstat") & (1 << 16),
+                1 << 16,
+                "PIO{index} SM0 TXFULL"
+            );
+        }
     }
 }

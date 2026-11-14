@@ -117,6 +117,18 @@ pub const TRNG_BASE: Address = 0x400F_0000;
 /// SHA-256 accelerator base / SHA-256 加速器基地址
 pub const SHA256_BASE: Address = 0x400F_8000;
 
+/// PIO0 register block base / PIO0 寄存器块基地址
+///
+/// RP2350 exposes three identical PIO blocks in the AHB peripheral space.
+/// RP2350 在 AHB 外设空间提供三个相同的 PIO 块。
+pub const PIO0_BASE: Address = 0x5020_0000;
+
+/// PIO1 register block base / PIO1 寄存器块基地址
+pub const PIO1_BASE: Address = 0x5030_0000;
+
+/// PIO2 register block base / PIO2 寄存器块基地址
+pub const PIO2_BASE: Address = 0x5040_0000;
+
 /// SIO base / SIO 基地址
 pub const SIO_BASE: Address = 0xD000_0000;
 

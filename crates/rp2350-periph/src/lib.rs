@@ -29,6 +29,7 @@ pub mod irq;
 pub mod map;
 pub mod pads_bank0;
 pub mod pads_qspi;
+pub mod pio;
 pub mod pll;
 pub mod powman;
 pub mod ppb;
@@ -50,6 +51,7 @@ pub mod xosc;
 pub use boot::{BootPeripherals, Timebase};
 pub use cycle::CycleSink;
 pub use irq::IrqAssert;
+pub use pio::Pio;
 pub use traits::Peripheral;
 pub use uart::UartSink;
 

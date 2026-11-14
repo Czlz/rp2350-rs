@@ -5,66 +5,89 @@
 
 ---
 
-## PIO (Programmable I/O) / 可编程 IO
+## PIO register blocks / PIO 寄存器块
+
+RP2350 has **three** PIO blocks, unlike RP2040's two. `BootPeripherals::mount`
+installs one `Pio` instance per block at its AHB base address:
+
+| Block | Base | Constant |
+|-------|------|----------|
+| PIO0 | `0x5020_0000` | `map::PIO0_BASE` |
+| PIO1 | `0x5030_0000` | `map::PIO1_BASE` |
+| PIO2 | `0x5040_0000` | `map::PIO2_BASE` |
+
+RP2350 与 RP2040 的两块 PIO 不同，共有 **三个** PIO 块。`BootPeripherals::mount`
+在每个块的 AHB 基地址各挂载一个 `Pio` 实例。
 
 ```rust
-pub struct RpPio {
-    pub index: u8,
-    pub sm: [StateMachine; 4],
-    pub instr_mem: [u16; 32],
-    pub irq: PioIrq,
-    pub gpio_base: u16,
-    pub fifo_join: FifoJoin,
-    pub clkdiv: [u32; 4],
-    pub input_sync_bypass: u32,
-    pub dbg_padout: u32,
-    pub dbg_padoe: u32,
-}
+pub struct Pio { /* private register file */ }
 
-impl RpPio {
-    pub fn tick(&mut self, clk_sys: u32, gpio: &[GpioPin]);
-    pub fn set_gpio_levels(&self, gpio: &mut [GpioPin]);
-    pub fn read_sm_register(&self, sm_index: u8, offset: u32) -> u32;
-    pub fn write_sm_register(&mut self, sm_index: u8, offset: u32, value: u32);
-}
-```
-
-### StateMachine
-
-```rust
-pub struct StateMachine {
-    pub pc: u8,
-    pub isr: u32, pub isr_count: u8,
-    pub osr: u32, pub osr_count: u8,
-    pub x: u32, pub y: u32,
-    pub tx_fifo: PioFifo,  // 4 deep
-    pub rx_fifo: PioFifo,  // 4 deep
-    pub exec_ctrl: SmExecCtrl,
-    pub shift_ctrl: SmShiftCtrl,
-    pub pin_ctrl: SmPinCtrl,
-    pub delay_counter: u32,
-    pub clkdiv_counter: u32,
-    pub wait_state: WaitCondition,
-    pub push_thresh: u8,
-    pub pull_thresh: u8,
+impl Pio {
+    pub fn new(index: u8) -> Self;
+    pub fn push_rx(&mut self, sm: usize, value: u32) -> bool;
+    pub fn pop_tx(&mut self, sm: usize) -> Option<u32>;
 }
 ```
 
-### PIO Assembler / PIO 汇编器
+`Pio` implements `MmioDevice` over a 4 KB window. `new(0/1/2)` selects
+PIO0/PIO1/PIO2; any other index panics.
+`Pio` 在 4 KB 窗口上实现 `MmioDevice`。`new(0/1/2)` 选择 PIO0/PIO1/PIO2，
+其它序号会 panic。
 
-```rust
-pub fn pio_assemble(source: &str) -> Result<Vec<u16>, AsmError>;
-```
+### Modelled registers / 已建模寄存器
 
-Example:
-```asm
-.program blink
-    set pindirs, 1
-loop:
-    set pins, 1    ; GPIO high
-    set pins, 0    ; GPIO low
-    jmp loop
-```
+- `CTRL` — `SM_ENABLE[3:0]` is read back; restart/clock-restart strobes are
+  self-clearing and not retained.
+  `CTRL` — 可读回 `SM_ENABLE[3:0]`；restart/clock-restart 脉冲位自清零，不保留。
+- `FSTAT` — reset `0x0F00_0F00`; per-SM `RXFULL[3:0]`, `RXEMPTY[11:8]`,
+  `TXFULL[19:16]`, `TXEMPTY[27:24]` are derived from FIFO levels.
+  `FSTAT` — 复位值 `0x0F00_0F00`；每个状态机的 `RXFULL`、`RXEMPTY`、
+  `TXFULL`、`TXEMPTY` 由 FIFO 占用推导。
+- `FDEBUG` — sticky `RXSTALL`/`RXUNDER`/`TXOVER`/`TXSTALL` flags, write-one-to-clear.
+  `FDEBUG` — 粘滞 `RXSTALL`/`RXUNDER`/`TXOVER`/`TXSTALL` 标志，写 1 清零。
+- `FLEVEL` — 4-bit TX/RX occupancy per state machine.
+  `FLEVEL` — 每个状态机的 4 位 TX/RX 占用。
+- `TXF0..TXF3` — each write pushes one word into the 4-deep TX FIFO; a write on
+  a full FIFO drops the word and sets `FDEBUG.TXOVER`.
+  `RXF0..RXF3` — each read pops one word from the 4-deep RX FIFO; a read on an
+  empty FIFO returns zero and sets `FDEBUG.RXUNDER`.
+  `TXF0..TXF3` — 每次写向 4 深度 TX FIFO 压入一个字；满时丢弃该字并置位
+  `FDEBUG.TXOVER`。`RXF0..RXF3` — 每次读从 4 深度 RX FIFO 取出一个字；
+  空时返回 0 并置位 `FDEBUG.RXUNDER`。
+- `IRQ` / `IRQ_FORCE` — eight PIO IRQ flags; `IRQ` is W1C, `IRQ_FORCE` sets
+  the internal flags. No processor interrupt line is routed yet.
+  `IRQ` / `IRQ_FORCE` — 8 个 PIO IRQ 标志；`IRQ` 写 1 清零，`IRQ_FORCE` 置位
+  内部标志。尚未接入处理器中断线。
+- `INPUT_SYNC_BYPASS`, `GPIOBASE` (`bit 4`), `DBG_CFGINFO` (`0x1020_0404`),
+  `DBG_PADOUT`/`DBG_PADOE` (read zero).
+  `INPUT_SYNC_BYPASS`、`GPIOBASE`（位 4）、`DBG_CFGINFO`（`0x1020_0404`）、
+  `DBG_PADOUT`/`DBG_PADOE`（读 0）。
+- `INSTR_MEM0..INSTR_MEM31` — 32 × 16-bit instruction slots. The hardware marks
+  these write-only; this model permits readback for debugging.
+  `INSTR_MEM0..INSTR_MEM31` — 32 × 16 位指令槽。硬件标称只写；本模型允许回读以便调试。
+- `SM0..SM3` windows — `CLKDIV` (reset `0x0001_0000`), `EXECCTRL`
+  (reset `0x0001_F000`), `SHIFTCTRL` (reset `0x000C_0000`), `ADDR`
+  (read-only, zero), `INSTR`, `PINCTRL` (reset `0x1400_0000`).
+  `SM0..SM3` 窗口 — `CLKDIV`（复位 `0x0001_0000`）、`EXECCTRL`（复位
+  `0x0001_F000`）、`SHIFTCTRL`（复位 `0x000C_0000`）、`ADDR`（只读，0）、
+  `INSTR`、`PINCTRL`（复位 `0x1400_0000`）。
+
+`push_rx` feeds the RX FIFO from the device side and `pop_tx` drains the TX
+FIFO as a state machine would; both return `false`/`None` on a full/empty FIFO
+and set the corresponding sticky debug flag.
+`push_rx` 从设备侧向 RX FIFO 送入数据，`pop_tx` 按状态机行为取走 TX FIFO
+数据；FIFO 满/空时分别返回 `false`/`None` 并置位对应粘滞调试标志。
+
+### Not modelled yet / 尚未建模
+
+State-machine execution, program counter movement, FIFO joining
+(`SHIFTCTRL.FJOIN_*`), DMA handshakes, the RP2350 `RXFn_PUTGET*` registers, the
+interrupt registers at `0x16C..0x184` and processor interrupt routing. Accesses
+to these offsets follow the project policy: read zero, ignore the write and
+emit one warning per address.
+状态机执行、程序计数器推进、FIFO 合并（`SHIFTCTRL.FJOIN_*`）、DMA 握手、
+RP2350 `RXFn_PUTGET*` 寄存器、`0x16C..0x184` 的中断寄存器以及处理器中断路由。
+访问这些偏移沿用项目策略：读为 0、忽略写入、每个地址只警告一次。
 
 ---
 
