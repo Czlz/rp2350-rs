@@ -109,7 +109,7 @@
 | 2.8 | `CortexM33Core` impl of `CpuCore` trait | core.rs (lib.rs) | ✅ |
 | 2.9 | BOOTROM load + reset vector fetch + SP/PC init | chip boot sequence | ✅（合成 bootrom + `CortexM33Core::boot`） |
 | 2.10 | egui register viewer panel (R0-R15 table) | panels.rs | ✅（可无头渲染测试） |
-| 2.11 | `GdbTarget` trait + Cortex-M33 adapter | gdb target.rs / cortex_m33.rs | ✅（RSP 服务器循环仍为桩 / RSP server loop still stub） |
+| 2.11 | `GdbTarget` trait + Cortex-M33 adapter | gdb target.rs / cortex_m33.rs | ✅（P1：RSP 协议层 + TCP 会话循环已落地；CLI 接线规划中 / RSP protocol + TCP session loop landed; CLI wiring planned） |
 
 ### Quality Gate (Current) / 质量门禁（当前）
 
@@ -241,6 +241,13 @@ Supports both GUI and headless/MCP mode.
 | 4.8 | egui PIO status panel (instruction view, SM registers, FIFO levels) | pio_view.rs |
 | 4.9 | Cross-validate PIO programs with rp2350js snapshots | tests/ |
 
+> **P1 进度 / P1 progress（2026-11-14）**：4.1（指令集）与 4.2（FIFO/autopush/autopull）
+> 已落地基础执行；4.3 部分（`CLKDIV` 固定 1:1，delay/side-set 待补）；4.4–4.9 待办。
+> `Pio::tick` 尚未接入仿真主循环，当前由 `step_sm`/`tick` 单元测试驱动。
+> 4.1 and 4.2 have a working base (instruction execution plus FIFO/autopush/autopull);
+> 4.3 is partial (`CLKDIV` fixed at 1:1, delay/side-set pending); 4.4-4.9 remain.
+> `Pio::tick` is not yet wired into the simulation loop; it is exercised through unit tests.
+
 ### Milestone M4 / 里程碑 M4
 
 - PIO 程序正确驱动 GPIO 波形 (blink via PIO)
@@ -321,6 +328,11 @@ Supports both GUI and headless/MCP mode.
 | 8.7 | Monitor commands: pio, gpio, dma, hstx, registers, memory, info, trace | monitor.rs |
 | 8.8 | ITM trace output via GDB (optional) | trace.rs |
 | 8.9 | GDB server integration test (connect → bp → step → registers → detach) | tests/ |
+
+> **P1 进度 / P1 progress（2026-11-14）**：8.1 的 RSP 协议层与 TCP 会话循环已落地
+> （`rsp.rs`/`server.rs`，37 条测试，含 6 条真实 TCP 端到端）；CLI `gdb` 接线、8.2–8.9 待办。
+> 8.1's RSP protocol layer and TCP session loop have landed (`rsp.rs`/`server.rs`, 37 tests,
+> including six real TCP end-to-end cases); CLI `gdb` wiring and 8.2-8.9 remain.
 
 ### Milestone M8 / 里程碑 M8
 

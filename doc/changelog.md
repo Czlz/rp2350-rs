@@ -50,6 +50,8 @@
 - `rp2350-bootrom`: RISC-V data lookup slot `0x7DF8 → 0x75FE` and an exception vector table at `0x7E00` (cause 2/5 → `0x7F00` diagnostic stub that prints `mcause`/`mepc`/`mtval` and halts cleanly)
 - `rp2350-riscv`: Zcmp `cm.push`/`cm.pop`/`cm.popret`(z) with register lists and `spimm`; Xh3irq priority/preemption (`meinext.update` claims the pending bit, `ppreempt`/`pppreempt` stack, NOIRQ preserved across `mret`) and CSR array windows selected from the raw operand (a `csrrc meiea` read-modify-write can no longer clear another window's IRQ)
 - `rp2350-cli`: `repl --arch arm|riscv` override plus UF2-family architecture detection, so the RISC-V MicroPython image reaches the raw REPL
+- `rp2350-periph`: PIO state-machine execution — `JMP`/`WAIT`/`IN`/`OUT`/`PUSH`/`PULL`/`MOV`/`IRQ`/`SET`, shift registers with autopush/autopull thresholds, wrap and `EXEC_STALLED`/`FDEBUG` stall reporting, plus a `pio/{mod,regs,sm,shift}` module split (16 new tests)
+- `rp2350-gdb`: TCP session loop — listener/accept, byte-level RSP framing with `+`/`-` acknowledgement, `QStartNoAckMode` negotiation, `Session::reset_transport()` per connection and six real TCP end-to-end tests
 
 ### Fixed / 修复
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
