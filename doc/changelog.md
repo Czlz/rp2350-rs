@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `rp2350-periph`: PIO shared handles and IRQ routing — `SharedPio` (`Arc<Mutex<Pio>>` + MMIO proxy), `BootPeripherals::pio()`/`with_pio()`/`pump_pio_irqs()`, PIO0..2 IRQ lines 15..20 (flags 0..3 → IRQ_0, 4..7 → IRQ_1) and a `Machine` tick every 64 steps; 12 periph + 3 CLI tests
+- `rp2350-arm`: saturating and packed SIMD instructions — SASX/SSAX/UASX/USAX, QADD/QSUB/QDADD/QDSUB, QADD8/16, QSUB8/16, UQADD/UQSUB, QASX/QSAX/UQASX/UQSAX, SEL and SSAT/SSAT16/USAT/USAT16 with Q/GE semantics; 23 tests
+- `rp2350-egui`: read-only DMA/HSTX/PIO panels — busy masks, transfer counts, channel registers, FIFO levels, underrun, PIO SM addresses/pins/IRQs, `PeripheralSource` injection with placeholders; 14 tests
 - `rp2350-gdb`: `qXfer:features:read:target.xml` — static ARMv8-M register description (`armv8-m.main` + `org.gnu.gdb.arm.m-profile`, validated with `arm-none-eabi-gdb 16.3`), byte-chunked `m`/`l` replies, `qXfer:features:read+` in `qSupported`, and 11 tests
 - `rp2350-cli`: DMA pump in `Machine` — every 64 steps the machine runs up to 16 DMA data units through `Dma::run`, on the same path used by `step`/`trace_step`/boot-ROM traps/GDB single-steps; `dma_transfers()`/`dma_state()` diagnostics, idle fast path, bounded per-batch budget; 7 tests
 - `rp2350-periph`: HSTX model — APB control window (`CSR`, `BIT0..7`, expanders) plus AHB FIFO window (`STAT`, `FIFO`), 8-word FIFO with WOF, RAW/RAW_REPEAT/TMDS/TMDS_REPEAT/NOP command decoding, documented WAIT extension, host `drain_output`/`take_scanline`, underrun accounting and model IRQ 46; 13 tests

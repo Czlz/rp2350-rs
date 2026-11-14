@@ -10,13 +10,13 @@
 | Item | Detail |
 |------|--------|
 | **Chip** | RP2350 (Raspberry Pi Pico 2) |
-| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU（单精度算术/比较/转换、FPCCR 惰性压栈）+ NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP 并行 SIMD（core1 常驻 WFE，`DualCoreM33` 脚手架已落地） |
+| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU（单精度算术/比较/转换、FPCCR 惰性压栈）+ NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP 并行 SIMD/饱和指令（core1 常驻 WFE，`DualCoreM33` 脚手架已落地） |
 | **RISC-V** | Hazard3 RV32IMAC + C（已实现，CLI `--arch riscv` 可用） |
 | **USB** | 设备控制器模型 + 主机桥 + raw REPL：真实 MicroPython UF2 → 官方 `run-perfbench.py` 全链路可跑（Arm/RISC-V 各 24/24） |
-| **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）+ 引脚/side-set/delay/CLKDIV/FIFO join；DMA/IRQ 路由待补 |
+| **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）+ 引脚/side-set/delay/CLKDIV/FIFO join + 共享句柄/IRQ 路由/主循环 tick；DMA 握手/FUNCSEL 待补 |
 | **DMA** | 16 通道模型 + 控制块 + AL 触发 + byte/half/word + RING/CHAIN_TO/DREQ/IRQ + CLI `Machine` 泵送 |
 | **HSTX** | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS 命令、宿主 drain/scanline、下溢 IRQ；完整 DVI/TMDS 时序待补 |
-| **GUI** | egui 0.37 (eframe + wgpu) — 寄存器面板（Virtual Electronics Lab 规划中） |
+| **GUI** | egui 0.37 (eframe + wgpu) — 寄存器面板 + DMA/HSTX/PIO 只读外设面板（Virtual Electronics Lab 规划中） |
 | **Debug** | GDB RSP：协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、内存、断点、resume、`Z2` 写监视点、`target.xml`）；读/访问监视点与多核 vCont 规划中 |
 | **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权 |
 | **Plugins** | libloading + abi_stable — 目录扫描 + `DeviceManager::reload` + CLI `list-devices`/`wire`/`--reload`/`--watch`；LED 与 UART Terminal 插件已就绪 |
