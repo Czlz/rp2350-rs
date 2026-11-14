@@ -265,6 +265,17 @@ impl<T: GdbTarget> Session<T> {
         &self.target
     }
 
+    /// Reset per-connection transport state / 重置每连接传输状态
+    ///
+    /// Clears the `QStartNoAckMode` negotiation so a new client starts in
+    /// acknowledged mode. The debug target itself is not touched: memory,
+    /// registers, and breakpoints survive a reconnect.
+    /// 清除 `QStartNoAckMode` 协商结果，使新客户端从应答模式开始。调试目标本身
+    /// 不受影响：内存、寄存器与断点在重连后保持。
+    pub fn reset_transport(&mut self) {
+        self.no_ack_mode = false;
+    }
+
     /// Decode and dispatch a complete frame / 解码并分发完整帧
     ///
     /// Malformed frames (including checksum errors) are answered with

@@ -3,16 +3,19 @@
 > GDB Remote Serial Protocol (RSP) protocol layer for RP2350 debugging.
 > 用于 RP2350 调试的 GDB 远程串行协议（RSP）协议层。
 >
-> **Status**: 协议层已实现 — `rsp.rs` 提供包编解码（`$<payload>#<checksum>`、
+> **Status**: 协议层与 TCP 服务已实现 — `rsp.rs` 提供包编解码（`$<payload>#<checksum>`、
 > `+`/`-` 应答、`}` 二进制转义、十六进制工具）与无 socket 的命令分发器
 > `RspSession<T>`；`CortexM33Target<B>` 为目标适配器。`GdbServer`
-> （`server.rs`）仍为桩：TCP 监听与 CLI `gdb` 接线尚未实现。
+> （`server.rs`）提供阻塞式 TCP 监听、顺序接受客户端与字节级 RSP 帧循环。
+> CLI `gdb` 子命令尚未接线。
 >
-> **Status** (EN): the protocol layer is implemented — `rsp.rs` provides packet
-> framing (`$<payload>#<checksum>`), `+`/`-` acknowledgements, `}` binary
-> escaping, hex helpers, and a socket-free dispatcher `RspSession<T>`.
-> `CortexM33Target<B>` is the target adapter. `GdbServer` (`server.rs`) is still
-> a stub: TCP listening and CLI `gdb` wiring are not implemented.
+> **Status** (EN): the protocol layer and the TCP server are implemented —
+> `rsp.rs` provides packet framing (`$<payload>#<checksum>`), `+`/`-`
+> acknowledgements, `}` binary escaping, hex helpers, and a socket-free
+> dispatcher `RspSession<T>`. `CortexM33Target<B>` is the target adapter.
+> `GdbServer` (`server.rs`) provides a blocking TCP listener, sequential client
+> accept, and the byte-level RSP frame loop. The CLI `gdb` subcommand is not
+> wired yet.
 
 ---
 
@@ -61,11 +64,12 @@ current instruction first.
 
 ## RSP Protocol Layer / RSP 协议层
 
-`rsp.rs` 不执行 I/O，所有函数与分发器均可直接单元测试。传输层（后续任务）
-只需负责读写字节、解析 `+`/`-` 应答，并调用 `handle_frame` / `encode_packet`。
+`rsp.rs` 不执行 I/O，所有函数与分发器均可直接单元测试。TCP 传输层
+（`server.rs`）负责读写字节、解析 `+`/`-` 应答，并调用 `Session::handle_packet`
+/ `encode_packet`。
 `rsp.rs` performs no I/O; every function and the dispatcher are directly
-unit-testable. A future transport only reads/writes bytes, handles `+`/`-`
-acknowledgements, and calls `handle_frame` / `encode_packet`.
+unit-testable. The TCP transport (`server.rs`) reads/writes bytes, handles
+`+`/`-` acknowledgements, and calls `Session::handle_packet` / `encode_packet`.
 
 ### Packet Codec / 包编解码
 
@@ -104,6 +108,7 @@ impl<T: GdbTarget> RspSession<T> {
     pub fn new(target: T) -> Self;
     pub fn no_ack_mode(&self) -> bool;
     pub fn target(&self) -> &T;
+    pub fn reset_transport(&mut self);
     pub fn handle_packet(&mut self, payload: &str) -> Option<String>;
     pub fn handle_frame(&mut self, frame: &[u8]) -> Option<String>;
 }
@@ -146,18 +151,82 @@ commands return an empty packet.
 
 ---
 
+## TCP Transport / TCP 传输
+
+`server.rs` 实现阻塞式 TCP 服务。`GdbServer` 持有监听地址与运行标志；目标以
+`Box<dyn GdbTarget + Send>` 传入，因此服务端无需知道具体 CPU 后端。
+`server.rs` implements the blocking TCP transport. `GdbServer` owns the listen
+address and a running flag; the target is supplied as
+`Box<dyn GdbTarget + Send>`, so the server never needs the concrete CPU type.
+
+```rust
+pub struct GdbServer { /* addr + running */ }
+
+impl GdbServer {
+    pub fn new(addr: SocketAddr) -> Self;
+    pub fn default_addr() -> Self;                  // 0.0.0.0:3333
+    pub fn serve(&mut self, target: Box<dyn GdbTarget + Send>) -> io::Result<()>;
+    pub fn serve_with(&mut self, listener: &TcpListener,
+                      target: Box<dyn GdbTarget + Send>) -> io::Result<()>;
+    pub fn stop(&mut self);
+    pub fn is_running(&self) -> bool;
+    pub fn addr(&self) -> SocketAddr;
+}
+```
+
+| Method | Behavior / 行为 |
+|--------|-----------------|
+| `serve` | 绑定 `addr`（端口 0 时回填实际端口），顺序 `accept`，客户端断开后继续接受；监听器错误时返回。Binds `addr`, accepts clients sequentially, keeps accepting after disconnects, returns on listener errors. |
+| `serve_with` | 服务调用方提供的已绑定监听器，处理**一个**连接后返回；测试用 `127.0.0.1:0` 获取端口。Serves one connection on a caller-supplied listener (tests bind `127.0.0.1:0`). |
+| `stop` | 仅清除运行标志；阻塞中的 `serve` 在返回时观察。Clears the running flag only; a blocked `serve` observes it on return. |
+| `addr` / `is_running` | 监听地址（`serve` 后为实际地址）/ 运行状态。Listen address (actual after `serve`) / running state. |
+
+### Frame Loop / 帧循环
+
+每个连接一个 `BufReader` + 克隆的写端，顺序处理：
+
+1. 扫描到 `$` 起始；帧外字节（含 GDB 的 `+`/`-` 应答）被丢弃。
+2. 读到未转义的 `#` 后再读两位校验和；`}` 转义字节不会终止帧。
+3. 校验通过 → 非无应答模式先回 `+`，再分发并回 `$<reply>#<checksum>`。
+4. 校验失败 → 回 `-`，**连接保持打开**，等待 GDB 重发。
+5. `QStartNoAckMode` → 仅对请求包回 `+`，随后发送 `OK`；之后不再回 `+`。
+6. `k` → 回 `+`、无回复、关闭连接。
+7. 客户端 EOF / 连接重置 → 视为正常断开，服务端继续接受下一个客户端。
+
+Per connection the server scans for `$` (discarding out-of-frame bytes such as
+GDB `+`/`-` acks), reads through the first unescaped `#` plus two checksum
+digits, acknowledges valid frames with `+` before replying, rejects bad
+checksums with `-` without closing, honours `QStartNoAckMode`, and closes on `k`
+or client EOF.
+
+每个新连接都会调用 `Session::reset_transport()` 清除上一客户端协商的无应答
+模式；目标状态（内存、寄存器、断点）保留，因为 `Session` 在整个 `serve`
+调用期间共享。
+Every new connection calls `Session::reset_transport()` to clear the previous
+client's no-ack negotiation; target state (memory, registers, breakpoints)
+survives because one `Session` is shared for the whole `serve` call.
+
+---
+
 ## Current Limitations / 当前限制
 
-- 无 TCP 监听、无 `GdbServer` 会话循环、无 CLI `gdb` 子命令。
-- 无 `qXfer:features:read` / `target.xml`，无 multiprocess、watchpoint（`Z2`-`Z4`）。
+- 无 CLI `gdb` 子命令；只能通过库 API 启动服务。
+- 单客户端串行：`serve` 在 `serve_connection` 返回前不接受新连接；无并发/多客户端。
+- 无 TLS、无 `qXfer:features:read` / `target.xml`，无 multiprocess、watchpoint（`Z2`-`Z4`）。
 - `vCont` 仅单动作单线程；多核动作列表返回空包。
 - 无 `qRcmd` monitor 命令、无 `qfThreadInfo` / `qsThreadInfo`。
+- `stop()` 只清标志，不能中断阻塞中的 `accept`（需要连接一次才退出）。
 
-- No TCP listener, no `GdbServer` session loop, no CLI `gdb` subcommand.
-- No `qXfer:features:read` / `target.xml`, multiprocess, or watchpoints.
+- No CLI `gdb` subcommand; the server is library-only.
+- One client at a time: `serve` does not accept the next connection until the
+  current `serve_connection` returns; no concurrency.
+- No TLS, no `qXfer:features:read` / `target.xml`, no multiprocess, no
+  watchpoints (`Z2`-`Z4`).
 - `vCont` is single-action single-thread only; multi-core action lists return
   an empty packet.
 - No `qRcmd` monitor commands or thread-list queries.
+- `stop()` only clears a flag; it cannot interrupt a blocked `accept` (one
+  connection is needed before `serve` returns).
 
 ---
 
@@ -174,8 +243,27 @@ let frame = encode_packet("m20000000,4");
 let reply = session.handle_frame(frame.as_bytes()).unwrap();
 ```
 
-未来 TCP 接线后的目标用法（规划）：
-Planned usage once the TCP transport lands:
+从库启动 TCP 服务：
+Starting the TCP server from the library:
+
+```rust
+use std::net::SocketAddr;
+use rp2350_gdb::{GdbServer, GdbTarget};
+
+let addr: SocketAddr = "127.0.0.1:3333".parse()?;
+let mut server = GdbServer::new(addr);
+// Blocks; Ctrl-C (or another thread) is required to leave `serve`.
+// 阻塞；需 Ctrl-C 或其他线程才能离开 `serve`。
+server.serve(Box::new(target))?;
+```
+
+`serve_with` 便于测试：先 `TcpListener::bind("127.0.0.1:0")`，把监听器交给
+后台线程，再用返回的端口连接客户端。
+`serve_with` is the test entry point: bind `127.0.0.1:0`, hand the listener to a
+background thread, then connect a client to the reported port.
+
+CLI `gdb` 子命令接线后的目标用法（规划）：
+Planned usage once the CLI `gdb` subcommand lands:
 
 ```bash
 cargo run -p rp2350-cli -- gdb --port 3333 --file firmware.elf

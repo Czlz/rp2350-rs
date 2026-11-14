@@ -1,11 +1,11 @@
 //! rp2350-gdb — GDB RSP (Remote Serial Protocol) server
 //!
 //! Implements the transport-independent RSP protocol layer (packet codec and
-//! command dispatch) that exposes the simulated RP2350 as a debug target. The
-//! TCP transport and CLI wiring arrive in a later task.
+//! command dispatch) plus a blocking TCP server ([`GdbServer`]) that exposes
+//! the simulated RP2350 as a debug target on the GDB remote protocol.
 //!
-//! 实现与传输无关的 RSP 协议层（包编解码与命令分发），将模拟的 RP2350 暴露
-//! 为调试目标。TCP 传输与 CLI 接线将在后续任务中完成。
+//! 实现与传输无关的 RSP 协议层（包编解码与命令分发），以及基于 TCP 的阻塞式
+//! 服务器（[`GdbServer`]），通过 GDB 远程协议将模拟的 RP2350 暴露为调试目标。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -374,6 +374,36 @@ mod rsp_tests {
             session.handle_packet("QStartNoAckMode").as_deref(),
             Some("OK")
         );
+    }
+
+    #[test]
+    fn reset_transport_clears_negotiated_no_ack_mode() {
+        let mut session = session();
+        assert!(!session.no_ack_mode());
+        session.reset_transport();
+        assert!(
+            !session.no_ack_mode(),
+            "reset on a fresh session is a no-op"
+        );
+
+        assert_eq!(
+            session.handle_packet("QStartNoAckMode").as_deref(),
+            Some("OK")
+        );
+        assert!(session.no_ack_mode());
+
+        session.reset_transport();
+        assert!(!session.no_ack_mode(), "reconnect must restore acks");
+        // Renegotiation still works after a transport reset.
+        // 传输重置后仍可重新协商。
+        assert_eq!(
+            session.handle_packet("QStartNoAckMode").as_deref(),
+            Some("OK")
+        );
+        assert!(session.no_ack_mode());
+        // The target survives the transport reset.
+        // 目标状态在传输重置后保持不变。
+        assert_eq!(session.handle_packet("p0").as_deref(), Some("11111111"));
     }
 
     #[test]
