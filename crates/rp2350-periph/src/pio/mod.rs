@@ -5,16 +5,18 @@
 //! 32-word instruction memory, the four state-machine register windows, the
 //! 4-deep TX/RX FIFOs (joinable into 8-deep FIFOs), the GPIO pin mapping with
 //! side-set and delay cycles, the 16.8 fixed-point clock dividers and the PIO
-//! instruction set (JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET). DMA handshakes and
-//! processor interrupt routing are deliberately not modelled yet; the
-//! corresponding offsets follow the project policy (reads return zero, writes
-//! are ignored, one warning per offset).
+//! instruction set (JMP/WAIT/IN/OUT/PUSH/PULL/MOV/IRQ/SET). DMA handshakes are
+//! deliberately not modelled yet; the corresponding offsets follow the project
+//! policy (reads return zero, writes are ignored, one warning per offset).
+//! Processor interrupt routing is provided by [`SharedPio`], which maps the
+//! eight `IRQ` flags onto the block's two shared `PIOx_IRQ_n` lines.
 //! RP2350 有三个 PIO 块（`PIO0`/`PIO1`/`PIO2`），分别位于 `0x5020_0000`、
 //! `0x5030_0000` 与 `0x5040_0000`。本模块建模寄存器文件、32 字指令存储、四个
 //! 状态机寄存器窗口、4 深度 TX/RX FIFO（可合并为 8 深度）、GPIO 引脚映射与
 //! side-set/延迟周期、16.8 定点分频器以及 PIO 指令集（JMP/WAIT/IN/OUT/PUSH/
-//! PULL/MOV/IRQ/SET）。DMA 握手与处理器中断路由暂不建模；对应偏移沿用项目策略
-//! （读为 0、写被忽略、每个偏移只警告一次）。
+//! PULL/MOV/IRQ/SET）。DMA 握手暂不建模；对应偏移沿用项目策略（读为 0、写被
+//! 忽略、每个偏移只警告一次）。处理器中断路由由 [`SharedPio`] 提供，它把八个
+//! `IRQ` 标志映射到本块的两条共享 `PIOx_IRQ_n` 线。
 //!
 //! Reset values are taken from the RP2350 register headers (`PIO_*_RESET`):
 //! `FSTAT = 0x0F00_0F00`, `SMx_CLKDIV = 0x0001_0000`,
@@ -28,6 +30,9 @@
 #[cfg(test)]
 mod pin_tests;
 mod regs;
+mod shared;
+#[cfg(test)]
+mod shared_tests;
 mod shift;
 mod sm;
 #[cfg(test)]
@@ -44,16 +49,25 @@ use super::map;
 #[allow(clippy::wildcard_imports)]
 use regs::*;
 
+pub use shared::SharedPio;
+
+/// Number of RP2350 PIO blocks / RP2350 的 PIO 块数量
+pub const PIO_BLOCKS: usize = 3;
+
 /// One RP2350 PIO register block / 一个 RP2350 PIO 寄存器块
 ///
 /// The block exposes the generic registers, the instruction memory and the
 /// four state-machine register windows through [`MmioDevice`]. Writing
 /// `SMx_INSTR` executes an instruction immediately and `SMx_ADDR` reports the
 /// current program counter. Call [`Pio::tick`] (or [`Pio::step_sm`]) to run the
-/// state machines one instruction at a time.
+/// state machines one instruction at a time. Hosts that need the block mounted
+/// on a bus while still driving it use [`SharedPio`], which owns one of these
+/// register files behind a shared handle.
 /// 该块通过 [`MmioDevice`] 暴露通用寄存器、指令存储与四个状态机寄存器窗口。
 /// 写 `SMx_INSTR` 会立即执行一条指令，`SMx_ADDR` 报告当前程序计数器。调用
 /// [`Pio::tick`]（或 [`Pio::step_sm`]）可按“每次一条指令”的方式驱动状态机。
+/// 需要在挂载到总线的同时继续驱动它的宿主应使用 [`SharedPio`]，它用共享句柄
+/// 持有其中一个寄存器文件。
 #[derive(Debug)]
 pub struct Pio {
     index: u8,
@@ -83,12 +97,7 @@ impl Pio {
     /// 当 `index` 不是合法的 RP2350 PIO 块序号时 panic。
     #[must_use]
     pub fn new(index: u8) -> Self {
-        let base = match index {
-            0 => map::PIO0_BASE,
-            1 => map::PIO1_BASE,
-            2 => map::PIO2_BASE,
-            _ => panic!("PIO index must be 0, 1 or 2"),
-        };
+        let base = Self::block_base(index);
         Self {
             index,
             base,
@@ -102,6 +111,29 @@ impl Pio {
             output_enables: 0,
             imem: [0; IMEM_WORDS],
             sm: core::array::from_fn(|slot| StateMachine::new(slot as u8)),
+        }
+    }
+
+    /// Register base address of a block index / 块序号的寄存器基地址
+    ///
+    /// # Panics
+    /// Panics when `index` is not a valid RP2350 PIO block index.
+    /// 当 `index` 不是合法的 RP2350 PIO 块序号时 panic。
+    pub(super) fn block_base(index: u8) -> u32 {
+        match index {
+            0 => map::PIO0_BASE,
+            1 => map::PIO1_BASE,
+            2 => map::PIO2_BASE,
+            _ => panic!("PIO index must be 0, 1 or 2"),
+        }
+    }
+
+    /// Device name of a block index / 块序号的设备名
+    pub(super) fn block_name(index: u8) -> &'static str {
+        match index {
+            0 => "PIO0",
+            1 => "PIO1",
+            _ => "PIO2",
         }
     }
 
@@ -271,11 +303,7 @@ impl Pio {
 
 impl MmioDevice for Pio {
     fn name(&self) -> &str {
-        match self.index {
-            0 => "PIO0",
-            1 => "PIO1",
-            _ => "PIO2",
-        }
+        Self::block_name(self.index)
     }
 
     fn window(&self) -> MmioWindow {

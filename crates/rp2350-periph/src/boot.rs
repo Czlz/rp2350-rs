@@ -29,7 +29,7 @@ use super::irq::IrqAssert;
 use super::map;
 use super::pads_bank0::PadsBank0;
 use super::pads_qspi::PadsQspi;
-use super::pio::Pio;
+use super::pio::{PIO_BLOCKS, Pio, SharedPio};
 use super::pll::Pll;
 use super::powman::Powman;
 use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
@@ -99,6 +99,7 @@ pub struct BootPeripherals {
     sio: Sio,
     dma: Dma,
     hstx: Hstx,
+    pio: [SharedPio; PIO_BLOCKS],
     irq: IrqAssert,
     system_writes: SystemWriteLog,
     core1_release: Arc<AtomicBool>,
@@ -175,14 +176,21 @@ impl BootPeripherals {
         );
         aon.mount(Box::new(Powman::new()))?;
         bus.register_region(Box::new(aon))?;
-        // RP2350 的三个 PIO 块位于 AHB 空间，按基地址顺序独立挂载；
-        // 本阶段仅建模寄存器、FIFO 与指令存储。
+        // RP2350 的三个 PIO 块位于 AHB 空间，按基地址顺序独立挂载。共享句柄与
+        // 总线适配器共用同一个寄存器文件，因此宿主可以直接 tick 状态机并观察
+        // `IRQ` 标志驱动的中断线。PIO 不参与 `advance` 的时基批量推进：机器在
+        // DMA 泵送点按客户机步数显式 tick。
         // The three RP2350 PIO blocks live in AHB space and are mounted
-        // standalone in base-address order; this stage models registers,
-        // FIFOs and instruction memory only.
-        mount_device(bus, Box::new(Pio::new(0)))?;
-        mount_device(bus, Box::new(Pio::new(1)))?;
-        mount_device(bus, Box::new(Pio::new(2)))?;
+        // standalone in base-address order. The shared handles and the bus
+        // adapters observe one register file, so the host can tick the state
+        // machines and watch the `IRQ` flags drive the interrupt lines. PIO
+        // does not take part in `advance`; the machine ticks it explicitly
+        // from the DMA pump point.
+        let pio: [SharedPio; PIO_BLOCKS] =
+            core::array::from_fn(|index| SharedPio::new(index as u8, irq.clone()));
+        for block in &pio {
+            mount_device(bus, block.device())?;
+        }
         // HSTX FIFO 位于 AHB 空间（0x5060_0000），与 PIO 块并列。
         // The HSTX FIFO lives in AHB space (0x5060_0000) next to the PIO blocks.
         mount_device(bus, hstx.fifo_device())?;
@@ -200,6 +208,7 @@ impl BootPeripherals {
             sio,
             dma,
             hstx,
+            pio,
             irq,
             system_writes,
             core1_release,
@@ -295,6 +304,41 @@ impl BootPeripherals {
     /// 用于取走输出字的可变 HSTX 句柄
     pub fn hstx_mut(&mut self) -> &mut Hstx {
         &mut self.hstx
+    }
+
+    /// Shared PIO block handle (`index` `0..=2`) / 共享 PIO 块句柄（`index` `0..=2`）
+    ///
+    /// The handle shares one register file with the bus adapter, so guest MMIO
+    /// writes are visible here and [`SharedPio::tick`] advances the state
+    /// machines the guest programmed. Indices above 2 return `None`.
+    /// 该句柄与总线适配器共享同一个寄存器文件，因此客户机 MMIO 写入在此可见，
+    /// [`SharedPio::tick`] 推进的是客户机编程的状态机。序号大于 2 返回 `None`。
+    #[must_use]
+    pub fn pio(&self, index: usize) -> Option<&SharedPio> {
+        self.pio.get(index)
+    }
+
+    /// Run `f` against a PIO block's register file / 在 PIO 块寄存器文件上执行 `f`
+    ///
+    /// The block's interrupt lines are refreshed after `f` returns. Indices
+    /// above 2 return `None` without running the closure.
+    /// `f` 返回后会刷新本块的中断线。序号大于 2 时直接返回 `None`，不执行闭包。
+    pub fn with_pio<R>(&self, index: usize, f: impl FnOnce(&mut Pio) -> R) -> Option<R> {
+        self.pio.get(index).map(|block| block.with_mut(f))
+    }
+
+    /// Refresh all six PIO interrupt lines from the raw `IRQ` flags
+    /// 按原始 `IRQ` 标志刷新全部六条 PIO 中断线
+    ///
+    /// [`SharedPio::tick`], [`BootPeripherals::with_pio`] and the bus adapters
+    /// already publish flag changes; this entry point covers hosts that edit a
+    /// block through another route and want a deterministic resynchronisation.
+    /// [`SharedPio::tick`]、[`BootPeripherals::with_pio`] 与总线适配器已会发布
+    /// 标志变化；本入口供通过其它路径修改块的宿主做确定性重同步。
+    pub fn pump_pio_irqs(&self) {
+        for block in &self.pio {
+            block.sync_irqs();
+        }
     }
 
     /// Elapsed microseconds since boot / 自启动以来的微秒数

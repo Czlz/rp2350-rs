@@ -269,6 +269,8 @@ pub struct Machine {
     pumped: u64,
     /// Steps at the last DMA pump / 上次 DMA 泵送时的步数
     dma_pumped: u64,
+    /// Steps at the last PIO pump / 上次 PIO 泵送时的步数
+    pio_pumped: u64,
     /// Cumulative DMA data units moved by the host pump / 宿主泵送累计搬运的 DMA 数据单元数
     dma_transfers: u64,
     /// Non-budget halt reason / 非预算原因的停机原因
@@ -398,6 +400,7 @@ impl Machine {
             advanced: 0,
             pumped: 0,
             dma_pumped: 0,
+            pio_pumped: 0,
             dma_transfers: 0,
             halt: None,
             finished: false,
@@ -483,6 +486,34 @@ impl Machine {
             self.dma_transfers(),
             self.peripherals.dma().busy_mask()
         )
+    }
+
+    /// Busy state machines across all three PIO blocks / 三个 PIO 块中忙碌的状态机
+    ///
+    /// Bit `block * 4 + sm` is set when that state machine has `CTRL.SM_ENABLE`
+    /// set. Host diagnostic only: it never prints on `repl --exec` stdout.
+    /// 位 `block * 4 + sm` 表示该状态机已置位 `CTRL.SM_ENABLE`。仅供宿主诊断，
+    /// 不会出现在 `repl --exec` 的 stdout。
+    #[must_use]
+    pub fn pio_busy_mask(&self) -> u16 {
+        let mut mask = 0u16;
+        for index in 0..rp2350_periph::pio::PIO_BLOCKS {
+            if let Some(block) = self.peripherals.pio(index) {
+                mask |= u16::from(block.enabled_mask()) << (index * 4);
+            }
+        }
+        mask
+    }
+
+    /// Program counter of PIO state machine `sm` in `block` / `block` 中状态机 `sm` 的 PC
+    ///
+    /// Test/diagnostic hook: returns `None` for a block index above 2 or a
+    /// machine index above 3.
+    /// 测试与诊断接口：块序号大于 2 或状态机序号大于 3 时返回 `None`。
+    #[cfg(test)]
+    #[must_use]
+    pub fn pio_pc(&self, block: usize, sm: usize) -> Option<u8> {
+        self.peripherals.pio(block)?.pc(sm)
     }
 
     /// Elapsed simulated microseconds / 已模拟的微秒数
@@ -761,6 +792,7 @@ impl Machine {
                 // DMA is pumped before IRQ delivery so a completion interrupt
                 // is visible to the guest in the same batch.
                 self.pump_dma_batch();
+                self.pump_pio_batch();
                 if let Some(halt) = outcome.halt {
                     self.halt = Some(format!("bootrom halt: {halt}"));
                     self.finalize();
@@ -789,6 +821,7 @@ impl Machine {
                 // GDB single steps all pass here, so a debugger cannot bypass
                 // DMA progress.
                 self.pump_dma_batch();
+                self.pump_pio_batch();
                 if trace.is_some() {
                     // 轨迹步与原 run 路径一致：每步泵送中断，不做自旋统计或时基推进。
                     // Trace steps mirror the original run path: pump every step and
@@ -909,6 +942,45 @@ impl Machine {
             .dma_mut()
             .run(&mut self.bus, DMA_PUMP_TRANSFERS);
         self.dma_transfers = self.dma_transfers.saturating_add(moved);
+    }
+
+    /// Advance the PIO state machines by the retired steps of this batch
+    /// 按本批次退役步数推进 PIO 状态机
+    ///
+    /// Throttled to one call per [`PUMP_INTERVAL`] retired steps, exactly like
+    /// the DMA pump. Every cycle handed to a block is one PIO clock, so the
+    /// model assumes the PIO clock equals the CPU clock (one step = one PIO
+    /// cycle). Each block checks `CTRL.SM_ENABLE` after one uncontended lock,
+    /// so an unused PIO costs three lock acquires per batch and no per-machine
+    /// work, and its interrupt lines are only republished when the `IRQ` flags
+    /// change. Blocks are ticked before IRQ delivery, so a flag raised in this
+    /// batch reaches the CPU in the same batch.
+    /// 与 DMA 泵送一样按退役步数每 [`PUMP_INTERVAL`] 步节流一次。交给块的一个
+    /// 周期就是一个 PIO 时钟，因此模型假定 PIO 时钟等于 CPU 时钟（一步 = 一个
+    /// PIO 周期）。每个块在一次无竞争加锁后检查 `CTRL.SM_ENABLE`，未使用的 PIO
+    /// 每批只花三次加锁、不做状态机工作，且只在 `IRQ` 标志变化时重新发布中断线。
+    /// 块在中断投递之前推进，因此本批次置位的标志会在同一批次送达 CPU。
+    fn pump_pio_batch(&mut self) {
+        if self.steps - self.pio_pumped < PUMP_INTERVAL {
+            return;
+        }
+        let elapsed = self.steps - self.pio_pumped;
+        self.pio_pumped = self.steps;
+        // 空闲快速路径：三个块都没有使能状态机时只做一次掩码探测就返回。
+        // Idle fast path: with no enabled state machine in any of the three
+        // blocks, one mask probe is the whole batch.
+        let busy = self.pio_busy_mask();
+        if busy == 0 {
+            return;
+        }
+        for index in 0..rp2350_periph::pio::PIO_BLOCKS {
+            if busy & (0x000F_u16 << (index * 4)) == 0 {
+                continue;
+            }
+            if let Some(block) = self.peripherals.pio(index) {
+                block.tick(elapsed);
+            }
+        }
     }
 
     fn advance_timebase(&mut self) {
@@ -1484,6 +1556,110 @@ mod tests {
         }
 
         assert_eq!(machine.dma_transfers(), 4);
+    }
+
+    /// PIO `CTRL` offset / PIO `CTRL` 偏移
+    const PIO_CTRL: u32 = 0x000;
+
+    /// PIO `IRQ` offset (write-one-to-clear) / PIO `IRQ` 偏移（写 1 清零）
+    const PIO_IRQ: u32 = 0x030;
+
+    /// PIO `INSTR_MEM0` offset / PIO `INSTR_MEM0` 偏移
+    const PIO_INSTR_MEM0: u32 = 0x048;
+
+    /// `SM0_EXECCTRL` offset / `SM0_EXECCTRL` 偏移
+    const PIO_SM0_EXECCTRL: u32 = 0x0CC;
+
+    /// `MOV Y, Y` no-op instruction / `MOV Y, Y` 空操作指令
+    const PIO_NOP: u32 = 0xA042;
+
+    /// `SET pins, data` instruction / `SET pins, data` 指令
+    fn pio_set_pins(data: u32) -> u32 {
+        0xE000 | (data & 0x1F)
+    }
+
+    /// `IRQ set, field` instruction / `IRQ set, field` 指令
+    fn pio_irq_set(field: u32) -> u32 {
+        0xC000 | (field & 0x1F)
+    }
+
+    #[test]
+    fn pio_state_machines_tick_once_per_pump_batch() {
+        // 10 条 NOP + WRAP_TOP = 9：PC 等于已执行拍数对 10 取模，因此 64 拍后
+        // 为 4、128 拍后为 8，可区分“每 64 步 tick 一次”与“未 tick”。
+        // Ten NOPs with WRAP_TOP = 9 make the PC the executed-cycle count mod
+        // 10, so 64 cycles land on 4 and 128 on 8: the value distinguishes the
+        // 64-step pump from no pump at all.
+        let mut machine = machine_with_budget(1_000);
+        let base = rp2350_periph::map::PIO0_BASE;
+        write_word(&mut machine, base + PIO_INSTR_MEM0, pio_set_pins(1));
+        for slot in 1..10 {
+            write_word(&mut machine, base + PIO_INSTR_MEM0 + slot * 4, PIO_NOP);
+        }
+        write_word(&mut machine, base + PIO_SM0_EXECCTRL, 9 << 12);
+        write_word(&mut machine, base + PIO_CTRL, 1);
+        assert_eq!(machine.pio_busy_mask(), 0b0001);
+        assert_eq!(machine.peripherals.pio(0).expect("pio0").output_levels(), 0);
+
+        machine.run_cycles(PUMP_INTERVAL - 1);
+        assert_eq!(machine.pio_pc(0, 0), Some(0), "no tick before the batch");
+        assert_eq!(
+            machine.peripherals.pio(0).expect("pio0").output_levels(),
+            0,
+            "no pin activity before the batch"
+        );
+
+        machine.run_cycles(1);
+        assert_eq!(machine.pio_pc(0, 0), Some(4), "one batch of 64 cycles");
+        assert_eq!(
+            machine.peripherals.pio(0).expect("pio0").output_levels() & 1,
+            1,
+            "SET pins ran inside the batch"
+        );
+
+        machine.run_cycles(1);
+        assert_eq!(machine.pio_pc(0, 0), Some(4), "one batch of 64 cycles");
+
+        machine.run_cycles(PUMP_INTERVAL);
+        assert_eq!(machine.pio_pc(0, 0), Some(8), "second batch");
+
+        // 未使能的块不推进：SM1 始终保持 PC 0。
+        // A disabled machine never advances: SM1 stays at PC 0.
+        assert_eq!(machine.pio_pc(0, 1), Some(0));
+    }
+
+    #[test]
+    fn pio_irq_flags_reach_the_shared_irq_mask() {
+        // `IRQ set` 在泵送批次内执行，标志必须出现在共享中断掩码中；客户机
+        // 写 1 清零后立即释放。
+        // `IRQ set` runs inside a pump batch, so the flag must appear in the
+        // shared IRQ mask and the guest's write-one-to-clear must release it.
+        let mut machine = machine_with_budget(1_000);
+        let base = rp2350_periph::map::PIO0_BASE;
+        write_word(&mut machine, base + PIO_INSTR_MEM0, pio_irq_set(2));
+        write_word(&mut machine, base + PIO_CTRL, 1);
+        let line = 1u64 << rp2350_periph::irq::PIO0_IRQ_0;
+        assert_eq!(machine.peripherals.irq_mask() & line, 0);
+
+        machine.run_cycles(PUMP_INTERVAL);
+        assert_ne!(machine.peripherals.irq_mask() & line, 0, "flag 2 asserted");
+
+        write_word(&mut machine, base + PIO_IRQ, 1 << 2);
+        assert_eq!(machine.peripherals.irq_mask() & line, 0, "W1C released");
+        assert_eq!(machine.peripherals.pio(0).expect("pio0").irq_flags(), 0);
+    }
+
+    #[test]
+    fn unused_pio_blocks_do_not_change_stepping() {
+        // 没有任何 PIO 使能时，泵送只做一次状态探测，步数与 PC 行为不变。
+        // With no PIO enabled the pump only probes state: step count and PC
+        // behaviour stay unchanged.
+        let mut machine = machine_with_budget(200);
+        machine.run_cycles(200);
+        assert_eq!(machine.steps(), 200);
+        assert_eq!(machine.pio_busy_mask(), 0);
+        assert_eq!(machine.pio_pc(0, 0), Some(0));
+        assert_eq!(machine.peripherals.irq_mask(), 0);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 ## PIO register blocks / PIO 寄存器块
 
 RP2350 has **three** PIO blocks, unlike RP2040's two. `BootPeripherals::mount`
-installs one `Pio` instance per block at its AHB base address:
+installs one shared block handle per block at its AHB base address:
 
 | Block | Base | Constant |
 |-------|------|----------|
@@ -17,10 +17,11 @@ installs one `Pio` instance per block at its AHB base address:
 | PIO2 | `0x5040_0000` | `map::PIO2_BASE` |
 
 RP2350 与 RP2040 的两块 PIO 不同，共有 **三个** PIO 块。`BootPeripherals::mount`
-在每个块的 AHB 基地址各挂载一个 `Pio` 实例。
+在每个块的 AHB 基地址各挂载一个共享块句柄。
 
 ```rust
 pub struct Pio { /* private register file + four state machines */ }
+pub struct SharedPio { /* Arc<Mutex<Pio>> + two interrupt lines */ }
 
 impl Pio {
     pub fn new(index: u8) -> Self;
@@ -34,17 +35,98 @@ impl Pio {
     pub fn output_levels(&self) -> u32;
     pub fn output_enables(&self) -> u32;
 }
+
+impl SharedPio {
+    pub fn new(index: u8, irq: IrqAssert) -> Self;
+    pub fn index(&self) -> u8;
+    pub fn device(&self) -> Box<dyn MmioDevice>;
+    pub fn with<R>(&self, f: impl FnOnce(&Pio) -> R) -> R;
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Pio) -> R) -> R;
+    pub fn tick(&self, cycles: u64);
+    pub fn sync_irqs(&self);
+    pub fn irq_flags(&self) -> u32;
+    pub fn enabled_mask(&self) -> u8;
+    pub fn stalled_mask(&self) -> u8;
+    pub fn pc(&self, sm: usize) -> Option<u8>;
+    pub fn output_levels(&self) -> u32;
+    pub fn output_enables(&self) -> u32;
+}
 ```
 
 `Pio` implements `MmioDevice` over a 4 KB window. `new(0/1/2)` selects
 PIO0/PIO1/PIO2; any other index panics. The implementation is split into
 `pio/mod.rs` (register block, pin model), `pio/regs.rs` (register layout, FIFOs,
-state), `pio/sm.rs` (clocking, delay/side-set, JMP/WAIT/IRQ/SET) and
-`pio/shift.rs` (IN/OUT/PUSH/PULL/MOV).
+state), `pio/shared.rs` (shared handle, MMIO proxy, IRQ routing), `pio/sm.rs`
+(clocking, delay/side-set, JMP/WAIT/IRQ/SET) and `pio/shift.rs`
+(IN/OUT/PUSH/PULL/MOV).
 `Pio` 在 4 KB 窗口上实现 `MmioDevice`。`new(0/1/2)` 选择 PIO0/PIO1/PIO2，
 其它序号会 panic。实现拆分为 `pio/mod.rs`（寄存器块、引脚模型）、
-`pio/regs.rs`（寄存器布局、FIFO、状态）、`pio/sm.rs`（时钟驱动、延迟/side-set、
-JMP/WAIT/IRQ/SET）以及 `pio/shift.rs`（IN/OUT/PUSH/PULL/MOV）。
+`pio/regs.rs`（寄存器布局、FIFO、状态）、`pio/shared.rs`（共享句柄、MMIO 代理、
+中断路由）、`pio/sm.rs`（时钟驱动、延迟/side-set、JMP/WAIT/IRQ/SET）以及
+`pio/shift.rs`（IN/OUT/PUSH/PULL/MOV）。
+
+### Shared handles / 共享句柄
+
+`BootPeripherals::mount` wraps each block in one [`SharedPio`] and mounts the
+proxy returned by `SharedPio::device`. The proxy and the handle share **one**
+register file (`Arc<Mutex<Pio>>`), so firmware MMIO writes are immediately
+visible to the host and a host `tick` advances the state machines the guest
+programmed — no register, FIFO or pin state is copied. `BootPeripherals::pio(i)`
+returns the handle, `with_pio(i, f)` runs a closure against the register file
+and republishes the IRQ lines, and `pump_pio_irqs()` refreshes all six lines
+from the raw `IRQ` flags. `SharedPio::tick` acquires the lock once, returns
+immediately when `CTRL.SM_ENABLE = 0`, and only rewrites the shared interrupt
+lines when the `IRQ` flags changed.
+
+`BootPeripherals::mount` 把每个块包装成一个 [`SharedPio`]，并挂载
+`SharedPio::device` 返回的代理。代理与句柄共享**同一份**寄存器文件
+（`Arc<Mutex<Pio>>`），因此固件的 MMIO 写入对宿主立即可见，宿主的 `tick`
+推进的正是客户机编程的状态机 —— 寄存器、FIFO 与引脚状态都不会被复制。
+`BootPeripherals::pio(i)` 返回句柄，`with_pio(i, f)` 在寄存器文件上执行闭包并
+重新发布中断线，`pump_pio_irqs()` 按原始 `IRQ` 标志刷新全部六条线。
+`SharedPio::tick` 只加锁一次，`CTRL.SM_ENABLE = 0` 时立即返回，且仅在 `IRQ`
+标志变化时才改写共享中断线。
+
+### Interrupt routing / 中断路由
+
+Each block owns two interrupt lines at RP2350 numbers `15..=20`
+(`irq::PIO0_IRQ_0` = 15 … `irq::PIO2_IRQ_1` = 20, table
+`irq::PIO_IRQ_LINES[block][line]`), immediately after `USBCTRL_IRQ` (14) and
+before `IO_IRQ_BANK0` (21). The eight `IRQ` flags are grouped as on silicon:
+flags `0..=3` assert the block's `IRQ_0` line and flags `4..=7` assert `IRQ_1`
+(the datasheet's `IRQ0_INTE`/`IRQ1_INTE` grouping). The model does not implement
+those enable/force registers, so any set flag asserts its line directly. Every
+path that can change a flag republishes the pair: the `IRQ` instruction executed
+inside `tick`, `IRQ_FORCE` writes, `IRQ` write-one-to-clear writes, and every
+`with_mut` call, so clearing a flag releases the line in the same operation.
+`Pio` used directly (unit tests, standalone mounts) has no IRQ routing; only
+`SharedPio` drives the shared `IrqAssert`.
+
+每个块在 RP2350 中断号 `15..=20` 上拥有两条中断线（`irq::PIO0_IRQ_0` = 15 …
+`irq::PIO2_IRQ_1` = 20，表为 `irq::PIO_IRQ_LINES[block][line]`），正好位于
+`USBCTRL_IRQ`（14）之后、`IO_IRQ_BANK0`（21）之前。八个 `IRQ` 标志按硬件分组：
+标志 `0..=3` 断言块的 `IRQ_0` 线，标志 `4..=7` 断言 `IRQ_1`（数据手册的
+`IRQ0_INTE`/`IRQ1_INTE` 分组）。模型不实现这些使能/强制寄存器，因此任何已置位
+标志都会直接断言对应线。所有可能改变标志的路径都会重新发布这一对线：`tick`
+内执行的 `IRQ` 指令、`IRQ_FORCE` 写入、`IRQ` 写 1 清零写入，以及每次
+`with_mut` 调用，因此清标志与释放线是同一次操作。直接使用 `Pio`（单元测试、
+独立挂载）没有中断路由；只有 `SharedPio` 会驱动共享 `IrqAssert`。
+
+### Tick semantics / tick 语义
+
+`SharedPio::tick(cycles)` models `cycles` PIO clock cycles and matches
+`Pio::tick`: each cycle gives every enabled machine one clock edge, `CLKDIV`
+gates the machine cycle, and a pending instruction delay is burned before the
+next fetch. The host decides the cycle budget; `rp2350-cli` hands one PIO cycle
+per retired guest instruction (see `doc/crates/rp2350-cli.md`). `Pio::tick`
+takes `&mut self` for standalone use, while the shared handle takes `&self`
+because the register file lives behind the mutex.
+
+`SharedPio::tick(cycles)` 建模 `cycles` 个 PIO 时钟周期，语义与 `Pio::tick`
+一致：每个周期给每台已使能状态机一个时钟边沿，`CLKDIV` 决定是否产生机器周期，
+待处理指令延迟在下次取指前消耗。周期预算由宿主决定；`rp2350-cli` 按每条退役的
+客户机指令给出一个 PIO 周期（见 `doc/crates/rp2350-cli.md`）。独立使用时
+`Pio::tick` 取 `&mut self`，共享句柄取 `&self`，因为寄存器文件位于互斥锁之后。
 
 ### Pin model / 引脚模型
 
@@ -107,10 +189,13 @@ zero, so a block with no host pin activity still behaves like the earlier
   满时丢弃该字并置位 `FDEBUG.TXOVER`。`RXF0..RXF3` — 每次读从 4 深度 RX FIFO
   （`FJOIN_RX` 时 8 深度）取出一个字；空时返回 0 并置位 `FDEBUG.RXUNDER`。
 - `IRQ` / `IRQ_FORCE` — eight PIO IRQ flags; `IRQ` is W1C, `IRQ_FORCE` sets
-  the internal flags. The `IRQ` instruction sets/clears/waits on these flags,
-  but no processor interrupt line is routed yet.
+  the internal flags. The `IRQ` instruction sets/clears/waits on these flags.
+  With `SharedPio`, flags `0..=3` drive the block's `IRQ_0` line and flags
+  `4..=7` drive `IRQ_1` (see *Interrupt routing* above).
   `IRQ` / `IRQ_FORCE` — 8 个 PIO IRQ 标志；`IRQ` 写 1 清零，`IRQ_FORCE` 置位
-  内部标志。`IRQ` 指令可置位/清零/等待这些标志，但尚未接入处理器中断线。
+  内部标志。`IRQ` 指令可置位/清零/等待这些标志。使用 `SharedPio` 时，标志
+  `0..=3` 驱动本块 `IRQ_0` 线，标志 `4..=7` 驱动 `IRQ_1`（见上文
+  *Interrupt routing / 中断路由*）。
 - `INPUT_SYNC_BYPASS`, `GPIOBASE` (`bit 4`), `DBG_CFGINFO` (`0x1020_0404`),
   `DBG_PADOUT`/`DBG_PADOE` (sample the current output levels/enables).
   `INPUT_SYNC_BYPASS`、`GPIOBASE`（位 4）、`DBG_CFGINFO`（`0x1020_0404`）、
@@ -247,16 +332,21 @@ Shift-register semantics / 移位寄存器语义:
 
 ### Not modelled yet / 尚未建模
 
-DMA handshakes (DREQ for TX/RX), the RP2350 `RXFn_PUTGET*` registers, the
-interrupt registers at `0x16C..0x184` and processor interrupt routing.
-`GPIOBASE` is stored but never added to PINCTRL pin numbers, so every block
-sees its own local GPIO 0..31 window. Cross-block `IRQ` routing (RP2350 index
+DMA handshakes (DREQ for TX/RX), the RP2350 `RXFn_PUTGET*` registers and the
+`IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
+interrupt registers at `0x16C..0x184` are not modelled: the shared handle
+asserts a line from the raw flag alone, without per-flag enables or forced
+status. `GPIOBASE` is stored but never added to PINCTRL pin numbers, so every
+block sees its own local GPIO 0..31 window, and no PINCTRL FUNCSEL crossbar
+routes PIO pins to real GPIO pads. Cross-block `IRQ` routing (RP2350 index
 modes 1/3) currently falls back to this block's flags.
 
-DMA 握手（TX/RX 的 DREQ）、RP2350 `RXFn_PUTGET*` 寄存器、`0x16C..0x184` 的
-中断寄存器以及处理器中断路由尚未建模。`GPIOBASE` 仅存储、不会加到 PINCTRL
-引脚号上，因此每个块看到的是自己局部的 GPIO 0..31 窗口。跨块 `IRQ` 路由
-（RP2350 索引模式 1/3）目前回落到本块标志。
+DMA 握手（TX/RX 的 DREQ）、RP2350 `RXFn_PUTGET*` 寄存器，以及 `0x16C..0x184`
+的 `IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
+中断寄存器尚未建模：共享句柄仅按原始标志断言中断线，没有逐标志使能与强制状态。
+`GPIOBASE` 仅存储、不会加到 PINCTRL 引脚号上，因此每个块看到的是自己局部的
+GPIO 0..31 窗口，也没有 PINCTRL FUNCSEL 交叉开关把 PIO 引脚接到真实 GPIO 焊盘。
+跨块 `IRQ` 路由（RP2350 索引模式 1/3）目前回落到本块标志。
 
 ---
 

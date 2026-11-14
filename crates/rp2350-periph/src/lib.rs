@@ -55,7 +55,7 @@ pub use cycle::CycleSink;
 pub use dma::Dma;
 pub use hstx::Hstx;
 pub use irq::IrqAssert;
-pub use pio::Pio;
+pub use pio::{Pio, SharedPio};
 pub use traits::Peripheral;
 pub use uart::UartSink;
 

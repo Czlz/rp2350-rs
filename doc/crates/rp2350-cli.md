@@ -503,7 +503,7 @@ impl Machine {
     pub fn finalize(&mut self);                  // flush timebase + UART
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
-    // dma_transfers, dma_state,
+    // dma_transfers, dma_state, pio_busy_mask, pio_pc (test hook),
     // take_uart_output, take_notices, recent_steps, register, dump_memory
     // debugger: read_register, write_register, xpsr, write_xpsr, cpu_state
 }
@@ -518,13 +518,15 @@ pub fn fault_tail_lines(machine: &mut Machine) -> Vec<String>; // [regs]+[mem]+[
 with the flash handle, mounted at `0x0000_0000`), the flash XIP window at
 `0x1000_0000` plus its non-cached alias at `0x1400_0000` (one shared backing
 store), the write-absorbing XIP maintenance window at `0x1800_0000`,
-520 KB SRAM at `0x2000_0000`, `BootPeripherals` (GPIO, UART0, timer, etc.),
-and `rp2350_usb::mount` for the USB controller (DPSRAM + register windows).
+520 KB SRAM at `0x2000_0000`, `BootPeripherals` (GPIO, UART0, timer, three
+shared PIO block handles, etc.), and `rp2350_usb::mount` for the USB controller
+(DPSRAM + register windows).
 `Machine::new` 依次构建：合成 boot ROM（`Rp2350Bootrom::new` 持有 flash
 句柄，挂载于 `0x0000_0000`）、`0x1000_0000` 的 Flash XIP 窗口与
 `0x1400_0000` 的非缓存别名（共享同一份底层存储）、`0x1800_0000` 吸收写入的
 XIP 维护窗口、`0x2000_0000` 的 520 KB SRAM、`BootPeripherals`（GPIO、UART0、
-定时器等），以及 USB 控制器的 `rp2350_usb::mount`（DPSRAM + 寄存器窗口）。
+定时器、三个共享 PIO 块句柄等），以及 USB 控制器的 `rp2350_usb::mount`
+（DPSRAM + 寄存器窗口）。
 
 ### Firmware formats / 固件格式
 
@@ -621,6 +623,57 @@ transfers happen because the machine pumps them, not because the guest writes
   （`TREQ_SEL` `0x3B..=0x3E`），也不建模 HSTX DMA 握手。每个 `Dma::run` 单元
   消耗一次总线读加一次总线写，但指令预算与外设时基只统计 CPU 步数，DMA 流量
   不计入 `steps` 或 `time_us`。
+
+### PIO pump / PIO 泵送
+
+Firmware only writes the PIO register blocks at `0x5020_0000` / `0x5030_0000` /
+`0x5040_0000`; the state machines run because the machine ticks them, not
+because the guest writes `CTRL.SM_ENABLE`.
+固件只写 `0x5020_0000` / `0x5030_0000` / `0x5040_0000` 的 PIO 寄存器块；状态机
+之所以运行，是因为机器在 tick 它们，而不是因为客户机写了 `CTRL.SM_ENABLE`。
+
+- **Pump point / 泵送点**：`Machine::pump_pio_batch` is called from
+  `execute_step` right next to `pump_dma_batch`, after the step retires and
+  **before** interrupt delivery. Plain `step`, `trace_step`, boot-ROM trap steps
+  and GDB `resume` all take this path, so a debugger cannot starve the PIO
+  state machines either.
+  `Machine::pump_pio_batch` 在一步退役后、**中断投递之前**、紧邻
+  `pump_dma_batch` 由 `execute_step` 调用。普通 `step`、`trace_step`、boot ROM
+  陷阱步与 GDB `resume` 都经过这里，因此调试器同样无法让 PIO 状态机停摆。
+- **Budget / 预算**：throttled to one call per `PUMP_INTERVAL` (64) retired
+  steps. Each call ticks every block that has `CTRL.SM_ENABLE` set by the number
+  of steps retired since the previous call, so one guest step is modelled as one
+  PIO clock cycle. Only blocks with at least one enabled machine are locked and
+  ticked; `IRQ`-driven interrupt lines are republished only when the flags
+  changed.
+  按退役步数每 `PUMP_INTERVAL`（64）步节流一次。每次把自上次调用以来退役的步数
+  作为周期数，tick 每个置位了 `CTRL.SM_ENABLE` 的块，因此一个客户机步长被视为
+  一个 PIO 时钟周期。只有含已使能状态机的块才会被加锁与 tick；由 `IRQ` 标志
+  驱动的中断线仅在标志变化时重新发布。
+- **Idle path / 空闲路径**：`Machine::pio_busy_mask()` probes
+  `CTRL.SM_ENABLE` of the three blocks; when it is zero the batch returns after
+  that single probe, without per-block ticks. An unused PIO therefore costs one
+  mask probe per 64 steps and never touches the bus.
+  `Machine::pio_busy_mask()` 探测三个块的 `CTRL.SM_ENABLE`；为零时本批在该次
+  探测后直接返回，不再逐块 tick。因此未使用的 PIO 每 64 步只花一次掩码探测，
+  且完全不访问总线。
+- **Diagnostics / 诊断**：`Machine::pio_busy_mask()` packs
+  `CTRL.SM_ENABLE` as bit `block * 4 + sm`, and `Machine::pio_pc(block, sm)` (a
+  test/diagnostic hook) reports a machine's program counter. Both are host-only
+  and never print on `repl --exec` stdout, so guest output stays byte-exact.
+  `Machine::pio_busy_mask()` 以位 `block * 4 + sm` 打包 `CTRL.SM_ENABLE`，
+  `Machine::pio_pc(block, sm)`（测试/诊断接口）报告状态机 PC。两者都只属于宿主，
+  绝不出现在 `repl --exec` 的 stdout 上，客户机输出保持逐字节一致。
+- **Limitations / 限制**：the PIO clock is assumed to equal the CPU clock (one
+  step = one PIO cycle), so a `CLKDIV` value scales instructions per PIO cycle
+  but not the PIO/CPU clock ratio. There is no PIO DMA handshake, no PINCTRL
+  FUNCSEL crossbar between PIO pins and GPIO pads, and no external GPIO device
+  model. The PIO tick is not added to `steps` or `time_us`, exactly like DMA
+  traffic.
+  假定 PIO 时钟等于 CPU 时钟（一步 = 一个 PIO 周期），因此 `CLKDIV` 只缩放每个
+  PIO 周期的指令数，不改变 PIO/CPU 时钟比。不做 PIO DMA 握手、不做 PIO 引脚与
+  GPIO 焊盘之间的 PINCTRL FUNCSEL 交叉开关，也不模拟外部 GPIO 设备。与 DMA
+  流量一样，PIO tick 不计入 `steps` 或 `time_us`。
 
 ---
 
