@@ -2,8 +2,9 @@
 //!
 //! Models the single-cycle GPIO output, output-enable and input registers, the
 //! inter-core FIFO (8 entries), spinlocks and the RP2350 doorbells. GPIO values
-//! loop back as inputs; the pin matrix between SIO, IO_BANK0 and PADS_BANK0 is
-//! not connected yet.
+//! follow the `IO_BANK0` `FUNCSEL` crossbar: `GPIO_IN` reports the resolved pad
+//! level only on pins routed to `SIO`, and the output latch drives the pad only
+//! there as well.
 //!
 //! The RP2350 SIO window is *per core*: both cores see it at `0xD000_0000`, but
 //! `FIFO_WR` pushes into the peer's receive queue and `FIFO_RD` drains the queue
@@ -12,8 +13,8 @@
 //! relaxed atomic store) so a driver that steps both cores can flip the FIFO,
 //! doorbell and `CPUID` direction around each core's instruction.
 //! 建模单周期 GPIO 输出、输出使能与输入寄存器、核间 FIFO（8 项）、自旋锁与
-//! RP2350 门铃。GPIO 值回环为输入；SIO、IO_BANK0 与 PADS_BANK0 之间的引脚
-//! 矩阵尚未连接。
+//! RP2350 门铃。GPIO 值遵循 `IO_BANK0` 的 `FUNCSEL` 交叉开关：`GPIO_IN` 只在
+//! 路由到 `SIO` 的引脚上报告合成后的 pad 电平，输出锁存也只在那些引脚驱动 pad。
 //!
 //! RP2350 的 SIO 窗口是**按核**区分的：两个核心都在 `0xD000_0000` 看到它，但
 //! `FIFO_WR` 压入对端的接收队列、`FIFO_RD` 排空对端写入的队列。因此单个总线
@@ -35,6 +36,7 @@ use rp2350_core::mmio::{MmioDevice, MmioWindow};
 use rp2350_core::types::CpuId;
 
 use super::gpio_pads::GpioPads;
+use super::io_bank0::PinFunction;
 use super::irq::IrqAssert;
 use super::map;
 
@@ -480,6 +482,45 @@ impl Sio {
         self.core1_irq.set(map::SIO_IRQ_FIFO, fifo1);
         self.core1_irq.set(map::SIO_IRQ_BELL, bell1);
     }
+
+    /// Publish `GPIO_OUT`/`GPIO_OE` (and the `GPIO_HI_*` pair) into the pin matrix
+    /// 把 `GPIO_OUT`/`GPIO_OE`（以及 `GPIO_HI_*` 对）发布到引脚矩阵
+    ///
+    /// The matrix only applies the latch to pads whose `IO_BANK0.FUNCSEL`
+    /// selects `SIO`, so a pad routed to a PIO block keeps following that block.
+    /// 矩阵只把锁存应用到 `IO_BANK0.FUNCSEL` 选中 `SIO` 的 pad，因此路由到 PIO 的
+    /// pad 仍然跟随 PIO 块。
+    fn publish_pins(&self) {
+        let (levels, enables) = {
+            let state = self.state.lock();
+            (
+                u64::from(state.out) | (u64::from(state.hi_out) << 32),
+                u64::from(state.oe) | (u64::from(state.hi_oe) << 32),
+            )
+        };
+        self.pads
+            .set_driver(PinFunction::Sio.to_bits(), levels, enables);
+    }
+
+    /// Input register value for the low 32 pins / 低 32 个引脚的输入寄存器值
+    ///
+    /// Only pads whose `FUNCSEL` selects `SIO` report the routed pad level; the
+    /// other bits keep the SIO latch loopback so a block that was never given
+    /// the pad function still reads its own output.
+    /// 只有 `FUNCSEL` 选中 `SIO` 的 pad 报告路由后的 pad 电平；其它位保持 SIO 锁存
+    /// 回环，使未被授予 pad 功能的位仍能读回自己的输出。
+    fn input_value(&self, state: &SioState) -> u32 {
+        let mask = self.pads.funcsel_mask(PinFunction::Sio.to_bits()) as u32;
+        let pad = self.pads.input_levels() as u32;
+        (pad & mask) | (state.out & state.oe & !mask)
+    }
+
+    /// `GPIO_HI_IN` value for pins 32..47 / 引脚 32..47 的 `GPIO_HI_IN` 值
+    fn hi_input_value(&self, state: &SioState) -> u32 {
+        let mask = (self.pads.funcsel_mask(PinFunction::Sio.to_bits()) >> 32) as u32;
+        let pad = (self.pads.input_levels() >> 32) as u32;
+        (pad & mask) | (state.hi_out & state.hi_oe & !mask)
+    }
 }
 
 impl MmioDevice for Sio {
@@ -496,18 +537,14 @@ impl MmioDevice for Sio {
         let mut state = self.state.lock();
         let value = match offset {
             CPUID => Some(core_index(view) as u32),
-            // GPIO inputs combine the SIO output latch (when the pin is an
-            // output) with the pad pull/external level (when it is an input).
-            // GPIO 输入：输出引脚回环 SIO 输出锁存，输入引脚使用 pad 上下拉/外部电平。
-            GPIO_IN => {
-                let external = self.pads.input_levels() as u32;
-                Some((state.out & state.oe) | (external & !state.oe))
-            }
+            // GPIO 输入只在本引脚 `FUNCSEL == SIO` 时报告 pad 合成电平；
+            // 其余引脚保持 SIO 输出回环，未使能时读 0。
+            // GPIO inputs report the resolved pad level only where
+            // `FUNCSEL == SIO`; other pins keep the SIO latch loopback and read
+            // 0 when the driver is off.
+            GPIO_IN => Some(self.input_value(&state)),
             GPIO_OUT => Some(state.out),
-            GPIO_HI_IN => {
-                let external = (self.pads.input_levels() >> 32) as u32;
-                Some((state.hi_out & state.hi_oe) | (external & !state.hi_oe))
-            }
+            GPIO_HI_IN => Some(self.hi_input_value(&state)),
             GPIO_HI_OUT => Some(state.hi_out),
             GPIO_OE => Some(state.oe),
             GPIO_HI_OE => Some(state.hi_oe),
@@ -590,12 +627,14 @@ impl MmioDevice for Sio {
             }
         }
         drop(state);
+        self.publish_pins();
         self.refresh_irq();
         true
     }
 
     fn reset(&mut self) {
         *self.state.lock() = SioState::default();
+        self.publish_pins();
         self.refresh_irq();
     }
 }
@@ -752,8 +791,13 @@ mod tests {
     fn pad_pull_up_reaches_the_gpio_input_register() {
         let pads = GpioPads::new();
         pads.set_pad(0, super::super::gpio_pads::PAD_PUE);
+        // 只有 `FUNCSEL == SIO` 的引脚才读 pad：pin 0 路由到 SIO，pin 1 不是。
+        // Only pins with `FUNCSEL == SIO` read the pad: pin 0 is routed to SIO,
+        // pin 1 is not.
+        pads.set_pad(1, super::super::gpio_pads::PAD_PUE);
+        pads.set_funcsel(0, PinFunction::Sio.to_bits());
         let mut sio = Sio::with_peer_irq_and_pads(IrqAssert::new(), IrqAssert::new(), pads);
-        assert_eq!(sio.read32(GPIO_IN), Some(1));
+        assert_eq!(sio.read32(GPIO_IN), Some(1), "routed pin reads the pad");
 
         // Enabling the output and driving it low overrides the pull-up.
         // 使能输出并驱动低电平会覆盖上拉。

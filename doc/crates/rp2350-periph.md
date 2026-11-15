@@ -25,6 +25,7 @@ pub struct SharedPio { /* Arc<Mutex<Pio>> + two interrupt lines */ }
 
 impl Pio {
     pub fn new(index: u8) -> Self;
+    pub fn with_pads(index: u8, pads: GpioPads) -> Self;   // wired to the pin matrix
     pub fn push_rx(&mut self, sm: usize, value: u32) -> bool;
     pub fn pop_tx(&mut self, sm: usize) -> Option<u32>;
     pub fn tx_fifo_empty(&self, sm: usize) -> Option<bool>;
@@ -36,12 +37,16 @@ impl Pio {
     pub fn set_input_levels(&mut self, levels: u32);
     pub fn input_levels(&self) -> u32;
     pub fn set_input_level(&mut self, pin: u8, high: bool);
+    pub fn sample_inputs(&mut self);
+    pub fn sampled_inputs(&self) -> u32;
+    pub fn publish_outputs(&self);
     pub fn output_levels(&self) -> u32;
     pub fn output_enables(&self) -> u32;
 }
 
 impl SharedPio {
     pub fn new(index: u8, irq: IrqAssert) -> Self;
+    pub fn with_pads(index: u8, irq: IrqAssert, pads: GpioPads) -> Self;
     pub fn index(&self) -> u8;
     pub fn device(&self) -> Box<dyn MmioDevice>;
     pub fn with<R>(&self, f: impl FnOnce(&Pio) -> R) -> R;
@@ -58,6 +63,7 @@ impl SharedPio {
     pub fn rx_fifo_full(&self, sm: usize) -> Option<bool>;
     pub fn output_levels(&self) -> u32;
     pub fn output_enables(&self) -> u32;
+    pub fn sampled_inputs(&self) -> u32;
 }
 ```
 
@@ -140,28 +146,51 @@ because the register file lives behind the mutex.
 
 The block owns three 32-bit pin vectors: input levels sampled by the state
 machines, output levels driven by them, and output enables. All three reset to
-zero, so a block with no host pin activity still behaves like the earlier
+zero, so a block with no pads wired up still behaves like the earlier
 "no pins attached" model (`IN PINS`/`WAIT`/`JMP PIN` read 0).
 
-- `set_input_levels(u32)` / `input_levels()` / `set_input_level(pin, high)`
-  drive the sampled inputs from the host side; pins `>= 32` are ignored.
+- `set_input_levels(u32)` / `input_levels()` / `set_input_level(pin, high)` set
+  the **host-side override** vector; pins `>= 32` are ignored. `sample_inputs()`
+  recomputes what the machines see, exposed as `input_levels()` /
+  `sampled_inputs()`.
+- A block built with `Pio::with_pads` / `SharedPio::with_pads` samples only the
+  pads whose `IO_BANK0.GPIOx_CTRL.FUNCSEL` equals `PIO0`/`PIO1`/`PIO2` for this
+  block; every other pin reads 0. The host override is OR-ed in, so a host can
+  still force a level on an unrouted pin.
 - `output_levels()` and `output_enables()` expose what `OUT`/`SET`/side-set
-  wrote, and are mirrored in `DBG_PADOUT`/`DBG_PADOE`.
-- Pin numbers wrap from 31 back to 0, as on the hardware.
-- `GPIOBASE` is stored but not applied to the pin mapping yet, so PINCTRL pin
-  numbers index this block's local 0..31 window.
+  wrote, and are mirrored in `DBG_PADOUT`/`DBG_PADOE`. `publish_outputs()` hands
+  the pair to the shared pin matrix, which only applies it to pads routed to
+  this block, so `OUT`/`SET`/**side-set** (including `SIDE_PINDIR`) reach the pad.
+- `GPIOBASE` (bit 4, i.e. base 0 or 16) shifts the local 0..31 pin window onto
+  the real GPIO numbers for both sampling and publishing.
+- Pin numbers wrap from 31 back to 0 inside the local window, as on the hardware.
+- `SharedPio::tick` resamples the routed inputs before the batch and publishes the
+  driven outputs after it, and `SharedPio::with_mut` does the same around each
+  host edit; a direct `Pio` user calls `sample_inputs()`/`publish_outputs()`
+  itself. A host that ticks in batches therefore sees pad changes at batch
+  granularity.
 
 该块持有三个 32 位引脚向量：状态机采样的输入电平、状态机驱动的输出电平与输出
-使能。三者复位均为 0，因此没有主机侧引脚活动时仍保持早期“未接引脚”模型的语义
+使能。三者复位均为 0，因此没有接 pad 的块仍保持早期“未接引脚”模型的语义
 （`IN PINS`/`WAIT`/`JMP PIN` 读 0）。
 
-- `set_input_levels(u32)` / `input_levels()` / `set_input_level(pin, high)`
-  由主机侧驱动采样输入；`>= 32` 的引脚被忽略。
+- `set_input_levels(u32)` / `input_levels()` / `set_input_level(pin, high)` 设置
+  **宿主侧覆盖**向量；`>= 32` 的引脚被忽略。`sample_inputs()` 重新计算状态机
+  看到的向量，由 `input_levels()` / `sampled_inputs()` 暴露。
+- 通过 `Pio::with_pads` / `SharedPio::with_pads` 接到 pad 的块只采样
+  `IO_BANK0.GPIOx_CTRL.FUNCSEL` 等于本块 `PIO0`/`PIO1`/`PIO2` 的 pad，其它引脚
+  读 0；宿主覆盖向量按位或入，因此宿主仍可强制未路由引脚的电平。
 - `output_levels()` 与 `output_enables()` 暴露 `OUT`/`SET`/side-set 写入的
-  结果，并反映在 `DBG_PADOUT`/`DBG_PADOE`。
-- 引脚编号按硬件行为从 31 回绕到 0。
-- `GPIOBASE` 仅存储、尚未作用于引脚映射，因此 PINCTRL 引脚号索引本块局部的
-  0..31 窗口。
+  结果，并反映在 `DBG_PADOUT`/`DBG_PADOE`。`publish_outputs()` 把这一对发布到
+  共享引脚矩阵，矩阵只作用于路由到本块的 pad，因此 `OUT`/`SET`/**side-set**
+  （含 `SIDE_PINDIR`）都能到达 pad。
+- `GPIOBASE`（位 4，即基址 0 或 16）把局部 0..31 引脚窗口平移到真实 GPIO 编号，
+  采样与发布都适用。
+- 局部窗口内的引脚编号按硬件行为从 31 回绕到 0。
+- `SharedPio::tick` 在批次前重采样路由输入、批次后发布驱动输出，
+  `SharedPio::with_mut` 在每次宿主编辑前后做同样的事；直接使用 `Pio` 的调用方
+  自行调用 `sample_inputs()`/`publish_outputs()`。按批次 tick 的宿主因此以批次
+  粒度看到 pad 变化。
 
 ### Modelled registers / 已建模寄存器
 
@@ -396,19 +425,21 @@ The RP2350 `RXFn_PUTGET*` registers and the
 `IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
 interrupt registers at `0x16C..0x184` are not modelled: the shared handle
 asserts a line from the raw flag alone, without per-flag enables or forced
-status. `GPIOBASE` is stored but never added to PINCTRL pin numbers, so every
-block sees its own local GPIO 0..31 window, and no PINCTRL FUNCSEL crossbar
-routes PIO pins to real GPIO pads. Cross-block `IRQ` routing (RP2350 index
-modes 1/3) currently falls back to this block's flags.
+status. `GPIOBASE` only models the documented 0/16 bases (bit 4) and applies to
+both sampling and publishing. Cross-block `IRQ` routing (RP2350 index modes
+1/3) currently falls back to this block's flags, and the pad side of the
+`PINCTRL` crossbar only reaches the modelled `SIO`/`PIO` drivers — see
+*Wiring and not-modelled routing* under `IO_BANK0`.
 
 PIO DREQ 电平已建模（见上文 *DMA requests*），但不是周期精确的：DMA 控制器按数据
 单元采样，由宿主决定何时重新发布（`Machine` 在每个受节流的 DMA 批次内执行）。
 RP2350 `RXFn_PUTGET*` 寄存器，以及 `0x16C..0x184` 的
 `IRQ0_INTE`/`IRQ0_INTF`/`IRQ0_INTS`/`IRQ1_INTE`/`IRQ1_INTF`/`IRQ1_INTS`
 中断寄存器尚未建模：共享句柄仅按原始标志断言中断线，没有逐标志使能与强制状态。
-`GPIOBASE` 仅存储、不会加到 PINCTRL 引脚号上，因此每个块看到的是自己局部的
-GPIO 0..31 窗口，也没有 PINCTRL FUNCSEL 交叉开关把 PIO 引脚接到真实 GPIO 焊盘。
-跨块 `IRQ` 路由（RP2350 索引模式 1/3）目前回落到本块标志。
+`GPIOBASE` 只建模文档化的 0/16 基址（位 4），采样与发布都适用。跨块 `IRQ` 路由
+（RP2350 索引模式 1/3）目前回落到本块标志；`PINCTRL` 交叉开关的 pad 侧只接到已
+建模的 `SIO`/`PIO` 驱动器——详见 `IO_BANK0` 的
+*Wiring and not-modelled routing*。
 
 ---
 
@@ -1159,35 +1190,44 @@ impl RpGpio {
 ### Pad electrical model / pad 电气模型
 
 `gpio_pads::GpioPads` is the shared source of truth between `PADS_BANK0`
-programming and the `SIO` input register. A pin reads the SIO output latch when
-its output driver is enabled, and otherwise reads the pad level: the host-driven
-external level if the host is driving that pin, else its programmed pull-up
-(`PUE`) or pull-down (`PDE`). All pins reset to pull-down, so a firmware that
-calls `gpio_pull_up` on a button input sees a high level and an unpressed
-button rather than a stuck-low "all buttons held" reading.
-`gpio_pads::GpioPads` 是 `PADS_BANK0` 配置与 `SIO` 输入寄存器之间共享的唯一
-事实来源。输出驱动器使能时引脚读取 SIO 输出锁存，否则读取 pad 电平：宿主驱动
-该引脚时取外部电平，否则取配置的上拉（`PUE`）或下拉（`PDE`）。所有引脚复位为
-下拉，因此对按键输入调用 `gpio_pull_up` 的固件读到高电平（未按下），而不是
-被拉低的「所有按键都按下」。
+programming, `IO_BANK0` routing and the `SIO` input register. A pin reads, in
+order of priority: the peripheral selected by `FUNCSEL` while its output enable
+is set (SIO latch or PIO `PADOUT`/`PADOE`), else the host-driven external level
+if the host drives that pin, else its programmed pull-up (`PUE`) or pull-down
+(`PDE`). All pins reset to pull-down, so a firmware that calls `gpio_pull_up` on
+a button input sees a high level and an unpressed button rather than a stuck-low
+"all buttons held" reading.
+`gpio_pads::GpioPads` 是 `PADS_BANK0` 配置、`IO_BANK0` 路由与 `SIO` 输入寄存器
+之间共享的唯一事实来源。引脚电平按优先级解析：先是 `FUNCSEL` 选中且输出使能
+有效的外设（SIO 锁存或 PIO 的 `PADOUT`/`PADOE`），其次是宿主驱动该引脚时的外部
+电平，最后是配置的上拉（`PUE`）或下拉（`PDE`）。所有引脚复位为下拉，因此对按键
+输入调用 `gpio_pull_up` 的固件读到高电平（未按下），而不是被拉低的「所有按键都
+按下」。
 
 ```rust
-pub struct GpioPads { /* external levels, driven mask, pull-up/pull-down masks */ }
+pub struct GpioPads { /* external levels, driven mask, pulls, FUNCSEL, drivers */ }
 impl GpioPads {
     pub fn new() -> Self;
     pub fn set_pad(&self, pin: u32, value: u32);          // PADS_BANK0 word
     pub fn set_external(&self, levels: u64);              // host drive, all pins
     pub fn set_external_pin(&self, pin: u32, high: bool);
+    pub fn set_funcsel(&self, pin: u32, bits: u32);       // IO_BANK0 routing
+    pub fn funcsel(&self, pin: u32) -> Option<u32>;
+    pub fn funcsel_mask(&self, bits: u32) -> u64;
+    pub fn set_driver(&self, selector: u32, levels: u64, enables: u64);
+    pub fn sample_for(&self, selector: u32, base: u32) -> u32;
     pub fn input_levels(&self) -> u64;
     pub fn reset(&self);
 }
 ```
 
 `BootPeripherals::pads()` hands out the handle so a host can inject button
-levels; `PADS_BANK0` writes feed `set_pad` and `SIO_GPIO_IN`/`GPIO_HI_IN` combine
-the latch with the pad levels.
-`BootPeripherals::pads()` 提供句柄供宿主注入按键电平；`PADS_BANK0` 写入会调用
-`set_pad`，`SIO_GPIO_IN`/`GPIO_HI_IN` 则把锁存与 pad 电平组合起来。
+levels; `PADS_BANK0` writes feed `set_pad`, `IO_BANK0` writes feed `set_funcsel`,
+`SIO`/`PIO` feed `set_driver`, and `SIO_GPIO_IN`/`GPIO_HI_IN` plus the PIO
+`IN PINS` source read the resolved levels.
+`BootPeripherals::pads()` 提供句柄供宿主注入按键电平；`PADS_BANK0` 写入调用
+`set_pad`，`IO_BANK0` 写入调用 `set_funcsel`，`SIO`/`PIO` 调用 `set_driver`，
+`SIO_GPIO_IN`/`GPIO_HI_IN` 与 PIO 的 `IN PINS` 源则读取解析后的电平。
 
 ---
 
@@ -1208,8 +1248,10 @@ pub struct IoBank0 { /* register file + shared GpioPads */ }
 impl IoBank0 {
     pub fn new() -> Self;
     pub fn with_pads(pads: GpioPads) -> Self;
+    pub fn pads(&self) -> &GpioPads;                 // shared pin matrix / 共享引脚矩阵
     pub fn funcsel(&self, pin: u32) -> Option<PinFunction>;
     pub fn set_funcsel(&mut self, pin: u32, function: PinFunction);
+    pub fn pins_for(&self, function: PinFunction) -> u64;  // pad bitmap / pad 位图
 }
 ```
 
@@ -1250,43 +1292,82 @@ writes that reset value explicitly instead of relying on zeroed storage, and
 `Unknown(bits)` so a host can distinguish "pin does not exist" from "firmware
 programmed an undocumented function". `IoBank0::funcsel` returns `None` for
 `pin >= 48`; `IoBank0::set_funcsel` ignores such pins and preserves every
-`CTRL` bit outside `FUNCSEL`.
+`CTRL` bit outside `FUNCSEL`. Every write to a `GPIOx_CTRL` register — through
+the accessor or the bus — also publishes the field into the shared `GpioPads`
+matrix, and `reset()` puts all 48 pads back to `NULL`.
 `PinFunction::from_bits` 仅在数值超出 5 位字段（大于 `0x1F`）时返回 `None`；
 未文档化的 5 位值以 `Unknown(bits)` 保留可观测性，使宿主能区分「引脚不存在」与
 「固件写入了未文档化功能」。`IoBank0::funcsel` 对 `pin >= 48` 返回 `None`；
 `IoBank0::set_funcsel` 忽略这类引脚，并保留 `CTRL` 中 `FUNCSEL` 之外的每一位。
+每次写 `GPIOx_CTRL`（经访问器或总线）都会把该字段发布到共享 `GpioPads` 矩阵，
+`reset()` 把全部 48 个 pad 恢复为 `NULL`。
 
 ### STATUS / 状态寄存器
 
 `GPIOx_STATUS` is read-only in hardware: writes are acknowledged (`write32`
 returns `true`) but change nothing. `read32` overlays the live pad level onto
 `INFROMPAD` (bit 17), taken from the shared `gpio_pads::GpioPads` handle that
-`PADS_BANK0` programs and `SIO` samples. `OETOPAD` (bit 13) and `OUTTOPAD`
-(bit 9) stay `0` because no peripheral drives a pad yet.
+`PADS_BANK0` programs and `SIO`/`PIO` drive. `OETOPAD` (bit 13) and `OUTTOPAD`
+(bit 9) stay `0` because the pad-output status bits are not modelled.
 `GPIOx_STATUS` 在硬件上是只读的：写入会被确认（`write32` 返回 `true`）但不改变
 任何位。`read32` 会把实时 pad 电平叠加到 `INFROMPAD`（第 17 位），电平取自
-`PADS_BANK0` 配置、`SIO` 采样的共享 `gpio_pads::GpioPads` 句柄。由于尚无外设驱动
-pad，`OETOPAD`（第 13 位）与 `OUTTOPAD`（第 9 位）恒为 `0`。
+`PADS_BANK0` 配置、`SIO`/`PIO` 驱动的共享 `gpio_pads::GpioPads` 句柄。
+`OETOPAD`（第 13 位）与 `OUTTOPAD`（第 9 位）仍为 `0`，因为 pad 输出状态位未建模。
 
-### Wiring and not-modelled routing / 接线与尚未建模的路由
+### Wiring and routing / 接线与路由
 
 `BootPeripherals::mount` builds one `GpioPads` handle and passes it to
-`IoBank0::with_pads`, `PadsBank0::with_pads` and `Sio`, so a pull-up programmed
-through `PADS_BANK0` is visible in both `IO_BANK0.STATUS.INFROMPAD` and
-`SIO_GPIO_IN`. `BootPeripherals::pads()` remains the host injection point.
+`IoBank0::with_pads`, `PadsBank0::with_pads`, `Sio` and all three
+`SharedPio::with_pads` blocks. That handle is the pin matrix: `IO_BANK0`
+publishes every `CTRL.FUNCSEL` into it (`IoBank0::pads()` /
+`IoBank0::pins_for`), `PADS_BANK0` programs the pulls, `SIO` publishes
+`GPIO_OE`/`GPIO_OUT`, each PIO block publishes its output levels/enables, and
+every reader resolves one level per pad.
+`BootPeripherals::mount` 只创建一个 `GpioPads` 句柄，并交给
+`IoBank0::with_pads`、`PadsBank0::with_pads`、`Sio` 与三个
+`SharedPio::with_pads` 块。该句柄就是引脚矩阵：`IO_BANK0` 把每个
+`CTRL.FUNCSEL` 发布进去（`IoBank0::pads()` / `IoBank0::pins_for`），
+`PADS_BANK0` 配置上下拉，`SIO` 发布 `GPIO_OE`/`GPIO_OUT`，每个 PIO 块发布自己
+的输出电平与使能，所有读者为每个 pad 解析出唯一电平。
 
-`FUNCSEL` is decoded but **not routed**: selecting UART, PWM or a PIO block
-does not move the pad driver to that peripheral, does not connect PIO/PWM/UART
-inputs to the pad, and `IO_BANK0` interrupt routing (`PROC0_*`/`PROC1_*`) is
-plain storage. That crossbar is the remaining half of GAP-01.
-`BootPeripherals::mount` 只创建一个 `GpioPads` 句柄，并同时交给
-`IoBank0::with_pads`、`PadsBank0::with_pads` 与 `Sio`，因此通过 `PADS_BANK0`
-配置的上拉在 `IO_BANK0.STATUS.INFROMPAD` 与 `SIO_GPIO_IN` 中都可见；
-`BootPeripherals::pads()` 仍是宿主注入电平的入口。
+Routing rules, highest priority first / 路由规则（优先级从高到低）：
 
-`FUNCSEL` 只被解码、**不做路由**：选择 UART、PWM 或 PIO 块既不会把 pad 驱动器
-交给该外设，也不会把 PIO/PWM/UART 输入接到 pad；`IO_BANK0` 的中断路由
-（`PROC0_*`/`PROC1_*`）也仅为普通存储。该交叉开关是 GAP-01 剩余的另一半。
+1. **`FUNCSEL == SIO` (5)** and the matching `GPIO_OE` bit set → the pad is driven
+   by the SIO `GPIO_OUT` latch (`GPIO_HI_*` for pins 32..47). `SIO_GPIO_IN` reports
+   the resolved pad level only on these bits.
+2. **`FUNCSEL == PIO0/1/2` (6/7/8)** → the pad is driven by that block's
+   `output_levels`/`output_enables`, i.e. whatever `OUT`/`SET`/side-set (including
+   `SIDE_PINDIR`) wrote, mapped through `PINCTRL` `OUT_BASE`/`SET_BASE`/
+   `SIDESET_BASE` + counts and `GPIOBASE`. The same pins feed `IN PINS`, `WAIT`
+   and `JMP PIN`; unrouted pins read 0.
+3. **Other functions** (HSTX/SPI/UART/I2C/PWM/USB/GPCK/UART1) have **no modelled
+   pad driver**, so the pad keeps its pull or host-driven external level.
+4. **`NULL`** (the reset value) — nothing drives; pads float to pull/external.
+
+1. **`FUNCSEL == SIO`（5）** 且对应 `GPIO_OE` 位置位 → pad 由 SIO 的 `GPIO_OUT`
+   锁存驱动（引脚 32..47 用 `GPIO_HI_*`）。`SIO_GPIO_IN` 只在这些位上报告解析后
+   的 pad 电平。
+2. **`FUNCSEL == PIO0/1/2`（6/7/8）** → pad 由该块的
+   `output_levels`/`output_enables` 驱动，即 `OUT`/`SET`/side-set（含
+   `SIDE_PINDIR`）写入的值，经 `PINCTRL` 的 `OUT_BASE`/`SET_BASE`/
+   `SIDESET_BASE` 与计数、以及 `GPIOBASE` 映射。同一批引脚供 `IN PINS`、`WAIT`
+   与 `JMP PIN` 采样；未路由的引脚读 0。
+3. **其它功能**（HSTX/SPI/UART/I2C/PWM/USB/GPCK/UART1）**没有建模 pad 驱动器**，
+   pad 保持上下拉或宿主驱动的外部电平。
+4. **`NULL`**（复位值）——无人驱动，pad 浮到上下拉/外部电平。
+
+Only one `FUNCSEL` wins per pad: the matrix always reads the **current** field, so
+a pad handed from PIO to SIO stops following the PIO on that write. Real silicon
+would see two drivers fighting; firmware must keep one function per pin at a
+time. Write arbitration between peripherals is therefore not modelled.
+每个 pad 只有一个 `FUNCSEL` 生效：矩阵始终读取**当前**字段，因此把 pad 从 PIO
+切到 SIO 的那次写入之后它就不再跟随 PIO。真实芯片上会出现两个驱动器相争；固件
+必须保证同一时刻每个引脚只有一个功能。因此外设间的写仲裁未建模。
+
+`STATUS.OETOPAD` (bit 13) and `OUTTOPAD` (bit 9) still read 0, and IO_BANK0
+interrupt routing (`PROC0_*`/`PROC1_*`) is plain storage.
+`STATUS.OETOPAD`（第 13 位）与 `OUTTOPAD`（第 9 位）仍读 0，IO_BANK0 的中断路由
+（`PROC0_*`/`PROC1_*`）仍仅为普通存储。
 
 ---
 
@@ -1333,6 +1414,20 @@ equivalents, `GPIO_OE` and its aliases, `FIFO_ST`, `FIFO_WR`, `FIFO_RD`,
 `GPIO_HI_*`、`GPIO_OE` 及其别名、`FIFO_ST`、`FIFO_WR`、`FIFO_RD`、
 `SPINLOCK_ST`、位于 `0x100 + 4*n` 的 32 个 `SPINLOCK0..31`，以及 `0x180`
 的 `DOORBELL_OUT/IN_SET/CLR`。
+
+### Pad routing / pad 路由
+
+The SIO output latch and enables are published into the shared pin matrix on
+every `GPIO_OUT`/`GPIO_OE` (and `GPIO_HI_*`) write, but the matrix applies them
+only to pads whose `IO_BANK0.FUNCSEL` selects `SIO` (5). `GPIO_IN` mirrors that
+gate: bits routed to `SIO` report the resolved pad level (latch, host level or
+pull), while every other bit keeps the SIO latch loopback (`out & oe`) and reads
+0 while the driver is off. `GPIO_HI_IN` does the same for pins 32..47.
+SIO 的输出锁存与使能在每次写 `GPIO_OUT`/`GPIO_OE`（以及 `GPIO_HI_*`）时发布到
+共享引脚矩阵，但矩阵只把它们应用到 `IO_BANK0.FUNCSEL` 选中 `SIO`（5）的 pad。
+`GPIO_IN` 遵循同一门控：路由到 `SIO` 的位报告解析后的 pad 电平（锁存、宿主电平
+或上下拉），其它位保持 SIO 锁存回环（`out & oe`），驱动器关闭时读 0。
+`GPIO_HI_IN` 对引脚 32..47 同理。
 
 ### Hardware spinlocks / 硬件自旋锁
 
@@ -1393,13 +1488,13 @@ core1，反之亦然。
 
 ### Not modelled yet / 尚未建模
 
-`INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, pad routing driven by a
-decoded `IO_BANK0` `FUNCSEL`, and exclusive/`LDREX`/`STREX` monitors. The FIFO
-is 8 entries deep per direction with sticky `WOF`/`ROE`; the spinlocks are 32
-bits wide because the RP2350 block exposes exactly `SPINLOCK0..31`.
-`INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新、由 `IO_BANK0` `FUNCSEL` 解码结果驱动
-的 pad 路由，以及独占访问/`LDREX`/`STREX` 监视器均未建模。每方向 FIFO 深度 8，
-带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350 该块只提供 `SPINLOCK0..31`。
+`INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, and exclusive/`LDREX`/`STREX`
+monitors. The FIFO is 8 entries deep per direction with sticky `WOF`/`ROE`; the
+spinlocks are 32 bits wide because the RP2350 block exposes exactly
+`SPINLOCK0..31`.
+`INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新，以及独占访问/`LDREX`/`STREX` 监视器
+均未建模。每方向 FIFO 深度 8，带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350
+该块只提供 `SPINLOCK0..31`。
 
 ---
 

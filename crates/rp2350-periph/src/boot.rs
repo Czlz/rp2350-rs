@@ -270,15 +270,18 @@ impl BootPeripherals {
         // RP2350 的三个 PIO 块位于 AHB 空间，按基地址顺序独立挂载。共享句柄与
         // 总线适配器共用同一个寄存器文件，因此宿主可以直接 tick 状态机并观察
         // `IRQ` 标志驱动的中断线。PIO 不参与 `advance` 的时基批量推进：机器在
-        // DMA 泵送点按客户机步数显式 tick。
+        // DMA 泵送点按客户机步数显式 tick。三个块同时接到共享 pad 矩阵，使
+        // `IO_BANK0.FUNCSEL` 选中的 PIO 块才能驱动/采样对应 pad。
         // The three RP2350 PIO blocks live in AHB space and are mounted
         // standalone in base-address order. The shared handles and the bus
         // adapters observe one register file, so the host can tick the state
         // machines and watch the `IRQ` flags drive the interrupt lines. PIO
         // does not take part in `advance`; the machine ticks it explicitly
-        // from the DMA pump point.
-        let pio: [SharedPio; PIO_BLOCKS] =
-            core::array::from_fn(|index| SharedPio::new(index as u8, irq.clone()));
+        // from the DMA pump point. All three blocks share the pad matrix, so
+        // only the block selected by `IO_BANK0.FUNCSEL` drives/samples a pad.
+        let pio: [SharedPio; PIO_BLOCKS] = core::array::from_fn(|index| {
+            SharedPio::with_pads(index as u8, irq.clone(), pads.clone())
+        });
         for block in &pio {
             mount_device(bus, block.device())?;
         }

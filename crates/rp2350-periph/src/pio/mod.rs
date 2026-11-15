@@ -45,6 +45,8 @@ mod tests;
 
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
+use super::gpio_pads::GpioPads;
+use super::io_bank0::PinFunction;
 use super::map;
 use crate::alias::{apply_alias, split_alias};
 // PIO 寄存器常量沿用数据手册命名并集中平铺，通配导入让寄存器映射保持直观。
@@ -91,9 +93,18 @@ pub struct Pio {
     irq: u32,
     input_sync_bypass: u32,
     gpio_base: u32,
-    /// GPIO input levels sampled by `IN PINS`, `WAIT` and `JMP PIN`
-    /// `IN PINS`、`WAIT` 与 `JMP PIN` 采样的 GPIO 输入电平
+    /// GPIO pin levels sampled by `IN PINS`, `WAIT` and `JMP PIN`
+    /// `IN PINS`、`WAIT` 与 `JMP PIN` 采样的 GPIO 引脚电平
+    ///
+    /// After [`Pio::sample_inputs`] this is the routed pad sample OR-ed with the
+    /// host override; without a pads handle it is the host vector verbatim.
+    /// 调用 [`Pio::sample_inputs`] 后，该值是路由后的 pad 采样与宿主覆盖的按位或；
+    /// 未接 pad 矩阵时就是宿主向量本身。
     input_levels: u32,
+    /// Host-injected override vector / 宿主注入的覆盖向量
+    host_inputs: u32,
+    /// Shared pad matrix; `None` for a standalone block / 共享 pad 矩阵；独立块为 `None`
+    pads: Option<GpioPads>,
     /// Output levels driven by `OUT`/`SET`/side-set / `OUT`/`SET`/side-set 驱动的输出电平
     output_levels: u32,
     /// Output enables driven by `OUT PINDIRS`/`SET PINDIRS`/side-set
@@ -121,11 +132,32 @@ impl Pio {
             input_sync_bypass: 0,
             gpio_base: 0,
             input_levels: 0,
+            host_inputs: 0,
+            pads: None,
             output_levels: 0,
             output_enables: 0,
             imem: [0; IMEM_WORDS],
             sm: core::array::from_fn(|slot| StateMachine::new(slot as u8)),
         }
+    }
+
+    /// Create a block wired to the shared pin matrix / 创建接到共享引脚矩阵的块
+    ///
+    /// The block then samples only pads whose `IO_BANK0.FUNCSEL` selects it
+    /// (`PIO0`/`PIO1`/`PIO2`) and publishes its driven levels back into the same
+    /// matrix, so PIO ↔ pad traffic follows the `FUNCSEL` crossbar.
+    /// 该块此后只采样 `IO_BANK0.FUNCSEL` 选中它（`PIO0`/`PIO1`/`PIO2`）的 pad，并
+    /// 把驱动电平发布回同一矩阵，因此 PIO ↔ pad 的流量遵循 `FUNCSEL` 交叉开关。
+    #[must_use]
+    pub fn with_pads(index: u8, pads: GpioPads) -> Self {
+        let mut block = Self::new(index);
+        block.pads = Some(pads);
+        block
+    }
+
+    /// `FUNCSEL` value that routes a pad to this block / 把 pad 路由到本块的 `FUNCSEL` 值
+    fn selector(&self) -> u32 {
+        PinFunction::Pio0.to_bits() + u32::from(self.index)
     }
 
     /// Register base address of a block index / 块序号的寄存器基地址
@@ -314,34 +346,92 @@ impl Pio {
         self.sm.get(sm).map(|machine| machine.rx.is_full())
     }
 
-    /// Set all 32 GPIO input levels at once / 一次设置全部 32 个 GPIO 输入电平
+    /// Set all 32 host-side pin levels at once / 一次设置全部 32 个宿主侧引脚电平
     ///
-    /// Bit `n` is the level sampled for PIO pin `n` by `IN PINS`, `WAIT` and
-    /// `JMP PIN`. The default of all-zero keeps the "no pins attached" behaviour.
-    /// 位 `n` 是 `IN PINS`、`WAIT` 与 `JMP PIN` 采样到的 PIO 引脚 `n` 电平。默认全 0，
-    /// 保持“未接引脚”的行为。
+    /// Bit `n` is OR-ed into the sampled vector for PIO pin `n` as a host-side
+    /// external override; pin levels that the `FUNCSEL` crossbar routes from the
+    /// shared pads keep participating. A block created without a pads handle
+    /// samples this vector verbatim, which preserves the earlier "no pins
+    /// attached" host injection.
+    /// 位 `n` 作为宿主侧外部覆盖，按位或进 PIO 引脚 `n` 的采样向量；由 `FUNCSEL`
+    /// 交叉开关从共享 pad 路由来的电平仍然参与。未接 pad 矩阵的块直接使用该向量，
+    /// 保持早期「未接引脚」的宿主注入语义。
     pub fn set_input_levels(&mut self, levels: u32) {
-        self.input_levels = levels;
+        self.host_inputs = levels;
+        self.sample_inputs();
     }
 
-    /// Current GPIO input levels / 当前的 GPIO 输入电平
+    /// Levels the state machines currently sample / 状态机当前采样的电平
+    ///
+    /// Without a pads handle this is exactly the vector set by
+    /// [`Pio::set_input_levels`]; with pads it is the routed pad sample OR-ed
+    /// with that host override (see [`Pio::sample_inputs`]).
+    /// 未接 pad 矩阵时就是 [`Pio::set_input_levels`] 设置的向量；接了 pad 时是
+    /// 路由后的 pad 采样与该宿主覆盖的按位或（见 [`Pio::sample_inputs`]）。
     #[must_use]
     pub fn input_levels(&self) -> u32 {
         self.input_levels
     }
 
-    /// Set one GPIO input level; pins `>= 32` are ignored
-    /// 设置单个 GPIO 输入电平；`>= 32` 的引脚被忽略
+    /// Set one host-side pin level; pins `>= 32` are ignored
+    /// 设置单个宿主侧引脚电平；`>= 32` 的引脚被忽略
     pub fn set_input_level(&mut self, pin: u8, high: bool) {
         if pin >= 32 {
             return;
         }
         let bit = 1u32 << pin;
         if high {
-            self.input_levels |= bit;
+            self.host_inputs |= bit;
         } else {
-            self.input_levels &= !bit;
+            self.host_inputs &= !bit;
         }
+        self.sample_inputs();
+    }
+
+    /// Resample the pin vector from the shared pads / 从共享 pad 重新采样引脚向量
+    ///
+    /// Only pads whose `IO_BANK0.FUNCSEL` selects this block contribute, offset
+    /// by `GPIOBASE`; every other pin reads `0` unless the host injected it.
+    /// [`crate::pio::SharedPio::tick`] calls this before every batch of state
+    /// machine cycles, which is the host tick boundary.
+    /// 只有 `IO_BANK0.FUNCSEL` 选中本块的 pad 参与采样（按 `GPIOBASE` 偏移），其它
+    /// 引脚读 `0`（除非宿主注入）。[`crate::pio::SharedPio::tick`] 在每个状态机批次
+    /// 之前调用，也就是宿主 tick 边界。
+    pub fn sample_inputs(&mut self) {
+        self.input_levels = match &self.pads {
+            Some(pads) => pads.sample_for(self.selector(), self.gpio_base) | self.host_inputs,
+            None => self.host_inputs,
+        };
+    }
+
+    /// Levels the state machines currently sample after routing
+    /// 状态机当前采样的（路由后）电平
+    ///
+    /// Same value as [`Pio::input_levels`]; the explicit name documents that the
+    /// `FUNCSEL` crossbar has already been applied.
+    /// 与 [`Pio::input_levels`] 相同；该名字强调 `FUNCSEL` 交叉开关已生效。
+    #[must_use]
+    pub fn sampled_inputs(&self) -> u32 {
+        self.input_levels
+    }
+
+    /// Publish the driven levels and enables into the shared pin matrix
+    /// 把驱动电平与输出使能发布到共享引脚矩阵
+    ///
+    /// `GPIOBASE` shifts the local 0..31 pin window onto the real GPIO
+    /// numbers; the matrix only applies the contribution to pads whose
+    /// `FUNCSEL` selects this block. A standalone block has nothing to publish.
+    /// `GPIOBASE` 把局部 0..31 引脚窗口平移到真实 GPIO 编号；矩阵只在
+    /// `FUNCSEL` 选中本块的 pad 上应用该贡献。独立块无发布目标。
+    pub fn publish_outputs(&self) {
+        let Some(pads) = &self.pads else {
+            return;
+        };
+        pads.set_driver(
+            self.selector(),
+            u64::from(self.output_levels) << self.gpio_base,
+            u64::from(self.output_enables) << self.gpio_base,
+        );
     }
 
     /// Output levels currently driven by the state machines / 状态机当前驱动的输出电平
@@ -484,6 +574,12 @@ impl MmioDevice for Pio {
     }
 
     fn reset(&mut self) {
+        // 寄存器与引脚向量回到复位值，但共享 pad 矩阵句柄属于宿主接线，必须保留。
+        // Registers and pin vectors return to their reset values; the shared pad
+        // handle belongs to the host wiring and must survive the reset.
+        let pads = self.pads.clone();
         *self = Self::new(self.index);
+        self.pads = pads;
+        self.publish_outputs();
     }
 }

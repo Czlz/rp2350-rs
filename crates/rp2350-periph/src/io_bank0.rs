@@ -14,17 +14,21 @@
 //! 共享的 [`GpioPads`] 电气模型，因此客户机能观察到 pad 电平。该 pad 句柄与
 //! `PADS_BANK0`、`SIO` 使用同一个。
 //!
-//! Routing is deliberately not modelled in this step: a non-`SIO` `FUNCSEL`
-//! neither moves the pad's driver to that peripheral nor connects PIO/PWM/UART
-//! inputs, and `STATUS.OETOPAD`/`OUTTOPAD` stay zero. Interrupt routing
-//! (`PROC0_*`/`PROC1_*`) is likewise stored only.
-//! 本步骤有意不建模路由：非 `SIO` 的 `FUNCSEL` 既不会把 pad 驱动器交给该外设，
-//! 也不会连接 PIO/PWM/UART 输入，且 `STATUS.OETOPAD`/`OUTTOPAD` 恒为零。中断
-//! 路由（`PROC0_*`/`PROC1_*`）同样仅作存储。
+//! `FUNCSEL` is routed through the shared pin matrix: every `CTRL` write also
+//! publishes the field into [`GpioPads`], where `SIO` and the `PIO` blocks only
+//! drive/read pads they were selected for. `HSTX`/`SPI`/`UART`/`I2C`/`PWM`/
+//! `USB`/`GPCK` have no modelled pad driver yet, so those pads keep their pull
+//! or host-driven external level. Interrupt routing (`PROC0_*`/`PROC1_*`) and
+//! `STATUS.OETOPAD`/`OUTTOPAD` are still stored only.
+//! `FUNCSEL` 经共享引脚矩阵路由：每次写 `CTRL` 都会把该字段发布到 [`GpioPads`]，
+//! `SIO` 与 `PIO` 块只驱动/读取自己被选中的 pad。`HSTX`/`SPI`/`UART`/`I2C`/
+//! `PWM`/`USB`/`GPCK` 尚未建模 pad 驱动器，因此这些 pad 保持上下拉或宿主驱动的
+//! 外部电平。中断路由（`PROC0_*`/`PROC1_*`）与 `STATUS.OETOPAD`/`OUTTOPAD`
+//! 仍仅为存储。
 
 use rp2350_core::mmio::{MmioDevice, MmioWindow, RegisterFile};
 
-use super::gpio_pads::{GpioPads, PAD_COUNT};
+use super::gpio_pads::{FUNCSEL_MASK, FUNCSEL_NULL, GpioPads, PAD_COUNT};
 use super::map;
 
 /// Offset of the first `GPIOx_STATUS` register / 首个 `GPIOx_STATUS` 寄存器偏移
@@ -36,11 +40,8 @@ const CTRL_BASE: u32 = 0x004;
 /// Offset stride between two consecutive pins / 相邻两个引脚之间的偏移步长
 const PIN_STRIDE: u32 = 8;
 
-/// Mask of the `FUNCSEL` field in `CTRL` / `CTRL` 中 `FUNCSEL` 字段的掩码
-const FUNCSEL_MASK: u32 = 0x1F;
-
 /// `FUNCSEL` reset value (`GPIO_FUNC_NULL`) / `FUNCSEL` 复位值（`GPIO_FUNC_NULL`）
-const FUNCSEL_RESET: u32 = 0x1F;
+const FUNCSEL_RESET: u32 = FUNCSEL_NULL;
 
 /// `STATUS.INFROMPAD`: pad input level before override / 覆盖前的 pad 输入电平
 const STATUS_INFROMPAD: u32 = 1 << 17;
@@ -170,8 +171,44 @@ impl IoBank0 {
         let mut regs = RegisterFile::new(map::DEVICE_WINDOW_SIZE);
         for pin in 0..PAD_COUNT {
             regs.fill(ctrl_offset(pin), FUNCSEL_RESET);
+            // 新句柄可能复用带旧 `FUNCSEL` 的 pad 矩阵，构造时统一置为 NULL。
+            // A reused pad handle may still hold old `FUNCSEL` values, so the
+            // constructor resets every pin to NULL.
+            pads.set_funcsel(pin, FUNCSEL_RESET);
         }
         Self { regs, pads }
+    }
+
+    /// Shared pad matrix this block publishes its `FUNCSEL` view into
+    /// 本块发布 `FUNCSEL` 视图所用的共享 pad 矩阵
+    ///
+    /// The handle is the same one `PADS_BANK0`, `SIO` and the `PIO` blocks use,
+    /// so [`IoBank0::set_funcsel`] immediately changes which peripheral drives
+    /// or samples a pad.
+    /// 该句柄与 `PADS_BANK0`、`SIO` 及 `PIO` 块使用的相同，因此
+    /// [`IoBank0::set_funcsel`] 会立即改变哪个外设驱动或采样某个 pad。
+    #[must_use]
+    pub fn pads(&self) -> &GpioPads {
+        &self.pads
+    }
+
+    /// Bitmap of pads whose `FUNCSEL` selects `function` / `FUNCSEL` 选中 `function` 的 pad 位图
+    ///
+    /// Bit `n` is set when `GPIO{n}_CTRL.FUNCSEL` equals `function.to_bits()`;
+    /// the result is the same mask the shared [`GpioPads`] routing uses.
+    /// 当 `GPIO{n}_CTRL.FUNCSEL` 等于 `function.to_bits()` 时置位位 `n`；结果与共享
+    /// [`GpioPads`] 路由使用的掩码一致。
+    #[must_use]
+    pub fn pins_for(&self, function: PinFunction) -> u64 {
+        let bits = function.to_bits();
+        let mut mask = 0u64;
+        for pin in 0..PAD_COUNT {
+            let ctrl = self.regs.read(ctrl_offset(pin)).unwrap_or(FUNCSEL_RESET);
+            if ctrl & FUNCSEL_MASK == bits {
+                mask |= 1u64 << pin;
+            }
+        }
+        mask
     }
 
     /// Function selected for `pin`, or `None` outside bank 0
@@ -196,18 +233,19 @@ impl IoBank0 {
     ///
     /// Writes `CTRL.FUNCSEL` (bits `[4:0]`) only; `OUTOVER`/`INOVER`/`OEOVER`
     /// and the interrupt bits are preserved. Pins outside bank 0 are ignored.
+    /// The new value is published into the shared [`GpioPads`] matrix, so the
+    /// selected peripheral starts driving/sampling the pad immediately.
     /// 仅写入 `CTRL.FUNCSEL`（bits `[4:0]`）；`OUTOVER`/`INOVER`/`OEOVER` 与中断
-    /// 位保持不变。超出 bank0 的引脚被忽略。
+    /// 位保持不变。超出 bank0 的引脚被忽略。新值会发布到共享 [`GpioPads`] 矩阵，
+    /// 被选中的外设立即开始驱动/采样该 pad。
     pub fn set_funcsel(&mut self, pin: u32, function: PinFunction) {
         if pin >= PAD_COUNT {
             return;
         }
         let offset = ctrl_offset(pin);
         let current = self.regs.read(offset).unwrap_or(FUNCSEL_RESET);
-        self.regs.fill(
-            offset,
-            (current & !FUNCSEL_MASK) | (function.to_bits() & FUNCSEL_MASK),
-        );
+        let value = (current & !FUNCSEL_MASK) | (function.to_bits() & FUNCSEL_MASK);
+        let _ = self.write32(offset, value);
     }
 
     /// Report whether `offset` addresses a pin `STATUS` register
@@ -215,6 +253,18 @@ impl IoBank0 {
     fn status_pin(offset: u32) -> Option<u32> {
         if offset % PIN_STRIDE == 0 {
             let pin = offset / PIN_STRIDE;
+            if pin < PAD_COUNT {
+                return Some(pin);
+            }
+        }
+        None
+    }
+
+    /// Report whether `offset` addresses a pin `CTRL` register
+    /// 判断 `offset` 是否指向某个引脚的 `CTRL` 寄存器
+    fn ctrl_pin(offset: u32) -> Option<u32> {
+        if offset % PIN_STRIDE == CTRL_BASE {
+            let pin = (offset - CTRL_BASE) / PIN_STRIDE;
             if pin < PAD_COUNT {
                 return Some(pin);
             }
@@ -267,17 +317,28 @@ impl MmioDevice for IoBank0 {
             // STATUS is read-only: the write is acknowledged but changes nothing.
             return true;
         }
-        self.regs.write(offset, value)
+        let written = self.regs.write(offset, value);
+        if written {
+            if let Some(pin) = Self::ctrl_pin(offset) {
+                // `CTRL.FUNCSEL` 同时发布到共享 pad 矩阵，路由立即生效。
+                // `CTRL.FUNCSEL` is also published into the shared pad matrix,
+                // so the routing takes effect immediately.
+                self.pads.set_funcsel(pin, value & FUNCSEL_MASK);
+            }
+        }
+        written
     }
 
     fn reset(&mut self) {
         // 恢复 `CTRL.FUNCSEL = NULL` 并清掉其它位；pad 电气状态属于
-        // `PADS_BANK0`，不在此复位。
+        // `PADS_BANK0`，不在此复位，但 `FUNCSEL` 路由视图必须一并清空。
         // Restore `CTRL.FUNCSEL = NULL` and clear every other bit; the pad
-        // electrical state belongs to `PADS_BANK0` and is not reset here.
+        // electrical state belongs to `PADS_BANK0` and is not reset here, but
+        // the `FUNCSEL` routing view must be cleared with it.
         self.regs.reset();
         for pin in 0..PAD_COUNT {
             self.regs.fill(ctrl_offset(pin), FUNCSEL_RESET);
+            self.pads.set_funcsel(pin, FUNCSEL_RESET);
         }
     }
 

@@ -37,6 +37,7 @@ use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
 use super::Pio;
 use super::regs::EXECCTRL_EXEC_STALLED;
+use crate::gpio_pads::GpioPads;
 use crate::irq::{IrqAssert, PIO_IRQ_LINES};
 
 /// `IRQ` flags routed to the block's `IRQ_0` line / 路由到块 `IRQ_0` 线的 `IRQ` 标志
@@ -87,6 +88,20 @@ impl SharedPio {
         }
     }
 
+    /// Create a shared block wired to the pin matrix / 创建接到引脚矩阵的共享块
+    ///
+    /// The block samples only pads whose `IO_BANK0.FUNCSEL` selects it and
+    /// publishes its driven levels back into the same matrix.
+    /// 该块只采样 `IO_BANK0.FUNCSEL` 选中它的 pad，并把驱动电平发布回同一矩阵。
+    #[must_use]
+    pub fn with_pads(index: u8, irq: IrqAssert, pads: GpioPads) -> Self {
+        Self {
+            index,
+            inner: Arc::new(Mutex::new(Pio::with_pads(index, pads))),
+            irq,
+        }
+    }
+
     /// Block index (`0` = PIO0, `1` = PIO1, `2` = PIO2) / 块序号（`0` = PIO0，`1` = PIO1，`2` = PIO2）
     #[must_use]
     pub fn index(&self) -> u8 {
@@ -117,11 +132,18 @@ impl SharedPio {
     /// 在共享寄存器文件上执行 `f` 并发布 IRQ 标志
     ///
     /// The block's two interrupt lines are refreshed after the closure returns,
-    /// because `f` may set or clear `IRQ` flags directly.
-    /// 闭包返回后会刷新本块的两条中断线，因为 `f` 可能直接置位或清除 `IRQ` 标志。
+    /// because `f` may set or clear `IRQ` flags directly. The pin matrix is
+    /// refreshed too: the routed inputs are resampled and the driven outputs
+    /// republished, so a host that edits pins or `FUNCSEL` through this path
+    /// sees the result immediately.
+    /// 闭包返回后会刷新本块的两条中断线，因为 `f` 可能直接置位或清除 `IRQ` 标志；
+    /// 引脚矩阵同样刷新：重采样路由输入并重新发布驱动输出，因此通过该路径修改引脚
+    /// 或 `FUNCSEL` 的宿主会立即看到结果。
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Pio) -> R) -> R {
         let mut pio = self.inner.lock();
         let result = f(&mut pio);
+        pio.sample_inputs();
+        pio.publish_outputs();
         publish(&self.irq, self.index, pio.irq);
         result
     }
@@ -130,18 +152,25 @@ impl SharedPio {
     /// 让所有已启用状态机推进 `cycles` 个 PIO 时钟周期
     ///
     /// One PIO clock cycle is modelled per caller-supplied cycle; the API
-    /// matches [`Pio::tick`]. A block with `CTRL.SM_ENABLE = 0` returns after
-    /// one uncontended lock and does no per-machine work, and the interrupt
-    /// lines are only republished when the `IRQ` flags actually changed.
-    /// 每个调用方给出的周期对应一个 PIO 时钟周期，语义与 [`Pio::tick`] 一致。
-    /// `CTRL.SM_ENABLE = 0` 的块在一次无竞争加锁后即返回、不做任何状态机工作；
-    /// 只有 `IRQ` 标志真正变化时才重新发布中断线。
+    /// matches [`Pio::tick`]. The routed input vector is resampled from the
+    /// shared pads before the batch and the driven outputs are published after
+    /// it, so `IO_BANK0.FUNCSEL` routing is applied once per host tick at batch
+    /// granularity. A block with `CTRL.SM_ENABLE = 0` returns after one
+    /// uncontended lock and does no per-machine work, and the interrupt lines
+    /// are only republished when the `IRQ` flags actually changed.
+    /// 每个调用方给出的周期对应一个 PIO 时钟周期，语义与 [`Pio::tick`] 一致。批次
+    /// 开始前从共享 pad 重采样路由输入，结束后发布驱动输出，因此
+    /// `IO_BANK0.FUNCSEL` 路由按宿主 tick 以批次粒度生效。`CTRL.SM_ENABLE = 0`
+    /// 的块在一次无竞争加锁后即返回、不做任何状态机工作；只有 `IRQ` 标志真正变化
+    /// 时才重新发布中断线。
     pub fn tick(&self, cycles: u64) {
         let mut pio = self.inner.lock();
         if pio.enabled == 0 {
             return;
         }
+        pio.sample_inputs();
         pio.tick(cycles);
+        pio.publish_outputs();
         publish(&self.irq, self.index, pio.irq);
     }
 
@@ -225,6 +254,16 @@ impl SharedPio {
     #[must_use]
     pub fn output_levels(&self) -> u32 {
         self.inner.lock().output_levels
+    }
+
+    /// Levels the state machines sample after `FUNCSEL` routing
+    /// 状态机在 `FUNCSEL` 路由后采样的电平
+    ///
+    /// Only pads selected for this block contribute; see [`Pio::sampled_inputs`].
+    /// 只有选中本块的 pad 参与；详见 [`Pio::sampled_inputs`]。
+    #[must_use]
+    pub fn sampled_inputs(&self) -> u32 {
+        self.inner.lock().sampled_inputs()
     }
 
     /// Output enables currently driven by the block / 本块当前驱动的输出使能
