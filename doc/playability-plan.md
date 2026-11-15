@@ -25,9 +25,14 @@ keyboard/gamepad input, audio output, and no crashes.
 
 **2026-11-15 更新（四轮性能后）**：吞吐 **3.0 → 28.5–30.2 M steps/s（≈10×）**，
 `play` 实测 **12.4 fps**（每游戏帧 ≈2.5 M 步，客户机按 60 fps 自我配速）。60 fps 需
-≥150 M steps/s（缺口 5×）。已确认固件用**忙等**实现（SDK `tight_loop_contents()`
-是空函数），因此 `WFI` 睡眠语义（GAP-07）对该固件**没有帮助**；剩余成本 65–75 % 在
-`rp2350-arm` 逐指令取指/译码，路线是译码缓存（P0-3c）→ 必要时 JIT。
+≥150 M steps/s（缺口 5×）。剩余成本 65–75 % 在 `rp2350-arm` 逐指令取指/译码，路线是
+译码缓存（P0-3c）→ 必要时 JIT。
+
+**关于 `WFI`（更正）**：emerald 用忙等实现（SDK `tight_loop_contents()` 是空函数），
+这只说明该固件不走睡眠路径，**不构成「不需要睡眠语义」的理由**。本项目是通用 RP2350
+模拟器（见 `.trae/rules/project.md` 的「通用性与指令精确」），`WFI`/`WFE`/`SEV` 与阻塞式
+FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保留在队列中并行推进，且不得
+为了本示例的帧率而用「跳过自旋」之类的取巧手段替代。
 
 ## 1. 组件与依赖 / Components and dependencies
 
@@ -75,6 +80,7 @@ keyboard/gamepad input, audio output, and no crashes.
 |----|------|------|------|
 | P2-1 ✅ | I2S 采样捕获：`AudioSink`/`AudioTap`，唯一接线点 `Pio::push_tx`（CPU 与 DMA 共用），`BootPeripherals::set_audio_tap` | `rp2350-periph` | periph 347 测试；CPU/DMA 两路径 + 端到端；未安装 tap 零开销 |
 | P2-2 ✅ | 宿主输出 crate `rp2350-audio`（`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏，最近邻重采样） | `crates/rp2350-audio`（新） | 12/13 测试（`--all-features` 实测 backend=cpal）；`shutdown` 毫秒级；无设备不 panic |
+| P2-3 ✅ | **GUI 已接线**：`PlayView` 勾选音频时用 `PlaySource::audio_source()` 取 worker 的 `AudioTap` 并启动 `AudioOutput`（容量 1 s / 96k 样本）；`stop`/`Drop` **先** join 音频线程再关会话；`audio-playback` feature 转发 `rp2350-audio/playback`；状态栏 `audio=<backend> underruns=<n>`，null 后端提示一次；运行中音频复选框置灰 | `rp2350-egui` | `cargo test -p rp2350-egui` **86 passed**（+6 音频接线）；`--features audio-playback` 86 passed；`backend ∈ {cpal, null}`；`stop()` 2 s 内 join；`Drop` 不 panic |
 
 ### P3 完善 / Polish
 
@@ -92,8 +98,18 @@ keyboard/gamepad input, audio output, and no crashes.
 2. **Wave 2 ✅**：P0-2（arm+core+cli）‖ P2-2（`rp2350-audio` 新 crate）——均已验收提交
 3. **Wave 3 ✅**：P0-3a（arm+core）‖ P1-1（cli lib + `play` worker + headless `--frames`）
 4. **Wave 4 ✅**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2（egui PlayView 已接线到真实 `PlaySession`）
-5. **Wave 5 🚧**：P0-3c（arm 译码缓存）‖ P2-3（PlayView 接 `rp2350-audio` 输出）
+5. **Wave 5 🚧**：P0-3c（arm 译码缓存）‖ P2-3 ✅（PlayView 接 `rp2350-audio` 输出，GUI 已接线）
 6. **Wave 6**：P1-3（示例 profile）+ P3-1（GAP-08b PSRAM 挂载）+ P3-2（存档/复位）+ P3-3（soak）
+
+## 3.5 通用性任务（与帧率无关，必须推进）/ Generality tasks
+
+| ID | 任务 | 归属 | 状态 |
+|----|------|------|------|
+| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ⏳ 待派发（正确性） |
+| GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ⏳ |
+| GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | ⏳ |
+| GAP-10 | MCP TLS 传输 | mcp | ⏳ |
+| GAP-12 | 陈旧文档段落同步 | doc | ⏳ |
 
 ## 4. 风险 / Risks
 
