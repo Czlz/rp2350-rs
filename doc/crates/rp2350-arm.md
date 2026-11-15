@@ -22,12 +22,12 @@
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
-| `scb` | `SCB_ICSR` NMI/PendSV/SysTick pending latches, `SVCall` latch, `SHPR2`/`SHPR3` priorities |
-| `faults` | `SHCSR` enables/views, `CFSR`/`HFSR` status, `AIRCR` (`VECTKEY`/`PRIS`/`SYSRESETREQ`), fault escalation |
+| `scb` | `SCB_ICSR` NMI/PendSV/SysTick pending latches, `SVCall` latch, `SHPR1`/`SHPR2`/`SHPR3` priorities |
+| `faults` | `SHCSR` enables/views, `CFSR`/`HFSR` status, `CCR` traps, `MMFAR`/`BFAR`, `AIRCR` (`VECTKEY`/`PRIS`/`SYSRESETREQ`), fault escalation |
 | `system_exceptions` | NMI (2) / SVCall (11) / PendSV (14) / SysTick (15) arbitration, delivery, `ICSR` view and diagnostics |
 | `scr` | `SCR` sleep-control bits (`SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND`) |
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
-| `system_access` | System control space routing (`SCB_VTOR`/`SCB_ICSR`/`SCB_AIRCR`/`SCB_SHCSR`/`SCB_CFSR`/`SCB_HFSR`/`SCB_SHPR2`/`SCB_SHPR3`/`SCB_CPACR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
+| `system_access` | System control space routing (`SCB_VTOR`/`SCB_ICSR`/`SCB_AIRCR`/`SCB_CCR`/`SCB_SHPR1`/`SCB_SHPR2`/`SCB_SHPR3`/`SCB_SHCSR`/`SCB_CFSR`/`SCB_HFSR`/`SCB_MMFAR`/`SCB_BFAR`/`SCB_CPACR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
 | `fetch_cache` | Direct-mapped flash XIP instruction fetch cache (private, enabled per core) |
 | `decode_cache` | Direct-mapped decoded-instruction cache: length, raw word, dispatch tag per flash `PC` |
 | `execute_thumb16::fast` | Hot Thumb-16 executors shared by the decoder and the decode-cache fast path |
@@ -44,9 +44,9 @@ pub struct CortexM33Core {
     pub core_id: CpuId,          // Core 0 or 1
     pub registers: CortexM33Registers,
     pub nvic: Nvic,              // external IRQ lines 0..=255 only
-    pub scb: Scb,                // NMI/SVCall/PendSV/SysTick latches + SHPR2/SHPR3
+    pub scb: Scb,                // NMI/SVCall/PendSV/SysTick latches + SHPR1/SHPR2/SHPR3
     pub systick: SysTick,
-    // private: faults: faults::FaultState  // SHCSR enables, HFSR, AIRCR
+    // private: faults: faults::FaultState  // SHCSR enables, HFSR, AIRCR, MMFAR/BFAR
 }
 
 impl CortexM33Core {
@@ -408,15 +408,16 @@ impl SleepReason {
     effects are not modeled.
   * The core-side register is reached through `CpuCore::system_write`
     (`0xE000_ED10`). In a full machine the `rp2350-periph` PPB stub also replays
-    `VTOR`, `CPACR`, `ICSR`, `SHPR2`, `SHPR3` and NVIC writes into the core, so a
-    firmware `STR` to `SCR` reaches it once the shared write log is drained.
-    SysTick itself is deliberately **not** replayed: the peripheral
-    `SysTickCounter` owns the counter and follows the live clock tree.
+    `VTOR`, `CPACR`, `ICSR`, `SHPR2`, `SHPR3`, the NVIC and the fault/reset
+    registers into the core, so a firmware `STR` to `SCR` reaches it once the
+    shared write log is drained. SysTick itself is deliberately **not** replayed:
+    the peripheral `SysTickCounter` owns the counter and follows the live clock
+    tree.
   * 核心侧寄存器通过 `CpuCore::system_write`（`0xE000_ED10`）访问。完整机器中
-    `rp2350-periph` 的 PPB 桩还会把 `VTOR`、`CPACR`、`ICSR`、`SHPR2`、`SHPR3`
-    与 NVIC 写入回放到核，因此固件对 `SCR` 的 `STR` 会在共享写入日志被排空时
-    到达核心。SysTick 本身有意**不**回放：外设侧 `SysTickCounter` 拥有计数器并
-    跟随实时时钟树。
+    `rp2350-periph` 的 PPB 桩还会把 `VTOR`、`CPACR`、`ICSR`、`SHPR2`、`SHPR3`、
+    NVIC 与故障/复位寄存器回放到核，因此固件对 `SCR` 的 `STR` 会在共享写入日志
+    被排空时到达核心。SysTick 本身有意**不**回放：外设侧 `SysTickCounter` 拥有
+    计数器并跟随实时时钟树。
 * **Sleeping cores still age**: [`CpuCore::step`] on a sleeping core advances
   `SysTick` and `total_cycles` by one, then checks the wake condition. The first
   step whose condition holds executes the instruction at `PC` immediately
@@ -1450,7 +1451,8 @@ Execution numbering and pending representation are kept separate from the NVIC:
   enters **exception 31**, never SysTick.
 - `Scb` (`scb.rs`) owns four system-exception latches — `ICSR.NMIPENDSET` (2),
   `SHCSR.SVCALLPENDED` (11), `ICSR.PENDSVSET` (14) and `ICSR.PENDSTSET` (15) —
-  plus `SHPR2` (SVCall byte 3) and `SHPR3` (PendSV byte 2, SysTick byte 3).
+  plus `SHPR1` (MemManage byte 0, BusFault byte 1, UsageFault byte 2), `SHPR2`
+  (SVCall byte 3) and `SHPR3` (PendSV byte 2, SysTick byte 3).
 - `SVC #imm` retires, pends exception 11, and the shared arbitration at the end
   of the same `step` enters `VTOR + 0x2C` when the priority gate allows. The
   handler recovers `imm` from the stacked return address: the frame holds the
@@ -1493,12 +1495,16 @@ Diagnostics: `system_exception_state()` (`systick=<state> pendsv=<state>`) is
 the stable string exposed by the core; `pend_nmi()`, `pend_svcall()`,
 `pend_pendsv()` and `pend_systick()` are the host entry points. In the full
 machine the `rp2350-periph` PPB stub replays `ICSR`/`SHPR2`/`SHPR3` writes into
-the core, so firmware pends NMI/PendSV and sets system priorities; delivering a
+the core, so firmware pends NMI/PendSV and sets system priorities; it also
+replays `SHCSR`/`CFSR`/`HFSR`/`AIRCR`, so firmware enables UsageFault, clears
+fault status with write-one-to-clear and requests a system reset. Delivering a
 peripheral-side SysTick expiry to the core needs the driver to forward
 `BootPeripherals::take_systick_pending()` to `pend_systick()` (CLI wiring,
-outside this crate). The PPB stub does **not** yet replay `SHCSR`, `CFSR`,
-`HFSR` or `AIRCR`, so firmware-side fault enables and `SYSRESETREQ` only take
-effect when a host writes them through `CpuCore::system_write` directly.
+outside this crate). The `AIRCR.SYSRESETREQ` latch is a host event:
+`rp2350-cli::run::Machine::take_system_reset_request()` polls both Cortex-M33
+cores and stops advancing the machine; `run` rebuilds it from the same image
+(at most 3 times) while `repl`/`play` report the request and stop (see
+[`rp2350-cli.md`](rp2350-cli.md)).
 
 执行编号与挂起表示与 NVIC 分开：
 
@@ -1507,8 +1513,8 @@ effect when a host writes them through `CpuCore::system_write` directly.
   软件挂起位 15 进入的是**异常 31**，绝不是 SysTick。
 - `Scb`（`scb.rs`）拥有四个系统异常锁存——`ICSR.NMIPENDSET`（2）、
   `SHCSR.SVCALLPENDED`（11）、`ICSR.PENDSVSET`（14）与 `ICSR.PENDSTSET`（15）
-  ——以及 `SHPR2`（第 3 字节 SVCall）与 `SHPR3`（第 2 字节 PendSV、第 3 字节
-  SysTick）。
+  ——以及 `SHPR1`（第 0/1/2 字节 MemManage/BusFault/UsageFault）、`SHPR2`
+  （第 3 字节 SVCall）与 `SHPR3`（第 2 字节 PendSV、第 3 字节 SysTick）。
 - `SVC #imm` 退役后挂起异常 11，同一步末尾的统一仲裁在优先级允许时进入
   `VTOR + 0x2C`。处理程序从压栈返回地址取回 `imm`：栈帧保存 `SVC` 的后继地址，
   因此 `stacked_pc - 2` 处的指令就是 `SVC` 本身。`SHCSR.SVCALLACT`/
@@ -1543,11 +1549,14 @@ effect when a host writes them through `CpuCore::system_write` directly.
 诊断：`system_exception_state()`（`systick=<state> pendsv=<state>`）是核心暴露的
 稳定字符串；`pend_nmi()`、`pend_svcall()`、`pend_pendsv()`、`pend_systick()` 是
 宿主入口。完整机器中 `rp2350-periph` 的 PPB 桩已把 `ICSR`/`SHPR2`/`SHPR3` 写入
-回放到核，因此固件可挂起 NMI/PendSV 并设置系统优先级；把外设侧 SysTick 到期投递
-到核仍需驱动把 `BootPeripherals::take_systick_pending()` 转发到 `pend_systick()`
-（属 CLI 接线，不在本 crate 内）。PPB 桩**尚未**回放 `SHCSR`、`CFSR`、`HFSR`、
-`AIRCR`，因此固件侧写故障使能或 `SYSRESETREQ` 只有在宿主直接通过
-`CpuCore::system_write` 写入时才生效。
+回放到核，因此固件可挂起 NMI/PendSV 并设置系统优先级；它也会回放
+`SHCSR`/`CFSR`/`HFSR`/`AIRCR`，因此固件可启用 UsageFault、以写 1 清零清除故障
+状态并请求系统复位。把外设侧 SysTick 到期投递到核仍需驱动把
+`BootPeripherals::take_systick_pending()` 转发到 `pend_systick()`（属 CLI 接线，
+不在本 crate 内）。`AIRCR.SYSRESETREQ` 锁存是宿主事件：
+`rp2350-cli::run::Machine::take_system_reset_request()` 轮询两个 Cortex-M33 核并
+停止推进机器；`run` 用同一映像重建机器（最多 3 次），`repl`/`play` 报告请求并
+停止（见 [`rp2350-cli.md`](rp2350-cli.md)）。
 
 ### Fault escalation / 故障升级
 
@@ -1559,6 +1568,8 @@ are identical for all sources:
 |---------------|-------------|--------------------|
 | Undefined instruction / 未定义指令 | `UFSR.UNDEFINSTR` (16) | UsageFault 6 if `USGFAULTENA` **and** priority allows, else HardFault 3 + `HFSR.FORCED` |
 | Illegal `EXC_RETURN` / 非法返回 | `UFSR.INVSTATE` (17) | same / 同上 |
+| Unaligned data access with `CCR.UNALIGN_TRP = 1` / `CCR.UNALIGN_TRP = 1` 时的未对齐数据访问 | `UFSR.UNALIGNED` (21) | same / 同上 |
+| `SDIV`/`UDIV` by zero with `CCR.DIV_0_TRP = 1` / `CCR.DIV_0_TRP = 1` 时的除零 | `UFSR.DIVBYZERO` (22) | same / 同上 |
 | Coprocessor access denied / 协处理器拒绝 | `UFSR.NOCP` (19) | same / 同上 |
 | `SVC` / 监管调用 | — | SVCall 11 (pending in `SHCSR.SVCALLPENDED`) |
 | `BKPT` without debugger / 无调试器 | `HFSR.DEBUGEVT` (31) | HardFault 3 |
@@ -1601,21 +1612,148 @@ are identical for all sources:
 | `CFSR` | `0xE000_ED28` | MMFSR/BFSR/UFSR bits for `UNDEFINSTR`, `INVSTATE`, `INVPC`, `NOCP`, `STKOF`, `STKERR`, `UNSTKERR`, `IBUSERR`, `PRECISERR`, `IMPRECISERR`, `UNALIGNED`, `DIVBYZERO`; write-one-to-clear. |
 | `HFSR` | `0xE000_ED2C` | `FORCED` (30), `DEBUGEVT` (31), `VECTTBL` (1); write-one-to-clear. `VECTTBL` has no source yet. |
 | `AIRCR` | `0xE000_ED0C` | A write is accepted only with `VECTKEY = 0x05FA`; `PRIS` (14) is stored; `SYSRESETREQ` (2) latches a one-shot event read by `take_system_reset_request()`; `VECTRESET` (0) is latched for diagnostics (`vect_reset_requested()`); `VECTKEYSTAT` reads `0xFA05`, write-only request bits read 0. |
-| `SHPR1` | `0xE000_ED18` | **Not modelled**: MemManage/BusFault/UsageFault priorities report 0. |
-| `CCR` | `0xE000_ED14` | **Not modelled**: `UNALIGN_TRP`/`DIV_0_TRP`/`STKALIGN` behave as 0. |
+| `SHPR1` | `0xE000_ED18` | Byte 0 MemManage (4), byte 1 BusFault (5), byte 2 UsageFault (6), implemented priority bits only; byte 3 reserved reads 0. The three priorities take part in entry, `BASEPRI` masking and preemption. |
+| `CCR` | `0xE000_ED14` | `STKALIGN` (9) reads as one (RAO/WI); `UNALIGN_TRP` (3) and `DIV_0_TRP` (4) gate the traps; `NONBASETHRDENA` (0), `USERSETMPEND` (1) and `BFHFNMIGN` (8) are **storage only**. Reserved bits read 0. |
+| `MMFAR` | `0xE000_ED34` | Address field only; validity is `CFSR.MMARVALID`. No MemManage source exists yet, so software-written values simply read back. |
+| `BFAR` | `0xE000_ED38` | Address field only; validity is `CFSR.BFARVALID`. Trapped unaligned accesses record their address here **without** setting `BFARVALID` (see below). |
 
 The table above is the complete modelled fault surface. **Still unmodelled /
 仍未建模**: TrustZone secure/non-secure state (there is one register file and one
 `SHCSR`; `SECUREFAULT*` bits are absent), MemManage/BusFault sources from MPU or
 data/instruction accesses (bus errors still surface as `CoreError` for the host
-and halt the core), `SHPR1` priorities, `CCR` traps, `HFSR.VECTTBL`, debug-monitor
-(`MONITORACT`) and lockup semantics, and `SHCSR.HARDFAULTPENDED`.
+and halt the core), `HFSR.VECTTBL`, debug-monitor (`MONITORACT`) and lockup
+semantics, and `SHCSR.HARDFAULTPENDED`.
 
 上表是完整的故障建模范围。**仍未建模**：TrustZone 安全/非安全态（只有一套
 寄存器文件与一个 `SHCSR`，没有 `SECUREFAULT*` 位）、来自 MPU 或数据/取指访问的
-MemManage/BusFault 源（总线错误仍以 `CoreError` 上报宿主并停机）、`SHPR1`
-优先级、`CCR` 陷阱、`HFSR.VECTTBL`、调试监视器（`MONITORACT`）与 lockup 语义，
-以及 `SHCSR.HARDFAULTPENDED`。
+MemManage/BusFault 源（总线错误仍以 `CoreError` 上报宿主并停机）、`HFSR.VECTTBL`、
+调试监视器（`MONITORACT`）与 lockup 语义，以及 `SHCSR.HARDFAULTPENDED`。
+
+### `CCR` traps: unaligned accesses and divide by zero / `CCR` 陷阱：未对齐与除零
+
+`CCR` is at `0xE000_ED14`. `STKALIGN` is read-only one in ARMv8-M, so exception
+entry always starts the frame on an 8-byte boundary and records the 4-byte
+aligner in stacked xPSR bit 9; `exception exit` adds it back and restores the
+exact interrupted SP (this now also applies to basic frames, not only to the
+extended FP frame).
+
+`CCR` 位于 `0xE000_ED14`。ARMv8-M 的 `STKALIGN` 只读为 1，因此异常进入总是把栈帧
+放在 8 字节边界上，并在压栈 xPSR 的 bit9 记录 4 字节对齐字；异常返回时补回，精确
+恢复被打断的 SP（现在基础帧也如此，不再只限扩展浮点帧）。
+
+**Unaligned accesses (`UNALIGN_TRP`, bit 3)**
+
+- `UNALIGN_TRP = 0` (reset): unaligned `LDR`/`LDRH`/`LDRSH`/`STR`/`STRH`,
+  `LDM`/`STM`, `PUSH`/`POP`, `LDRD`/`STRD`, `LDREX`/`STREX` and the
+  acquire/release forms execute as unaligned accesses, exactly as this model did
+  before `CCR` existed. Byte accesses are always naturally aligned.
+- `UNALIGN_TRP = 1`: any data access whose address violates its natural
+  alignment raises `CFSR.UFSR.UNALIGNED` (bit 21), routed to UsageFault (6) when
+  `SHCSR.USGFAULTENA = 1` and the priority allows, otherwise escalated to
+  HardFault (3) with `HFSR.FORCED`. The access is abandoned: no memory is
+  touched, the base register of an indexed/multiple form is **not** written
+  back, and the destination register of a load stays unchanged. The stacked
+  return address is the faulting instruction itself.
+- The trapped address is stored in the `BFAR` address field for host
+  diagnostics, but `CFSR.BFARVALID` stays **0** and `MMFAR` is untouched:
+  ARMv8-M defines no fault-address register for `UFSR.UNALIGNED` (`BFAR` is
+  reserved for precise BusFaults, `MMFAR` for MemManage).
+- Instruction fetch alignment is not affected by `UNALIGN_TRP`: a Thumb PC with
+  bit 0 clear is rejected by `BX`/`BLX`/PC writes as `INVSTATE`, as before.
+- FPU data transfers (`VLDR`/`VSTR`) and coprocessor transfers are **not** gated
+  by `UNALIGN_TRP` in this model; they keep using the bus exactly as before.
+  ARMv8-M does not support unaligned FPU data accesses, so this remains a
+  documented divergence until a dedicated task models the FPU alignment rule.
+- The model deliberately gates **all** of the listed forms on `UNALIGN_TRP`.
+  The ARMv8-M architecture additionally makes `LDM`/`STM`, `PUSH`/`POP`,
+  `LDRD`/`STRD` and the exclusive accesses always fault when unaligned, even
+  with `UNALIGN_TRP = 0`; this model keeps the long-standing permissive
+  behaviour for those forms when the bit is clear, as required to preserve the
+  pre-`CCR` firmware behaviour.
+
+**未对齐访问（`UNALIGN_TRP`，位 3）**
+
+- `UNALIGN_TRP = 0`（复位值）：未对齐的 `LDR`/`LDRH`/`LDRSH`/`STR`/`STRH`、
+  `LDM`/`STM`、`PUSH`/`POP`、`LDRD`/`STRD`、`LDREX`/`STREX` 与获取/释放形式按
+  未对齐访问执行，与 `CCR` 存在之前的行为完全一致。字节访问天然对齐。
+- `UNALIGN_TRP = 1`：任何地址违反自然对齐的数据访问产生
+  `CFSR.UFSR.UNALIGNED`（位 21）；`SHCSR.USGFAULTENA = 1` 且优先级允许时进入
+  UsageFault（6），否则带 `HFSR.FORCED` 升级为 HardFault（3）。访问被放弃：
+  不触碰内存、索引/多寄存器形式的基址**不**写回、加载目标寄存器保持原值；压栈
+  返回地址是故障指令本身。
+- 被捕获地址写入 `BFAR` 地址字段供宿主诊断，但 `CFSR.BFARVALID` 保持 **0**，
+  `MMFAR` 不变：ARMv8-M 未为 `UFSR.UNALIGNED` 定义地址寄存器（`BFAR` 属于精确
+  BusFault、`MMFAR` 属于 MemManage）。
+- 取指对齐不受 `UNALIGN_TRP` 影响：bit0 为 0 的 Thumb PC 仍由
+  `BX`/`BLX`/写 PC 以 `INVSTATE` 拒绝，与之前一致。
+- 浮点数据传输（`VLDR`/`VSTR`）与协处理器传输在本模型中**不**受
+  `UNALIGN_TRP` 控制，仍按原总线路径执行。ARMv8-M 不支持未对齐的浮点数据访问，
+  因此这一差异在文档中保留，待后续专门任务补齐 FPU 对齐规则。
+- 本模型有意让上述**全部**形式都受 `UNALIGN_TRP` 控制。ARMv8-M 还规定
+  `LDM`/`STM`、`PUSH`/`POP`、`LDRD`/`STRD` 与独占访问在未对齐时**始终**故障
+  （即使 `UNALIGN_TRP = 0`）；本模型在该位清零时保留长期以来的宽松行为，以维持
+  `CCR` 引入前的固件可见行为。
+
+**Divide by zero (`DIV_0_TRP`, bit 4)**
+
+- `DIV_0_TRP = 0` (reset): `SDIV` writes 0 when the divisor is 0 and `INT_MIN`
+  for `INT_MIN / -1`; `UDIV` writes 0 when the divisor is 0. No fault is
+  reported.
+- `DIV_0_TRP = 1`: a zero divisor raises `CFSR.UFSR.DIVBYZERO` (bit 22), routed
+  like the other UsageFaults; the destination register is **not** written.
+  `INT_MIN / -1` is not a divide-by-zero event and keeps `SDIV`'s architectural
+  result `INT_MIN`.
+
+**除零（`DIV_0_TRP`，位 4）**
+
+- `DIV_0_TRP = 0`（复位值）：`SDIV` 除数为 0 时写 0，`INT_MIN / -1` 写
+  `INT_MIN`；`UDIV` 除数为 0 时写 0。不上报故障。
+- `DIV_0_TRP = 1`：除数为 0 产生 `CFSR.UFSR.DIVBYZERO`（位 22），按其它
+  UsageFault 的路由处理；目标寄存器**不**写入。`INT_MIN / -1` 不是除零事件，
+  仍按 `SDIV` 的架构结果写 `INT_MIN`.
+
+**Storage-only bits / 仅存储位**: `NONBASETHRDENA` (0), `USERSETMPEND` (1) and
+`BFHFNMIGN` (8) read back what software wrote. They are not consulted because
+this model has no privilege separation (`USERSETMPEND`), no Thread-mode entry
+interlock (`NONBASETHRDENA`) and no BusFault-ignore state for priority -1/-2
+(`BFHFNMIGN`).
+
+**仅存储位**：`NONBASETHRDENA`（位 0）、`USERSETMPEND`（位 1）与 `BFHFNMIGN`
+（位 8）读回软件写入值。本模型没有特权分离（`USERSETMPEND`）、没有 Thread 模式
+进入互锁（`NONBASETHRDENA`）以及优先级 -1/-2 的 BusFault 忽略状态
+（`BFHFNMIGN`），因此不查询它们。
+
+### `SHPR1` priorities / `SHPR1` 优先级
+
+`SHPR1` (`0xE000_ED18`) holds one byte per fault: byte 0 = MemManage (4), byte 1
+= BusFault (5), byte 2 = UsageFault (6), byte 3 is reserved and reads 0. Only
+the implemented priority bits (`0xE0` per byte, three bits on this model) are
+writable. `CortexM33Core::exception_priority` decodes the same bytes for both
+entry and preemption, so a synchronous UsageFault may preempt a lower-priority
+IRQ handler, an equal/lower priority cannot preempt and escalates to HardFault,
+and a higher-priority IRQ can preempt an active UsageFault handler through the
+normal `check_pending_exceptions` pass. `BASEPRI` masking uses the decoded value
+as well. `SHPR2`/`SHPR3` continue to carry SVCall/PendSV/SysTick.
+
+`SHPR1`（`0xE000_ED18`）每个故障一个字节：第 0 字节 MemManage（4）、第 1 字节
+BusFault（5）、第 2 字节 UsageFault（6），第 3 字节保留读 0。只有实现的优先级位
+可写（每字节 `0xE0`，本模型三位）。`CortexM33Core::exception_priority` 在异常进入
+与抢占时解码同样的字节，因此同步 UsageFault 可以抢占更低优先级的 IRQ 处理程序；
+同优先级或更低优先级无法抢占时会升级为 HardFault；更高优先级的 IRQ 可通过正常的
+`check_pending_exceptions` 遍历抢占活跃的 UsageFault 处理程序。`BASEPRI` 屏蔽也
+使用解码后的值。`SHPR2`/`SHPR3` 继续承载 SVCall/PendSV/SysTick。
+
+> **PPB replay / PPB 回放**: in the full machine the `rp2350-periph` PPB stub
+> replays `VTOR`, `CPACR`, `ICSR`, `SHPR2`/`SHPR3`, `SCR`, `STIR`, the NVIC and
+> `SHCSR`/`CFSR`/`HFSR`/`AIRCR`, so firmware-side fault enables, write-one-to-
+> clear fault status and `SYSRESETREQ` take effect. `CCR` and `SHPR1` are still
+> not replayed; until that wiring lands (outside this crate), host code must
+> program them through `CpuCore::system_write`.
+> **PPB 回放**：完整机器中 `rp2350-periph` 的 PPB 桩会回放 `VTOR`、`CPACR`、
+> `ICSR`、`SHPR2`/`SHPR3`、`SCR`、`STIR`、NVIC 以及
+> `SHCSR`/`CFSR`/`HFSR`/`AIRCR`，因此固件侧的故障使能、写 1 清零的故障状态与
+> `SYSRESETREQ` 都会生效。`CCR` 与 `SHPR1` 仍未回放；在该接线（不在本 crate）
+> 落地前，宿主必须通过 `CpuCore::system_write` 编程。
 
 ---
 

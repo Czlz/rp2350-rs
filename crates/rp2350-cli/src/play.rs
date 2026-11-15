@@ -50,7 +50,7 @@ use anyhow::{Context, Result};
 use rp2350_periph::pio::{PIO_BLOCKS, PIO_SM_COUNT};
 use rp2350_periph::{AudioSink, AudioTap};
 
-use crate::run::{Machine, MachineOptions};
+use crate::run::{Machine, MachineOptions, SYSTEM_RESET_MESSAGE};
 
 /// Worker thread name / worker 线程名
 const WORKER_NAME: &str = "rp2350-play";
@@ -460,6 +460,12 @@ fn step_frame(
             if let Some(reason) = machine.halt_reason() {
                 return Some(reason.to_owned());
             }
+            // 复位请求：`play` 的策略是报告并停止 worker，不自动重启。
+            // A reset request makes `play` report and stop the worker; it never
+            // reboots automatically.
+            if machine.take_system_reset_request() {
+                return Some(SYSTEM_RESET_MESSAGE.to_owned());
+            }
         }
         let slice = (config.steps_per_frame - stepped).min(STOP_POLL_STEPS);
         if *trace_left > 0 {
@@ -493,6 +499,12 @@ fn step_frame(
                 return Some(error.to_string());
             }
             stepped += slice;
+        }
+        // 切片内部发生的复位请求必须在同一帧内发现，不能等到下一帧边界。
+        // A reset requested inside the slice must be caught within this frame,
+        // not at the next frame boundary.
+        if machine.take_system_reset_request() {
+            return Some(SYSTEM_RESET_MESSAGE.to_owned());
         }
     }
     None
@@ -695,6 +707,12 @@ fn machine_options(options: &PlayOptions) -> MachineOptions {
 /// when stdout cannot be written.
 /// profile 非法、必需设置缺失、固件读取失败、worker 无法启动或 stdout 写入失败时
 /// 返回错误。
+///
+/// A guest `AIRCR.SYSRESETREQ` stops the worker with
+/// [`SYSTEM_RESET_MESSAGE`] and the summary reports it as `halted`; `play` never
+/// reboots the machine automatically.
+/// 客户机的 `AIRCR.SYSRESETREQ` 以 [`SYSTEM_RESET_MESSAGE`] 停止 worker，汇总把它
+/// 记为 `halted`；`play` 绝不自动重启机器。
 pub fn run(args: &PlayArgs) -> Result<()> {
     let options = options::resolve(args).map_err(|message| anyhow::anyhow!(message))?;
     let image = std::fs::read(&options.file).with_context(|| {
@@ -733,7 +751,10 @@ pub fn run(args: &PlayArgs) -> Result<()> {
                 }
             }
         }
-        if stats.halted.is_some() {
+        if let Some(reason) = stats.halted.as_deref() {
+            if reason == SYSTEM_RESET_MESSAGE {
+                println!("[play] {SYSTEM_RESET_MESSAGE}; stopping / 检测到系统复位请求，停止");
+            }
             break;
         }
         if !session.is_running() && stats.frames <= printed {

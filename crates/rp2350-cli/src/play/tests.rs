@@ -540,6 +540,25 @@ fn step_frame_applies_the_current_button_mask() {
 }
 
 #[test]
+fn step_frame_reports_a_system_reset_and_stops() {
+    // `play` 的停止策略：帧内检测到 AIRCR.SYSRESETREQ 就返回诊断，worker 随
+    // `halted` 停止，绝不自动重启。
+    // The `play` stop policy: a frame that sees AIRCR.SYSRESETREQ returns the
+    // diagnostic and the worker stops via `halted`; it never reboots.
+    let mut machine = Machine::new(&aircr_uf2(), &spin_options(u64::MAX)).expect("machine");
+    let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 64);
+    let stop = AtomicBool::new(false);
+    let buttons = AtomicU16::new(0);
+    let mut trace_left = 0;
+    let reason = step_frame(&mut machine, &config, &stop, &buttons, &mut trace_left);
+    assert_eq!(reason.as_deref(), Some(SYSTEM_RESET_MESSAGE));
+    assert!(
+        machine.steps() < 64,
+        "the frame stops at the request / 帧在请求处停止"
+    );
+}
+
+#[test]
 fn buttons_are_resampled_inside_a_frame() {
     // 一帧内部（而不是帧边界）就要重新读取按键掩码：宿主在帧中途按下时，
     // 本帧内后续的切片必须已经看到。
@@ -569,6 +588,27 @@ fn buttons_are_resampled_inside_a_frame() {
     // the press and left the pin low.
     let levels = machine.peripherals().pads().input_levels();
     assert_eq!(levels & (1 << 4), 0, "press sampled inside the frame");
+}
+
+/// UF2 image whose reset handler requests `AIRCR.SYSRESETREQ`
+/// 复位处理程序请求 `AIRCR.SYSRESETREQ` 的 UF2 映像
+///
+/// Thumb program / Thumb 程序: `ldr r0,[pc,#12]` → `0xE000_ED0C`,
+/// `ldr r1,[pc,#16]` → `0x05FA_0004`, `str r1,[r0]`, `b .`, then the literals.
+/// `play` must report the reset and stop the worker instead of rebooting.
+/// `play` 必须报告该复位并停止 worker，而不是自动重启。
+fn aircr_uf2() -> Vec<u8> {
+    let mut vectors = Vec::with_capacity(8);
+    vectors.extend_from_slice(&0x2008_2000u32.to_le_bytes());
+    vectors.extend_from_slice(&(FLASH_BASE + 0x09).to_le_bytes());
+    let mut code = vec![0u8; 0x18];
+    // ldr r0,[pc,#12] / ldr r1,[pc,#16] / str r1,[r0] / b .
+    code[0..8].copy_from_slice(&[0x03, 0x48, 0x04, 0x49, 0x01, 0x60, 0xFE, 0xE7]);
+    code[0x10..0x14].copy_from_slice(&0xE000_ED0Cu32.to_le_bytes());
+    code[0x14..0x18].copy_from_slice(&0x05FA_0004u32.to_le_bytes());
+    let mut image = uf2_block(0, 2, FLASH_BASE, &vectors);
+    image.extend(uf2_block(1, 2, FLASH_BASE + 8, &code));
+    image
 }
 
 /// UF2 image whose reset handler stores one byte into the PSRAM window

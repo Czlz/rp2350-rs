@@ -2,26 +2,42 @@
 //!
 //! The PPB window (SCB, NVIC, SysTick, MPU) is plain storage so `ldr`/`str`
 //! accesses from firmware do not halt on an unmapped address. `CPUID` reports a
-//! Cortex-M33 part number. Writes to the NVIC, `ICSR`, `SHPR2`/`SHPR3`, `SCR`,
-//! `STIR` and SysTick registers are also appended to a shared log; the
-//! simulation driver replays them into the core through `CpuCore::system_write`,
-//! which is how interrupt enables, priorities, PendSV/SysTick pending requests,
-//! `SLEEPONEXIT` and software-triggered interrupts reach the emulated core.
+//! Cortex-M33 part number. Writes to the NVIC, `ICSR`, `SHCSR`, `CFSR`, `HFSR`,
+//! `AIRCR`, `SHPR2`/`SHPR3`, `SCR`, `STIR` and SysTick registers are also
+//! appended to a shared log; the simulation driver replays them into the core
+//! through `CpuCore::system_write`, which is how interrupt enables, fault
+//! enables, fault status clears, priorities, PendSV/SysTick pending requests,
+//! `SLEEPONEXIT`, `AIRCR.SYSRESETREQ` and software-triggered interrupts reach
+//! the emulated core.
+//!
+//! `SHCSR`, `CFSR`, `HFSR` and `AIRCR` are architecturally owned by the core, so
+//! the PPB keeps only a read-back cache for them and reproduces the core's write
+//! rules (write-one-to-clear for `CFSR`/`HFSR`, the three fault enables for
+//! `SHCSR`, and the `VECTKEY` gate plus `PRIS` for `AIRCR`). The cache must not
+//! invent a second semantics: live `*ACT`/`SVCALLPENDED` views and fault bits
+//! raised inside the core stay core-only.
 //!
 //! SysTick is the exception: its counter follows the live clock tree, so this
 //! module owns a [`SysTickCounter`] instead of replaying the four SysTick
 //! registers. A write still reaches the shared log only for registers whose
-//! behaviour lives inside the core (`ICSR`, `SHPR2`/`SHPR3`, `SCR`, `STIR`,
-//! NVIC).
+//! behaviour lives inside the core (`ICSR`, `SHCSR`, `CFSR`, `HFSR`, `AIRCR`,
+//! `SHPR2`/`SHPR3`, `SCR`, `STIR`, NVIC).
 //! PPB 窗口（SCB、NVIC、SysTick、MPU）为普通存储，固件发出的 `ldr`/`str`
 //! 不会因地址未映射而停机。`CPUID` 报告 Cortex-M33 部件号。对 NVIC、`ICSR`、
-//! `SHPR2`/`SHPR3`、`SCR`、`STIR` 与 SysTick 寄存器的写入还会追加到共享日志；
-//! 仿真驱动通过 `CpuCore::system_write` 把它们回放到核中，中断使能、优先级、
-//! PendSV/SysTick 挂起请求、`SLEEPONEXIT` 与软件触发中断由此到达被模拟的核。
+//! `SHCSR`、`CFSR`、`HFSR`、`AIRCR`、`SHPR2`/`SHPR3`、`SCR`、`STIR` 与 SysTick
+//! 寄存器的写入还会追加到共享日志；仿真驱动通过 `CpuCore::system_write` 把它们
+//! 回放到核中，中断使能、故障使能、故障状态清除、优先级、PendSV/SysTick 挂起
+//! 请求、`SLEEPONEXIT`、`AIRCR.SYSRESETREQ` 与软件触发中断由此到达被模拟的核。
+//!
+//! `SHCSR`、`CFSR`、`HFSR` 与 `AIRCR` 架构上属于核，因此 PPB 只为它们保留读回
+//! 缓存，并复现核的写入规则（`CFSR`/`HFSR` 写 1 清零、`SHCSR` 只保存三个故障
+//! 使能、`AIRCR` 的 `VECTKEY` 门控与 `PRIS`）。缓存不得产生第二套语义：`*ACT`/
+//! `SVCALLPENDED` 实时视图与核内故障路径置位的状态位仍只存在于核内。
 //!
 //! SysTick 是例外：其计数器跟随实时时钟树，因此本模块自己持有
 //! [`SysTickCounter`]，不把四个 SysTick 寄存器回放给核。只有行为属于核内部的
-//! 寄存器（`ICSR`、`SHPR2`/`SHPR3`、`SCR`、`STIR`、NVIC）才进入共享日志。
+//! 寄存器（`ICSR`、`SHCSR`、`CFSR`、`HFSR`、`AIRCR`、`SHPR2`/`SHPR3`、`SCR`、
+//! `STIR`、NVIC）才进入共享日志。
 
 use std::sync::Arc;
 
@@ -63,6 +79,37 @@ pub const SCB_SCR: u32 = 0xE000_ED10;
 
 /// `SCB_ICSR` absolute address / `SCB_ICSR` 绝对地址
 pub const SCB_ICSR: u32 = 0xE000_ED04;
+
+/// `SCB_AIRCR` absolute address (`VECTKEY`/`PRIS`/reset requests)
+/// `SCB_AIRCR` 绝对地址（`VECTKEY`/`PRIS`/复位请求）
+pub const SCB_AIRCR: u32 = 0xE000_ED0C;
+
+/// `SCB_SHCSR` absolute address (fault enables plus active/pending views)
+/// `SCB_SHCSR` 绝对地址（故障使能与活跃/挂起视图）
+pub const SCB_SHCSR: u32 = 0xE000_ED24;
+
+/// `SCB_CFSR` absolute address (write-one-to-clear fault status)
+/// `SCB_CFSR` 绝对地址（写 1 清零的故障状态）
+pub const SCB_CFSR: u32 = 0xE000_ED28;
+
+/// `SCB_HFSR` absolute address (write-one-to-clear HardFault status)
+/// `SCB_HFSR` 绝对地址（写 1 清零的 HardFault 状态）
+pub const SCB_HFSR: u32 = 0xE000_ED2C;
+
+/// `SHCSR` bits software may change (`MEMFAULTENA`/`BUSFAULTENA`/`USGFAULTENA`)
+/// 软件可写的 `SHCSR` 位（三个故障使能）
+const SHCSR_WRITABLE_MASK: u32 = 0x0007_0000;
+
+/// Value `AIRCR[31:16]` must hold for a write to be accepted
+/// `AIRCR[31:16]` 必须等于该值才接受写入
+const AIRCR_VECTKEY: u32 = 0x05FA_0000;
+
+/// Value always read back from `AIRCR.VECTKEYSTAT`
+/// `AIRCR.VECTKEYSTAT` 恒读回该值
+const AIRCR_VECTKEYSTAT: u32 = 0xFA05_0000;
+
+/// `AIRCR.PRIS` storage bit / `AIRCR.PRIS` 存储位
+const AIRCR_PRIS: u32 = 1 << 14;
 
 /// `SCB_SHPR2` absolute address (SVCall priority in byte 3)
 /// `SCB_SHPR2` 绝对地址（第 3 字节为 SVCall 优先级）
@@ -118,17 +165,26 @@ pub fn new_system_write_log() -> SystemWriteLog {
 /// `SLEEPONEXIT` and software-triggered interrupts are core state.
 /// `ICSR`/`SHPR2`/`SHPR3` carry the PendSV/SysTick pending latches and the
 /// system-exception priorities, which only the core can deliver or preempt.
+/// `SHCSR`/`CFSR`/`HFSR`/`AIRCR` carry the fault enables, the fault status
+/// latches and the reset requests: without the replay firmware never enables
+/// UsageFault, never clears a fault status and never resets the chip.
 /// SysTick is deliberately **not** replayed: [`SysTickCounter`] follows the live
 /// clock tree in this crate.
 /// `CPACR` 必须回放，因为它属于核而不是 PPB 存储：固件在 `runtime_init` 里对
 /// `arm_cpu_hw->cpacr |= ...` 的写入是启用 FPU 的唯一动作，不回放的话每条 VFP
 /// 指令都会触发 UsageFault `NOCP`。`SCR` 与 `STIR` 同理：`SLEEPONEXIT` 与软件
 /// 触发中断都是核状态。`ICSR`/`SHPR2`/`SHPR3` 承载 PendSV/SysTick 挂起锁存与
-/// 系统异常优先级，只有核才能投递或抢占它们。SysTick 有意**不**回放：本 crate 的
+/// 系统异常优先级，只有核才能投递或抢占它们。`SHCSR`/`CFSR`/`HFSR`/`AIRCR`
+/// 承载故障使能、故障状态锁存与复位请求：不回放则固件永远无法启用 UsageFault、
+/// 无法清除故障状态，也无法复位芯片。SysTick 有意**不**回放：本 crate 的
 /// [`SysTickCounter`] 跟随实时时钟树。
 fn is_replayed(addr: u32) -> bool {
     addr == 0xE000_ED08 // SCB_VTOR
         || addr == SCB_ICSR
+        || addr == SCB_AIRCR
+        || addr == SCB_SHCSR
+        || addr == SCB_CFSR
+        || addr == SCB_HFSR
         || addr == SCB_SHPR2
         || addr == SCB_SHPR3
         || addr == SCB_SCR
@@ -229,6 +285,32 @@ impl Ppb {
         }
         let _ = self.regs.write(offset, latches);
     }
+
+    /// Cache one `SHCSR`/`CFSR`/`HFSR`/`AIRCR` write with the core's rules
+    /// 按核的规则缓存一次 `SHCSR`/`CFSR`/`HFSR`/`AIRCR` 写入
+    ///
+    /// The authoritative state lives in `rp2350-arm`; this cache only exists so
+    /// a firmware read-back sees the same value. `SHCSR` keeps the three fault
+    /// enables, `CFSR`/`HFSR` are write-one-to-clear, and `AIRCR` is ignored
+    /// without `VECTKEY = 0x05FA` and otherwise keeps only `PRIS`.
+    /// 权威状态位于 `rp2350-arm`；缓存只为让固件读回看到相同的值。`SHCSR` 只保存
+    /// 三个故障使能，`CFSR`/`HFSR` 写 1 清零，`AIRCR` 在缺少
+    /// `VECTKEY = 0x05FA` 时整次忽略，否则只保存 `PRIS`。
+    fn write_status_shadow(&mut self, offset: u32, addr: u32, value: u32) {
+        let current = self.regs.read(offset).unwrap_or(0);
+        let next = match addr {
+            SCB_SHCSR => value & SHCSR_WRITABLE_MASK,
+            SCB_CFSR | SCB_HFSR => current & !value,
+            SCB_AIRCR => {
+                if value & 0xFFFF_0000 != AIRCR_VECTKEY {
+                    return;
+                }
+                value & AIRCR_PRIS
+            }
+            _ => return,
+        };
+        let _ = self.regs.write(offset, next);
+    }
 }
 
 impl Default for Ppb {
@@ -247,11 +329,19 @@ impl MmioDevice for Ppb {
     }
 
     fn read32(&mut self, offset: u32) -> Option<u32> {
+        let addr = map::PPB_BASE.saturating_add(offset);
         match offset {
             SCB_CPUID => Some(CPUID_CORTEX_M33),
             SYST_CSR..=SYST_CALIB if offset.trailing_zeros() >= 2 => {
                 self.systick_access(offset, None)
             }
+            // AIRCR.VECTKEYSTAT 恒读 0xFA05；只写的复位请求读 0，PRIS 读缓存值。
+            // AIRCR.VECTKEYSTAT always reads 0xFA05; the write-only reset
+            // requests read zero and PRIS reads the cached bit.
+            _ if addr == SCB_AIRCR => self
+                .regs
+                .read(offset)
+                .map(|value| value | AIRCR_VECTKEYSTAT),
             _ => self.regs.read(offset),
         }
     }
@@ -271,10 +361,14 @@ impl MmioDevice for Ppb {
                 log.push((addr, value));
             }
         }
-        if addr == SCB_ICSR {
-            self.write_icsr_shadow(offset, value);
-        } else {
-            let _ = self.regs.write(offset, value);
+        match addr {
+            SCB_ICSR => self.write_icsr_shadow(offset, value),
+            SCB_SHCSR | SCB_CFSR | SCB_HFSR | SCB_AIRCR => {
+                self.write_status_shadow(offset, addr, value);
+            }
+            _ => {
+                let _ = self.regs.write(offset, value);
+            }
         }
         true
     }
@@ -351,11 +445,94 @@ mod tests {
     fn plain_ppb_writes_are_not_logged() {
         let log = new_system_write_log();
         let mut ppb = Ppb::with_log(Arc::clone(&log));
-        // AIRCR at 0xE000_ED0C is plain storage in this stub.
-        // 本桩中 0xE000_ED0C 的 AIRCR 只是普通存储。
-        let offset = 0xE000_ED0C - map::PPB_BASE;
-        assert!(ppb.write32(offset, 0x05FA_0000));
+        // SCB_CCR at 0xE000_ED14 is plain storage in this stub.
+        // 本桩中 0xE000_ED14 的 SCB_CCR 只是普通存储。
+        let offset = 0xE000_ED14 - map::PPB_BASE;
+        assert!(ppb.write32(offset, 0x0000_0200));
         assert!(log.lock().is_empty());
+        assert_eq!(ppb.read32(offset), Some(0x0000_0200));
+    }
+
+    #[test]
+    fn fault_and_reset_registers_are_logged_for_replay() {
+        // 固件写故障使能、故障状态与复位请求必须回放到核。
+        // Firmware writes to the fault enables, fault status and reset requests
+        // must be replayed into the core.
+        let log = new_system_write_log();
+        let mut ppb = Ppb::with_log(Arc::clone(&log));
+        let shcsr = SCB_SHCSR - map::PPB_BASE;
+        let cfsr = SCB_CFSR - map::PPB_BASE;
+        let hfsr = SCB_HFSR - map::PPB_BASE;
+        let aircr = SCB_AIRCR - map::PPB_BASE;
+        assert!(ppb.write32(shcsr, 0x0005_0000));
+        assert!(ppb.write32(cfsr, 0x0008_0000));
+        assert!(ppb.write32(hfsr, 0x4000_0000));
+        assert!(ppb.write32(aircr, 0x05FA_0004));
+        assert_eq!(
+            log.lock().as_slice(),
+            &[
+                (SCB_SHCSR, 0x0005_0000),
+                (SCB_CFSR, 0x0008_0000),
+                (SCB_HFSR, 0x4000_0000),
+                (SCB_AIRCR, 0x05FA_0004),
+            ]
+        );
+    }
+
+    #[test]
+    fn aircr_requires_vectkey_and_reads_vectkeystat() {
+        let mut ppb = Ppb::new();
+        let offset = SCB_AIRCR - map::PPB_BASE;
+        // 无 key：PRIS 与复位请求都不得进入读视图。
+        // Without the key neither PRIS nor the reset requests reach the view.
+        assert!(ppb.write32(offset, 0x0000_4004));
+        assert_eq!(
+            ppb.read32(offset),
+            Some(0xFA05_0000),
+            "VECTKEYSTAT only without a key / 无 key 时只读 VECTKEYSTAT"
+        );
+        // 有 key：只保存 PRIS，只写位读 0。
+        // With the key only PRIS is stored; the write-only bits read zero.
+        assert!(ppb.write32(offset, 0x05FA_4004));
+        assert_eq!(ppb.read32(offset), Some(0xFA05_4000));
+        assert!(ppb.write32(offset, 0x05FA_0004));
+        assert_eq!(ppb.read32(offset), Some(0xFA05_0000));
+    }
+
+    #[test]
+    fn shcsr_shadow_keeps_only_the_fault_enables() {
+        let mut ppb = Ppb::new();
+        let offset = SCB_SHCSR - map::PPB_BASE;
+        assert!(ppb.write32(offset, 0xFFFF_FFFF));
+        assert_eq!(
+            ppb.read32(offset),
+            Some(0x0007_0000),
+            "only MEMFAULTENA/BUSFAULTENA/USGFAULTENA are writable / 只有三个故障使能可写"
+        );
+        assert!(ppb.write32(offset, 0));
+        assert_eq!(ppb.read32(offset), Some(0));
+    }
+
+    #[test]
+    fn cfsr_and_hfsr_shadows_are_write_one_to_clear() {
+        let mut ppb = Ppb::new();
+        let cfsr = SCB_CFSR - map::PPB_BASE;
+        let hfsr = SCB_HFSR - map::PPB_BASE;
+        // 模拟核内故障已经写入缓存的状态位。
+        // Simulate fault bits already cached from the core-side fault paths.
+        assert!(ppb.regs.write(cfsr, 0x0009_0001));
+        assert!(ppb.regs.write(hfsr, 0x4000_0002));
+        assert_eq!(ppb.read32(cfsr), Some(0x0009_0001));
+        assert_eq!(ppb.read32(hfsr), Some(0x4000_0002));
+
+        // 写 0 不改变状态；写 1 只清除对应位。
+        // Writing zero changes nothing; writing one clears only those bits.
+        assert!(ppb.write32(cfsr, 0));
+        assert_eq!(ppb.read32(cfsr), Some(0x0009_0001));
+        assert!(ppb.write32(cfsr, 0x0008_0001));
+        assert_eq!(ppb.read32(cfsr), Some(0x0001_0000));
+        assert!(ppb.write32(hfsr, 0x4000_0000));
+        assert_eq!(ppb.read32(hfsr), Some(0x0002));
     }
 
     #[test]

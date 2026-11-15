@@ -56,6 +56,12 @@ impl Machine {
         if self.halt.is_some() {
             return Ok(CpuState::Halted);
         }
+        // 复位请求已锁存：宿主必须先重建机器，继续步进只会执行复位前的旧状态。
+        // A reset request is latched: the host must rebuild the machine first;
+        // stepping further would only execute the stale pre-reset state.
+        if self.system_reset_pending {
+            return Ok(CpuState::Halted);
+        }
         let end = self.steps.saturating_add(max_steps).min(self.budget);
         if end <= self.steps {
             return Ok(CpuState::Halted);
@@ -131,13 +137,15 @@ impl Machine {
                         // 陷阱步与原路径一致：立即泵送中断，不推进时基。
                         // Trap steps mirror the original path: pump interrupts now
                         // and do not advance the timebase.
-                        pump(
+                        if pump(
                             &mut self.core,
                             self.core1.as_mut(),
                             &self.peripherals,
                             &self.usb,
                             &mut self.irqs,
-                        );
+                        ) {
+                            self.system_reset_pending = true;
+                        }
                         // 陷阱步不执行 `after_running_step`：跳过 PPB 回放、自旋
                         // 统计与批次边界工作，与原路径一致。
                         // Trap steps skip `after_running_step`: no PPB replay, spin
@@ -204,7 +212,9 @@ impl Machine {
                         let epoch = self.bus.ppb_write_epoch();
                         if epoch != self.ppb_epoch_seen {
                             self.ppb_epoch_seen = epoch;
-                            replay_system_writes(&mut self.core, &self.peripherals);
+                            if replay_system_writes(&mut self.core, &self.peripherals) {
+                                self.system_reset_pending = true;
+                            }
                         }
                     }
                 }
@@ -266,6 +276,17 @@ impl Machine {
                 self.note_both_sleeping(core0_sleeping && core1_sleeping, !core0_sleeping);
 
                 retired += 1;
+                // 复位请求一旦锁存就停止推进：前端随后重建机器（`run`）或报告
+                // 并停止（`repl`/`play`）。
+                // Stop advancing as soon as a reset request is latched: the
+                // frontend then either rebuilds the machine (`run`) or reports
+                // and stops (`repl`/`play`).
+                if self.system_reset_pending {
+                    self.steps = steps;
+                    self.spin_base = spin_base;
+                    self.spin_steps = spin_steps;
+                    return Ok(CpuState::Halted);
+                }
                 if trapped {
                     break;
                 }

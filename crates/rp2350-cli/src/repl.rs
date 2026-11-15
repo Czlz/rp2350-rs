@@ -22,7 +22,9 @@ use rp2350_usb_host::{
     UsbHostBridge,
 };
 
-use crate::run::{ArchArg, Machine, MachineOptions, PsramOptions, fault_tail_lines};
+use crate::run::{
+    ArchArg, Machine, MachineOptions, PsramOptions, SYSTEM_RESET_MESSAGE, fault_tail_lines,
+};
 
 /// Default total instruction budget for `repl` / `repl` 的默认总指令预算
 pub const DEFAULT_MAX_CYCLES: u64 = 300_000_000;
@@ -139,6 +141,14 @@ pub enum EnumerationError {
         /// Halt reason / 停机原因
         reason: String,
     },
+    /// The guest requested `AIRCR.SYSRESETREQ` while enumerating
+    /// 客户机在枚举期间请求 `AIRCR.SYSRESETREQ`
+    SystemReset {
+        /// Executed steps / 已执行步数
+        steps: u64,
+        /// Last program counter / 最后程序计数器
+        pc: u32,
+    },
 }
 
 impl fmt::Display for EnumerationError {
@@ -182,6 +192,11 @@ impl fmt::Display for EnumerationError {
                 "machine halted during enumeration / 枚举期间机器停机: {reason} \
                  (steps={steps}, PC={pc:#010X})"
             ),
+            Self::SystemReset { steps, pc } => write!(
+                f,
+                "{SYSTEM_RESET_MESSAGE} during enumeration / 枚举期间发生系统复位请求 \
+                 (steps={steps}, PC={pc:#010X})"
+            ),
         }
     }
 }
@@ -198,9 +213,10 @@ impl std::error::Error for EnumerationError {}
 /// 每个 `Wait` 提示都会把 CPU 推进到请求周期（受枚举期限限制）。
 ///
 /// # Errors
-/// Returns [`EnumerationError`] when the guest halts, detaches, fails a control
-/// transfer, or exhausts the enumeration/machine budget. / 客户机停机、设备
-/// 消失、控制传输失败或枚举/机器预算耗尽时返回 [`EnumerationError`]。
+/// Returns [`EnumerationError`] when the guest halts, requests a system reset,
+/// detaches, fails a control transfer, or exhausts the enumeration/machine
+/// budget. / 客户机停机、请求系统复位、设备消失、控制传输失败或枚举/机器预算
+/// 耗尽时返回 [`EnumerationError`]。
 pub fn open_session<'a>(
     machine: &'a mut Machine,
     enum_cycles: u64,
@@ -221,6 +237,17 @@ pub fn open_session<'a>(
                 steps: machine.steps(),
                 pc: machine.pc(),
                 reason: reason.to_string(),
+            });
+        }
+        // 复位请求后机器不再推进，继续等待枚举只会空转；`repl` 的策略是报告并
+        // 停止，而不是像 `run` 那样自动重启。
+        // The machine stops advancing after a reset request, so waiting for
+        // enumeration would only spin; `repl` reports the request and stops
+        // instead of rebooting like `run`.
+        if machine.system_reset_pending() {
+            return Err(EnumerationError::SystemReset {
+                steps: machine.steps(),
+                pc: machine.pc(),
             });
         }
         let now = machine.now_cycles();
@@ -471,6 +498,12 @@ fn effective_max_cycles(max_cycles: u64) -> u64 {
 /// `--max-cycles 0` 表示不限制（`u64::MAX`）；该选项默认值仍为
 /// [`DEFAULT_MAX_CYCLES`]，因此 `repl --exec` 保持原有预算行为。
 ///
+/// A guest `AIRCR.SYSRESETREQ` is reported as
+/// [`SYSTEM_RESET_MESSAGE`] and stops the subcommand with an error; unlike
+/// `run`, `repl` never reboots the machine behind the user's back.
+/// 客户机的 `AIRCR.SYSRESETREQ` 以 [`SYSTEM_RESET_MESSAGE`] 报告，并让子命令带错误
+/// 停止；与 `run` 不同，`repl` 绝不在用户不知情时重启机器。
+///
 /// # Errors
 /// Returns an error when the firmware cannot be loaded, USB enumeration fails,
 /// the raw REPL protocol times out, executed source writes to stderr, or
@@ -551,7 +584,21 @@ pub fn run(options: &ReplOptions) -> Result<()> {
             .map_err(|error| anyhow!("exit raw REPL failed / 退出 raw REPL 失败: {error:?}"))?;
         Ok(())
     })();
+    // 复位请求会让机器停止推进：`repl` 的策略是报告并停止，不自动重启（自动重启
+    // 只属于 `run`）。此时即使 raw REPL 因客户机停走而超时，也以复位请求为准。
+    // A system reset request stops the machine: `repl` reports it and stops
+    // instead of rebooting (automatic restarts belong to `run` only). Even if
+    // the raw REPL timed out because the guest stopped, the reset is the reason.
+    let system_reset = machine.take_system_reset_request();
     machine.finalize();
+    if system_reset {
+        report.line(&format!(
+            "{SYSTEM_RESET_MESSAGE}; stopping / 检测到系统复位请求，停止"
+        ));
+        diagnose_failure(&mut machine);
+        let state = machine_state(&machine);
+        return Err(anyhow::Error::msg(SYSTEM_RESET_MESSAGE).context(state));
+    }
 
     let state = machine_state(&machine);
     match result {

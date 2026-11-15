@@ -19,7 +19,7 @@ const THUMB_BRANCH_SELF: [u8; 2] = [0xFE, 0xE7];
 
 /// Build a minimal little-endian ELF32 with one `PT_LOAD` per tuple entry
 /// 为元组中的每一项构建一个带 `PT_LOAD` 的最小 LE ELF32 文件
-fn build_elf(entry: u32, segments: &[(u32, &[u8], u32)]) -> Vec<u8> {
+pub(crate) fn build_elf(entry: u32, segments: &[(u32, &[u8], u32)]) -> Vec<u8> {
     const EHDR_SIZE: usize = 52;
     const PHDR_SIZE: usize = 32;
     let phnum = segments.len();

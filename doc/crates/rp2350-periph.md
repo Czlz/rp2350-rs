@@ -2284,6 +2284,88 @@ pico-sdk 的 `flash_init_boot2_copyout` 能立即返回，而本模型保持 Fla
 
 ---
 
+## PPB (private peripheral bus) / 私有外设总线
+
+`ppb::Ppb` owns the 4 KB window at `0xE000_0000`. `CPUID` reports a Cortex-M33
+part number, the SysTick registers are backed by `SysTickCounter` (which follows
+the live clock tree), and every other word is storage so a firmware `ldr`/`str`
+never faults on an unmodelled SCB/MPU field.
+`ppb::Ppb` 拥有 `0xE000_0000` 处的 4 KB 窗口。`CPUID` 报告 Cortex-M33 部件号，
+SysTick 寄存器由跟随实时时钟树的 `SysTickCounter` 支撑，其余字都是存储，因此固件
+对未建模 SCB/MPU 字段的 `ldr`/`str` 不会触发故障。
+
+### Replay list / 回放清单
+
+Writes to registers whose behaviour lives in `rp2350-arm` are appended to a
+shared log (`SystemWriteLog`) and drained by the driver through
+`CpuCore::system_write` before the next instruction (PPB write epoch) or at the
+boot-ROM trap pump. Firmware-side configuration therefore takes effect
+immediately, exactly like a real store into the system control space.
+行为属于 `rp2350-arm` 的寄存器写入会追加到共享日志（`SystemWriteLog`），驱动在
+下一条指令前（PPB 写世代）或 boot ROM 陷阱泵送时通过 `CpuCore::system_write`
+排空。因此固件侧配置立即生效，与真实写入系统控制空间一致。
+
+| Register / 寄存器 | Address / 地址 | Replayed semantics / 回放语义 |
+|-------------------|----------------|-------------------------------|
+| `SCB_VTOR` | `0xE000_ED08` | Vector table base (low 7 bits reserved) / 向量表基址（低 7 位保留） |
+| `SCB_ICSR` | `0xE000_ED04` | NMI/PendSV/SysTick pending set/clear / NMI/PendSV/SysTick 挂起置位与清除 |
+| `SCB_AIRCR` | `0xE000_ED0C` | `VECTKEY` gate, `PRIS`, `SYSRESETREQ`/`VECTRESET` latches / `VECTKEY` 门控、`PRIS`、复位锁存 |
+| `SCB_SCR` | `0xE000_ED10` | `SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND` / 睡眠与事件位 |
+| `SCB_SHPR2` | `0xE000_ED1C` | SVCall priority / SVCall 优先级 |
+| `SCB_SHPR3` | `0xE000_ED20` | PendSV and SysTick priorities / PendSV 与 SysTick 优先级 |
+| `SCB_SHCSR` | `0xE000_ED24` | `MEMFAULTENA`/`BUSFAULTENA`/`USGFAULTENA`; `*ACT`/`SVCALLPENDED` are live core views / 三个故障使能；活跃与挂起位为核内实时视图 |
+| `SCB_CFSR` | `0xE000_ED28` | MMFSR/BFSR/UFSR status, write-one-to-clear / 故障状态，写 1 清零 |
+| `SCB_HFSR` | `0xE000_ED2C` | `VECTTBL`/`FORCED`/`DEBUGEVT`, write-one-to-clear / 写 1 清零 |
+| `SCB_CPACR` | `0xE000_ED88` | CP0–CP7 (GPIOC/DCP) and CP10–CP11 (FPU) keys / 协处理器访问键 |
+| `SCB_STIR` | `0xE000_EF00` | Software-triggered external interrupt / 软件触发外部中断 |
+| NVIC | `0xE000_E100..=0xE000_E4FF` | `ISER`/`ICER`/`ISPR`/`ICPR`/`IPR` / NVIC 使能、挂起与优先级 |
+
+SysTick (`0xE000_E010..=0xE000_E01C`), `CPUID` and every unmodelled SCB/MPU word
+stay local to the PPB: replaying the SysTick counter would make it tick twice.
+SysTick（`0xE000_E010..=0xE000_E01C`）、`CPUID` 与所有未建模 SCB/MPU 字只留在
+PPB 内：回放 SysTick 计数器会让它重复计时。
+
+### Read-back shadow / 读回影子
+
+`SHCSR`, `CFSR`, `HFSR` and `AIRCR` are architecturally owned by the core, so the
+PPB keeps a **cache only** and applies the same write rules the core applies.
+`SHCSR` stores the three fault enables (`0x0007_0000`); `CFSR`/`HFSR` are
+write-one-to-clear (writing 0 changes nothing); an `AIRCR` write is accepted only
+when `bits[31:16] == 0x05FA` and then stores `PRIS` only. `AIRCR` always reads
+`VECTKEYSTAT = 0xFA05_0000` and the write-only reset requests read as zero. The
+cache never becomes a second source of truth: fault escalation, live `*ACT`/
+`SVCALLPENDED` views and the reset latch are computed inside `rp2350-arm`.
+`SHCSR`、`CFSR`、`HFSR` 与 `AIRCR` 架构上属于核，因此 PPB 只保留**缓存**，并套用
+核的写入规则。`SHCSR` 保存三个故障使能（`0x0007_0000`）；`CFSR`/`HFSR` 写 1
+清零（写 0 不变）；`AIRCR` 仅当 `bits[31:16] == 0x05FA` 时接受写入，且只保存
+`PRIS`。`AIRCR` 恒读 `VECTKEYSTAT = 0xFA05_0000`，只写的复位请求读 0。缓存绝不
+成为第二真相源：故障升级、`*ACT`/`SVCALLPENDED` 实时视图与复位锁存都在
+`rp2350-arm` 内计算。
+
+A write without `VECTKEY` is ignored by the core and leaves both the cache and the
+reset latch unchanged, which is why `firmware` disassembly that clears `PRIS`
+with a bare `0x0000_xxxx` store has no effect.
+无 `VECTKEY` 的写入被核忽略，缓存与复位锁存都不变，因此用裸 `0x0000_xxxx` 写入
+清 `PRIS` 的固件不会有任何效果。
+
+### System reset request / 系统复位请求
+
+`AIRCR.SYSRESETREQ` is latched by `FaultState` and read through
+`CortexM33Core::take_system_reset_request()` (one-shot; repeated polls return
+`false`). `rp2350-cli::run::Machine::take_system_reset_request()` polls both
+Cortex-M33 cores and stops advancing the machine, precisely so a frontend can
+act before the guest executes more pre-reset code. `run` rebuilds the machine
+from the same image at most 3 times, while `repl`/`play` report and stop; the
+policy is documented in [`rp2350-cli.md`](rp2350-cli.md).
+`AIRCR.SYSRESETREQ` 由 `FaultState` 锁存，经
+`CortexM33Core::take_system_reset_request()` 读取（一次性；重复轮询返回
+`false`）。`rp2350-cli::run::Machine::take_system_reset_request()` 轮询两个
+Cortex-M33 核并停止推进机器，正是为了让前端在客户机执行更多复位前代码之前响应。
+`run` 用同一映像最多重建 3 次，`repl`/`play` 报告并停止；策略见
+[`rp2350-cli.md`](rp2350-cli.md)。
+
+---
+
 ## USB Controller
 
 ```rust

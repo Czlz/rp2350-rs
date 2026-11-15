@@ -2,9 +2,14 @@
 //! `run` 子命令：构建 Stage 4 总线、加载固件、启动并输出轨迹
 
 // 前端地址常量与映像偏移都在 32 位客户机地址空间内换算，这是模拟器前端的固有特性。
+// 机器同时携带多个独立的布尔状态位（严格译码、boot ROM 适用性、收尾标志、复位
+// 请求），它们来自不同生命周期，合并成状态机会让每步路径多一次匹配。
 // Frontend address constants and image offsets are converted within the 32-bit
-// guest address space, inherent to emulator-frontend address arithmetic.
-#![allow(clippy::cast_possible_truncation)]
+// guest address space, inherent to emulator-frontend address arithmetic. The
+// machine carries several independent boolean state bits (strict decode, boot
+// ROM applicability, finalization, reset request) from different lifecycles;
+// folding them into a state machine would add a match to every step.
+#![allow(clippy::cast_possible_truncation, clippy::struct_excessive_bools)]
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -71,6 +76,16 @@ const TAIL_TRACE_STEPS: usize = 32;
 /// Reason reported when the instruction budget runs out
 /// 指令预算耗尽时报告的原因
 const BUDGET_REASON: &str = "instruction budget exhausted / 指令预算耗尽";
+
+/// Diagnostic emitted when firmware requests `AIRCR.SYSRESETREQ`
+/// 固件请求 `AIRCR.SYSRESETREQ` 时输出的诊断
+///
+/// `run`, `repl` and `play` share this exact text so the host reaction is
+/// recognisable across frontends: `run` reboots the machine (at most three
+/// times), while `repl` and `play` stop.
+/// `run`、`repl` 与 `play` 共用这段文本，使宿主响应在各前端间可识别：`run`
+/// 重启机器（最多三次），`repl` 与 `play` 则停止。
+pub const SYSTEM_RESET_MESSAGE: &str = "system reset requested (AIRCR.SYSRESETREQ)";
 
 /// Consecutive steps with both cores asleep before a diagnostic is printed
 /// 双核同时睡眠多少步后打印诊断
@@ -551,6 +566,9 @@ pub struct Machine {
     sio_events_seen: u32,
     /// Consecutive steps with both cores asleep / 双核同时睡眠的连续步数
     both_sleeping_steps: u64,
+    /// Latched `AIRCR.SYSRESETREQ` not yet taken by the frontend
+    /// 尚未被前端取走的 `AIRCR.SYSRESETREQ` 锁存
+    system_reset_pending: bool,
 }
 
 impl Machine {
@@ -716,6 +734,7 @@ impl Machine {
             was_sleeping: [false; 2],
             sio_events_seen: 0,
             both_sleeping_steps: 0,
+            system_reset_pending: false,
         })
     }
 
@@ -956,6 +975,69 @@ impl Machine {
     #[must_use]
     pub fn budget_exhausted(&self) -> bool {
         self.steps >= self.budget
+    }
+
+    /// Whether a guest `AIRCR.SYSRESETREQ` is waiting for the frontend
+    /// 是否有等待前端处理的客户机 `AIRCR.SYSRESETREQ`
+    ///
+    /// Once this returns `true` the machine stops advancing: the reset has been
+    /// requested and the host must rebuild it. The latch is one-shot and is
+    /// consumed by [`Self::take_system_reset_request`].
+    /// 返回 `true` 后机器不再推进：复位已被请求，宿主必须重建机器。锁存为一次性，
+    /// 由 [`Self::take_system_reset_request`] 取走。
+    #[must_use]
+    pub fn system_reset_pending(&self) -> bool {
+        self.system_reset_pending
+    }
+
+    /// Take a latched `AIRCR.SYSRESETREQ` request from either core
+    /// 取走任一核心锁存的 `AIRCR.SYSRESETREQ` 请求
+    ///
+    /// Both Cortex-M33 cores share the chip-level reset line, so a request from
+    /// core 1 is just as fatal as one from core 0; the RISC-V core has no
+    /// `AIRCR` and therefore never reports one. Polling also drains any latch
+    /// written by a host-side `CpuCore::system_write` that no step has replayed
+    /// yet. Repeated calls return `false` until firmware requests another reset.
+    /// 两个 Cortex-M33 核心共享芯片级复位线，因此 core1 的请求与 core0 同样致命；
+    /// RISC-V 核心没有 `AIRCR`，永不报告。轮询还会取走宿主直接通过
+    /// `CpuCore::system_write` 写入、尚未被任何一步回放的锁存。重复调用返回
+    /// `false`，直到固件再次请求复位。
+    pub fn take_system_reset_request(&mut self) -> bool {
+        self.detect_system_reset();
+        std::mem::take(&mut self.system_reset_pending)
+    }
+
+    /// Rebuild every bus region, peripheral and core from the same image
+    /// 用同一映像重建全部总线区域、外设与核心
+    ///
+    /// This is a cold reboot: flash, SRAM, clocks, peripherals, both cores, the
+    /// step counter, the IRQ/trap logs and every diagnostic counter return to
+    /// their post-reset values. The image bytes and options are the ones passed
+    /// to [`Self::new`], so a frontend can honour `AIRCR.SYSRESETREQ` without
+    /// keeping a second copy of the boot code around.
+    /// 这是一次冷重启：Flash、SRAM、时钟、外设、两个核心、步数计数器、IRQ/陷阱
+    /// 日志与所有诊断计数都回到复位后的值。映像字节与选项就是传给 [`Self::new`]
+    /// 的那一份，因此前端无需另存启动代码即可响应 `AIRCR.SYSRESETREQ`。
+    ///
+    /// # Errors
+    /// Returns the same boot errors as [`Self::new`].
+    /// 返回与 [`Self::new`] 相同的启动错误。
+    pub fn reboot(&mut self, bytes: &[u8], options: &MachineOptions) -> Result<()> {
+        *self = Self::new(bytes, options)?;
+        Ok(())
+    }
+
+    /// Drain both cores' `AIRCR.SYSRESETREQ` latches into the machine flag
+    /// 把两个核心的 `AIRCR.SYSRESETREQ` 锁存汇入机器标志
+    fn detect_system_reset(&mut self) {
+        if take_core_system_reset(&mut self.core) {
+            self.system_reset_pending = true;
+        }
+        if let Some(core1) = self.core1.as_mut() {
+            if core1.take_system_reset_request() {
+                self.system_reset_pending = true;
+            }
+        }
     }
 
     /// Non-budget halt reason, if the machine stopped / 非预算原因的停机原因
@@ -1369,7 +1451,7 @@ impl Machine {
     /// 通过 [`Self::step_cores`] 获得。
     pub fn run_cycles(&mut self, cycles: u64) {
         let target = self.steps.saturating_add(cycles).min(self.budget);
-        while self.steps < target && self.halt.is_none() {
+        while self.steps < target && self.halt.is_none() && !self.system_reset_pending {
             match self.run_steps(target - self.steps) {
                 Ok(CpuState::Running) => {}
                 Ok(_) => break,
@@ -1410,7 +1492,10 @@ impl Machine {
         core1: bool,
         trace: Option<usize>,
     ) -> Result<CpuState> {
-        if self.halt.is_some() || self.budget_exhausted() {
+        // 复位请求已锁存后，宿主必须先重建机器；继续步进只会执行旧状态。
+        // Once a reset request is latched the host must rebuild the machine;
+        // stepping further would only execute the stale pre-reset state.
+        if self.halt.is_some() || self.budget_exhausted() || self.system_reset_pending {
             return Ok(CpuState::Halted);
         }
         // 核心之间的 SIO 事件与 SEV 转发必须在推进任何核心之前发生，使同一步内
@@ -1511,11 +1596,14 @@ impl Machine {
             };
         self.peripherals.sio().select_core(CpuId::Core0);
         // 按写入核心回放 PPB 系统写入：core1 的 CPACR/VTOR/NVIC 属于它自己。
+        // core1 写 AIRCR.SYSRESETREQ 同样复位整颗芯片，因此也必须上报。
         // Replay PPB system writes into the writing core: core 1's CPACR, VTOR
-        // and NVIC belong to core 1.
+        // and NVIC belong to core 1. A core-1 AIRCR.SYSRESETREQ resets the whole
+        // chip, so it is reported as well.
         for (addr, value) in self.peripherals.take_system_writes() {
             core1.system_write(addr, value);
         }
+        let reset_requested = core1.take_system_reset_request();
         match result {
             Ok(CpuState::Running) => {}
             // 睡眠的 core1 不是故障：机器时间照常推进，唤醒条件在下一步检查。
@@ -1530,6 +1618,9 @@ impl Machine {
             Err(reason) => {
                 self.core1_halt = Some(reason);
             }
+        }
+        if reset_requested {
+            self.system_reset_pending = true;
         }
         true
     }
@@ -1603,13 +1694,15 @@ impl Machine {
                 // 陷阱步与原 run 路径一致：立即泵送中断，不在此处推进时基。
                 // Trap steps mirror the original run path: pump interrupts now and
                 // do not advance the timebase here.
-                pump(
+                if pump(
                     &mut self.core,
                     self.core1.as_mut(),
                     &self.peripherals,
                     &self.usb,
                     &mut self.irqs,
-                );
+                ) {
+                    self.system_reset_pending = true;
+                }
                 return Ok(CpuState::Running);
             }
         }
@@ -1634,13 +1727,15 @@ impl Machine {
                     // 轨迹步与原 run 路径一致：每步泵送中断，不做自旋统计或时基推进。
                     // Trace steps mirror the original run path: pump every step and
                     // skip spin accounting and timebase advancement.
-                    pump(
+                    if pump(
                         &mut self.core,
                         self.core1.as_mut(),
                         &self.peripherals,
                         &self.usb,
                         &mut self.irqs,
-                    );
+                    ) {
+                        self.system_reset_pending = true;
+                    }
                 } else {
                     let pc = self.core.pc();
                     self.after_running_step(Some(pc));
@@ -1732,7 +1827,9 @@ impl Machine {
         let epoch = self.bus.ppb_write_epoch();
         if epoch != self.ppb_epoch_seen {
             self.ppb_epoch_seen = epoch;
-            replay_system_writes(&mut self.core, &self.peripherals);
+            if replay_system_writes(&mut self.core, &self.peripherals) {
+                self.system_reset_pending = true;
+            }
         }
         if self.steps - self.pumped >= PUMP_INTERVAL {
             self.peripherals.service_core1_peer();
@@ -1903,70 +2000,8 @@ pub fn run(options: &RunOptions) -> Result<()> {
         )
     })?;
 
-    let machine_options = MachineOptions {
-        arch: options.arch,
-        max_cycles: options.max_cycles,
-        strict_decode: options.strict_decode,
-        psram: options.psram,
-    };
-    let mut machine = Machine::new(&bytes, &machine_options)?;
-
     let mut stdout = std::io::stdout();
-    writeln!(stdout, "[run] {}", machine.image_description())?;
-    writeln!(stdout, "[run] core: {}", machine.core_description())?;
-    if let Some((sp, pc)) = machine.boot_vectors() {
-        writeln!(stdout, "[run] boot vectors: SP={sp:#010X} PC={pc:#010X}")?;
-    }
-    writeln!(
-        stdout,
-        "[run] started: PC={:#010X} SP={:#010X}",
-        machine.pc(),
-        machine.sp()
-    )?;
-
-    for index in 0..options.trace_steps {
-        let state = machine.trace_step(index)?;
-        drain_notices(&mut machine, &mut stdout)?;
-        if state != CpuState::Running {
-            break;
-        }
-    }
-    while machine.halt_reason().is_none() && !machine.budget_exhausted() {
-        let state = machine.run_steps(machine.budget() - machine.steps())?;
-        if machine.notices_pending() {
-            drain_notices(&mut machine, &mut stdout)?;
-        }
-        if state != CpuState::Running {
-            break;
-        }
-    }
-    machine.finalize();
-
-    let reason = machine
-        .halt_reason()
-        .map_or_else(|| BUDGET_REASON.to_string(), str::to_owned);
-    writeln!(stdout, "[run] halt: {reason}")?;
-    for (step, pc, opcode) in machine.recent_steps() {
-        writeln!(stdout, "[tail] {step:06} PC={pc:#010X} op={opcode:#06X}")?;
-    }
-    writeln!(
-        stdout,
-        "[run] executed {steps} steps, {us} us simulated, final PC={pc:#010X}",
-        steps = machine.steps(),
-        us = machine.time_us(),
-        pc = machine.pc()
-    )?;
-    print_post_mortem(&mut machine, &mut stdout)?;
-    write_dumps(&mut machine, &options.dumps)?;
-    for dump in &options.dumps {
-        writeln!(
-            stdout,
-            "[run] dump {:#010X}+{:#X} -> {}",
-            dump.address,
-            dump.length,
-            dump.path.display()
-        )?;
-    }
+    reset::execute(&bytes, options, &mut stdout)?;
     stdout.flush()?;
     Ok(())
 }
@@ -2231,25 +2266,45 @@ fn load_image(
 /// Used on boot ROM traps and traced steps, where the original `run` loop
 /// pumped every step. The untraced hot path uses the two halves separately so
 /// system writes take effect immediately while IRQ lines stay throttled.
+/// Returns whether either core latched an `AIRCR.SYSRESETREQ` request.
 /// 用于 boot ROM 陷阱与轨迹步（原 `run` 循环每步都泵送）。无轨迹的热路径分开
-/// 调用两半：系统写入立即生效，中断线保持节流。
+/// 调用两半：系统写入立即生效，中断线保持节流。返回任一核心是否锁存了
+/// `AIRCR.SYSRESETREQ` 请求。
 fn pump(
     core: &mut CoreHandle,
-    core1: Option<&mut CortexM33Core>,
+    mut core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
     irq_log: &mut Vec<String>,
-) {
+) -> bool {
     peripherals.service_core1_peer();
-    replay_system_writes(core, peripherals);
+    let mut reset = replay_system_writes(core, peripherals);
+    if let Some(peer) = core1.as_deref_mut() {
+        reset |= peer.take_system_reset_request();
+    }
     deliver_irqs(core, core1, peripherals, usb, irq_log);
+    reset
 }
 
-/// Replay PPB system writes into the core
-/// 将 PPB 系统写入回放到核
-fn replay_system_writes(core: &mut dyn CpuCore, peripherals: &BootPeripherals) {
+/// Replay PPB system writes into the core and report a latched reset request
+/// 将 PPB 系统写入回放到核，并报告锁存的复位请求
+fn replay_system_writes(core: &mut CoreHandle, peripherals: &BootPeripherals) -> bool {
     for (addr, value) in peripherals.take_system_writes() {
         core.system_write(addr, value);
+    }
+    take_core_system_reset(core)
+}
+
+/// Take a latched `AIRCR.SYSRESETREQ` from one core handle
+/// 从一个核心句柄取走锁存的 `AIRCR.SYSRESETREQ`
+///
+/// The RISC-V core has no system control space of its own, so it can never
+/// report one.
+/// RISC-V 核心没有自己的系统控制空间，因此永远不会报告该请求。
+fn take_core_system_reset(core: &mut CoreHandle) -> bool {
+    match core {
+        CoreHandle::Arm(core) => core.take_system_reset_request(),
+        CoreHandle::RiscV(_) => false,
     }
 }
 
@@ -2324,6 +2379,9 @@ fn log_irq(irq_log: &mut Vec<String>, core: &str, irq: u16, pc: u32) {
 mod batch;
 #[cfg(test)]
 mod psram_tests;
+mod reset;
+#[cfg(test)]
+mod reset_tests;
 #[cfg(test)]
 mod sleep_tests;
 mod systick;

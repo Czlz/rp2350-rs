@@ -131,6 +131,26 @@ busy=… chain=… treq=…` 通道快照，最后是 core1 行。`Machine` 按 
 （每 64 步）以 periph 的像素时钟节拍泵送 HSTX，因此健康的 60 Hz 扫描每帧让
 `words` 增加约 134 400，且 `underruns=0`、`wof=false`、`unknown=0`。
 
+#### System reset requests / 系统复位请求
+
+A firmware store of `VECTKEY | SYSRESETREQ` into `SCB_AIRCR` is replayed into
+the core, where it latches a one-shot reset request. `run` prints
+`[run] system reset requested (AIRCR.SYSRESETREQ)` and then rebuilds the whole
+`Machine` from the same image (`[run] reboot 1/3: PC=… SP=…`): flash, SRAM,
+clocks, peripherals, both cores and every step/IRQ/trap/diagnostic counter start
+over. Up to **3** restarts are honoured; the next request stops the command with
+a `reset storm: guest requested AIRCR.SYSRESETREQ 4 times, more than the 3
+restart limit` error. `--dump` files describe the final boot.
+固件向 `SCB_AIRCR` 写入 `VECTKEY | SYSRESETREQ` 后，写入会回放到核并锁存为一次性
+复位请求。`run` 打印 `[run] system reset requested (AIRCR.SYSRESETREQ)`，随后用
+同一映像重建整个 `Machine`（`[run] reboot 1/3: PC=… SP=…`）：Flash、SRAM、时钟、
+外设、两个核心以及全部步数/中断/陷阱/诊断计数都从头开始。最多响应 **3** 次重启；
+下一次请求以 `reset storm: guest requested AIRCR.SYSRESETREQ 4 times, more than
+the 3 restart limit` 错误停止命令。`--dump` 写的是最后一次启动的内存。
+A write without `VECTKEY = 0x05FA` is ignored by the core (and by the PPB
+read-back cache), so it never reaches the latch.
+无 `VECTKEY = 0x05FA` 的写入被核（以及 PPB 读回缓存）忽略，永远不会进入锁存。
+
 Each `--dump` request then writes its bytes and prints
 `[run] dump 0x<addr>+0x<len> -> <path> (<n> bytes)`. This is the fastest way to
 capture a firmware framebuffer without attaching GDB; the concrete address of a
@@ -170,6 +190,23 @@ interactive line-based session. Enumeration failures print the host bridge's
 `HostProgress::Configured`（须在 `--enum-cycles` 内），进入 raw REPL，随后
 要么执行 `--exec` 并打印 stdout/stderr，要么进入交互式按行会话。枚举失败
 会打印主机桥的 `progress_line` 快照与故障尾部诊断。
+
+#### System reset requests / 系统复位请求
+
+`repl` never reboots the machine behind the user's back. A guest store of
+`VECTKEY | SYSRESETREQ` into `SCB_AIRCR` is replayed into the core, the machine
+stops advancing, and the subcommand reports
+`system reset requested (AIRCR.SYSRESETREQ)` on the diagnostic stream and exits
+with an error. During enumeration this is a `SystemReset` enumeration error;
+during the raw REPL phase the same diagnostic is printed before the fault-tail
+dump. A write without `VECTKEY = 0x05FA` is ignored by the core and never reaches
+the latch. Use `run` when the image is expected to reset itself.
+`repl` 绝不在用户不知情时重启机器。客户机向 `SCB_AIRCR` 写入
+`VECTKEY | SYSRESETREQ` 后，写入回放到核，机器停止推进，子命令在诊断流上报告
+`system reset requested (AIRCR.SYSRESETREQ)` 并带错误退出。枚举期间这是
+`SystemReset` 枚举错误；raw REPL 阶段会在故障尾部转储前打印同一条诊断。无
+`VECTKEY = 0x05FA` 的写入被核忽略，永不进入锁存。若映像预期会自我复位，请使用
+`run`。
 
 #### `--stdio` transparent bridge / 透明桥接
 
@@ -393,6 +430,13 @@ until the machine halts or the process is killed. A frame buffer that cannot be
 read completely (unmapped window) prints `[play] warn: frame buffer unreadable`
 once and the affected pixels are black; nothing panics.
 
+`play` also **never reboots**: a guest `AIRCR.SYSRESETREQ` makes the current
+frame stop with `system reset requested (AIRCR.SYSRESETREQ)`, the worker
+publishes the frame reached so far and the session ends with `halted=system
+reset requested (AIRCR.SYSRESETREQ)` in `[play] summary`. This keeps the window,
+input state and audio tap owned by the host instead of silently resetting the
+image under the player.
+
 Measured on `emerald.uf2` with `example/gba/profile.conf`
 (`--profile example/gba/profile.conf --frames 20`): **11.7–12.5 fps /
 29.3–31.2 M steps/s** (two runs), 20 frames in 1.6–1.7 s wall clock. Before the
@@ -402,6 +446,10 @@ measured 8.26 fps.
 帧缓冲并为每帧打印一行。`--frames N` 跑满 N 帧后以状态码 0 退出；不带该参数时
 运行到机器停机或进程被杀。帧缓冲读不全（窗口未映射）时只打印一次
 `[play] warn: frame buffer unreadable`，缺失像素为黑色，不会 panic。
+`play` 同样**绝不自动重启**：客户机发出 `AIRCR.SYSRESETREQ` 时当前帧以
+`system reset requested (AIRCR.SYSRESETREQ)` 停止，worker 发布已到达的帧，会话以
+`[play] summary` 中的 `halted=system reset requested (AIRCR.SYSRESETREQ)` 结束。
+窗口、输入状态与音频 tap 始终由宿主掌控，不会在玩家不知情时重置映像。
 `emerald.uf2` + `example/gba/profile.conf` 实测：**11.7–12.5 fps /
 29.3–31.2 M steps/s**（两次运行），20 帧约 1.6–1.7 秒墙钟。第四轮批量步进与按字
 `read_block` 之前，同一命令为 8.26 fps。
