@@ -40,12 +40,12 @@
 >
 > | ID | 任务 / Task | 归属 / Crates | 依赖 / Depends | 状态 |
 > |----|-------------|---------------|----------------|------|
-> | GAP-01a | `IO_BANK0` `FUNCSEL` 寄存器语义与访问器 | periph | — | 🚧 进行中（wave 1） |
-> | GAP-01b | PIO/SIO 引脚按 `FUNCSEL` 路由到 pad | periph | GAP-01a | ⏳ |
-> | GAP-02 | GDB 多核线程表与 `vCont`/`thread:` | gdb + cli | — | 🚧 进行中（wave 1） |
+> | GAP-01a | `IO_BANK0` `FUNCSEL` 寄存器语义与访问器 | periph | — | ✅ |
+> | GAP-01b | PIO/SIO 引脚按 `FUNCSEL` 路由到 pad | periph | GAP-01a | ✅ |
+> | GAP-02 | GDB 多核线程表与 `vCont`/`thread:` | gdb + cli | — | ✅ |
 > | GAP-03 | ARM `SMLALxy` + `FPCCR` 惰性压栈剩余位 | arm | — | ⏳ wave 2 |
-> | GAP-04 | RISC-V 非法 CSR 陷阱 + ROM 表项 + `misa.B` | riscv | — | ⏳ wave 2 |
-> | GAP-05 | USB 主机 1 ms SOF 调度 + 双缓冲 OUT | usb-host + usb | — | ⏳ wave 3 |
+> | GAP-04 | RISC-V 非法 CSR 陷阱 + ROM 表项 + `misa.B` | riscv + bootrom | — | ✅ |
+> | GAP-05 | USB 主机 1 ms SOF 调度 + 双缓冲 OUT | usb-host + usb | — | ✅ |
 > | GAP-06 | HSTX TMDS/像素捕获 API + 原始路径计时 | periph | — | ⏳ wave 3 |
 > | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ，重新落地 `WFI`/`WFE` | periph → arm/cli | GAP-07a | ⏳ wave 4 |
 > | GAP-08 | PSRAM XIP 接入 QMI | virt-periph + periph | — | ⏳ wave 4 |
