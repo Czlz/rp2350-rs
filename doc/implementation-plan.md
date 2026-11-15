@@ -42,42 +42,56 @@
 > [playability-plan.md](playability-plan.md); the new gaps GAP-13…GAP-17 are in the skill's
 > GAP table. **Performance is the primary blocker**: 3.0 M steps/s now vs ≥50 M needed.
 
-> **P1 任务队列 / Task queue（主会话拆分，子会话实现）**
+> **任务队列 / Task queue（主会话拆分，子会话实现）**
 >
-> 规则见 `.trae/rules/project.md` 的「角色边界」与「子会话使用规则」：主会话只做分析、
-> 拆分、派发与验收；**一个任务 = 一个全新子会话**，禁止复用已完成的会话。
+> 规则见 `.trae/rules/project.md` 的「角色边界」「子会话使用规则」与
+> 「定位：精确时钟与精确指令优先（强制）」：主会话只做分析、拆分、派发与验收；
+> **一个任务 = 一个全新子会话**，禁止复用已完成的会话；**不做 JIT**，精度优先。
 >
-> | ID | 任务 / Task | 归属 / Crates | 依赖 / Depends | 状态 |
-> |----|-------------|---------------|----------------|------|
-> | GAP-01a | `IO_BANK0` `FUNCSEL` 寄存器语义与访问器 | periph | — | ✅ |
-> | GAP-01b | PIO/SIO 引脚按 `FUNCSEL` 路由到 pad | periph | GAP-01a | ✅ |
-> | GAP-02 | GDB 多核线程表与 `vCont`/`thread:` | gdb + cli | — | ✅ |
-> | GAP-03 | ARM `SMLALxy` + `FPCCR` 行为位（TS/CLRONRET） | arm | — | ✅ |
-> | GAP-04 | RISC-V 非法 CSR 陷阱 + ROM 表项 + `misa.B` | riscv + bootrom | — | ✅ |
-> | GAP-05 | USB 主机 1 ms SOF 调度 + 双缓冲 OUT | usb-host + usb | — | ✅ |
-> | GAP-06 | HSTX 原始路径计时 + 像素捕获 API | periph | — | ✅ |
-> | GAP-02b | `Machine` 按核步进，`vCont;s:1/s:2` 只推进选中核 | cli + gdb | GAP-02 | ✅ |
-| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ，重新落地 `WFI`/`WFE` | periph → arm/cli | GAP-07a | ⏳ wave 4 |
-> | GAP-08 | PSRAM（XIP CS1）内存模型 + 挂载助手 | periph | — | ✅（CLI 接线见 GAP-08b） |
-> | GAP-08b | CLI 挂载 PSRAM 窗口（`run`/`repl` 地址映射） | cli | GAP-08 | ⏳ wave 5 |
-| GAP-09 | egui 设备调色板 + 画布持久化 | egui | — | ✅ |
-> | GAP-10 | MCP TLS 传输 | mcp | — | ⏳ wave 5 |
-> | GAP-11 | DMA `SNIFF` 其余模式 / 周期精确仲裁 / PERFCTR | periph | — | ⏳ wave 6 |
-> | GAP-12 | 文档陈旧段落同步 | doc | — | 🚧 主会话直接改 |
+> | ID | 任务 / Task | 归属 / Crates | 状态 |
+> |----|-------------|---------------|------|
+> | GAP-01a/01b | `IO_BANK0` FUNCSEL + PIO/SIO 引脚矩阵 | periph | ✅ |
+> | GAP-02/02b | GDB 多核线程、`vCont` 按核步进、混合动作列表 | gdb + cli | ✅ |
+> | GAP-03 | ARM `SMLALxy` + `FPCCR` 行为位 | arm | ✅ |
+> | GAP-04 | RISC-V 非法 CSR + ROM 表 + `misa.B` | riscv + bootrom | ✅ |
+> | GAP-05 | USB 1 ms SOF + 双缓冲 OUT | usb-host + usb | ✅ |
+> | GAP-06 | HSTX 原始路径计时 + 像素捕获 | periph | ✅ |
+> | GAP-07 | 阻塞 FIFO/IRQ + `WFI`/`WFE`/`SEV` + 睡眠调度 | periph → arm/riscv/cli | ✅ |
+> | GAP-08/08b | PSRAM 模型 + CLI `--psram` 挂载 | periph + cli | ✅ |
+> | GAP-09 | egui 调色板 + 画布持久化 | egui | ✅ |
+> | GAP-10 | MCP TLS 传输 | mcp | ⏳ 未开始（需引入 rustls 依赖，优先级最低） |
+> | GAP-11 | DMA `CALC` 6 模式 + `PERFCTR` + 总线记账 | periph | ✅ |
+> | GAP-12 | 文档陈旧段落同步 | doc | 🚧 主会话 |
+> | GAP-18 | 时钟精度（PLL/分频/超频） | periph + core + cli + usb-host | ✅（P4-1/P4-2） |
+> | P1-1/2/3 | `play` worker、egui PlayView、示例 profile | cli + egui + example | ✅ |
+> | P2-1/2/3 | I2S 捕获、`rp2350-audio`、GUI 音频输出 | periph + audio + egui | ✅ |
+> | P3-1 | CLI 挂载 PSRAM（= GAP-08b） | cli | ✅ |
+> | P3-3 | 长时间 soak（headless，≥30 分钟模拟时间） | 主会话 | ⏳ |
+> | P4-1 | 时钟树（XOSC/ROSC/PLL/CLOCKS + 超频） | periph + core | ✅ |
+> | P4-2 | 动态频率接入全部计时消费者 | periph + core + cli + usb-host | ✅ |
+> | P4-2b | SysTick/PendSV 异常号与向量 | arm + periph | ✅ |
+> | P4-2c | CLI 转发 SysTick 挂起 | cli | ✅ |
+> | P4-2d | SVCall/HardFault/NMI/故障升级 | arm | ✅ |
+> | P4-2e | PPB 故障寄存器回放 + `SYSRESETREQ` 策略 | periph + cli | 🚧 |
+> | P4-2f | `CCR` 陷阱（未对齐/除零）+ `SHPR1` | arm | 🚧 |
+> | P4-3 | 时钟频率回归矩阵（150/252/降频/源切换）+ 文档 | 主会话 | ⏳ |
+> | GAP-19 | MCP TLS（可选安全加固） | mcp | ⏳ |
+> | GAP-20 | SysTick 投递时延收紧（10 064 步 → 逐周期） | periph + cli | ⏳ 已知限制 |
 >
-> **验收记录 / Acceptance（2026-11-15，wave 1–4）**
+> **验收记录 / Acceptance（2026-11-16）**
 >
-> 全仓 `cargo fmt --check` / `clippy --all-targets --all-features -D warnings -W pedantic`
-> / `cargo test --all-features`（36 个测试目标）/ `cargo doc --no-deps` 全绿；FV-1/2/3 均
-> `stdout: 42`；emerald 300M 步 135 s 跑满、`hstx words=5401204 underruns=0 wof=false
-> unknown=0`、`core1 Running`、无总线错误。
+> 全仓 `cargo fmt --check` / `clippy --all-targets --all-features -D warnings -W pedantic` /
+> `cargo test --all-features`（**40 个测试目标**）/ `cargo doc --no-deps` 全绿；
+> FV-1/2/3 均 `stdout: 42`。
 >
-> 当前测试规模：periph 332、arm 398、cli 108(+1 ignored)、gdb 78、riscv 49、bootrom 21、
-> usb 53、usb-host 31、egui 55、core 65。
+> 当前测试规模：arm **512**、periph **435**、cli **127(+1 ignored)/86**、core **104**、
+> riscv **85**、gdb **91**、egui **100**、virt-periph **51**、audio **13**、usb **53**、
+> usb-host **33(+2)**、bootrom 21。
 >
-> Remaining: GAP-08b（CLI 挂载 PSRAM）、GAP-10（MCP TLS）、GAP-11（DMA 收尾）、
-> GAP-07（阻塞式 SIO FIFO → 睡眠语义，需要新的总线 stall/重试机制，已在 GAP 表标注前置
-> 条件）。
+> 时钟与帧率（诚实口径）：固件把 `clk_sys` 配到 **252 MHz**（启动 150 MHz），
+> 1 秒客户机时间 = 252 M 周期，60 fps 一帧 = **4.2 M 周期**；真实游戏段 8.5 M 步/s →
+> **≈2 fps**。**不做 JIT**，优先精确时钟/精确指令/功能与插件稳定；性能数据按
+> 300–500 M 步窗口报告（见 `doc/performance.md` §9/§9.1）。
 >
 > 并发上限 2（crate 不相交）；每波完成后主会话复跑四道门禁 + FV-1/2/3 + emerald
 > 300M 冒烟，再派下一波。Concurrency is capped at 2 disjoint crates per wave; the main
