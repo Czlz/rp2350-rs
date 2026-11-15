@@ -66,7 +66,7 @@ keyboard/gamepad input, audio output, and no crashes.
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
 | P2-1 ✅ | I2S 采样捕获：`AudioSink`/`AudioTap`，唯一接线点 `Pio::push_tx`（CPU 与 DMA 共用），`BootPeripherals::set_audio_tap` | `rp2350-periph` | periph 347 测试；CPU/DMA 两路径 + 端到端；未安装 tap 零开销 |
-| P2-2 🚧 | **宿主输出 crate** `rp2350-audio`（插件 ABI 只面向 virt-periph 引脚，拿不到 PIO 的 `AudioTap`，故改为宿主后端）：`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏 | `crates/rp2350-audio`（新） | 默认 feature 无声卡全绿；`shutdown` ≤2 s；无设备不 panic；文档 |
+| P2-2 🚧 | **宿主输出 crate（`cpal` 可选）** `rp2350-audio`（插件 ABI 只面向 virt-periph 引脚，拿不到 PIO 的 `AudioTap`，故改为宿主后端）：`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏 | `crates/rp2350-audio`（新） | 默认 feature 无声卡全绿（≥10 单测）；`shutdown` ≤2 s；无设备不 panic；`doc/crates/rp2350-audio.md` |
 
 ### P3 完善 / Polish
 

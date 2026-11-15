@@ -7,6 +7,7 @@ members = [
     "crates/rp2350-bootrom",
     "crates/rp2350-riscv",
     "crates/rp2350-periph",
+    "crates/rp2350-audio",
     "crates/rp2350-virt-periph",
     "crates/rp2350-usb",
     "crates/rp2350-usb-host",
@@ -70,6 +71,7 @@ rp2350-arm = { path = "crates/rp2350-arm" }
 rp2350-bootrom = { path = "crates/rp2350-bootrom" }
 rp2350-riscv = { path = "crates/rp2350-riscv" }
 rp2350-periph = { path = "crates/rp2350-periph" }
+rp2350-audio = { path = "crates/rp2350-audio" }
 rp2350-virt-periph = { path = "crates/rp2350-virt-periph" }
 rp2350-usb = { path = "crates/rp2350-usb" }
 rp2350-usb-host = { path = "crates/rp2350-usb-host" }

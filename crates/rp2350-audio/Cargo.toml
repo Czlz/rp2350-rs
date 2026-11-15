@@ -1,0 +1,21 @@
+[package]
+name = "rp2350-audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Host-side audio output backend for the RP2350 I2S sample tap"
+
+[features]
+default = []
+# 启用真实声卡输出（cpal）。关闭时只编译 null 后端，CI/无声卡环境零额外依赖。
+# Enables real sound-card output through cpal. When disabled only the null
+# backend is compiled, so CI and device-less hosts need no extra dependency.
+playback = ["dep:cpal"]
+
+[dependencies]
+parking_lot = { workspace = true }
+rp2350-periph = { workspace = true }
+cpal = { version = "0.18", optional = true }
