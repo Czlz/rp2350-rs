@@ -75,6 +75,7 @@ impl Machine {
         let mut steps = self.steps;
         let mut spin_base = self.spin_base;
         let mut spin_steps = self.spin_steps;
+        let mut spin_activity = self.spin_activity;
         let mut core1_live = core1_running(self);
 
         while steps < end {
@@ -132,6 +133,7 @@ impl Machine {
                             self.finalize();
                             self.spin_base = spin_base;
                             self.spin_steps = spin_steps;
+                            self.spin_activity = spin_activity;
                             return Ok(CpuState::Halted);
                         }
                         // 陷阱步与原路径一致：立即泵送中断，不推进时基。
@@ -169,6 +171,7 @@ impl Machine {
                             self.finalize();
                             self.spin_base = spin_base;
                             self.spin_steps = spin_steps;
+                            self.spin_activity = spin_activity;
                             return Ok(state);
                         }
                         Err(error) => {
@@ -177,6 +180,7 @@ impl Machine {
                             self.finalize();
                             self.spin_base = spin_base;
                             self.spin_steps = spin_steps;
+                            self.spin_activity = spin_activity;
                             return Ok(CpuState::Faulted);
                         }
                     }
@@ -189,20 +193,31 @@ impl Machine {
                             self.record_sync_trap();
                         }
                         // 紧凑自旋检测：PC 连续停留在同一小窗口内达到阈值时告警一次。
+                        // 窗口内发生过睡眠/唤醒/中断投递时属于等待循环，只重新武装
+                        // 窗口而不告警；真正无活动的纯自旋仍会报告。
                         // Tight-spin detection: warn once when the PC stays inside one
-                        // small window for the threshold number of steps.
+                        // small window for the threshold number of steps. Sleep, wake
+                        // or IRQ activity inside the window marks a wait loop, so the
+                        // window is only re-armed; a pure spin with no activity still
+                        // reports.
                         let pc = self.core.pc();
                         if pc.wrapping_sub(spin_base) < SPIN_WINDOW_BYTES {
                             spin_steps += 1;
-                            if spin_steps == SPIN_REPORT_STEPS
-                                && self.spin_reports < SPIN_REPORT_LIMIT
-                            {
-                                self.spin_reports += 1;
-                                self.emit_spin_notice(spin_base, spin_steps);
+                            if spin_steps == SPIN_REPORT_STEPS {
+                                let activity = self.spin_activity_now();
+                                if spin_activity.differs(activity) {
+                                    spin_base = pc;
+                                    spin_steps = 0;
+                                    spin_activity = activity;
+                                } else if self.spin_reports < SPIN_REPORT_LIMIT {
+                                    self.spin_reports += 1;
+                                    self.emit_spin_notice(spin_base, spin_steps);
+                                }
                             }
                         } else {
                             spin_base = pc;
                             spin_steps = 0;
+                            spin_activity = self.spin_activity_now();
                         }
                         // PPB 系统写入必须在下一条指令前生效。世代未推进时回放队列
                         // 必然为空，直接跳过（省去一次互斥锁）。
@@ -285,6 +300,7 @@ impl Machine {
                     self.steps = steps;
                     self.spin_base = spin_base;
                     self.spin_steps = spin_steps;
+                    self.spin_activity = spin_activity;
                     return Ok(CpuState::Halted);
                 }
                 if trapped {
@@ -298,6 +314,7 @@ impl Machine {
         self.steps = steps;
         self.spin_base = spin_base;
         self.spin_steps = spin_steps;
+        self.spin_activity = spin_activity;
         Ok(CpuState::Running)
     }
 }

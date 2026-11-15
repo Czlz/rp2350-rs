@@ -70,6 +70,56 @@ const SPIN_REPORT_STEPS: u64 = 1_000_000;
 /// Maximum number of spin warnings per run / 每次运行最多打印的自旋告警条数
 const SPIN_REPORT_LIMIT: usize = 4;
 
+/// Activity counters observed when the current spin window started
+/// 当前自旋窗口开始时的活动计数器快照
+///
+/// A PC that stays inside one small window is ambiguous: a poll of a value that
+/// never changes looks exactly like a wait loop that sleeps, wakes on an
+/// interrupt and returns to the same window. Sleep steps, wake-ups and interrupt
+/// deliveries are the proof that the window made progress, so the detector
+/// snapshots them when the window starts and suppresses its warning when any of
+/// them grew. After suppression the snapshot is refreshed, so activity from an
+/// old window can never mask a later pure spin.
+/// PC 停留在同一个小窗口内是有歧义的：轮询一个永不变化的值，与「睡眠、被中断唤醒、
+/// 再回到同一窗口」的等待循环看起来完全相同。睡眠步数、唤醒次数与中断投递正是窗口
+/// 内有进展的证据，因此检测器在窗口开始时记录这些计数器，任一增长即抑制告警；抑制
+/// 后立即刷新快照，因此旧窗口的活动绝不会掩盖之后的纯自旋。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SpinActivity {
+    /// Per-core sleep step counters / 各核睡眠步数计数器
+    sleep_steps: [u64; 2],
+    /// Per-core wake counters / 各核唤醒次数计数器
+    wakes: [u64; 2],
+    /// Total interrupt deliveries / 中断投递总数
+    irqs: u64,
+}
+
+impl SpinActivity {
+    /// Whether any activity counter changed since this snapshot
+    /// 自该快照以来是否有任一活动计数器变化
+    fn differs(self, other: Self) -> bool {
+        self.sleep_steps != other.sleep_steps
+            || self.wakes != other.wakes
+            || self.irqs != other.irqs
+    }
+}
+
+/// Bounded interrupt delivery log with a cumulative counter
+/// 带累计计数的有界中断投递日志
+///
+/// [`IRQ_LOG_LIMIT`] caps the retained lines so a long run cannot grow the log,
+/// but the spin detector needs to know that *any* delivery happened even after
+/// the earliest lines were evicted; `total` keeps that proof.
+/// [`IRQ_LOG_LIMIT`] 限制保留的行数，使长跑不会增长日志；但自旋检测需要知道
+/// **发生过**投递，即使最早的行已被淘汰，`total` 保留了这一证据。
+#[derive(Debug, Default)]
+struct IrqLog {
+    /// Retained delivery lines, oldest evicted first / 保留的投递行，最旧的先淘汰
+    lines: Vec<String>,
+    /// Total deliveries, including evicted lines / 累计投递数（含已淘汰的行）
+    total: u64,
+}
+
 /// Steps retained for the post-mortem PC trace / 停机后回溯保留的步数
 const TAIL_TRACE_STEPS: usize = 32;
 
@@ -535,8 +585,9 @@ pub struct Machine {
     halt: Option<String>,
     /// Whether the peripheral timebase has been finalized / 外设时基是否已收尾
     finished: bool,
-    /// Logged interrupt deliveries / 已记录的中断投递
-    irqs: Vec<String>,
+    /// Bounded interrupt delivery log with a cumulative counter
+    /// 带累计计数的有界中断投递日志
+    irqs: IrqLog,
     /// Synchronous trap history (first entries) / 同步陷阱历史（前若干条）
     traps: Vec<String>,
     /// Last recorded synchronous `mcause` / 上次记录的同步 `mcause`
@@ -549,6 +600,9 @@ pub struct Machine {
     spin_base: u32,
     /// Consecutive steps inside the current spin window / 当前窗口内的连续步数
     spin_steps: u64,
+    /// Activity counters at the start of the current spin window
+    /// 当前自旋窗口开始时的活动计数器快照
+    spin_activity: SpinActivity,
     /// Number of spin warnings already printed / 已打印的自旋告警条数
     spin_reports: usize,
     /// Ring buffer of recent `(step, PC)` pairs for post-mortem traces
@@ -716,7 +770,7 @@ impl Machine {
             hstx_words: 0,
             halt: None,
             finished: false,
-            irqs: Vec::new(),
+            irqs: IrqLog::default(),
             traps: Vec::new(),
             // 复位后 mcause 为 0；用 0 作为初值可避免把复位值误记为陷阱。
             // mcause resets to 0; seeding with 0 avoids logging the reset value
@@ -726,6 +780,7 @@ impl Machine {
             notices: Vec::new(),
             spin_base,
             spin_steps: 0,
+            spin_activity: SpinActivity::default(),
             spin_reports: 0,
             recent: RecentSteps::new(),
             ppb_epoch_seen: 0,
@@ -1164,7 +1219,20 @@ impl Machine {
     /// Logged interrupt deliveries / 已记录的中断投递
     #[must_use]
     pub fn irqs(&self) -> &[String] {
-        &self.irqs
+        &self.irqs.lines
+    }
+
+    /// Total interrupt deliveries recorded on both cores
+    /// 两核记录的中断投递总数
+    ///
+    /// Unlike [`Self::irqs`], which keeps only the latest `IRQ_LOG_LIMIT`
+    /// lines, this counter never saturates, so the spin detector can prove that
+    /// a window saw interrupt traffic even after the log wrapped.
+    /// 与只保留最近 `IRQ_LOG_LIMIT` 行的 [`Self::irqs`] 不同，该计数器不会饱和，
+    /// 因此即使日志已回绕，自旋检测仍能证明窗口内发生过中断流量。
+    #[must_use]
+    pub fn irq_delivery_count(&self) -> u64 {
+        self.irqs.total
     }
 
     /// Synchronous trap history / 同步陷阱历史
@@ -1770,6 +1838,35 @@ impl Machine {
         }
     }
 
+    /// Snapshot the counters that prove a spin window is a wait loop
+    /// 记录能证明自旋窗口属于等待循环的计数器快照
+    fn spin_activity_now(&self) -> SpinActivity {
+        SpinActivity {
+            sleep_steps: self.sleep_steps,
+            wakes: self.sleep_wakes,
+            irqs: self.irqs.total,
+        }
+    }
+
+    /// Re-arm the spin window at `pc` with a fresh activity snapshot
+    /// 在 `pc` 处重新武装自旋窗口并刷新活动快照
+    ///
+    /// Used both when the PC leaves the window and when a wait inside the window
+    /// suppresses a would-be warning, so later pure spins still report.
+    /// 既在 PC 离开窗口时使用，也在窗口内的等待抑制了一次告警后使用，使之后的纯自旋
+    /// 仍会报告。
+    fn reset_spin_window(&mut self, pc: u32) {
+        self.spin_base = pc;
+        self.spin_steps = 0;
+        self.spin_activity = self.spin_activity_now();
+    }
+
+    /// Whether the current spin window saw sleep, wake or interrupt activity
+    /// 当前自旋窗口内是否发生过睡眠、唤醒或中断活动
+    fn spin_window_waited(&self) -> bool {
+        self.spin_activity.differs(self.spin_activity_now())
+    }
+
     /// Post-step housekeeping for core 0 and the shared peripherals
     /// core0 与共享外设的步后维护
     ///
@@ -1783,22 +1880,30 @@ impl Machine {
     /// 自旋。PPB 回放、中断/SEV 转发与时基工作始终执行，因为它们是每步共享路径。
     fn after_running_step(&mut self, core0_pc: Option<u32>) {
         // 紧凑自旋通常意味着固件在轮询一个永远不变的 MMIO 值（未建模设备静默
-        // 读 0）或执行延时循环，会无声耗尽指令预算。PC 连续停在同一小窗口内
-        // 达到阈值就告警一次，并给出窗口范围以便反汇编定位。
+        // 读 0）或执行延时循环，会无声耗尽指令预算。但睡眠/唤醒等待循环也会长
+        // 时间停留在同一小窗口内，因此窗口内任一活动计数器增长时不告警，只重新
+        // 武装窗口。真正无睡眠、无唤醒、无中断的纯自旋仍会打印一次告警，并给出
+        // 窗口范围以便反汇编定位。
         // A tight spin usually means the firmware polls a register that never
         // changes (unmodelled devices read zero) or runs a delay loop, silently
-        // burning the budget. Warn once when the PC stays inside one small window
-        // and print the window so the spin point can be disassembled.
+        // burning the budget. A sleep/wake wait loop also stays inside one small
+        // window for a long time, so the detector suppresses its warning when any
+        // activity counter grew during the window and only re-arms itself. A pure
+        // spin with no sleep, wake or interrupt still warns once and prints the
+        // window so the spin point can be disassembled.
         if let Some(pc) = core0_pc {
             if pc.wrapping_sub(self.spin_base) < SPIN_WINDOW_BYTES {
                 self.spin_steps += 1;
-                if self.spin_steps == SPIN_REPORT_STEPS && self.spin_reports < SPIN_REPORT_LIMIT {
-                    self.spin_reports += 1;
-                    self.emit_spin_notice(self.spin_base, self.spin_steps);
+                if self.spin_steps == SPIN_REPORT_STEPS {
+                    if self.spin_window_waited() {
+                        self.reset_spin_window(pc);
+                    } else if self.spin_reports < SPIN_REPORT_LIMIT {
+                        self.spin_reports += 1;
+                        self.emit_spin_notice(self.spin_base, self.spin_steps);
+                    }
                 }
             } else {
-                self.spin_base = pc;
-                self.spin_steps = 0;
+                self.reset_spin_window(pc);
             }
         }
         // 睡眠/唤醒统计与「双核都在睡」诊断。睡眠步的 PC 冻结不算自旋，因此由调用方
@@ -2275,7 +2380,7 @@ fn pump(
     mut core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
-    irq_log: &mut Vec<String>,
+    irq_log: &mut IrqLog,
 ) -> bool {
     peripherals.service_core1_peer();
     let mut reset = replay_system_writes(core, peripherals);
@@ -2329,7 +2434,7 @@ fn deliver_irqs(
     core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
-    irq_log: &mut Vec<String>,
+    irq_log: &mut IrqLog,
 ) {
     // SysTick 的计数与 COUNTFLAG 归外设 `SysTickCounter`（唯一真相源），这里只把
     // 一次性到期锁存转发给核的系统异常 15（`SCB_ICSR.PENDSTSET`），由核经
@@ -2369,11 +2474,14 @@ fn deliver_irqs(
 
 /// Record the latest interrupt deliveries in a bounded ring
 /// 在有界环形缓冲中记录最近的中断投递
-fn log_irq(irq_log: &mut Vec<String>, core: &str, irq: u16, pc: u32) {
-    if irq_log.len() == IRQ_LOG_LIMIT {
-        irq_log.remove(0);
+fn log_irq(irq_log: &mut IrqLog, core: &str, irq: u16, pc: u32) {
+    if irq_log.lines.len() == IRQ_LOG_LIMIT {
+        irq_log.lines.remove(0);
     }
-    irq_log.push(format!("[irq] {core}signal {irq} at PC={pc:#010X}"));
+    irq_log.total = irq_log.total.saturating_add(1);
+    irq_log
+        .lines
+        .push(format!("[irq] {core}signal {irq} at PC={pc:#010X}"));
 }
 
 mod batch;
@@ -2384,6 +2492,8 @@ mod reset;
 mod reset_tests;
 #[cfg(test)]
 mod sleep_tests;
+#[cfg(test)]
+mod spin_tests;
 mod systick;
 #[cfg(test)]
 mod systick_tests;

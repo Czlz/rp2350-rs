@@ -1273,9 +1273,15 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
   核心；中断线每 64 步泵送一次，`controller.irq_asserted()` 成立时投递
   `USBCTRL_IRQ`。
 - A tight spin warning prints when the PC stays within one 32-byte window
-  for 1 000 000 consecutive steps (up to 4 warnings per run).
-  当 PC 在同一个 32 字节窗口内连续停留 1 000 000 步时打印一次自旋告警
-  （每次运行最多 4 条）。
+  for 1 000 000 consecutive instructions (up to 4 warnings per run). A window
+  that saw sleep steps, wake-ups or interrupt deliveries is a wait loop
+  (`WFI`/`WFE` plus a timer/IRQ wake) rather than a stuck poll: the detector
+  suppresses its warning and re-arms from the current counters, so later pure
+  spins still report.
+  当 PC 在同一个 32 字节窗口内连续停留 1 000 000 条指令时打印一次自旋告警
+  （每次运行最多 4 条）。窗口内出现过睡眠步数、唤醒或中断投递时属于等待循环
+  （`WFI`/`WFE` + 定时器/中断唤醒），而不是卡死轮询：检测器不告警，并用当前
+  计数器值重新武装窗口，因此之后的纯自旋仍会报告。
 - `deliver_irqs` walks only the asserted bits of the mask
   (`trailing_zeros` + `mask &= mask - 1`), in the same ascending order as the
   former `0..64` scan, so IRQ log lines and delivery order are unchanged.

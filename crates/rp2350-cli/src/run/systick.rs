@@ -25,7 +25,7 @@
 use rp2350_cpu::CpuCore;
 use rp2350_periph::BootPeripherals;
 
-use super::{CoreHandle, IRQ_LOG_LIMIT};
+use super::{CoreHandle, IRQ_LOG_LIMIT, IrqLog};
 
 /// Forward one peripheral SysTick expiry to the ARM core
 /// 把一次外设侧 SysTick 到期转发给 ARM 核心
@@ -43,7 +43,7 @@ use super::{CoreHandle, IRQ_LOG_LIMIT};
 pub(super) fn forward_systick_pending(
     core: &mut CoreHandle,
     peripherals: &BootPeripherals,
-    irq_log: &mut Vec<String>,
+    irq_log: &mut IrqLog,
 ) {
     let CoreHandle::Arm(core) = core else {
         return;
@@ -64,9 +64,12 @@ pub(super) fn forward_systick_pending(
 /// 15 is a system exception, not external IRQ 15 (exception 31).
 /// 该行沿用与外设投递相同的 `[irq]` 前缀，前端可解析同一条流；它与
 /// `signal <n>` 区分开，因为异常 15 是系统异常，不是外部 IRQ 15（异常 31）。
-fn log_systick(irq_log: &mut Vec<String>, pc: u32) {
-    if irq_log.len() == IRQ_LOG_LIMIT {
-        irq_log.remove(0);
+fn log_systick(irq_log: &mut IrqLog, pc: u32) {
+    if irq_log.lines.len() == IRQ_LOG_LIMIT {
+        irq_log.lines.remove(0);
     }
-    irq_log.push(format!("[irq] core0 systick at PC={pc:#010X}"));
+    irq_log.total = irq_log.total.saturating_add(1);
+    irq_log
+        .lines
+        .push(format!("[irq] core0 systick at PC={pc:#010X}"));
 }
