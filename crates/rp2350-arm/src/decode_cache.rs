@@ -430,6 +430,12 @@ fn sign_extend(value: u32, bits: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::flash_generation_lock;
+
+    // Tests that fill the table and then require a hit (or count flushes) must
+    // not race another flash-touching test: the generation is process-global.
+    // 先填充再要求命中的测试（或统计清空次数的测试）不得与其它接触 Flash 的测试
+    // 并发：世代号是进程级全局量。
 
     #[test]
     fn flash_windows_are_cacheable_and_sram_is_not() {
@@ -443,6 +449,7 @@ mod tests {
 
     #[test]
     fn empty_slots_never_match_pc_zero() {
+        let _generation = flash_generation_lock();
         // PC=0 与空槽位的 tag=0 相等，但空槽位不是有效条目：核心必须回落到
         // 总线取指（真实固件在 boot ROM 地址 0 上执行）。
         // PC=0 matches an empty slot's tag 0, but an empty slot is not a valid
@@ -457,6 +464,7 @@ mod tests {
 
     #[test]
     fn decoded_fields_round_trip() {
+        let _generation = flash_generation_lock();
         let mut cache = DecodeCache::new();
         // `b.n 0x1000B222` at 0x1000B262.
         let entry = decode16(0x1000_B262, 0xE7DE);
@@ -506,6 +514,7 @@ mod tests {
     fn host_flash_write_flushes_the_table() {
         use rp2350_core::flash::{FlashHandle, FlashRegion};
 
+        let _generation = flash_generation_lock();
         let flash = FlashRegion::new("flash", FLASH_XIP_BASE, 0x1000);
         let handle: FlashHandle = flash.handle();
         let mut cache = DecodeCache::new();
@@ -519,6 +528,7 @@ mod tests {
 
     #[test]
     fn conflicting_pcs_replace_each_other() {
+        let _generation = flash_generation_lock();
         let mut cache = DecodeCache::new();
         let a = FLASH_XIP_BASE;
         let b = FLASH_XIP_BASE + (DECODE_CACHE_ENTRIES as u32 * 2);

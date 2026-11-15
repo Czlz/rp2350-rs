@@ -665,6 +665,23 @@ pub fn decode32(pc: u32, word: u32) -> Entry;
 diagnostics and tests.
 `CortexM33Core::decode_cache_flushes()` 暴露世代清空计数，供诊断与测试使用。
 
+### Test isolation / 测试隔离
+
+`flash::content_generation` is process-global: `FlashRegion::new`, host writes/erases
+and loader writes all bump the same counter. Cache tests therefore cannot overlap with
+any other test that creates or programs flash, or a concurrent bump would drop their
+entries between `store` and `lookup`. `src/test_support.rs` provides a process-local
+mutex; the tests in `fetch_cache`, `decode_cache`, `tests::decode_cache` and the
+flash-booting `dual_core` tests hold it for their whole body. Tests that never touch
+flash take no lock.
+
+`flash::content_generation` 是进程级全局量：`FlashRegion::new`、宿主写入/擦除与
+加载器写入都会递增同一个计数器。因此缓存测试不能与任何其它构造或编程 Flash 的
+测试重叠——并发递增会在 `store` 与 `lookup` 之间清空条目。`src/test_support.rs`
+提供进程内互斥锁；`fetch_cache`、`decode_cache`、`tests::decode_cache` 以及从
+Flash 启动的 `dual_core` 测试都在整个测试体期间持有它。完全不接触 Flash 的测试
+无需加锁。
+
 ## Thumb-32 Decoder / Thumb-32 解码器
 
 The Thumb-32 decoder is fully implemented (see `execute_thumb32`): 60+ ALU,
@@ -1511,10 +1528,11 @@ the stable string exposed by the core; `pend_nmi()`, `pend_svcall()`,
 machine the `rp2350-periph` PPB stub replays `ICSR`/`SHPR2`/`SHPR3` writes into
 the core, so firmware pends NMI/PendSV and sets system priorities; it also
 replays `SHCSR`/`CFSR`/`HFSR`/`AIRCR`, so firmware enables UsageFault, clears
-fault status with write-one-to-clear and requests a system reset. Delivering a
-peripheral-side SysTick expiry to the core needs the driver to forward
-`BootPeripherals::take_systick_pending()` to `pend_systick()` (CLI wiring,
-outside this crate). The `AIRCR.SYSRESETREQ` latch is a host event:
+fault status with write-one-to-clear and requests a system reset. A peripheral-side
+SysTick expiry is delivered by the driver polling
+`BootPeripherals::take_systick_pending()` and calling `pend_systick()` once per
+pump (implemented in `rp2350-cli`), so a guest SysTick interrupt enters
+exception 15 at `VTOR + 0x3C`. The `AIRCR.SYSRESETREQ` latch is a host event:
 `rp2350-cli::run::Machine::take_system_reset_request()` polls both Cortex-M33
 cores and stops advancing the machine; `run` rebuilds it from the same image
 (at most 3 times) while `repl`/`play` report the request and stop (see
@@ -1565,9 +1583,9 @@ cores and stops advancing the machine; `run` rebuilds it from the same image
 宿主入口。完整机器中 `rp2350-periph` 的 PPB 桩已把 `ICSR`/`SHPR2`/`SHPR3` 写入
 回放到核，因此固件可挂起 NMI/PendSV 并设置系统优先级；它也会回放
 `SHCSR`/`CFSR`/`HFSR`/`AIRCR`，因此固件可启用 UsageFault、以写 1 清零清除故障
-状态并请求系统复位。把外设侧 SysTick 到期投递到核仍需驱动把
-`BootPeripherals::take_systick_pending()` 转发到 `pend_systick()`（属 CLI 接线，
-不在本 crate 内）。`AIRCR.SYSRESETREQ` 锁存是宿主事件：
+状态并请求系统复位。外设侧 SysTick 到期由驱动每步轮询
+`BootPeripherals::take_systick_pending()` 并调用 `pend_systick()` 投递（已在
+`rp2350-cli` 实现），客户机 SysTick 中断因此进入异常 15（`VTOR + 0x3C`）。`AIRCR.SYSRESETREQ` 锁存是宿主事件：
 `rp2350-cli::run::Machine::take_system_reset_request()` 轮询两个 Cortex-M33 核并
 停止推进机器；`run` 用同一映像重建机器（最多 3 次），`repl`/`play` 报告请求并
 停止（见 [`rp2350-cli.md`](rp2350-cli.md)）。

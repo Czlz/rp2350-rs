@@ -16,6 +16,15 @@ use rp2350_core::types::CpuId;
 use rp2350_cpu::CpuCore;
 
 use crate::CortexM33Core;
+use crate::test_support::flash_generation_lock;
+
+// Every test below builds at least one [`FlashRegion`], and constructing or
+// programming one bumps the process-global flash generation. The tests hold
+// this lock so they cannot invalidate caches belonging to another test (and
+// vice versa); see `crate::test_support`.
+// 下面的每个测试至少构造一个 [`FlashRegion`]，而构造或编程它会递增进程级
+// Flash 世代号。这些测试持有本锁，从而不会使其它测试的缓存失效（反之亦然）；
+// 见 `crate::test_support`。
 
 /// Flash window size used by these tests / 测试使用的 Flash 窗口大小
 const FLASH_SIZE: usize = 0x1000;
@@ -144,6 +153,7 @@ fn loop_program(words: &[u16]) -> Vec<u8> {
 
 #[test]
 fn every_specialised_thumb16_encoding_matches_the_decoder() {
+    let _generation = flash_generation_lock();
     // 每条编码都在循环里执行 4 次：第 1 次填充缓存，之后命中。
     // Each encoding runs four times in the loop: the first fills the cache, the
     // rest hit it.
@@ -191,6 +201,7 @@ fn every_specialised_thumb16_encoding_matches_the_decoder() {
 
 #[test]
 fn branches_and_it_blocks_match_the_decoder() {
+    let _generation = flash_generation_lock();
     // `cmp r7,r7` sets Z; `beq` then skips the `movs r0,#0xAA`; the IT block
     // executes one conditional `movs` and one suppressed-flag `adds`.
     // `cmp r7,r7` 置 Z；随后 `beq` 跳过 `movs r0,#0xAA`；IT 块内执行一条条件
@@ -212,6 +223,7 @@ fn branches_and_it_blocks_match_the_decoder() {
 
 #[test]
 fn thumb32_groups_match_the_decoder() {
+    let _generation = flash_generation_lock();
     let words: &[u16] = &[
         // movs.w r2,#0x1234
         0xF24C, 0x3245, // movw r2,#0xC245 (plain binary immediate)
@@ -248,6 +260,7 @@ fn thumb32_groups_match_the_decoder() {
 
 #[test]
 fn undefined_instructions_are_reported_identically() {
+    let _generation = flash_generation_lock();
     // 0xDE00 = UDF #0 in Thumb; both paths must produce the same
     // `Undefined`/halt behaviour, in strict and in tolerant mode.
     // 0xDE00 = Thumb 的 UDF #0；两条路径都必须产生相同的 `Undefined`/停机行为。
@@ -274,6 +287,7 @@ fn undefined_instructions_are_reported_identically() {
 
 #[test]
 fn a_host_flash_write_is_visible_immediately() {
+    let _generation = flash_generation_lock();
     let mut bus = SimpleBus::new();
     let flash = FlashRegion::new("flash", FLASH_XIP_BASE, FLASH_SIZE);
     let handle = flash.handle();
@@ -303,6 +317,7 @@ fn a_host_flash_write_is_visible_immediately() {
 
 #[test]
 fn sram_code_is_never_cached_and_self_modification_is_visible() {
+    let _generation = flash_generation_lock();
     let mut bus = SimpleBus::new();
     let mut flash = FlashRegion::new("flash", FLASH_XIP_BASE, FLASH_SIZE);
     // `ldr r6,[pc,#0]; bx r6` + literal pointing at the SRAM routine.
@@ -345,6 +360,7 @@ fn sram_code_is_never_cached_and_self_modification_is_visible() {
 
 #[test]
 fn unaligned_pc_fetch_matches_the_decoder() {
+    let _generation = flash_generation_lock();
     // 非对齐 PC 取指沿用既有行为：直接按该地址读取半字，两个核心必须一致。
     // An unaligned PC keeps the pre-existing behaviour (the halfword is read at
     // that exact address); both cores must agree.
@@ -364,6 +380,7 @@ fn unaligned_pc_fetch_matches_the_decoder() {
 
 #[test]
 fn thumb32_straddling_the_flash_window_end_matches_the_decoder() {
+    let _generation = flash_generation_lock();
     // 让一条 32 位指令的第二个半字落在 Flash 窗口之外：两个核心必须一致
     // （缓存不记录该 PC，下一取指仍走总线）。
     // Put the second halfword of a Thumb-32 instruction past the flash window:
@@ -388,6 +405,7 @@ fn thumb32_straddling_the_flash_window_end_matches_the_decoder() {
 
 #[test]
 fn pseudo_random_instruction_stream_stays_equivalent() {
+    let _generation = flash_generation_lock();
     // 伪随机指令流：混合合法 16/32 位编码与随机字，逐步比较两个核心。
     // A pseudo-random instruction stream mixing valid 16/32-bit encodings with
     // arbitrary words, compared step by step.
@@ -414,23 +432,24 @@ fn pseudo_random_instruction_stream_stays_equivalent() {
 
 #[test]
 fn the_cache_fills_and_hits_within_the_hot_loop() {
+    let _generation = flash_generation_lock();
     let program = loop_program(&[0x2001, 0x2102, 0x1840]);
     let (mut core, mut bus) = machine(&program, true);
-    // 第一步是填充，之后每一步都命中（同一个 4 条指令的循环）。
-    // The first pass fills, every later step hits (the same four-instruction loop).
+    // 第一步是填充，之后每一步都命中（同一个 4 条指令的循环）。没有宿主侧
+    // Flash 变更，因此整个过程不得发生世代清空。
+    // The first pass fills, every later step hits (the same four-instruction
+    // loop). No host-side flash mutation occurs, so no generation flush is
+    // allowed during the run.
     for _ in 0..64 {
         core.step(&mut bus).unwrap();
     }
     assert_eq!(core.read_register(1), 2);
-    // 并行测试共享同一个 Flash 世代号，因此这里只要求循环本身不触发清空之外
-    // 的行为：命中路径不改变状态。
-    // Parallel tests share one flash generation, so this only asserts that the
-    // loop keeps working; hit behaviour is covered by the differential tests.
-    assert!(core.decode_cache_flushes() < 16);
+    assert_eq!(core.decode_cache_flushes(), 0);
 }
 
 #[test]
 fn pc_zero_falls_back_to_the_bus_with_the_cache_enabled() {
+    let _generation = flash_generation_lock();
     // PC=0 与译码缓存空槽位的 tag=0 相等；空槽位不是有效条目，因此缓存核心
     // 必须像无缓存核心一样访问总线（此处地址 0 未映射 → BusError）。
     // PC=0 equals an empty decode-cache slot's tag 0; an empty slot is not a

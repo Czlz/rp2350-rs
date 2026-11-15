@@ -12,6 +12,7 @@ mod sleep;
 mod systick;
 
 use super::*;
+use crate::test_support::flash_generation_lock;
 
 /// `SCB_SHCSR` absolute address / `SCB_SHCSR` 绝对地址
 const SCB_SHCSR: u32 = 0xE000_ED24;
@@ -433,6 +434,12 @@ fn flash_bus(program: &[u16]) -> (rp2350_core::memory::SimpleBus, rp2350_core::F
 
 #[test]
 fn flash_fetch_cache_observes_host_rewrites() {
+    // `flash_bus` creates and programs a FlashRegion, which bumps the
+    // process-global flash generation; hold the lock so this test and any
+    // concurrent cache test cannot invalidate each other.
+    // `flash_bus` 构造并编程 FlashRegion，会递增进程级 Flash 世代号；持锁可避免
+    // 本测试与并发的缓存测试互相使对方失效。
+    let _generation = flash_generation_lock();
     // MOVS r0, #1 / MOVS r0, #2
     // MOVS r0, #1 / MOVS r0, #2
     let (mut bus, handle) = flash_bus(&[0x2001, 0x2002]);
@@ -458,6 +465,7 @@ fn flash_fetch_cache_observes_host_rewrites() {
 
 #[test]
 fn flash_fetch_cache_books_the_same_cycles_and_state() {
+    let _generation = flash_generation_lock();
     let program = [0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006];
     let (mut cached_bus, _cached_handle) = flash_bus(&program);
     let (mut plain_bus, _plain_handle) = flash_bus(&program);

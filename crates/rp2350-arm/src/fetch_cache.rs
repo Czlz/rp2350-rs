@@ -147,11 +147,19 @@ impl Default for FetchCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::flash_generation_lock;
     use rp2350_core::bus::MemoryRegion;
     use rp2350_core::flash::{FlashHandle, FlashRegion};
 
+    // These tests observe the process-global flash generation, and two of them
+    // bump it through a host handle, so they must not overlap with any other
+    // flash-touching test (see `crate::test_support`).
+    // 这些测试观察进程级 Flash 世代号，其中两个还经宿主句柄递增它，因此不得与
+    // 其它接触 Flash 的测试重叠（见 `crate::test_support`）。
+
     #[test]
     fn flash_halfwords_round_trip_and_sram_is_never_cached() {
+        let _generation = flash_generation_lock();
         let mut cache = FetchCache::new();
         assert_eq!(cache.lookup(FLASH_XIP_BASE), None);
         cache.store(FLASH_XIP_BASE, 0xB672);
@@ -165,6 +173,7 @@ mod tests {
 
     #[test]
     fn nocache_alias_and_cached_window_are_both_cached() {
+        let _generation = flash_generation_lock();
         let mut cache = FetchCache::new();
         // 两个窗口偏移 0x100 与 0x102 映射到不同的表项（同偏移会因别名差值
         // 是 1 KiB 的倍数而落在同一索引上）。
@@ -181,6 +190,7 @@ mod tests {
 
     #[test]
     fn a_host_flash_write_invalidates_the_cached_halfword() {
+        let _generation = flash_generation_lock();
         let mut flash = FlashRegion::new("flash", FLASH_XIP_BASE, 0x1000);
         let handle: FlashHandle = flash.handle();
         let mut cache = FetchCache::new();
@@ -200,6 +210,7 @@ mod tests {
 
     #[test]
     fn erase_also_invalidates() {
+        let _generation = flash_generation_lock();
         let flash = FlashRegion::new("flash", FLASH_XIP_BASE, 0x1000);
         let handle = flash.handle();
         let mut cache = FetchCache::new();

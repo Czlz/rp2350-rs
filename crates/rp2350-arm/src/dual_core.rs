@@ -186,8 +186,15 @@ impl DualCoreM33 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::flash_generation_lock;
     use rp2350_core::flash::FlashRegion;
     use rp2350_core::memory::{RamRegion, SimpleBus};
+
+    // `test_bus` creates and programs a FlashRegion (a process-global flash
+    // generation bump), so tests that boot from it hold the generation lock to
+    // avoid invalidating another test's fetch/decode cache.
+    // `test_bus` 构造并编程 FlashRegion（递增进程级 Flash 世代号），因此从它启动
+    // 的测试持有世代锁，避免使其它测试的取指/译码缓存失效。
 
     /// Code/vector RAM base / 代码与向量 RAM 基地址
     const CODE_BASE: u32 = 0x0000_0000;
@@ -264,6 +271,7 @@ mod tests {
 
     #[test]
     fn core1_does_not_execute_before_release() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_halfwords(&mut bus, 0x0000_0100, &SPIN);
         write_store_program(&mut bus, 0x0000_0040, RAM_BASE + 0x20);
@@ -288,6 +296,7 @@ mod tests {
 
     #[test]
     fn released_core1_shares_sram_with_core0() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_halfwords(&mut bus, 0x0000_0100, &SPIN);
         write_store_program(&mut bus, 0x0000_0040, RAM_BASE);
@@ -315,6 +324,7 @@ mod tests {
 
     #[test]
     fn cores_keep_independent_register_files() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_halfwords(&mut bus, 0x0000_0100, &SPIN);
         pair.core_mut(CpuId::Core0).write_register(0, 0xAAAA_AAAA);
@@ -337,6 +347,7 @@ mod tests {
 
     #[test]
     fn alternating_steps_advance_both_counters() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_counter_program(&mut bus, 0x0000_0100, RAM_BASE + 0x10);
         write_counter_program(&mut bus, 0x0000_0200, RAM_BASE + 0x14);
@@ -357,6 +368,7 @@ mod tests {
 
     #[test]
     fn run_cycles_advances_core1_only_after_release() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_counter_program(&mut bus, 0x0000_0100, RAM_BASE + 0x10);
         write_counter_program(&mut bus, 0x0000_0200, RAM_BASE + 0x14);
@@ -376,6 +388,7 @@ mod tests {
 
     #[test]
     fn run_cycles_respects_the_budget() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_counter_program(&mut bus, 0x0000_0100, RAM_BASE + 0x10);
 
@@ -397,6 +410,7 @@ mod tests {
 
     #[test]
     fn interrupts_reach_only_the_requested_core() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_halfwords(&mut bus, 0x0000_0100, &SPIN);
         pair.release_core1(&mut bus, RAM_BASE + 0x800, 0x0000_0041, CODE_BASE)
@@ -421,6 +435,7 @@ mod tests {
 
     #[test]
     fn releasing_core1_again_reinitialises_it() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         write_halfwords(&mut bus, 0x0000_0100, &SPIN);
         write_store_program(&mut bus, 0x0000_0040, RAM_BASE);
@@ -446,6 +461,7 @@ mod tests {
 
     #[test]
     fn release_core1_rejects_an_unmapped_vector_table() {
+        let _generation = flash_generation_lock();
         let (mut pair, mut bus) = booted_pair(0x0000_0101);
         let error = pair
             .release_core1(&mut bus, RAM_BASE + 0x800, 0x0000_0041, 0x4000_0000)

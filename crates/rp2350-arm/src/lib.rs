@@ -1119,4 +1119,7 @@ impl CpuCore for CortexM33Core {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests;
