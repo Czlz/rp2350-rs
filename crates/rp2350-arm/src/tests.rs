@@ -358,3 +358,92 @@ fn fpu_instruction_executes_when_cpacr_allows_it() {
     assert_eq!(core.cfsr, 0);
     assert_eq!(core.active_exceptions.len(), 0);
 }
+
+/// Program offset used by the flash fetch-cache tests / Flash 取指缓存测试使用的程序偏移
+const CACHE_PROGRAM_OFFSET: u32 = 0x100;
+
+/// Build a bus with a flash XIP image, SRAM and a reset vector into the image
+/// 构建带 Flash XIP 映像、SRAM 与指向映像的复位向量的总线
+fn flash_bus(program: &[u16]) -> (rp2350_core::memory::SimpleBus, rp2350_core::FlashHandle) {
+    let mut bus = rp2350_core::memory::SimpleBus::new();
+    let flash = rp2350_core::FlashRegion::new("flash", rp2350_core::FLASH_XIP_BASE, 0x1000);
+    let handle = flash.handle();
+    bus.register_region(Box::new(rp2350_core::memory::RamRegion::new(
+        "sram",
+        0x2000_0000,
+        0x1000,
+    )))
+    .unwrap();
+    bus.register_region(Box::new(flash)).unwrap();
+    let mut image = Vec::with_capacity(8);
+    image.extend_from_slice(&0x2000_1000u32.to_le_bytes());
+    image
+        .extend_from_slice(&(rp2350_core::FLASH_XIP_BASE + CACHE_PROGRAM_OFFSET + 1).to_le_bytes());
+    handle.write(rp2350_core::FLASH_XIP_BASE, &image).unwrap();
+    let mut program_bytes = Vec::with_capacity(program.len() * 2);
+    for half in program {
+        program_bytes.extend_from_slice(&half.to_le_bytes());
+    }
+    handle
+        .write(
+            rp2350_core::FLASH_XIP_BASE + CACHE_PROGRAM_OFFSET,
+            &program_bytes,
+        )
+        .unwrap();
+    (bus, handle)
+}
+
+#[test]
+fn flash_fetch_cache_observes_host_rewrites() {
+    // MOVS r0, #1 / MOVS r0, #2
+    // MOVS r0, #1 / MOVS r0, #2
+    let (mut bus, handle) = flash_bus(&[0x2001, 0x2002]);
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    core.set_flash_fetch_cache(true);
+    core.boot_from(&mut bus, rp2350_core::FLASH_XIP_BASE)
+        .unwrap();
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.read_register(0), 1);
+
+    // 宿主改写 Flash 后，下一次取指必须看到新指令（缓存整表失效）。
+    // After a host rewrite the next fetch must observe the new instruction.
+    handle
+        .write(
+            rp2350_core::FLASH_XIP_BASE + CACHE_PROGRAM_OFFSET,
+            &0x2007u16.to_le_bytes(),
+        )
+        .unwrap();
+    core.registers.pc = rp2350_core::FLASH_XIP_BASE + CACHE_PROGRAM_OFFSET;
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.read_register(0), 7);
+}
+
+#[test]
+fn flash_fetch_cache_books_the_same_cycles_and_state() {
+    let program = [0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006];
+    let (mut cached_bus, _cached_handle) = flash_bus(&program);
+    let (mut plain_bus, _plain_handle) = flash_bus(&program);
+
+    let mut cached = CortexM33Core::new(CpuId::Core0);
+    cached.set_flash_fetch_cache(true);
+    cached
+        .boot_from(&mut cached_bus, rp2350_core::FLASH_XIP_BASE)
+        .unwrap();
+
+    let mut plain = CortexM33Core::new(CpuId::Core0);
+    plain
+        .boot_from(&mut plain_bus, rp2350_core::FLASH_XIP_BASE)
+        .unwrap();
+
+    for _ in 0..12 {
+        assert_eq!(
+            cached.step(&mut cached_bus).unwrap(),
+            plain.step(&mut plain_bus).unwrap()
+        );
+    }
+    assert_eq!(cached.pc(), plain.pc());
+    assert_eq!(cached.read_register(0), plain.read_register(0));
+    // 周期记账必须逐周期一致，否则 total_cycles 诊断会漂移。
+    // Cycle accounting must match exactly or the `total_cycles` diagnostic drifts.
+    assert_eq!(cached.total_cycles(), plain.total_cycles());
+}

@@ -16,7 +16,7 @@
 | Module | Description / 描述 |
 |--------|-------------------|
 | `bus` | `AddressBus` / `MemoryRegion` dyn-safe traits, `AccessWidth`, `BusResult` |
-| `memory` | `SimpleBus` (flat router), `RamRegion` (writable / ROM) |
+| `memory` | `SimpleBus` (flat router), `RamRegion` (writable / ROM); tests live in `memory/tests.rs` |
 | `flash` | `FlashRegion` (XIP + nocache alias), `FlashHandle` (host-only) |
 | `mmio` | `MmioDevice` / `MmioWindow` / `MmioRegion` / `MmioRouter`, `mount_device` |
 | `xip_maintenance` | Write-only XIP_MAINTENANCE window (`0x1800_0000`, 64 MB) |
@@ -72,6 +72,19 @@ pub trait MemoryRegion: Send + Sync {
 diagnostic sees every word store.
 总线上的 `write_u32` 会调用 `watch::check_write`，使 `RP2350_WATCH` 诊断能看到
 每一次整字存储。
+
+`SimpleBus` overrides `write_u8` / `write_u16` / `write_u32` / `load_u8` for one
+extra side effect: guest writes into the ARMv8-M PPB window
+(`0xE000_0000..0xE010_0000`) advance a monotonic counter exposed by
+[`SimpleBus::ppb_write_epoch`]. Those are the only writes that feed the core's
+system-register replay queue, so a frontend that sees an unchanged epoch can
+skip the drain (and its mutex) entirely. Routing, error and watchpoint
+semantics are byte-for-byte the trait defaults.
+`SimpleBus` 覆写 `write_u8` / `write_u16` / `write_u32` / `load_u8`，只增加一项
+副作用：客户机对 ARMv8-M PPB 窗口（`0xE000_0000..0xE010_0000`）的写会推进
+[`SimpleBus::ppb_write_epoch`] 暴露的单调计数器。这些写正是核系统寄存器回放队列的
+唯一来源，因此前端发现世代未变即可完全跳过回放（及其互斥锁）。路由、错误与监视点
+语义与 trait 默认实现逐字节一致。
 
 ### `SimpleBus` / `RamRegion`
 
@@ -160,6 +173,25 @@ always agree.
 客户机写 Flash 返回 `AccessDenied`；只有加载器（`load_u8`/`load_bytes`）和
 `FlashHandle` 能编程。克隆与 `alias` 窗口共享底层存储，因此 `0x1000_0000` 与
 `0x1400_0000` 始终一致。
+
+Every host-side mutation publishes a generation number:
+
+```rust
+/// Current flash content generation / 当前 Flash 内容世代号
+pub fn content_generation() -> u32;
+```
+
+`FlashRegion::new`, `FlashRegion::load_bytes`, the `MemoryRegion::load_u8` path,
+`FlashHandle::write` and `FlashHandle::erase` each bump it (relaxed atomic
+`fetch_add`). Readers can therefore cache flash bytes and revalidate with one
+relaxed load instead of taking the shared-store lock per access;
+`rp2350-arm`'s flash instruction fetch cache is the only consumer today. The
+counter is monotonic and process-wide, so a mismatch simply discards the cache.
+每次宿主侧变更都会发布世代号：`FlashRegion::new`、`FlashRegion::load_bytes`、
+`MemoryRegion::load_u8` 路径、`FlashHandle::write` 与 `FlashHandle::erase` 各递增
+一次（relaxed 原子 `fetch_add`）。因此读取方可缓存 Flash 字节，并用一次 relaxed
+读取重新验证，而不必每次访问都获取共享存储锁；目前唯一使用者是 `rp2350-arm`
+的 Flash 取指缓存。计数器是进程级单调量，失配即丢弃整个缓存。
 
 ### XIP maintenance window / XIP 维护窗口
 

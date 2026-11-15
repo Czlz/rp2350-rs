@@ -23,6 +23,8 @@
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
+| `system_access` | System control space routing (`SCB_VTOR`/`SCB_CPACR`/`SCB_CFSR`, FPU system registers, NVIC/IPR aliases, SysTick) |
+| `fetch_cache` | Direct-mapped flash XIP instruction fetch cache (private, enabled per core) |
 | `exceptions` | Exception entry/exit, EXC_RETURN decoding, standard and extended (lazy FP) stack frames |
 
 ---
@@ -41,21 +43,52 @@ pub struct CortexM33Core {
 
 impl CortexM33Core {
     pub fn new(core_id: CpuId) -> Self;
+
+    // Boot / 启动
+    pub fn boot(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError>;
+    pub fn boot_from(&mut self, bus: &mut dyn AddressBus, vector_base: u32)
+        -> Result<(), CoreError>;
+    pub fn boot_at(&mut self, msp: u32, reset: u32, vector_base: u32);
+
+    // Decoding / 译码
+    pub fn set_strict_decode(&mut self, strict: bool);
+    pub fn write_xpsr(&mut self, value: u32);
+
+    // Flash fetch cache / Flash 取指缓存
+    pub fn set_flash_fetch_cache(&mut self, enabled: bool);
 }
 
 impl CpuCore for CortexM33Core {
-    fn init(&mut self, chip: &mut dyn AddressBus) -> Result<(), CoreError>;
-    fn step(&mut self, chip: &mut dyn AddressBus) -> Result<CycleCount, CoreError>;
-    fn reset(&mut self, chip: &mut dyn AddressBus) -> Result<(), CoreError>;
+    fn init(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError>;
+    fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError>;
+    fn run_cycles(&mut self, bus: &mut dyn AddressBus, cycles: CycleCount) -> (CycleCount, CpuState);
+    fn reset(&mut self);
     fn signal_interrupt(&mut self, irq: IrqNumber);
     fn servicing_irq(&self) -> Option<IrqNumber>;
     fn pc(&self) -> u32;
     fn read_register(&self, index: u8) -> u32;
     fn write_register(&mut self, index: u8, value: u32);
-    fn core_id(&self) -> CpuId;
+    fn cpu_id(&self) -> CpuId;
     fn state(&self) -> CpuState;
+    fn total_cycles(&self) -> CycleCount;
 }
 ```
+
+`set_flash_fetch_cache(true)` opts a core into the flash instruction fetch
+cache. It is **off by default** and is only exact when both flash XIP windows
+are backed by a read-only `rp2350_core::FlashRegion`: guest writes to flash are
+rejected, and every host-side mutation (loader, debugger, boot ROM) bumps
+`rp2350_core::flash::content_generation`, which clears the table. SRAM is never
+cached, so self-modifying SRAM code keeps its exact semantics. The table books
+the same two bus cycles a region halfword read does, so `total_cycles` does not
+move.
+
+`set_flash_fetch_cache(true)` 让核心启用 Flash 取指缓存。该缓存**默认关闭**，
+且只有在两个 Flash XIP 窗口都由只读 `rp2350_core::FlashRegion` 支撑时才精确：
+客户机对 Flash 的写会被拒绝，而每次宿主侧变更（加载器、调试器、boot ROM）都会
+递增 `rp2350_core::flash::content_generation` 并清空整表。SRAM 从不入缓存，因此
+自修改 SRAM 代码语义完全不变。缓存按区域半字读记入同样的两个总线周期，因此
+`total_cycles` 不会漂移。
 
 ### `CortexM33Registers`
 
@@ -194,6 +227,36 @@ impl Nvic {
     pub fn find_highest_priority(&self) -> Option<IrqNumber>;
 }
 ```
+
+### Priority selection / 优先级选择
+
+`find_highest_priority` builds the candidate set as eight `u32` bitmaps
+(`ISER & ISPR & !IABR`, one per 32-IRQ group) and then walks eight priority
+buckets from 0 upwards. Each bucket is a `u32` mask of the IRQs that carry that
+priority, maintained incrementally by `set_priority` / `write_ipr_word`
+(`write_ipr_byte` only moves the bit when the *decoded* priority changes).
+
+The result is identical to a 256-entry linear scan:
+
+* a numerically smaller priority wins;
+* within one priority the lowest IRQ number wins (`trailing_zeros` returns the
+  least significant set bit);
+* an active interrupt is never selected again (skipped by `!IABR`);
+* `PRIMASK` / `BASEPRI` are core-level masks, unchanged by this selector — the
+  core still short-circuits on `PRIMASK` before it calls into the NVIC, and
+  `BASEPRI` keeps its stored-only semantics.
+
+`nvic.rs` unit tests compare the bitmap selector against a linear reference
+implementation over pseudorandom enable/pending/active/priority matrices.
+
+`find_highest_priority` 先把候选集表示为 8 个 `u32` 位图
+（`ISER & ISPR & !IABR`，每 32 个 IRQ 一组），再按优先级从 0 逐桶遍历。每个
+优先级桶是一个 `u32` 掩码，由 `set_priority` / `write_ipr_word` 增量维护
+（`write_ipr_byte` 只在*解码后*优先级变化时移动位）。结果与 256 项线性扫描完全
+一致：数字越小优先级越高；同优先级取 IRQ 号最小者（`trailing_zeros` 返回最低
+置位）；活跃中断不再被选中（由 `!IABR` 排除）；`PRIMASK`/`BASEPRI` 属于核级
+掩码，选择器语义不变——核在调用 NVIC 之前仍按 `PRIMASK` 短路，`BASEPRI` 保持
+「仅存储」语义。单元测试用伪随机矩阵把位图选择器与线性参考实现对表。
 
 ### `SysTick`
 

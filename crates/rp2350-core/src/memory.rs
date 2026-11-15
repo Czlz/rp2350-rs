@@ -262,10 +262,24 @@ impl MemoryRegion for RamRegion {
 /// 路由是解释器中最热的操作：每次取指与每次数据访问都要把地址解析到区域。按地址
 /// 最高字节索引的直接映射表把稳态查找从「遍历动态对象」降到几次比较。同一桶内
 /// 存在多个区域时回退到线性扫描，因此该表绝不改变地址由哪个区域响应。
+///
+/// The bus also counts guest writes into the architectural PPB window
+/// (`0xE000_0000..0xE010_0000`). Firmware writes there are replayed into the
+/// core's system-register file by the frontend, so a caller can skip the drain
+/// entirely while the counter is unchanged.
+/// 总线还统计客户机对架构 PPB 窗口（`0xE000_0000..0xE010_0000`）的写入。前端会把
+/// 这些写回放到核的系统寄存器组，因此计数未变时调用方可完全跳过回放。
 pub struct SimpleBus {
     regions: Vec<Box<dyn MemoryRegion>>,
     buckets: [RegionBucket; REGION_BUCKETS],
+    ppb_write_epoch: u64,
 }
+
+/// Base of the ARMv8-M Private Peripheral Bus window / ARMv8-M 私有外设总线窗口基址
+const PPB_WINDOW_BASE: Address = 0xE000_0000;
+
+/// Size of the ARMv8-M Private Peripheral Bus window / ARMv8-M 私有外设总线窗口大小
+const PPB_WINDOW_SIZE: Address = 0x0010_0000;
 
 /// Number of region-lookup buckets covering the 32-bit address space
 /// 覆盖 32 位地址空间的区域查找桶数量
@@ -319,6 +333,28 @@ impl SimpleBus {
         self.buckets = [RegionBucket::default(); REGION_BUCKETS];
     }
 
+    /// Number of guest writes into the PPB window since machine construction
+    /// 自机器构造以来客户机对 PPB 窗口的写入次数
+    ///
+    /// The counter is monotonic and only advances for PPB addresses, which are
+    /// the only source of core system-register replay entries. A frontend can
+    /// therefore compare it with its own snapshot and skip the drain (and its
+    /// lock) whenever nothing could have been queued.
+    /// 该计数器单调递增且只在 PPB 地址上推进，而 PPB 是核系统寄存器回放条目的唯一
+    /// 来源。因此前端可以用它和自身快照比较：没有新写入时直接跳过回放（及其锁）。
+    #[must_use]
+    pub fn ppb_write_epoch(&self) -> u64 {
+        self.ppb_write_epoch
+    }
+
+    /// Count a write that lands in the PPB window / 统计落入 PPB 窗口的写
+    #[inline]
+    fn note_write(&mut self, addr: Address) {
+        if addr.wrapping_sub(PPB_WINDOW_BASE) < PPB_WINDOW_SIZE {
+            self.ppb_write_epoch = self.ppb_write_epoch.wrapping_add(1);
+        }
+    }
+
     /// Resolve `addr` through the bucket table, if the cached span still covers it
     /// 若缓存跨度仍覆盖该地址则经桶表解析
     #[inline]
@@ -336,6 +372,7 @@ impl Default for SimpleBus {
         Self {
             regions: Vec::new(),
             buckets: [RegionBucket::default(); REGION_BUCKETS],
+            ppb_write_epoch: 0,
         }
     }
 }
@@ -391,253 +428,74 @@ impl AddressBus for SimpleBus {
         let region = self.regions.get_mut(index)?;
         Some(region.as_mut())
     }
+
+    /// Byte write that also counts PPB traffic / 同时统计 PPB 流量的字节写
+    ///
+    /// The body is the trait default; only the PPB epoch bookkeeping is added,
+    /// so routing, error and watchpoint semantics are unchanged.
+    /// 函数体即 trait 默认实现，只增加 PPB 世代记账，因此路由、错误与监视点语义
+    /// 完全不变。
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
+        self.note_write(addr);
+        self.find_region_mut(addr)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            })?
+            .write_u8(addr, value, cycles)
+    }
+
+    /// Halfword write that also counts PPB traffic / 同时统计 PPB 流量的半字写
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn write_u16(&mut self, addr: Address, value: u16, cycles: &mut u64) -> BusResult<()> {
+        self.note_write(addr);
+        self.find_region_mut(addr)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            })?
+            .write_u16(addr, value, cycles)
+    }
+
+    /// Word write that also counts PPB traffic / 同时统计 PPB 流量的字写
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn write_u32(&mut self, addr: Address, value: u32, cycles: &mut u64) -> BusResult<()> {
+        crate::watch::check_write(addr, value);
+        self.note_write(addr);
+        self.find_region_mut(addr)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            })?
+            .write_u32(addr, value, cycles)
+    }
+
+    /// Host-side byte write that also counts PPB traffic
+    /// 同时统计 PPB 流量的宿主侧字节写
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
+        self.note_write(addr);
+        self.find_region_mut(addr)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            })?
+            .load_u8(addr, value, cycles)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ram_round_trip_byte() {
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
-        let mut cycles = 0;
-        ram.write_u8(0x2000_0003, 0xA5, &mut cycles).unwrap();
-        assert_eq!(ram.read_u8(0x2000_0003, &mut cycles).unwrap(), 0xA5);
-        assert_eq!(ram.bytes()[3], 0xA5);
-    }
-
-    #[test]
-    fn ram_word_round_trip_uses_byte_accessors() {
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
-        let mut cycles = 0;
-        ram.write_u32(0x2000_0004, 0xDEAD_BEEF, &mut cycles)
-            .unwrap();
-        assert_eq!(ram.read_u32(0x2000_0004, &mut cycles).unwrap(), 0xDEAD_BEEF);
-    }
-
-    #[test]
-    fn ram_rejects_out_of_range() {
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
-        let mut cycles = 0;
-        assert!(ram.read_u8(0x2000_0010, &mut cycles).is_err());
-    }
-
-    #[test]
-    fn ram_wide_writes_land_at_the_last_full_span() {
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 8);
-        let mut cycles = 0;
-        ram.write_u16(0x2000_0006, 0xBEEF, &mut cycles).unwrap();
-        ram.write_u32(0x2000_0000, 0x1122_3344, &mut cycles)
-            .unwrap();
-        assert_eq!(ram.bytes(), &[0x44, 0x33, 0x22, 0x11, 0, 0, 0xEF, 0xBE]);
-        // 两次宽写各记满宽度个周期。/ Each wide store books its full width.
-        assert_eq!(cycles, 6);
-        assert_eq!(ram.read_u32(0x2000_0000, &mut cycles).unwrap(), 0x1122_3344);
-        assert_eq!(ram.read_u16(0x2000_0006, &mut cycles).unwrap(), 0xBEEF);
-        assert_eq!(cycles, 12);
-    }
-
-    #[test]
-    fn ram_wide_write_past_the_end_matches_the_byte_path() {
-        // 默认实现先写能写下的字节，再在越界处报 NoDevice；快速路径必须一致。
-        // The default stores the bytes that fit, then reports NoDevice; the fast
-        // path must behave identically.
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 4);
-        let mut cycles = 0;
-        let err = ram.write_u16(0x2000_0003, 0x1122, &mut cycles).unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::NoDevice),
-            other => panic!("unexpected error: {other:?}"),
-        }
-        assert_eq!(ram.bytes(), &[0, 0, 0, 0x22]);
-        // 与逐字节路径一致：两个 `write_u8` 都先记周期，第二个随后越界。
-        // Matches the byte path: both `write_u8` calls book a cycle first, the
-        // second then reports the out-of-range address.
-        assert_eq!(cycles, 2);
-    }
-
-    #[test]
-    fn ram_wide_read_past_the_end_reports_no_device() {
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 4);
-        let mut cycles = 0;
-        let err = ram.read_u32(0x2000_0002, &mut cycles).unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::NoDevice),
-            other => panic!("unexpected error: {other:?}"),
-        }
-        // 与逐字节路径一致：前两个字节成功，第三次字节读在记周期后越界。
-        // Matches the byte path: two bytes succeed, the third byte read books a
-        // cycle and then reports the out-of-range address.
-        assert_eq!(cycles, 3);
-    }
-
-    #[test]
-    fn rom_wide_write_is_denied_and_changes_nothing() {
-        let mut rom = RamRegion::new_rom("rom", 0x0000_0000, 8);
-        let mut cycles = 0;
-        let err = rom
-            .write_u32(0x0000_0000, 0xFFFF_FFFF, &mut cycles)
-            .unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::AccessDenied),
-            other => panic!("unexpected error: {other:?}"),
-        }
-        assert_eq!(rom.bytes(), &[0; 8]);
-    }
-
-    #[test]
-    fn wide_writes_keep_the_byte_wise_path_while_a_write_watch_is_armed() {
-        // 写监视开启时改走逐字节路径，存储结果与周期数不变。
-        // With a write watch armed the byte-wise path runs; the stored value and
-        // the cycle count stay the same.
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
-        crate::watch::set_write_watch(Some((0x2000_0000, 0x2000_0010)));
-        assert!(crate::watch::write_watch_armed());
-        let mut cycles = 0;
-        ram.write_u32(0x2000_0004, 0x1122_3344, &mut cycles)
-            .unwrap();
-        ram.write_u16(0x2000_0008, 0xAABB, &mut cycles).unwrap();
-        crate::watch::set_write_watch(None);
-        assert!(!crate::watch::write_watch_armed());
-        assert_eq!(&ram.bytes()[4..10], &[0x44, 0x33, 0x22, 0x11, 0xBB, 0xAA]);
-        assert_eq!(cycles, 6);
-    }
-
-    #[test]
-    fn read_watch_records_one_hit_per_access_with_its_width() {
-        let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
-        let mut cycles = 0;
-        crate::watch::set_read_watch(Some((0x2000_0000, 0x2000_0010)));
-
-        ram.read_u8(0x2000_0001, &mut cycles).unwrap();
-        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0001, 1)));
-        ram.read_u16(0x2000_0002, &mut cycles).unwrap();
-        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0002, 2)));
-        ram.read_u32(0x2000_0004, &mut cycles).unwrap();
-        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0004, 4)));
-        // 未取走前有新的读命中时只保留最新一次。
-        // A newer hit replaces an unconsumed one.
-        ram.read_u8(0x2000_0000, &mut cycles).unwrap();
-        ram.read_u8(0x2000_0003, &mut cycles).unwrap();
-        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0003, 1)));
-
-        crate::watch::set_read_watch(None);
-        assert_eq!(cycles, 9, "byte cycles must match the default path");
-    }
-
-    #[test]
-    fn rom_rejects_writes() {
-        let mut rom = RamRegion::new_rom("rom", 0x0000_0000, 16);
-        let mut cycles = 0;
-        let err = rom.write_u8(0x0000_0000, 1, &mut cycles).unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::AccessDenied),
-            other => panic!("unexpected error: {other:?}"),
-        }
-        assert!(!rom.is_writable());
-    }
-
-    #[test]
-    fn bus_routes_to_region() {
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 64)))
-            .unwrap();
-        let mut cycles = 0;
-        bus.write_u32(0x2000_0000, 0x1234_5678, &mut cycles)
-            .unwrap();
-        assert_eq!(bus.read_u32(0x2000_0000, &mut cycles).unwrap(), 0x1234_5678);
-    }
-
-    #[test]
-    fn bus_reports_unmapped_address() {
-        let mut bus = SimpleBus::new();
-        let mut cycles = 0;
-        let err = bus.read_u8(0x4000_0000, &mut cycles).unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::NoDevice),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bus_rejects_overlapping_regions() {
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("a", 0x2000_0000, 64)))
-            .unwrap();
-        let err = bus
-            .register_region(Box::new(RamRegion::new("b", 0x2000_0010, 64)))
-            .unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::Overlap),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bus_unregister_by_name() {
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 64)))
-            .unwrap();
-        assert_eq!(bus.region_count(), 1);
-        bus.unregister_region("ram");
-        assert_eq!(bus.region_count(), 0);
-    }
-
-    #[test]
-    fn bus_routes_regions_that_share_one_bucket() {
-        // 0x2000_0000 与 0x20F0_0000 落在同一个 16 MiB 桶：缓存必须回退到扫描，
-        // 两次访问都要落到各自的区域。
-        // Both live in the same 16 MiB bucket: the cache must fall back to the
-        // scan and each access must still reach its own region.
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("low", 0x2000_0000, 0x100)))
-            .unwrap();
-        bus.register_region(Box::new(RamRegion::new("high", 0x20F0_0000, 0x100)))
-            .unwrap();
-        let mut cycles = 0;
-        for _ in 0..4 {
-            bus.write_u32(0x2000_0010, 0x1111_1111, &mut cycles)
-                .unwrap();
-            bus.write_u32(0x20F0_0010, 0x2222_2222, &mut cycles)
-                .unwrap();
-        }
-        assert_eq!(bus.read_u32(0x2000_0010, &mut cycles).unwrap(), 0x1111_1111);
-        assert_eq!(bus.read_u32(0x20F0_0010, &mut cycles).unwrap(), 0x2222_2222);
-    }
-
-    #[test]
-    fn bus_cache_does_not_survive_unregister() {
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 0x100)))
-            .unwrap();
-        let mut cycles = 0;
-        bus.write_u32(0x2000_0000, 0x1234_5678, &mut cycles)
-            .unwrap();
-        assert_eq!(bus.read_u32(0x2000_0000, &mut cycles).unwrap(), 0x1234_5678);
-        bus.unregister_region("ram");
-        // 撤除后同一地址必须报 NoDevice，而不是命中陈旧缓存。
-        // After removal the same address must report NoDevice, not a stale hit.
-        let err = bus.read_u32(0x2000_0000, &mut cycles).unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::NoDevice),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bus_cache_picks_up_a_newly_registered_region() {
-        let mut bus = SimpleBus::new();
-        bus.register_region(Box::new(RamRegion::new("first", 0x2000_0000, 0x100)))
-            .unwrap();
-        let mut cycles = 0;
-        let err = bus.read_u8(0x3000_0000, &mut cycles).unwrap_err();
-        match err {
-            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::NoDevice),
-            other => panic!("unexpected error: {other:?}"),
-        }
-        bus.register_region(Box::new(RamRegion::new("second", 0x3000_0000, 0x100)))
-            .unwrap();
-        bus.write_u8(0x3000_0004, 0x5A, &mut cycles).unwrap();
-        assert_eq!(bus.read_u8(0x3000_0004, &mut cycles).unwrap(), 0x5A);
-    }
-}
+mod tests;

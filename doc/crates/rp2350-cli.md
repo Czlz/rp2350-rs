@@ -680,8 +680,8 @@ impl Machine {
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
     // dma_transfers, dma_state, hstx_words, hstx_state, pio_busy_mask,
     // pio_pc (test hook), core1_state, core1_pc, core1_sp, core1_launch_count,
-    // core1_halt_reason, take_uart_output, take_notices, recent_steps,
-    // register, dump_memory
+    // core1_halt_reason, take_uart_output, take_notices, notices_pending,
+    // recent_steps, register, dump_memory
     // debugger: read_register, write_register, xpsr, write_xpsr, cpu_state
 }
 
@@ -768,6 +768,26 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
   former `0..64` scan, so IRQ log lines and delivery order are unchanged.
   `deliver_irqs` 只遍历掩码中已断言的位（`trailing_zeros` + `mask &= mask - 1`），
   顺序与原先的 `0..64` 扫描一致，因此 IRQ 日志行与投递顺序不变。
+- `record_step` writes the `(step, PC)` pair into a fixed 32-entry ring
+  (`RecentSteps`) instead of a `VecDeque`; `[tail]` and fault traces iterate the
+  same chronological order, so the diagnostic text is unchanged.
+  `record_step` 把 `(步数, PC)` 写入定长 32 条的 `RecentSteps` 环形缓冲（替代
+  `VecDeque`）；`[tail]` 与故障回溯仍按相同的时间顺序迭代，诊断文本不变。
+- The boot ROM stub check is gated by the ROM window
+  (`pc - ROM_BASE < ROM_SIZE`) before scanning the stub table. Every stub is
+  built inside the ROM image, so the gate cannot skip a real trap.
+  boot ROM 桩检查先用 ROM 窗口（`pc - ROM_BASE < ROM_SIZE`）过滤，再扫描桩表。
+  所有桩都构建在 ROM 映像内，因此该门控不会漏掉真实陷阱。
+- System-control replay is gated by `SimpleBus::ppb_write_epoch`: an unchanged
+  epoch proves the replay queue is empty, so the drain (and its mutex) is
+  skipped. A PPB write in the same step is still replayed before the next
+  instruction.
+  系统控制回放由 `SimpleBus::ppb_write_epoch` 门控：世代未变即证明回放队列为空，
+  于是跳过回放（及其互斥锁）。同一步内发生的 PPB 写仍会在下一条指令前回放。
+- The `run` loop drains notices only when `Machine::notices_pending()` reports a
+  queued line; trace lines and spin warnings are emitted in the same order.
+  `run` 循环仅在 `Machine::notices_pending()` 报告有排队内容时才取走通知；轨迹行
+  与自旋告警的输出顺序不变。
 
 #### Bus, MMIO and watch cost / 总线、MMIO 与监视开销
 

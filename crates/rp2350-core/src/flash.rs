@@ -17,7 +17,33 @@
 use super::bus::{BusResult, MemoryRegion};
 use super::error::{BusErrorKind, CoreError};
 use super::types::Address;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Monotonic generation of host-side flash content changes
+/// 宿主侧 Flash 内容变更的单调世代号
+///
+/// Guest writes to flash are rejected, so the only way the programmed bytes can
+/// change is a host-side loader or debugger write through [`FlashRegion`] or
+/// [`FlashHandle`]. Every such mutation bumps this counter, which lets a reader
+/// cache flash bytes and revalidate them with one relaxed load instead of
+/// taking the shared-store lock on every access.
+/// 客户机对 Flash 的写会被拒绝，因此已编程字节只可能经由 [`FlashRegion`] 或
+/// [`FlashHandle`] 的宿主侧加载器/调试器写入而改变。每次变更都会递增本计数器，
+/// 读取方据此缓存 Flash 字节，并用一次 relaxed 读取重新验证，而不必每次访问都
+/// 获取共享存储锁。
+static CONTENT_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// Current flash content generation / 当前 Flash 内容世代号
+#[must_use]
+pub fn content_generation() -> u32 {
+    CONTENT_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Publish a host-side content change / 发布一次宿主侧内容变更
+fn bump_content_generation() {
+    CONTENT_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Base address of the RP2350 flash XIP window / RP2350 Flash XIP 窗口基地址
 pub const FLASH_XIP_BASE: Address = 0x1000_0000;
@@ -53,6 +79,10 @@ impl FlashRegion {
     /// 调用者需确保 `base + size` 不超出 32 位地址空间。
     #[must_use]
     pub fn new(name: impl Into<String>, base: Address, size: usize) -> Self {
+        // 新建底层存储等同于内容变更：任何按地址缓存的 Flash 字节都必须失效。
+        // A fresh backing store counts as a content change so any address-keyed
+        // cache of flash bytes is dropped.
+        bump_content_generation();
         Self {
             name: name.into(),
             base,
@@ -140,6 +170,8 @@ impl FlashRegion {
             kind: BusErrorKind::DeviceError,
         })?;
         slot.copy_from_slice(bytes);
+        drop(data);
+        bump_content_generation();
         Ok(())
     }
 
@@ -261,6 +293,8 @@ impl MemoryRegion for FlashRegion {
             kind: BusErrorKind::DeviceError,
         })?;
         *slot = value;
+        drop(data);
+        bump_content_generation();
         Ok(())
     }
 }
@@ -330,6 +364,8 @@ impl FlashHandle {
             kind: BusErrorKind::DeviceError,
         })?;
         slot.copy_from_slice(bytes);
+        drop(data);
+        bump_content_generation();
         Ok(())
     }
 
@@ -351,6 +387,8 @@ impl FlashHandle {
             kind: BusErrorKind::DeviceError,
         })?;
         slot.fill(0xFF);
+        drop(data);
+        bump_content_generation();
         Ok(())
     }
 

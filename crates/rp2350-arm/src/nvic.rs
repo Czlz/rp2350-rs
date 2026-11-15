@@ -48,7 +48,23 @@ pub struct Nvic {
     /// Interrupt Priority Registers (IPR0..IPR63, 8-bit each)
     /// 中断优先级寄存器
     ipr: [u8; 256],
+    /// Priority buckets: `priority_mask[p][g]` marks the IRQs of group `g`
+    /// whose priority equals `p`
+    /// 优先级分桶：`priority_mask[p][g]` 标记第 `g` 组中优先级等于 `p` 的中断
+    ///
+    /// Selection walks eight buckets instead of 256 interrupts, and the bitmaps
+    /// are rebuilt only when a priority register changes.
+    /// 选择时只遍历 8 个优先级桶而不是 256 个中断，位图仅在优先级寄存器变化时重建。
+    priority_mask: [[u32; 8]; 8],
 }
+
+/// Number of 32-bit groups covering the 256 implemented interrupts
+/// 覆盖 256 个已实现中断的 32 位组数
+const IRQ_GROUPS: usize = 8;
+
+/// Number of distinct priority values (`PRIORITY_BITS` bits)
+/// 不同优先级值的数量（`PRIORITY_BITS` 位）
+const PRIORITY_LEVELS: usize = 1 << PRIORITY_BITS;
 
 impl Nvic {
     /// Create a new NVIC in reset state (all interrupts disabled, no pending)
@@ -62,6 +78,13 @@ impl Nvic {
             icpr: [0; 8],
             iabr: [0; 8],
             ipr: [0; 256],
+            // 复位时所有 IPR 字节为 0，即全部中断处于优先级 0。
+            // All IPR bytes reset to zero, so every interrupt starts at priority 0.
+            priority_mask: {
+                let mut mask = [[0u32; IRQ_GROUPS]; PRIORITY_LEVELS];
+                mask[0] = [u32::MAX; IRQ_GROUPS];
+                mask
+            },
         }
     }
 
@@ -102,7 +125,28 @@ impl Nvic {
     /// Set the priority of an interrupt
     /// 设置中断优先级
     pub fn set_priority(&mut self, irq: IrqNumber, priority: u8) {
-        self.ipr[irq as usize] = priority << (8 - PRIORITY_BITS);
+        self.write_ipr_byte(irq as usize, priority << (8 - PRIORITY_BITS));
+    }
+
+    /// Store one IPR byte and keep the priority buckets in sync
+    /// 写入一个 IPR 字节并同步优先级分桶
+    ///
+    /// The buckets only change when the *decoded* priority changes, so repeated
+    /// writes of the same value cost nothing beyond one comparison.
+    /// 只有*解码后*的优先级变化时才移动桶内位，因此重复写同一值的开销只有一次比较。
+    fn write_ipr_byte(&mut self, irq: usize, value: u8) {
+        if irq >= self.ipr.len() {
+            return;
+        }
+        let old = (self.ipr[irq] >> (8 - PRIORITY_BITS)) as usize;
+        let new = (value >> (8 - PRIORITY_BITS)) as usize;
+        self.ipr[irq] = value;
+        if old != new {
+            let group = irq / NVIC_REGISTER_STRIDE;
+            let bit = 1u32 << (irq % NVIC_REGISTER_STRIDE);
+            self.priority_mask[old][group] &= !bit;
+            self.priority_mask[new][group] |= bit;
+        }
     }
 
     /// Read ISER value (word at 4-byte offset)
@@ -132,7 +176,7 @@ impl Nvic {
         let base = index * 4;
         for i in 0..4 {
             if base + i < 256 {
-                self.ipr[base + i] = ((value >> (i * 8)) & 0xFF) as u8;
+                self.write_ipr_byte(base + i, ((value >> (i * 8)) & 0xFF) as u8);
             }
         }
     }
@@ -265,25 +309,40 @@ impl Nvic {
     ///
     /// Returns `None` if no interrupt is pending and enabled.
     /// 如果没有挂起且已使能的中断，返回 `None`。
+    ///
+    /// The candidate set is built as eight `u32` bitmaps (`enabled & pending &
+    /// !active`) and then walked bucket by bucket from priority 0 upwards, so a
+    /// cycle costs a handful of word operations instead of 256 interrupt tests.
+    /// Ties inside one priority bucket pick the lowest IRQ number because
+    /// `trailing_zeros` returns the least significant set bit.
+    /// 候选集先表示为 8 个 `u32` 位图（`使能 & 挂起 & !活跃`），再按优先级从 0
+    /// 逐桶遍历；一次选择只需若干字操作，而不是 256 次中断判定。同一优先级桶内
+    /// 由 `trailing_zeros` 取最低置位，因此并列时总是 IRQ 号最小者。
     #[must_use]
     pub fn find_highest_priority(&self) -> Option<IrqNumber> {
-        let mut best_irq: Option<IrqNumber> = None;
-        let mut best_prio: u8 = 0xFF;
-
-        for irq in 0u16..256 {
-            if !self.is_enabled(irq) || !self.is_pending(irq) || self.is_active(irq) {
-                continue;
-            }
-            let prio = self.get_priority(irq);
-            // Lower number = higher priority
-            // 数字越小 = 优先级越高
-            if prio < best_prio {
-                best_prio = prio;
-                best_irq = Some(irq);
+        let mut candidates = [0u32; IRQ_GROUPS];
+        for (group, bits) in candidates.iter_mut().enumerate() {
+            // 活跃中断不能抢占自身，因此从候选集中排除。
+            // An active interrupt cannot preempt itself, so drop it.
+            *bits = self.iser[group] & self.ispr[group] & !self.iabr[group];
+        }
+        if candidates.iter().all(|bits| *bits == 0) {
+            return None;
+        }
+        // 数字越小优先级越高。/
+        // A numerically smaller priority wins.
+        for priority in 0..PRIORITY_LEVELS {
+            let bucket = &self.priority_mask[priority];
+            for (group, bits) in candidates.iter().enumerate() {
+                let hit = *bits & bucket[group];
+                if hit != 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let irq = (group as u16) * 32 + hit.trailing_zeros() as u16;
+                    return Some(irq);
+                }
             }
         }
-
-        best_irq
+        None
     }
 }
 
@@ -359,5 +418,163 @@ mod tests {
 
         nvic.clear_active(3);
         assert_eq!(nvic.find_highest_priority(), Some(3));
+    }
+
+    /// Linear scan used as the reference for the bitmap selector
+    /// 位图选择器的参考实现（线性扫描）
+    fn reference(nvic: &Nvic) -> Option<IrqNumber> {
+        let mut best_irq = None;
+        let mut best_prio = u8::MAX;
+        for irq in 0u16..256 {
+            if !nvic.is_enabled(irq) || !nvic.is_pending(irq) || nvic.is_active(irq) {
+                continue;
+            }
+            let prio = nvic.get_priority(irq);
+            if prio < best_prio {
+                best_prio = prio;
+                best_irq = Some(irq);
+            }
+        }
+        best_irq
+    }
+
+    /// Fill the NVIC from a deterministic pseudo-random stream
+    /// 用确定性伪随机流填充 NVIC
+    fn fill_pseudo_random(nvic: &mut Nvic, seed: u64) {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        for index in 0..8 {
+            nvic.write_iser(index, next());
+            nvic.write_ispr(index, next());
+            nvic.write_ipr_word(index * 8, next());
+            nvic.write_ipr_word(index * 8 + 1, next());
+            nvic.write_ipr_word(index * 8 + 2, next());
+            nvic.write_ipr_word(index * 8 + 3, next());
+            nvic.write_ipr_word(index * 8 + 4, next());
+            nvic.write_ipr_word(index * 8 + 5, next());
+            nvic.write_ipr_word(index * 8 + 6, next());
+            nvic.write_ipr_word(index * 8 + 7, next());
+        }
+        // 半数 IRQ 置为活跃，覆盖「活跃中断被跳过」的分支。
+        // Mark half the IRQs active to exercise the "active is skipped" branch.
+        for irq in 0..256u16 {
+            if next() & 1 != 0 {
+                nvic.set_active(irq);
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_selector_matches_the_linear_reference() {
+        for seed in 1..24u64 {
+            let mut nvic = Nvic::new();
+            fill_pseudo_random(&mut nvic, seed);
+            assert_eq!(
+                nvic.find_highest_priority(),
+                reference(&nvic),
+                "seed {seed} must agree with the linear scan"
+            );
+        }
+    }
+
+    #[test]
+    fn every_irq_enabled_and_pending_picks_the_lowest_number() {
+        let mut nvic = Nvic::new();
+        for index in 0..8 {
+            nvic.write_iser(index, u32::MAX);
+            nvic.write_ispr(index, u32::MAX);
+        }
+        // 全部默认优先级 0：必须取 IRQ0。
+        // All priorities reset to 0, so IRQ0 must win.
+        assert_eq!(nvic.find_highest_priority(), Some(0));
+        // 屏蔽 IRQ0 后应取 IRQ1，说明同优先级按编号最小者。
+        // Masking IRQ0 must select IRQ1, proving ties pick the lowest number.
+        nvic.write_icpr(0, 1);
+        assert_eq!(nvic.find_highest_priority(), Some(1));
+        nvic.set_active(1);
+        assert_eq!(nvic.find_highest_priority(), Some(2));
+    }
+
+    #[test]
+    fn equal_priority_across_groups_picks_the_lowest_irq() {
+        let mut nvic = Nvic::new();
+        nvic.write_iser(0, 1 << 31);
+        nvic.write_iser(7, 1 << 31);
+        nvic.set_pending(31);
+        nvic.set_pending(255);
+        nvic.set_priority(31, 3);
+        nvic.set_priority(255, 3);
+        assert_eq!(nvic.find_highest_priority(), Some(31));
+        nvic.set_active(31);
+        assert_eq!(nvic.find_highest_priority(), Some(255));
+    }
+
+    #[test]
+    fn lower_priority_number_wins_across_groups() {
+        let mut nvic = Nvic::new();
+        nvic.write_iser(7, 1);
+        nvic.write_iser(0, 1);
+        nvic.set_pending(7 * 32);
+        nvic.set_pending(0);
+        nvic.set_priority(7 * 32, 0);
+        nvic.set_priority(0, 5);
+        assert_eq!(nvic.find_highest_priority(), Some(7 * 32));
+        nvic.set_priority(0, 0);
+        assert_eq!(nvic.find_highest_priority(), Some(0));
+    }
+
+    #[test]
+    fn ipr_word_writes_move_ints_between_priority_buckets() {
+        let mut nvic = Nvic::new();
+        nvic.write_iser(0, (1 << 1) | (1 << 2));
+        nvic.set_pending(1);
+        nvic.set_pending(2);
+        // IPR 字按小端打包：字节 1 是 IRQ1，字节 2 是 IRQ2。
+        // 把 IRQ1 设为优先级 0、IRQ2 设为 7，然后反过来。
+        // The IPR word packs little-endian: byte 1 is IRQ1, byte 2 is IRQ2.
+        // Program IRQ1 to 0 and IRQ2 to 7, then swap them.
+        nvic.write_ipr_word(0, 0x00E0_0000);
+        assert_eq!(nvic.get_priority(1), 0);
+        assert_eq!(nvic.get_priority(2), 7);
+        assert_eq!(nvic.find_highest_priority(), Some(1));
+        // 同优先级 7 时编号更小者胜出。
+        // Both at priority 7: the lower IRQ number wins.
+        nvic.write_ipr_word(0, 0x00E0_E000);
+        assert_eq!(nvic.find_highest_priority(), Some(1));
+        // 把 IRQ2 提升到 0：它现在必须胜出。
+        // Promote IRQ2 to 0: it must win now.
+        nvic.write_ipr_word(0, 0x0000_E000);
+        assert_eq!(nvic.find_highest_priority(), Some(2));
+    }
+
+    #[test]
+    fn disabled_or_unpending_or_active_irqs_are_skipped() {
+        let mut nvic = Nvic::new();
+        // IRQ4/IRQ5 位于 ISER0（每 32 个 IRQ 一个寄存器）。
+        // IRQ4/IRQ5 live in ISER0 (one register per 32 IRQs).
+        nvic.write_iser(0, (1 << 4) | (1 << 5));
+        nvic.set_pending(4);
+        nvic.set_pending(5);
+        assert_eq!(nvic.find_highest_priority(), Some(4));
+        nvic.write_icer(0, 1 << 4);
+        assert_eq!(nvic.find_highest_priority(), Some(5));
+        nvic.set_active(5);
+        assert_eq!(nvic.find_highest_priority(), None);
+        nvic.write_icpr(0, 1 << 5);
+        nvic.clear_active(5);
+        assert_eq!(nvic.find_highest_priority(), None);
+    }
+
+    #[test]
+    fn reset_priorities_are_zero_for_every_irq() {
+        let nvic = Nvic::new();
+        for irq in 0u16..256 {
+            assert_eq!(nvic.get_priority(irq), 0);
+        }
     }
 }
