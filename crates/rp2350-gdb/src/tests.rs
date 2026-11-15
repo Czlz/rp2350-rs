@@ -14,6 +14,10 @@ use crate::target::{
     GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, ThreadId, WatchKind,
 };
 
+// `vCont` 动作列表测试拆到子模块，控制单文件行数。
+// `vCont` action-list tests live in a submodule to keep this file compact.
+mod vcont;
+
 /// Mock target that records watchpoint requests and can simulate a stop
 /// 记录监视点请求并可模拟停止的 mock 目标
 #[derive(Default)]
@@ -771,7 +775,7 @@ fn vcont_stop_and_invalid_actions_reply_legally() {
         session.handle_packet("vCont;t:2").as_deref(),
         Some("T02thread:2;")
     );
-    assert_eq!(session.handle_packet("vCont;x").as_deref(), Some(""));
+    assert_eq!(session.handle_packet("vCont;x").as_deref(), Some("E01"));
     assert_eq!(session.handle_packet("vCont;c:9").as_deref(), Some("E01"));
     assert_eq!(session.handle_packet("vCont;c;s").as_deref(), Some("E01"));
     assert_eq!(session.target().resumed, Vec::new());

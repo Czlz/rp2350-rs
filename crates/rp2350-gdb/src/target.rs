@@ -93,6 +93,24 @@ pub enum ResumeMode {
     Step,
 }
 
+/// One entry of a multi-thread resume request / 多线程恢复请求中的一条
+///
+/// RSP `vCont` carries an action list: each entry names one action for one
+/// thread, and a list without a thread id is the *default* action applied to
+/// every thread the list does not mention. [`GdbTarget::cont`] consumes these
+/// entries, so a target never parses the wire format itself.
+/// RSP `vCont` 携带动作列表：每条为一个线程指定一个动作，不带线程号的条目是
+/// *缺省* 动作，作用于列表中未提到的所有线程。[`GdbTarget::cont`] 消费这些条目，
+/// 因此目标实现本身无需解析线上格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadAction {
+    /// Thread this action applies to; `None` = the default action
+    /// 本动作适用的线程；`None` 表示缺省动作
+    pub thread: Option<ThreadId>,
+    /// Continue or single-step / 继续或单步
+    pub mode: ResumeMode,
+}
+
 /// Kind of watchpoint requested by the debugger / 调试器请求的监视点类型
 ///
 /// `Write` maps to RSP `Z2` (`watch`), `Read` to `Z3` (`rwatch`), and `Access`
@@ -338,6 +356,44 @@ pub trait GdbTarget: Send {
     /// See [`Self::resume`]. / 参见 [`Self::resume`]。
     fn step_thread(&mut self, _thread: ThreadId) -> Result<StopReply, GdbError> {
         self.resume(ResumeMode::Step)
+    }
+
+    /// Execute a multi-thread resume request (`vCont` action list)
+    /// 执行多线程恢复请求（`vCont` 动作列表）
+    ///
+    /// The default implementation performs every `Step` entry first (one
+    /// instruction per thread) and reports the last one; the `Continue` entries
+    /// are only run when the list contains no `Step` entry. That is the
+    /// all-stop interpretation this server implements: a list such as
+    /// `vCont;s:2;c` steps thread 2 and leaves the continued threads stopped,
+    /// so the client sees exactly one thread move.
+    /// 默认实现先执行所有 `Step` 条目（每线程一条指令）并上报最后一条；仅当列表
+    /// 中没有 `Step` 条目时才运行 `Continue` 条目。这就是本服务器实现的 all-stop
+    /// 解释：`vCont;s:2;c` 只单步线程 2，被继续的线程保持停止，客户端因此只看到
+    /// 一个线程前进。
+    ///
+    /// # Errors
+    /// Returns whatever the per-thread resume hook returns, and
+    /// [`GdbError::Unsupported`] for an empty action list.
+    /// 返回按线程恢复钩子的错误；空动作列表返回 [`GdbError::Unsupported`]。
+    fn cont(&mut self, actions: &[ThreadAction]) -> Result<StopReply, GdbError> {
+        let stepping = actions.iter().any(|action| action.mode == ResumeMode::Step);
+        let mut last = None;
+        for action in actions {
+            // 有单步时继续集合不运行，否则 all-stop 客户端会看到其它线程也前进。
+            // With a step present the continue set stays stopped, so an all-stop
+            // client never sees other threads advance.
+            if stepping && action.mode != ResumeMode::Step {
+                continue;
+            }
+            last = Some(match (action.mode, action.thread) {
+                (ResumeMode::Step, Some(thread)) => self.step_thread(thread)?,
+                (ResumeMode::Step, None) => self.resume(ResumeMode::Step)?,
+                (ResumeMode::Continue, Some(thread)) => self.continue_thread(thread)?,
+                (ResumeMode::Continue, None) => self.resume(ResumeMode::Continue)?,
+            });
+        }
+        last.ok_or(GdbError::Unsupported("empty vCont action list"))
     }
 
     /// Thread that produced the most recent stop reply

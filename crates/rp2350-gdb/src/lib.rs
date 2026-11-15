@@ -30,7 +30,8 @@ pub use rsp::{
 };
 pub use server::GdbServer;
 pub use target::{
-    GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, ThreadId, WatchKind,
+    GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, ThreadAction, ThreadId,
+    WatchKind,
 };
 pub use target_xml::{ANNEX as TARGET_XML_ANNEX, ANNEX_ERROR as TARGET_XML_ERROR, TARGET_XML};
 
@@ -393,10 +394,10 @@ mod rsp_tests {
             session.handle_packet("vCont;t").as_deref(),
             Some("T02thread:1;")
         );
-        // 继续与单步混用无法由本目标满足。 / Mixed actions are unsupported.
+        // 继续与单步混用的缺省动作相互冲突。 / Conflicting default actions.
         assert_eq!(session.handle_packet("vCont;c;s").as_deref(), Some("E01"));
-        // 未知动作按 RSP 约定回复空包。 / Unknown actions reply an empty packet.
-        assert_eq!(session.handle_packet("vCont;x").as_deref(), Some(""));
+        // 未知动作按 RSP 错误码回复 `E01`。 / Unknown actions reply `E01`.
+        assert_eq!(session.handle_packet("vCont;x").as_deref(), Some("E01"));
         assert_eq!(session.handle_packet("vCont;s:2").as_deref(), Some("E01"));
     }
 

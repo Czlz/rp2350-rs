@@ -15,7 +15,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use rp2350_cpu::CpuState;
 
 use crate::rsp::{ACK, NACK, Session, decode_packet, encode_packet};
-use crate::target::{GdbError, GdbTarget, ResumeMode, StopReply, TargetStatus, ThreadId};
+use crate::target::{
+    GdbError, GdbTarget, ResumeMode, StopReply, TargetStatus, ThreadAction, ThreadId,
+};
 
 /// Blocking GDB Remote Serial Protocol server / 阻塞式 GDB 远程串行协议服务器
 pub struct GdbServer {
@@ -176,6 +178,10 @@ impl GdbTarget for Box<dyn GdbTarget + Send> {
 
     fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
         (**self).step_thread(thread)
+    }
+
+    fn cont(&mut self, actions: &[ThreadAction]) -> Result<StopReply, GdbError> {
+        (**self).cont(actions)
     }
 
     fn stopped_thread(&self) -> ThreadId {

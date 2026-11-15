@@ -56,6 +56,7 @@ pub trait GdbTarget: Send {
         -> Result<(), GdbError>;
     fn continue_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError>;
     fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError>;
+    fn cont(&mut self, actions: &[ThreadAction]) -> Result<StopReply, GdbError>;
     fn stopped_thread(&self) -> ThreadId;                      // default: core0
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError>;
     fn status(&self) -> TargetStatus;
@@ -65,6 +66,8 @@ pub trait GdbTarget: Send {
 支持类型 / Supporting types：
 - `ThreadId(u32)`：`CORE0 = 1`、`CORE1 = 2`；`number()` 返回线上编号
 - `ResumeMode`：`Continue` / `Step`
+- `ThreadAction { thread: Option<ThreadId>, mode: ResumeMode }`：`vCont` 动作列表
+  的一条；`thread = None` 表示缺省动作（作用于列表中未提到的线程）
 - `WatchKind`：`Write`（`Z2`）/ `Read`（`Z3`）/ `Access`（`Z4`）
 - `StopReply { reason: StopReason, pc: u32 }`；`signal()` 返回 GDB 信号号
 - `StopReason`：`Breakpoint`、`SingleStep`、`Fault`、`Sleeping`、`Halted`、
@@ -192,11 +195,11 @@ impl<T: GdbTarget> RspSession<T> {
 | `Hg<id>` / `Hc<id>` | `OK`（越界 `E01`） | 记录寄存器/继续线程；`0`/`-1` 表示全部 |
 | `T<id>` | `OK` / `E01` | 查询线程是否存活 |
 | `vCont?` | `vCont;c;C;s;S;t` | 多线程动作能力 |
-| `vCont;<action>[:<tid>][;...]` | `T<sig>thread:<n>;`、`E01` 或空包 | 见下文“线程模型与 `vCont`” |
+| `vCont;<action>[:<tid>][;...]` | `T<sig>thread:<n>;` / `T02thread:<n>;`（`t`）/ `E01` | 动作列表可为每个线程指定不同动作，见下文“线程模型与 `vCont`” |
 | `QStartNoAckMode` | `OK` | 置位 `no_ack_mode()`，状态化 |
 | `qXfer:features:read:target.xml:<off>,<len>` | `m<chunk>` / `l<chunk>` | 按字节切片的目标描述；`len=0`、`off` 到界或越界均返回空 `l` |
 | `qXfer:features:read:<其他 annex>:...` | `E00` | 未提供的 annex；参数非法同样 `E00` |
-| 未知 / 不支持的 `q`、`Q`、`v` | 空包 `""` | 符合 RSP 探测约定 |
+| 未知 / 不支持的 `q`、`Q`、`v`（`vCont` 非法动作除外） | 空包 `""` | 符合 RSP 探测约定 |
 
 写监视点命中时停止回复为 `T05watch:<hex-addr>;`，读监视点为
 `T05rwatch:<hex-addr>;`，访问监视点为 `T05awatch:<hex-addr>;`；目标无法给出
@@ -251,19 +254,55 @@ replies `OK` or `E01`.
 
 `vCont` 语法：`vCont;<action>[:<tid>][;...]`，动作可为 `c`/`C<sig>`（继续）、
 `s`/`S<sig>`（单步）或 `t`（停止）。省略 `:<tid>`、`tid = -1`/`0` 均表示全部
-线程；`c:1;c:2` 与裸 `c` 等价。继续与单步混用的列表无法由本目标满足，回复
-`E01`；未知动作回复空包；越界线程号回复 `E01`。`vCont;t` 以
-`T02thread:<n>;`（SIGINT）应答。注意 all-stop 模式下 GDB 的单步会发送
-`vCont;s:2;c` 这类混合列表，因此客户端需 `set scheduler-locking step` 或直接发
-`vCont;s:2`，才能真正只推进选中核。
+线程（即“缺省动作”）。**同一列表可为不同线程指定不同动作**，这是 all-stop 模式下
+真实 GDB 的默认报文形状：
+
+| 报文 | 语义 / Reply |
+|------|--------------|
+| `vCont;c` | 全部线程继续，任一停止即回报；等价于裸 `c` |
+| `vCont;c:1;c:2` | 覆盖全部线程 → 折叠为一次整目标继续，等价于裸 `c` |
+| `vCont;c:2` | 只继续线程 2（core1），线程 1 保持停止 |
+| `vCont;s:2` | 只单步线程 2 一条指令，线程 1 保持停止，回复 `T05thread:2;` |
+| `vCont;s:2;c` | **混合列表**：单步集合先执行（线程 2 前进一条），继续集合不运行；回复 `T05thread:2;`，core0 不前进 |
+| `vCont;s:1;s:2` | 两个线程各单步一条，回复最后执行的线程（`thread:2;`） |
+| `vCont;s:2;s` | 无线程缺省单步覆盖全部线程 → 折叠为一次整目标单步（每核一条） |
+| `vCont;t` / `vCont;t:2` | 停止全部，以 `T02thread:<n>;`（SIGINT）应答，不推进任何核心 |
+
+执行规则（由 `rsp/vcont.rs` 规划、`GdbTarget::cont` 执行）：
+
+1. 列表含 `t` → 只停止，回复 `T02thread:<n>;`；`t` 与恢复动作混用视为非法。
+2. 列表含单步 → 逐个执行单步（每线程一条指令），**继续集合保持停止**，停止回复取
+   最后执行的那条动作的线程号。这是 all-stop 客户端期望的“被单步的线程停住，其余
+   保持停止”。
+3. 列表只含继续 → 若覆盖全部线程（或带无线程缺省动作）折叠为一次整目标继续，否则
+   只继续被点名的线程。
+
+错误码：同一线程被指定两次（`c:1;c:1`）、两条**不同**的无线程缺省动作
+（`vCont;c;s`）、未知动作（含不支持的 `vCont;r`）、空动作列表（`vCont;`）、越界
+线程号（单核目标收到 `:2`）均回复 `E01`，且不推进任何核心。重复的**同一**无线程
+动作（`vCont;c;c`）是幂等的，等价于裸 `c`。
+
+> 未列出的线程**保持停止**（本实现的选择）：RSP 规范允许对未列出的线程套用缺省
+> 动作，但在混合列表中套用会让 all-stop 客户端看到未被单步的线程也前进，因此本
+> 实现只在没有单步动作时才使用缺省动作。
+> Threads not named by a list **stay stopped** (this implementation's choice): RSP
+> allows applying the default action to unlisted threads, but doing so in a mixed
+> list would make an all-stop client observe threads it did not step. The default
+> action is therefore only used when the list contains no step action.
+
 `vCont` syntax is `vCont;<action>[:<tid>][;...]` with `c`/`C<sig>` (continue),
-`s`/`S<sig>` (step) or `t` (stop). A missing `:<tid>`, `tid = -1` and `tid = 0`
-all mean every thread, and `c:1;c:2` is equivalent to a bare `c`. Mixed
-continue/step lists cannot be satisfied by this target and reply `E01`; unknown
-actions reply an empty packet and out-of-range ids reply `E01`. `vCont;t` answers
-`T02thread:<n>;` (SIGINT). Note that in all-stop mode GDB steps with a mixed list
-such as `vCont;s:2;c`, so a client needs `set scheduler-locking step` (or a
-direct `vCont;s:2`) to really advance only the selected core.
+`s`/`S<sig>` (step) or `t` (stop). A missing `:<tid>` and `tid = -1`/`0` all mean
+every thread (the *default action*). **One list may name a different action per
+thread**, which is exactly what real GDB sends in all-stop mode: `vCont;s:2;c`
+steps thread 2, does **not** run the continue set, and answers `T05thread:2;`,
+so core 0 never advances. `vCont;s:1;s:2` steps each thread once and reports the
+last one; `vCont;t` stops everything with `T02thread:<n>;` (SIGINT) and advances
+nothing. Duplicate thread ids, two conflicting threadless default actions
+(`vCont;c;s`), unknown actions (including the unsupported `vCont;r`), an empty
+list (`vCont;`) and out-of-range ids (`:2` on a single-core target) all reply
+`E01` without resuming anything; repeating the *same* threadless action
+(`vCont;c;c`) collapses to a bare `c`. The action list is parsed by
+`rsp/vcont.rs` and executed through `GdbTarget::cont`.
 
 具体推进哪个核心由目标实现决定：`MachineTarget` 通过 `Machine::step_cores`
 真正只推进被选中的核（线程 1 → core0、线程 2 → core1），整目标请求（无 `:<tid>`、
@@ -479,7 +518,8 @@ survives because one `Session` is shared for the whole `serve` call.
   `thread_count() == 1`）。`MachineTarget` 暴露两线程，core1 寄存器只读且仅
   PC/SP 为真实值（其余读 0），单线程 `vCont`/`Hc` 选择通过 `Machine::step_cores`
   真正只推进该核。
-- 继续与单步混用的 `vCont` 动作列表返回 `E01`；不支持 `vCont;r`（range step）。
+- 已支持 `vCont` 混合动作列表（`vCont;s:2;c` 等）；不支持 `vCont;r`（range step）、
+  `vCont;t` 与恢复动作混用，也不支持超过两核的线程表。
 - `qRcmd` monitor 命令由目标定义；库层默认全部返回 `OK`（无输出）。
 - `stop()` 只清标志，不能中断阻塞中的 `accept`（需要连接一次才退出）。
 
@@ -513,8 +553,10 @@ survives because one `Session` is shared for the whole `serve` call.
   exposes two threads; core-1 registers are read-only and only PC/SP carry real
   values (everything else reads 0), and a single-thread `vCont`/`Hc` selection
   really advances only that core through `Machine::step_cores`.
-- Mixed continue/step `vCont` action lists reply `E01`; `vCont;r` (range step) is
-  not supported.
+- Mixed `vCont` action lists (`vCont;s:2;c` and friends) are supported: steps run
+  first and the continue set stays stopped. `vCont;r` (range step), mixing `t`
+  with resume actions, and thread tables larger than two cores are not
+  supported.
 - `qRcmd` monitor commands are defined by the target; the library default
   answers everything with `OK` (no output).
 - `stop()` only clears a flag; it cannot interrupt a blocked `accept` (one

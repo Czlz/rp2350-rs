@@ -54,14 +54,18 @@ Arm 机器还会在 DMA/HSTX 计数之后打印一行
 
 The diagnostic block is `[run] dma=<units> busy=<mask>`, then
 `[run] hstx words=<expanded> underruns=<episodes> fifo=<level> enabled=<bool>
-wof=<bool> unknown=<count>`, then three `[run] dma chN rd=… wr=… cnt=… ctrl=…
+wof=<bool> unknown=<count>`, then the sleep counters
+`[run] sleep core0 steps=<n> wakes=<n> core1 steps=<n> wakes=<n>`, then three
+`[run] dma chN rd=… wr=… cnt=… ctrl=…
 busy=… chain=… treq=…` channel snapshots, then the core-1 line. `Machine` pumps
 HSTX on the DMA batch cadence (every 64 steps) with the periph pixel-clock
 pacing, so a healthy 60 Hz scanout advances `words` by ~134 400 per frame with
 `underruns=0`, `wof=false` and `unknown=0`.
 诊断块依次为 `[run] dma=<单元数> busy=<掩码>`、
 `[run] hstx words=<展开字数> underruns=<断流次数> fifo=<电平> enabled=<布尔>
-wof=<布尔> unknown=<计数>`、三条 `[run] dma chN rd=… wr=… cnt=… ctrl=…
+wof=<布尔> unknown=<计数>`、睡眠计数
+`[run] sleep core0 steps=<n> wakes=<n> core1 steps=<n> wakes=<n>`、三条
+`[run] dma chN rd=… wr=… cnt=… ctrl=…
 busy=… chain=… treq=…` 通道快照，最后是 core1 行。`Machine` 按 DMA 批次节拍
 （每 64 步）以 periph 的像素时钟节拍泵送 HSTX，因此健康的 60 Hz 扫描每帧让
 `words` 增加约 134 400，且 `underruns=0`、`wof=false`、`unknown=0`。
@@ -443,6 +447,7 @@ arm-none-eabi-gdb firmware.elf
 (gdb) info threads         # 2 个线程：1 = core0，2 = core1
 (gdb) thread 2             # 切换到 core1
 (gdb) info registers pc    # core1 的 PC（core1 只读）
+(gdb) stepi                # 裸 stepi 可用：GDB 发 vCont;s:2;c，只推进 core1
 (gdb) vCont;s:2            # 仅推进 core1 一条指令（core0 冻结）
 (gdb) thread 1
 (gdb) break main
@@ -530,15 +535,17 @@ arm-none-eabi-gdb firmware.elf
   Stop replies always carry `thread:<n>;`: a normal stop is `T05thread:1;`, a
   watchpoint stop is `T05watch:<addr>;thread:2;`, and `?` reuses the last stopped
   thread. `monitor info` still prints the core 0/1 summary.
-- 真实 GDB 单步注意：all-stop 模式下线程 2 的 `stepi` 默认发送混合动作列表
-  `vCont;s:2;c`，而 RSP 层无法满足混合列表、回复 `E01`（该限制位于
-  `rp2350-gdb`，不在本 crate）。先执行 `set scheduler-locking step`，或用
-  `maintenance packet vCont;s:2` 直接发单核动作，即可只推进选中核。
-  Real-GDB note: in all-stop mode `stepi` on thread 2 sends the mixed list
-  `vCont;s:2;c`, which the RSP layer cannot satisfy and answers with `E01` (that
-  limit lives in `rp2350-gdb`, not here). Run `set scheduler-locking step`, or
-  send `maintenance packet vCont;s:2` directly, to advance only the selected
-  core.
+- 混合动作列表已支持：all-stop 模式下线程 2 的裸 `stepi` 会发送 `vCont;s:2;c`，
+  RSP 层按“先单步、继续集合保持停止”执行，因此 core1 前进一条指令后回复
+  `T05thread:2;`，core0 完全不动。无需再 `set scheduler-locking step`；`s:1;s:2`
+  这类多线程单步、`c:1;s:2` 与 `c;c`（等价裸 `c`）同样可用，重复线程号 / 未知
+  动作 / 空列表 / 越界线程号一律 `E01`。
+  Mixed action lists are supported: in all-stop mode a bare `stepi` on thread 2
+  sends `vCont;s:2;c`, and the RSP layer steps first while keeping the continue
+  set stopped, so core 1 advances one instruction and answers `T05thread:2;`
+  while core 0 stays frozen. `set scheduler-locking step` is no longer needed;
+  `s:1;s:2`, `c:1;s:2` and `c;c` (identical to a bare `c`) work too, and
+  duplicate ids, unknown actions, empty lists and out-of-range ids reply `E01`.
 - 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点、
   监视点）保留，仅无应答模式协商会被重置。
   After a client disconnects `serve` keeps accepting; target state (memory,
@@ -572,13 +579,14 @@ arm-none-eabi-gdb firmware.elf
   (core 0/1 state, step count, DMA/HSTX summaries) and `halt` (the next `c`/`s`
   stops immediately with SIGINT; `reset` clears it). Unknown commands are logged
   with `log::info!` and answered with `OK`, so the session never breaks.
-- 已支持双核线程模型（core0/core1）与真正的按核 `vCont`/`Hc` 选择：单核
-  `s`/`c` 只推进选中核，停止回复的线程号与该核一致。单核继续以逐条
-  `step_cores` 循环实现，吞吐低于整目标 `c`；单客户端串行、无 TLS；细节见
-  `doc/crates/rp2350-gdb.md`。
-  The dual-core thread model (core 0/core 1) and true per-core `vCont`/`Hc`
-  selection are supported: a single-core `s`/`c` advances only the selected
-  core, and the stop reply names that core. A single-core continue loops over
+- 已支持双核线程模型（core0/core1）、真正的按核 `vCont`/`Hc` 选择与 `vCont` 混合
+  动作列表（`vCont;s:2;c` 只单步 core1、core0 冻结）：单核 `s`/`c` 只推进选中核，
+  停止回复的线程号与该核一致。单核继续以逐条 `step_cores` 循环实现，吞吐低于整目标
+  `c`；单客户端串行、无 TLS；细节见 `doc/crates/rp2350-gdb.md`。
+  The dual-core thread model (core 0/core 1), true per-core `vCont`/`Hc` selection
+  and mixed `vCont` action lists (`vCont;s:2;c` steps only core 1 and freezes
+  core 0) are supported: a single-core `s`/`c` advances only the selected core,
+  and the stop reply names that core. A single-core continue loops over
   `step_cores`, so it is slower than a whole-target `c`. One sequential client
   and no TLS; see `doc/crates/rp2350-gdb.md`.
 - 不做 Flash 编程：Flash 窗口对客户机写保护，`M`/`load` 写 Flash 会以 `E01`
@@ -828,6 +836,7 @@ impl Machine {
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
     // dma_transfers, dma_state, hstx_words, hstx_state, pio_busy_mask,
+    // sleep_counters, sleep_state,
     // pio_pc (test hook), core1_state, core1_pc, core1_sp, core1_launch_count,
     // core1_halt_reason, take_uart_output, take_notices, notices_pending,
     // recent_steps, register, dump_memory
@@ -1267,21 +1276,76 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   `LDREX`/`STREX` exclusive monitor with `CLREX`.
   **已建模**：SIO 硬件自旋锁（`SPINLOCK0..31` 位于 `0x100+4n`，读即取/写即放，
   `SPINLOCK_ST` 为真实位图）与每核 `LDREX`/`STREX` 独占监视器 + `CLREX`。
-- **Not modelled / 未建模项**：DMA arbitration between cores, `WFI`/`WFE`/`SEV`
-  as scheduling points (still no-ops in the current tree; the sleep work landed as
-  `9a6b088` and was reverted pending blocking `SIO_FIFO_RD`/FIFO-IRQ semantics),
-  and core-1 writable registers: GDB exposes core 1 as thread 2 with read-only
+- **Not modelled / 未建模项**：DMA arbitration between cores, `SLEEPDEEP`/
+  `SCR.SLEEPONEXIT` power-down entry, and SysTick exception delivery (SysTick
+  pending marks external IRQ 15 instead of entering exception 15). Core-1
+  writable registers: GDB exposes core 1 as thread 2 with read-only
   PC/SP, while per-core stepping is available through `Machine::step_cores`.
   Core 1 has no
   modelled mask ROM: a launch jumps straight to `entry`, reproducing the post-ROM
   state, and only the trap stubs (`rom_table_lookup` at `0x74`, the ROM function
   table) are dispatched.
-  **未建模项**：双核之间的 DMA 仲裁、作为调度点的 `WFI`/`WFE`/`SEV`（当前仍为空
-  操作；睡眠语义曾以 `9a6b088` 落地但因缺少阻塞式 `SIO_FIFO_RD`/FIFO IRQ 而回退）、
+  **未建模项**：双核之间的 DMA 仲裁、`SLEEPDEEP`/`SCR.SLEEPONEXIT` 掉电进入，
+  以及 SysTick 异常投递（SysTick 挂起目前只标记外部 IRQ 15，而不是进入异常 15）。
   core1 可写寄存器：GDB 把 core1 暴露为线程 2（PC/SP 只读），而按核步进已可通过
   `Machine::step_cores` 使用。core1 不建模掩膜 ROM：启动直接跳到
   `entry` 并复现 post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与
   ROM 函数表）。
+
+### Sleep scheduling and diagnostics / 睡眠调度与诊断
+
+`WFI`, `WFE` and `SEV` are real scheduling points now, and a core that blocks on
+`SIO_FIFO_RD` sleeps instead of reading a discarded value.
+
+* **Sleeping cores do not retire instructions but time still advances.** A step
+  in which the selected core reports `CpuState::Sleeping` increments the machine
+  step counter (the timebase, DMA/PIO pumps and interrupt delivery all key off
+  it), counts one sleep step for that core and pushes nothing into the
+  executed-PC post-mortem ring. The machine stays `Running`: only `Halted`,
+  `Faulted` and `Reset` stop it, so a sleeping core 0 never freezes core 1 or the
+  display pipeline.
+* **Events before stepping.** `step_cores_with_trace` (and the batched
+  `run_steps`) call `Machine::sync_core_events` before stepping: a change of
+  `BootPeripherals::sio_event_generation()` is broadcast to both cores as an ARM
+  event, and a core's `SEV` count is forwarded to the peer. Together with
+  `deliver_irqs` (NVIC pending) this is what lets the SDK's
+  `while (!multicore_fifo_rvalid()) __wfe();` launch handshake finish inside a
+  sleeping core-0 loop.
+* **Zero-step wake latency.** When the wake condition holds, the very next step
+  makes progress: a `WFE`/`WFI` sleeper executes the instruction at `PC` (or
+  enters the takeable interrupt in that same step), and a blocked load replays
+  and retires its instruction.
+* **Diagnostics.** `Machine::sleep_counters()` returns
+  `([core0_steps, core1_steps], [core0_wakes, core1_wakes])` and
+  `Machine::sleep_state()` renders the stable line
+  `sleep core0 steps=<n> wakes=<n> core1 steps=<n> wakes=<n>`, printed by
+  `run` as `[run] sleep …` after the HSTX line. A machine whose cores all sleep
+  while no event arrives can only advance its clock, so after
+  `SLEEP_STALL_STEPS` (1 000 000) consecutive double-sleep steps the machine
+  queues one `[run] sleep stall: …` notice instead of silently burning the
+  budget.
+
+`WFI`、`WFE` 与 `SEV` 现在是真实调度点；在 `SIO_FIFO_RD` 上阻塞的核心进入睡眠，
+而不是读回被丢弃的值。
+
+- **睡眠核不退役指令，但时间照常推进。** 被选中核心报告 `CpuState::Sleeping`
+  的那一步仍递增机器步数（时基、DMA/PIO 泵送与中断投递都以它为准），为该核记一次
+  睡眠步，并且不写入「已执行 PC」回溯环形缓冲。机器状态仍是 `Running`：只有
+  `Halted`、`Faulted`、`Reset` 会停机，因此 core0 睡眠绝不会冻结 core1 或显示流水线。
+- **先转发事件再推进核心。** `step_cores_with_trace`（以及批量 `run_steps`）在推进前
+  调用 `Machine::sync_core_events`：`BootPeripherals::sio_event_generation()` 变化会
+  作为 ARM 事件广播给两个核心，某核的 `SEV` 计数会转发给对端。配合
+  `deliver_irqs`（NVIC 挂起），SDK 的
+  `while (!multicore_fifo_rvalid()) __wfe();` 启动握手才能在睡眠的 core0 循环内完成。
+- **唤醒 0 步延迟。** 唤醒条件成立后的下一步立即取得进展：`WFE`/`WFI` 睡眠者执行
+  `PC` 处指令（或在那一步进入可进入的中断），阻塞载入则重放并退役其指令。
+- **诊断。** `Machine::sleep_counters()` 返回
+  `([core0_steps, core1_steps], [core0_wakes, core1_wakes])`，
+  `Machine::sleep_state()` 生成稳定行
+  `sleep core0 steps=<n> wakes=<n> core1 steps=<n> wakes=<n>`，由 `run` 在 HSTX 行
+  之后打印为 `[run] sleep …`。若所有核心都睡眠且没有事件到达，机器只能推进时钟，
+  因此在 `SLEEP_STALL_STEPS`（1 000 000）个连续双核睡眠步之后排队一条
+  `[run] sleep stall: …` 通知，而不是静默耗尽预算。
 
 ### DMA pump / DMA 泵送
 

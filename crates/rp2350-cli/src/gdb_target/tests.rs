@@ -773,6 +773,196 @@ fn rsp_vcont_continue_all_is_equivalent_to_plain_continue() {
     assert_eq!(session.target().stopped_thread(), ThreadId::CORE0);
 }
 
+#[test]
+fn rsp_vcont_mixed_step_and_continue_advances_only_core1() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let steps = target.machine.steps();
+    let mut session = RspSession::new(target);
+
+    // 真实 GDB 在 all-stop 模式下裸 `stepi` 就发送 `vCont;s:2;c`。
+    // Real GDB sends `vCont;s:2;c` for a bare `stepi` in all-stop mode.
+    assert_eq!(
+        session.handle_packet("vCont;s:2;c").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_eq!(session.target().stopped_thread(), ThreadId::CORE1);
+    assert_ne!(session.target().machine.core1_pc(), Some(core1_pc));
+    assert_eq!(
+        session.target().machine.pc(),
+        core0_pc,
+        "the continued core must stay stopped / 被继续的 core0 必须保持停止"
+    );
+    assert_eq!(session.target().machine.steps(), steps + 1);
+}
+
+#[test]
+fn rsp_vcont_continue_then_step_keeps_the_continued_core_frozen() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;c:1;s:2").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_ne!(session.target().machine.core1_pc(), Some(core1_pc));
+    assert_eq!(session.target().machine.pc(), core0_pc);
+}
+
+#[test]
+fn rsp_vcont_two_step_actions_advance_both_cores_once() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let steps = target.machine.steps();
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;s:1;s:2").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_eq!(session.target().stopped_thread(), ThreadId::CORE1);
+    assert_ne!(session.target().machine.pc(), core0_pc);
+    assert_ne!(session.target().machine.core1_pc(), Some(core1_pc));
+    assert_eq!(
+        session.target().machine.steps(),
+        steps + 2,
+        "each step action retires exactly one instruction per core"
+    );
+}
+
+#[test]
+fn rsp_vcont_stop_actions_never_advance_a_core() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let steps = target.machine.steps();
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;t").as_deref(),
+        Some("T02thread:1;")
+    );
+    assert_eq!(
+        session.handle_packet("vCont;t:2").as_deref(),
+        Some("T02thread:2;")
+    );
+    assert_eq!(session.target().machine.steps(), steps);
+    assert_eq!(session.target().machine.pc(), core0_pc);
+    assert_eq!(session.target().machine.core1_pc(), Some(core1_pc));
+}
+
+#[test]
+fn rsp_vcont_rejects_duplicate_and_out_of_range_actions() {
+    let target = dual_core_target();
+    let steps = target.machine.steps();
+    let mut session = RspSession::new(target);
+
+    for packet in [
+        "vCont;c:1;c:1",
+        "vCont;s:2;c:2",
+        "vCont;s:3",
+        "vCont;x",
+        "vCont;c;s",
+        "vCont;",
+        "vCont;t;c",
+    ] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("E01"),
+            "{packet}"
+        );
+    }
+    // 非法列表不得推进任何一个核心。 / Malformed lists never advance a core.
+    assert_eq!(session.target().machine.steps(), steps);
+}
+
+/// Single-core target built from a RISC-V UF2 image / 由 RISC-V UF2 映像构造的单核目标
+///
+/// RISC-V builds have no core 1, so the thread table stays `m1` and any `:2`
+/// action must be rejected. The image carries the legacy boot2 header (magic,
+/// entry point and initial SP) plus one `c.nop`, so the core boots without any
+/// core-1 launch stream.
+/// RISC-V 构建没有 core1，线程表保持 `m1`，任何 `:2` 动作都必须被拒绝。映像带旧式
+/// boot2 头（魔数、入口点与初始 SP）以及一条 `c.nop`，因此核心启动不依赖 core1
+/// 启动流。
+fn riscv_target() -> MachineTarget {
+    /// Size of the boot2 header plus one `c.nop`
+    /// boot2 头加一条 `c.nop` 的长度
+    const IMAGE_LEN: usize = 0x30;
+    let mut image = vec![0u8; IMAGE_LEN];
+    image[0x00..0x04].copy_from_slice(&0x7188_EBF2u32.to_le_bytes());
+    image[0x04..0x08].copy_from_slice(&(FLASH_XIP_BASE + 0x28).to_le_bytes());
+    image[0x24..0x28].copy_from_slice(&(SRAM_BASE + 0x1000).to_le_bytes());
+    image[0x28..0x2C].copy_from_slice(&1u32.to_le_bytes());
+
+    let mut block = vec![0u8; 512];
+    block[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes());
+    block[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes());
+    // Family-ID-present flag. / 置位 family ID 存在标志。
+    block[8..12].copy_from_slice(&0x0000_2000u32.to_le_bytes());
+    block[12..16].copy_from_slice(&FLASH_XIP_BASE.to_le_bytes());
+    block[16..20].copy_from_slice(&u32::try_from(IMAGE_LEN).expect("length").to_le_bytes());
+    block[24..28].copy_from_slice(&1u32.to_le_bytes());
+    block[28..32].copy_from_slice(&0xE48B_FF5Au32.to_le_bytes());
+    block[32..32 + IMAGE_LEN].copy_from_slice(&image);
+    block[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes());
+
+    let options = MachineOptions {
+        arch: None,
+        max_cycles: u64::MAX,
+        strict_decode: false,
+    };
+    MachineTarget::new(Machine::new(&block, &options).expect("riscv machine"))
+}
+
+#[test]
+fn rsp_vcont_rejects_thread_two_on_a_single_core_target() {
+    let target = riscv_target();
+    assert_eq!(target.thread_count(), 1);
+    let mut session = RspSession::new(target);
+    assert_eq!(session.handle_packet("qfThreadInfo").as_deref(), Some("m1"));
+    for packet in ["vCont;s:2", "vCont;c:2", "vCont;t:2", "vCont;c:1;c:2"] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("E01"),
+            "{packet}"
+        );
+    }
+    assert_eq!(
+        session.handle_packet("vCont;s").as_deref(),
+        Some("T05thread:1;")
+    );
+}
+
+#[test]
+fn cont_dispatches_a_thread_action_list_through_the_machine() {
+    let mut target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let reply = target
+        .cont(&[
+            rp2350_gdb::ThreadAction {
+                thread: Some(ThreadId::CORE1),
+                mode: ResumeMode::Step,
+            },
+            rp2350_gdb::ThreadAction {
+                thread: None,
+                mode: ResumeMode::Continue,
+            },
+        ])
+        .expect("cont");
+
+    assert_eq!(reply.reason, StopReason::SingleStep);
+    assert_eq!(reply.pc, target.machine.core1_pc().expect("core1 pc"));
+    assert_eq!(target.stopped_thread(), ThreadId::CORE1);
+    assert_ne!(target.machine.core1_pc(), Some(core1_pc));
+    assert_eq!(target.machine.pc(), core0_pc);
+}
+
 /// One TCP round trip against the real server and machine target
 /// 针对真实服务器与机器目标的一次 TCP 往返
 #[test]

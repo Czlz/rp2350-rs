@@ -15,6 +15,11 @@ use std::fmt::Write as _;
 use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason, ThreadId, WatchKind};
 use crate::target_xml::{ANNEX, ANNEX_ERROR};
 
+// `vCont` 动作列表解析拆到子模块，使本文件保持在单文件代码行预算内。
+// `vCont` action-list parsing lives in a submodule to keep this file within the
+// per-file code-line budget.
+mod vcont;
+
 /// Positive acknowledgement byte sent by GDB / GDB 发送的肯定应答字节
 pub const ACK: u8 = b'+';
 /// Negative acknowledgement byte sent by GDB / GDB 发送的否定应答字节
@@ -659,67 +664,42 @@ impl<T: GdbTarget> Session<T> {
 
     /// Parse and execute a `vCont` action list / 解析并执行 `vCont` 动作列表
     ///
-    /// `c`/`C<sig>` continue and `s`/`S<sig>` step; `t` stops. A missing
-    /// `:<tid>` means every thread, and an explicit list covering all threads is
-    /// equivalent to the bare form. Mixed continue/step lists cannot be
-    /// satisfied by this target, so they reply `E01`; unknown actions reply an
-    /// empty packet as RSP requires.
-    /// `c`/`C<sig>` 继续、`s`/`S<sig>` 单步、`t` 停止。省略 `:<tid>` 表示全部
-    /// 线程；覆盖全部线程的显式列表与裸形式等价。本目标无法满足继续/单步混用的
-    /// 列表，因此回复 `E01`；未知动作按 RSP 约定回复空包。
-    fn vcont(&mut self, actions: &str) -> Result<String, Error> {
-        let mut parsed = Vec::new();
-        for action in actions.split(';').filter(|part| !part.is_empty()) {
-            let Some(entry) = parse_vcont_action(action) else {
-                return Ok(String::new());
+    /// The list may name a different action for every thread: `vCont;s:2;c`
+    /// steps thread 2 and leaves the other threads stopped. `t` stops
+    /// everything and answers `T02` (SIGINT). Malformed lists (duplicate thread
+    /// ids, conflicting defaults, unknown actions, unknown thread ids, empty
+    /// lists) reply `E01`.
+    /// 列表可为每个线程指定不同动作：`vCont;s:2;c` 只单步线程 2，其余线程保持
+    /// 停止。`t` 停止全部并以 `T02`（SIGINT）应答。非法列表（重复线程号、冲突的
+    /// 缺省动作、未知动作、未知线程号、空列表）回复 `E01`。
+    fn vcont(&mut self, text: &str) -> Result<String, Error> {
+        let known = self.thread_numbers();
+        let actions = vcont::parse(text, &known)?;
+        if let Some(stop) = vcont::stop_thread(&actions) {
+            let thread = match stop {
+                vcont::Stop::Thread(thread) => thread,
+                vcont::Stop::AllThreads => self.selected_thread(),
             };
-            parsed.push(entry);
-        }
-        let Some(&(action, _)) = parsed.first() else {
-            return Ok(String::new());
-        };
-        if parsed.iter().any(|(kind, _)| *kind != action) {
-            return Ok(ERROR_REPLY.to_string());
-        }
-        if action == VContAction::Stop {
-            let thread = parsed
-                .iter()
-                .find_map(|(_, thread)| *thread)
-                .unwrap_or_else(|| self.selected_thread());
             // `t` stops without a real stop event: SIGINT plus the thread.
             // `t` 停止但没有真实停止事件：使用 SIGINT 并附带线程号。
             return Ok(format!("T02thread:{};", thread.number()));
         }
+        let plan = vcont::plan(&actions, &known);
+        let reply = self.target.cont(&plan)?;
+        let thread = plan
+            .last()
+            .and_then(|action| action.thread)
+            .unwrap_or_else(|| self.target.stopped_thread());
+        Ok(self.stop_packet(reply.reason, thread))
+    }
 
-        if parsed.iter().any(|(_, thread)| thread.is_none()) {
-            return match action {
-                VContAction::Continue => self.resume(ResumeMode::Continue),
-                _ => self.resume(ResumeMode::Step),
-            };
-        }
-        let mut threads = Vec::new();
-        for (_, thread) in &parsed {
-            let thread = thread.expect("threadless actions were handled above");
-            if !thread_known(&self.target, thread.number()) {
-                return Ok(ERROR_REPLY.to_string());
-            }
-            threads.push(thread);
-        }
-        let covers_all = threads.contains(&ThreadId::CORE0)
-            && (self.target.thread_count() == 1 || threads.contains(&ThreadId::CORE1));
-        if covers_all {
-            return match action {
-                VContAction::Continue => self.resume(ResumeMode::Continue),
-                _ => self.resume(ResumeMode::Step),
-            };
-        }
-        let [thread] = threads.as_slice() else {
-            return Ok(ERROR_REPLY.to_string());
-        };
-        match action {
-            VContAction::Continue => self.continue_thread(*thread),
-            _ => self.step_thread(*thread),
-        }
+    /// Thread numbers present in the target's thread table
+    /// 目标线程表中的线程编号
+    fn thread_numbers(&self) -> Vec<u32> {
+        (0..self.target.thread_count())
+            .filter_map(|index| self.target.thread_id(index))
+            .map(ThreadId::number)
+            .collect()
     }
 
     /// Reply to `q...` queries / 回复 `q...` 查询
@@ -828,39 +808,6 @@ impl<T: GdbTarget> Session<T> {
         };
         crate::target_xml::read_chunk(xml.as_bytes(), offset, length)
     }
-}
-
-/// Thread action parsed from one `vCont` entry / 从一条 `vCont` 条目解析出的动作
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VContAction {
-    /// `c` / `C<sig>`: continue / 继续
-    Continue,
-    /// `s` / `S<sig>`: single-step / 单步
-    Step,
-    /// `t`: stop / 停止
-    Stop,
-}
-
-/// Parse one `vCont` action (`c`, `C05`, `s:2`, `S05:1`, `t`, …)
-/// 解析一条 `vCont` 动作（`c`、`C05`、`s:2`、`S05:1`、`t` 等）
-///
-/// Returns `None` for unknown actions so the caller can answer with an empty
-/// packet. / 未知动作返回 `None`，调用方可回复空包。
-fn parse_vcont_action(text: &str) -> Option<(VContAction, Option<ThreadId>)> {
-    let (action, thread) = match text.split_once(':') {
-        Some((action, thread)) => (action, parse_thread_id(thread).ok().flatten()),
-        None => (text, None),
-    };
-    let mut bytes = action.bytes();
-    let kind = match bytes.next()? {
-        b'c' if action.len() == 1 => VContAction::Continue,
-        b'C' if action[1..].bytes().all(|byte| byte.is_ascii_hexdigit()) => VContAction::Continue,
-        b's' if action.len() == 1 => VContAction::Step,
-        b'S' if action[1..].bytes().all(|byte| byte.is_ascii_hexdigit()) => VContAction::Step,
-        b't' if action.len() == 1 => VContAction::Stop,
-        _ => return None,
-    };
-    Some((kind, thread))
 }
 
 /// Parse a GDB thread id / 解析 GDB 线程编号
