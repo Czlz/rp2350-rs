@@ -29,7 +29,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
@@ -143,6 +143,26 @@ const DOORBELL_IN_CLR: u32 = 0x18C;
 /// Inter-core FIFO depth / 核间 FIFO 深度
 const FIFO_DEPTH: usize = 8;
 
+/// `FIFO_ST.VLD`: the receive FIFO is not empty / 接收 FIFO 非空
+pub const FIFO_ST_VLD: u32 = 1 << 0;
+
+/// `FIFO_ST.RDY`: the transmit FIFO is not full / 发送 FIFO 未满
+pub const FIFO_ST_RDY: u32 = 1 << 1;
+
+/// `FIFO_ST.WOF`: sticky "wrote while full" flag / 粘滞「写满」标志
+pub const FIFO_ST_WOF: u32 = 1 << 2;
+
+/// `FIFO_ST.ROE`: sticky "read while empty" flag / 粘滞「读空」标志
+pub const FIFO_ST_ROE: u32 = 1 << 3;
+
+/// Bits of `FIFO_ST` that firmware can clear by writing them back
+/// 固件可通过写回清除的 `FIFO_ST` 位
+///
+/// Both sticky flags are `WC` (write one to clear) in the RP2350 register map;
+/// every other bit of the register is read-only.
+/// 在 RP2350 寄存器表中两个粘滞标志都是 `WC`（写 1 清除）；寄存器其余位只读。
+pub const FIFO_ST_CLEARABLE: u32 = FIFO_ST_WOF | FIFO_ST_ROE;
+
 /// Atomic register update mode / 原子寄存器更新模式
 #[derive(Debug, Clone, Copy)]
 enum Patch {
@@ -237,22 +257,41 @@ impl SioState {
     }
 
     /// `FIFO_ST` value as seen by `core` / `core` 视角的 `FIFO_ST` 值
+    ///
+    /// Bits follow the RP2350 register map: `VLD` (RX has data), `RDY` (TX has
+    /// room), `WOF` (sticky write-while-full) and `ROE` (sticky read-while-empty).
+    /// 位定义遵循 RP2350 寄存器表：`VLD`（RX 有数据）、`RDY`（TX 有空间）、
+    /// `WOF`（粘滞「写满」）与 `ROE`（粘滞「读空」）。
     fn fifo_status(&self, core: CpuId) -> u32 {
         let index = core_index(core);
         let mut status = 0;
         if !self.inbox(core).is_empty() {
-            status |= 1; // VLD
+            status |= FIFO_ST_VLD;
         }
         if self.outbox(core).len() < FIFO_DEPTH {
-            status |= 1 << 1; // RDY
+            status |= FIFO_ST_RDY;
         }
         if self.wof[index] {
-            status |= 1 << 2; // WOF
+            status |= FIFO_ST_WOF;
         }
         if self.roe[index] {
-            status |= 1 << 3; // ROE
+            status |= FIFO_ST_ROE;
         }
         status
+    }
+
+    /// Whether `core`'s `SIO_IRQ_FIFO` line is asserted
+    /// `core` 的 `SIO_IRQ_FIFO` 线是否断言
+    ///
+    /// The datasheet defines this line as the logical OR of the receiving core's
+    /// `VLD`, `WOF` and `ROE` bits, so a data frame, a dropped write and a
+    /// dropped read all raise it; firmware clears the two sticky bits by writing
+    /// them back to `FIFO_ST`.
+    /// 数据手册把这条线定义为接收核心 `VLD`、`WOF` 与 `ROE` 三位的逻辑或，因此
+    /// 数据到达、被丢弃的写与被丢弃的读都会拉高它；固件通过把两个粘滞位写回
+    /// `FIFO_ST` 来清除。
+    fn fifo_irq(&self, core: CpuId) -> bool {
+        self.fifo_status(core) & (FIFO_ST_VLD | FIFO_ST_WOF | FIFO_ST_ROE) != 0
     }
 
     /// Doorbells posted to `core` / 投递给 `core` 的门铃
@@ -314,6 +353,18 @@ pub struct Sio {
     core1_irq: IrqAssert,
     view: Arc<AtomicU8>,
     pads: GpioPads,
+    /// Monotonic event generation / 单调事件世代号
+    ///
+    /// Bumped by every state change that can complete a blocked access or wake a
+    /// sleeping core: a FIFO push or pop, a doorbell change and any change of the
+    /// two `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` levels. A driver compares it with its
+    /// own snapshot to know whether it must signal an ARM event to a sleeping
+    /// core; it is diagnostic state, never guest-visible.
+    /// 每一次可能完成阻塞访问或唤醒睡眠核心的状态变化都会递增它：FIFO 压入/弹出、
+    /// 门铃变化，以及两条 `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` 电平的任何变化。驱动器
+    /// 与自身快照比较即可知道是否需要给睡眠核心发 ARM 事件；它只是诊断状态，
+    /// 不对客户机可见。
+    events: Arc<AtomicU32>,
 }
 
 impl Sio {
@@ -351,7 +402,73 @@ impl Sio {
             core1_irq,
             view: Arc::new(AtomicU8::new(0)),
             pads,
+            events: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Current event generation / 当前事件世代号
+    ///
+    /// Monotonic, starting at 0. A driver that sleeps cores compares this value
+    /// with the last one it observed: any difference means a FIFO, doorbell or
+    /// SIO interrupt change happened, which is an ARM event source.
+    /// 单调递增，从 0 开始。驱动睡眠核心的宿主把它与上次观察值比较：任何差异都意味着
+    /// 发生了 FIFO、门铃或 SIO 中断变化，也就是一个 ARM 事件源。
+    #[must_use]
+    pub fn event_generation(&self) -> u32 {
+        self.events.load(Ordering::Relaxed)
+    }
+
+    /// Advance the event generation once / 事件世代号递增一次
+    fn bump_event(&self) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether `core`'s receive FIFO holds a frame / `core` 的接收 FIFO 是否有帧
+    ///
+    /// Equivalent to reading `FIFO_ST` and testing `VLD`, but without touching the
+    /// register file, so a driver can poll it without side effects.
+    /// 等价于读 `FIFO_ST` 并测试 `VLD`，但不触碰寄存器文件，因此驱动器可以无副作用
+    /// 地轮询。
+    #[must_use]
+    pub fn fifo_rx_ready(&self, core: CpuId) -> bool {
+        !self.state.lock().inbox(core).is_empty()
+    }
+
+    /// Pop one frame for `core`, or `None` when the FIFO is empty
+    /// 为 `core` 弹出一帧；FIFO 为空时返回 `None`
+    ///
+    /// This is the host-side blocking-read contract: an empty queue returns
+    /// `None` **without** latching `ROE` and without consuming anything, so the
+    /// caller can retry the identical access once data arrives. A successful pop
+    /// raises the RX event generation and refreshes `SIO_IRQ_FIFO`.
+    /// 这是宿主侧的阻塞读契约：空队列返回 `None` 且**不**锁存 `ROE`、不消费任何东西，
+    /// 因此调用方可以在数据到达后重试完全相同的访问。成功弹出会递增 RX 事件世代并
+    /// 刷新 `SIO_IRQ_FIFO`。
+    #[must_use]
+    pub fn fifo_read_blocking(&self, core: CpuId) -> Option<u32> {
+        let mut state = self.state.lock();
+        let frame = state.inbox_mut(core).pop_front();
+        drop(state);
+        if frame.is_some() {
+            self.bump_event();
+            self.refresh_irq();
+        }
+        frame
+    }
+
+    /// `FIFO_ST` as seen by `core` / `core` 视角的 `FIFO_ST`
+    ///
+    /// Read-only diagnostic accessor with the same bit layout as the register.
+    /// 只读诊断访问器，位布局与寄存器相同。
+    #[must_use]
+    pub fn fifo_status(&self, core: CpuId) -> u32 {
+        self.state.lock().fifo_status(core)
+    }
+
+    /// Whether `core`'s `SIO_IRQ_FIFO` line is asserted / `core` 的 FIFO 中断线是否断言
+    #[must_use]
+    pub fn fifo_irq_asserted(&self, core: CpuId) -> bool {
+        self.state.lock().fifo_irq(core)
     }
 
     /// Select which core's view the next bus accesses use
@@ -391,6 +508,7 @@ impl Sio {
     /// 核心时验证接收路径。
     pub fn post_to_core(&self, value: u32) {
         self.state.lock().from_core1.push_back(value);
+        self.bump_event();
         self.refresh_irq();
     }
 
@@ -400,6 +518,7 @@ impl Sio {
     /// 0 only. / 位落入 core0 的 `DOORBELL_IN`，只断言 core0 的 `SIO_IRQ_BELL`。
     pub fn ring_core(&self, mask: u8) {
         self.state.lock().bell_core0 |= mask;
+        self.bump_event();
         self.refresh_irq();
     }
 
@@ -410,6 +529,9 @@ impl Sio {
         let mut state = self.state.lock();
         let frames: Vec<u32> = state.from_core0.drain(..).collect();
         drop(state);
+        if !frames.is_empty() {
+            self.bump_event();
+        }
         self.refresh_irq();
         frames
     }
@@ -426,6 +548,7 @@ impl Sio {
         let frame = state.from_core0.pop_front();
         drop(state);
         if frame.is_some() {
+            self.bump_event();
             self.refresh_irq();
         }
         frame
@@ -462,25 +585,36 @@ impl Sio {
 
     /// Recompute the SIO interrupt lines / 重新计算 SIO 中断线
     ///
-    /// `SIO_IRQ_FIFO` follows the receiving core's `VLD` flag and
-    /// `SIO_IRQ_BELL` that core's doorbells, so the two cores get independent
-    /// levels for the same line numbers.
-    /// `SIO_IRQ_FIFO` 跟随接收核心的 `VLD` 标志、`SIO_IRQ_BELL` 跟随该核心的
-    /// 门铃，因此两个核心在同一线号上得到独立的电平。
+    /// `SIO_IRQ_FIFO` is the logical OR of the receiving core's `VLD`, `WOF` and
+    /// `ROE` bits and `SIO_IRQ_BELL` that core's doorbells, so the two cores get
+    /// independent levels for the same line numbers. Only a real level change
+    /// bumps the event generation, which keeps a polled `FIFO_ST` from flooding
+    /// sleeping cores with spurious events.
+    /// `SIO_IRQ_FIFO` 是接收核心 `VLD`、`WOF`、`ROE` 三位的逻辑或，`SIO_IRQ_BELL`
+    /// 是该核心的门铃，因此两个核心在同一线号上得到独立的电平。只有电平真的变化时才
+    /// 递增事件世代，避免被轮询的 `FIFO_ST` 给睡眠核心灌入虚假事件。
     pub fn refresh_irq(&self) {
         let (fifo0, bell0, fifo1, bell1) = {
             let state = self.state.lock();
             (
-                !state.from_core1.is_empty(),
+                state.fifo_irq(CpuId::Core0),
                 state.bell_core0 != 0,
-                !state.from_core0.is_empty(),
+                state.fifo_irq(CpuId::Core1),
                 state.bell_core1 != 0,
             )
         };
+        let before = self.irq.mask();
+        let before1 = self.core1_irq.mask();
         self.irq.set(map::SIO_IRQ_FIFO, fifo0);
         self.irq.set(map::SIO_IRQ_BELL, bell0);
         self.core1_irq.set(map::SIO_IRQ_FIFO, fifo1);
         self.core1_irq.set(map::SIO_IRQ_BELL, bell1);
+        // 只有电平真的变化才是一次事件；否则被轮询的寄存器会让睡眠核心永不入睡。
+        // Only a real level change is an event; otherwise a polled register would
+        // keep a sleeping core awake forever.
+        if before != self.irq.mask() || before1 != self.core1_irq.mask() {
+            self.bump_event();
+        }
     }
 
     /// Publish `GPIO_OUT`/`GPIO_OE` (and the `GPIO_HI_*` pair) into the pin matrix
@@ -551,11 +685,23 @@ impl MmioDevice for Sio {
             FIFO_ST => Some(state.fifo_status(view)),
             FIFO_RD => {
                 let index = core_index(view);
-                let value = state.inbox_mut(view).pop_front().unwrap_or_else(|| {
+                let popped = state.inbox_mut(view).pop_front();
+                if let Some(value) = popped {
+                    // 成功弹出改变队列深度，因此与压入一样是唤醒源。
+                    // A successful pop changes the queue depth, so it is a wake
+                    // source just like a push.
+                    Some(value)
+                } else {
+                    // 空读被丢弃并锁存 ROE，与数据手册一致。总线适配器在
+                    // `stall_on_read32` 为真时已经拦下整字读，因此这条路径只服务
+                    // 非整字访问与直接设备调用（例如宿主的 `FIFO_ST` 诊断）。
+                    // An empty read is ignored and latches ROE, exactly as the
+                    // datasheet says. Word reads are already gated by
+                    // `stall_on_read32`, so this path only serves sub-word
+                    // accesses and direct device calls (host diagnostics).
                     state.roe[index] = true;
-                    0
-                });
-                Some(value)
+                    Some(0)
+                }
             }
             // `SPINLOCK_ST` is a read-only snapshot of the claim bitmap: 1 = held.
             // `SPINLOCK_ST` 是占用位图的只读快照：1 = 已锁。
@@ -584,6 +730,7 @@ impl MmioDevice for Sio {
         let view = self.selected_core();
         let peer = SioState::peer(view);
         let mut state = self.state.lock();
+        let mut pushed = false;
         match offset {
             GPIO_OUT => state.out = value,
             GPIO_HI_OUT => state.hi_out = value,
@@ -602,7 +749,9 @@ impl MmioDevice for Sio {
             GPIO_OE_XOR => SioState::patch(&mut state.oe, value, Patch::Xor),
             GPIO_HI_OE_XOR => SioState::patch(&mut state.hi_oe, value, Patch::Xor),
             // FIFO_WR pushes towards the peer; a full queue sets that writer's
-            // WOF. FIFO_WR 向对端压入；队列满时置位该写入方的 WOF。
+            // WOF. Either outcome changes the peer's status, so it is an event.
+            // FIFO_WR 向对端压入；队列满时置位该写入方的 WOF。两种结果都会改变对端
+            // 状态，因此都是一次事件。
             FIFO_WR => {
                 let index = core_index(view);
                 let outbox = state.outbox_mut(view);
@@ -610,6 +759,18 @@ impl MmioDevice for Sio {
                     outbox.push_back(value);
                 } else {
                     state.wof[index] = true;
+                }
+                pushed = true;
+            }
+            // Writing 1 to a sticky flag clears it; the other bits are read-only.
+            // 向粘滞标志写 1 即清除；其余位只读。
+            FIFO_ST => {
+                let index = core_index(view);
+                if value & FIFO_ST_WOF != 0 {
+                    state.wof[index] = false;
+                }
+                if value & FIFO_ST_ROE != 0 {
+                    state.roe[index] = false;
                 }
             }
             DOORBELL_OUT_SET => *state.bells_mut(peer) |= (value & 0xFF) as u8,
@@ -627,6 +788,11 @@ impl MmioDevice for Sio {
             }
         }
         drop(state);
+        if pushed {
+            // FIFO 写入是唤醒对端 WFE 的事件源。
+            // A FIFO write is the event source that wakes a peer in WFE.
+            self.bump_event();
+        }
         self.publish_pins();
         self.refresh_irq();
         true
@@ -634,8 +800,20 @@ impl MmioDevice for Sio {
 
     fn reset(&mut self) {
         *self.state.lock() = SioState::default();
+        self.bump_event();
         self.publish_pins();
         self.refresh_irq();
+    }
+
+    fn stall_on_read32(&self, offset: u32) -> bool {
+        // `FIFO_RD` blocks while the receiving FIFO is empty: the read must be
+        // replayed later instead of returning a discarded value and latching
+        // `ROE`. The gate is a pure query, so a stalled access never consumes a
+        // frame or changes `ROE`/`WOF`/`VLD`.
+        // 接收 FIFO 为空时 `FIFO_RD` 阻塞：该读必须稍后重放，而不是返回一个被丢弃的值
+        // 并锁存 `ROE`。该门控是纯查询，因此被 stall 的访问绝不消费帧、也不改变
+        // `ROE`/`WOF`/`VLD`。
+        offset == FIFO_RD && self.state.lock().inbox(self.selected_core()).is_empty()
     }
 }
 
@@ -804,5 +982,167 @@ mod tests {
         assert!(sio.write32(GPIO_OE, 1));
         assert!(sio.write32(GPIO_OUT, 0));
         assert_eq!(sio.read32(GPIO_IN), Some(0));
+    }
+
+    // ---- FIFO blocking semantics, sticky flags and events ------------------
+
+    #[test]
+    fn empty_fifo_read_stalls_without_side_effects() {
+        let (sio, _irq) = sio();
+        let generation = sio.event_generation();
+        assert!(
+            sio.stall_on_read32(FIFO_RD),
+            "an empty receive FIFO must report a retryable read"
+        );
+        // 门控是纯查询：不得消费、不得锁存 ROE、不得改变世代号。
+        // The gate is a pure query: no consume, no ROE latch, no generation bump.
+        assert_eq!(sio.fifo_status(CpuId::Core0), FIFO_ST_RDY);
+        assert_eq!(sio.event_generation(), generation);
+        assert!(
+            !sio.stall_on_read32(FIFO_ST),
+            "FIFO_ST never blocks / FIFO_ST 永不阻塞"
+        );
+    }
+
+    #[test]
+    fn fifo_read_blocking_returns_none_on_empty() {
+        let (sio, _irq) = sio();
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), None);
+        // 空读不得锁存 ROE：只有总线上被忽略的读才会。 / An empty blocking read must
+        // not latch ROE; only an ignored bus read does.
+        assert_eq!(sio.fifo_status(CpuId::Core0) & FIFO_ST_ROE, 0);
+        assert!(!sio.fifo_rx_ready(CpuId::Core0));
+    }
+
+    #[test]
+    fn a_peer_write_wakes_the_reader() {
+        let (mut sio, _irq) = sio();
+        let generation = sio.event_generation();
+        sio.select_core(CpuId::Core1);
+        assert!(sio.write32(FIFO_WR, 0xA5A5_1234));
+        sio.select_core(CpuId::Core0);
+        assert!(sio.fifo_rx_ready(CpuId::Core0));
+        assert!(
+            sio.event_generation() > generation,
+            "a peer write must advance the generation / 对端写入必须递增世代"
+        );
+        assert!(!sio.stall_on_read32(FIFO_RD), "data unblocks the read");
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), Some(0xA5A5_1234));
+        assert!(!sio.fifo_rx_ready(CpuId::Core0));
+        assert_eq!(sio.read32(FIFO_ST), Some(FIFO_ST_RDY));
+    }
+
+    #[test]
+    fn fifo_read_blocking_pops_exactly_one_frame() {
+        let (mut sio, _irq) = sio();
+        // core1 写入的帧进入 core0 的接收队列。 / Core-1 writes feed core 0's RX queue.
+        sio.select_core(CpuId::Core1);
+        for value in 0..3u32 {
+            assert!(sio.write32(FIFO_WR, value));
+        }
+        sio.select_core(CpuId::Core0);
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), Some(0));
+        assert_eq!(sio.read32(FIFO_ST), Some(FIFO_ST_VLD | FIFO_ST_RDY));
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), Some(1));
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), Some(2));
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), None);
+    }
+
+    #[test]
+    fn roe_is_sticky_until_written_back() {
+        let (mut sio, irq) = sio();
+        // 直接调用设备（非整字总线读）才会走「忽略空读并锁存 ROE」路径。
+        // Only a direct device call (not a word bus read) takes the
+        // ignored-read-and-latch-ROE path.
+        assert_eq!(sio.read32(FIFO_RD), Some(0));
+        assert_eq!(sio.fifo_status(CpuId::Core0), FIFO_ST_RDY | FIFO_ST_ROE);
+        assert!(
+            sio.fifo_irq_asserted(CpuId::Core0),
+            "ROE is part of the FIFO interrupt level"
+        );
+        assert_eq!(irq.mask(), 1 << map::SIO_IRQ_FIFO);
+        // 写回 1 清除；写 0 不清除。
+        // Write one to clear; writing zero leaves the flag set.
+        assert!(sio.write32(FIFO_ST, 0));
+        assert_eq!(sio.fifo_status(CpuId::Core0) & FIFO_ST_ROE, FIFO_ST_ROE);
+        assert!(sio.write32(FIFO_ST, FIFO_ST_CLEARABLE));
+        assert_eq!(sio.fifo_status(CpuId::Core0) & FIFO_ST_ROE, 0);
+        assert_eq!(irq.mask(), 0, "clearing ROE drops the FIFO level");
+    }
+
+    #[test]
+    fn wof_is_sticky_until_written_back() {
+        let (mut sio, irq) = sio();
+        for value in 0..FIFO_DEPTH as u32 {
+            assert!(sio.write32(FIFO_WR, value));
+        }
+        assert!(sio.write32(FIFO_WR, 0xDEAD));
+        assert_eq!(sio.fifo_status(CpuId::Core0) & FIFO_ST_RDY, 0);
+        assert_eq!(sio.fifo_status(CpuId::Core0) & FIFO_ST_WOF, FIFO_ST_WOF);
+        assert_eq!(irq.mask(), 1 << map::SIO_IRQ_FIFO);
+        assert!(sio.write32(FIFO_ST, FIFO_ST_WOF));
+        assert_eq!(sio.fifo_status(CpuId::Core0) & FIFO_ST_WOF, 0);
+        assert_eq!(irq.mask(), 0);
+    }
+
+    #[test]
+    fn fifo_irq_is_per_core() {
+        let irq0 = IrqAssert::new();
+        let irq1 = IrqAssert::new();
+        let mut sio = Sio::with_peer_irq(irq0.clone(), irq1.clone());
+        sio.select_core(CpuId::Core1);
+        assert!(sio.write32(FIFO_WR, 7));
+        sio.select_core(CpuId::Core0);
+        // core1 的写只喂给 core0：core1 自己的中断线保持静默。
+        // A core-1 write only feeds core 0: core 1's own line stays silent.
+        assert_eq!(irq0.mask(), 1 << map::SIO_IRQ_FIFO);
+        assert_eq!(irq1.mask(), 0);
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), Some(7));
+        assert_eq!(irq0.mask(), 0);
+    }
+
+    #[test]
+    fn event_generation_is_monotonic_and_tracks_every_wake_source() {
+        let (mut sio, _irq) = sio();
+        let mut last = sio.event_generation();
+        let check = |sio: &Sio, last: &mut u32, what: &str| {
+            let now = sio.event_generation();
+            assert!(now > *last, "{what} must advance the generation");
+            *last = now;
+        };
+        assert!(sio.write32(FIFO_WR, 1));
+        check(&sio, &mut last, "a FIFO push / FIFO 压入");
+        sio.post_to_core(2);
+        check(&sio, &mut last, "a peer post / 对端投递");
+        sio.ring_core(1);
+        check(&sio, &mut last, "a doorbell / 门铃");
+        assert!(sio.write32(DOORBELL_IN_CLR, 1));
+        check(&sio, &mut last, "a doorbell clear / 门铃清除");
+        assert_eq!(sio.fifo_read_blocking(CpuId::Core0), Some(2));
+        check(&sio, &mut last, "a FIFO pop / FIFO 弹出");
+        // 只读寄存器不产生事件，否则睡眠核心永远醒着。
+        // A read-only register never generates an event; otherwise a sleeping
+        // core would never stay asleep.
+        let _ = sio.read32(FIFO_ST);
+        assert_eq!(sio.event_generation(), last);
+    }
+
+    #[test]
+    fn sub_word_fifo_read_latches_roe() {
+        // 字节/半字读绕过整字 stall 门控，因此复现数据手册的「忽略空读 + ROE」。
+        // Byte/halfword reads bypass the word-read stall gate, so they reproduce
+        // the datasheet's ignored-read + ROE behaviour.
+        let (mut sio, _irq) = sio();
+        assert_eq!(sio.read32(FIFO_RD), Some(0));
+        assert_ne!(sio.fifo_status(CpuId::Core0) & FIFO_ST_ROE, 0);
+    }
+
+    #[test]
+    fn fifo_status_reports_ready_and_valid_independently() {
+        let (mut sio, _irq) = sio();
+        assert_eq!(sio.fifo_status(CpuId::Core0), FIFO_ST_RDY);
+        sio.post_to_core(0x42);
+        assert_eq!(sio.fifo_status(CpuId::Core0), FIFO_ST_RDY | FIFO_ST_VLD);
+        assert_eq!(sio.read32(FIFO_ST), Some(FIFO_ST_RDY | FIFO_ST_VLD));
     }
 }

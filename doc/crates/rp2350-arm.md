@@ -286,11 +286,73 @@ enable/ICPR/`PRIMASK`/SysTick paths.
 `enabled && pending` 的线性参考对表，核心测试锁定使能/ICPR/`PRIMASK`/SysTick
 各路径上的投递行为。
 
+### Sleep, events and blocked loads / 睡眠、事件与阻塞载入
+
+`WFI`, `WFE`, `SEV` and `SEVL` are real instructions, not `NOP`s, and a load that
+hits a blocking device is retried instead of being skipped.
+
+```rust
+pub enum SleepReason {
+    WaitForInterrupt, // WFI with nothing pending
+    WaitForEvent,     // WFE with the event register clear
+    BlockedRead,      // the last load hit a retryable bus stall
+}
+
+impl CortexM33Core {
+    pub fn sleep_reason(&self) -> Option<SleepReason>;
+    pub fn signal_event(&mut self);        // host event source (FIFO, doorbell, peer SEV)
+    pub fn event_register(&self) -> bool;  // diagnostics
+    pub fn take_events_sent(&mut self) -> u32; // SEV count for peer forwarding
+}
+```
+
+* **`WFI`** retires normally (so `PC` already points past it) and then suspends
+  only when no enabled interrupt is pending. A pending interrupt, masked or not,
+  keeps the core running: the ARM ARM guarantees `WFI` wakes on it, and the
+  instruction is never skipped. A sleeping core wakes on **any** enabled pending
+  interrupt — `PRIMASK`/`FAULTMASK` only decide whether that interrupt is then
+  *taken* — or on an event-source change surfaced by the host.
+* **`WFE`** clears a set event register and continues, otherwise it suspends
+  until an event (host `signal_event`, `SEV`, exception entry or return) or an
+  enabled pending interrupt arrives. `WFI` never consumes the event register, so
+  `SEV` cannot wake it, exactly as the architecture requires.
+* **`SEV`** sets this core's event register and increments a counter the host
+  forwards to the peer core (`take_events_sent`), implementing the ARM ARM rule
+  that `SEV` signals every core in the multiprocessor. `SEVL` sets only the local
+  register. Exception entry and exception return also set the event register,
+  which is the architectural event source that makes `while (!flag) __wfe();`
+  loops correct.
+* **Sleeping cores still age**: [`CpuCore::step`] on a sleeping core advances
+  `SysTick` and `total_cycles` by one, then checks the wake condition. The first
+  step whose condition holds executes the instruction at `PC` immediately
+  (zero-step wake latency); when the wake is caused by a takeable interrupt the
+  exception is entered in that step instead, so no thread instruction runs
+  between sleep and the handler.
+* **Blocked load (`BlockedRead`)**: when a load raises
+  `CoreError::BusError { kind: BusErrorKind::Stall }` (an empty blocking FIFO
+  read, see `rp2350-periph`), the instruction is **not** retired: `PC`, the IT
+  state and every register keep their pre-instruction values, the attempt books
+  no cycles, and the core reports [`CpuState::Sleeping`]. The stall gate lives in
+  the bus (`MemoryRegion::read_would_stall`), so the device is never touched and
+  nothing can be consumed or latched by a stalled access; the identical load is
+  replayed once data arrives and then retires exactly once.
+* `check_pending_exceptions` now honours `FAULTMASK` and `BASEPRI` in addition to
+  `PRIMASK`, and the sleep wake path uses the same gate, so a sleeping core never
+  enters an interrupt it should keep masked.
+
+**Not modelled**: the `SEVONPEND` event from a disabled interrupt becoming
+pending, the `SCR.SLEEPONEXIT`/`SLEEPDEEP` power-down entry, deep-sleep state
+retention, `WFE`'s optional timeout (`-w`), and SysTick exception delivery
+(`nvic.set_pending(EXC_SYSTICK)` marks the external IRQ of the same number; a
+dedicated SysTick exception entry is still a gap). A host that never signals an
+event and never enables an interrupt will see a `WFE`/`WFI` sleeper stay asleep
+while the machine clock keeps running — that is the hardware behaviour, and the
+CLI reports it as a `[run] sleep stall` diagnostic instead of hanging silently.
+
 ### `SysTick`
 
 ```rust
-pub mod csr {
-    pub const ENABLE: u32 = 1 << 0;
+pub mod csr {    pub const ENABLE: u32 = 1 << 0;
     pub const TICKINT: u32 = 1 << 1;
     pub const CLKSOURCE: u32 = 1 << 2;
     pub const COUNTFLAG: u32 = 1 << 16;
@@ -378,13 +440,24 @@ pub fn exit_exception(
 ## Thumb-16 Decoder / Thumb-16 解码器
 
 ```rust
+pub enum SleepKind { WaitForInterrupt, WaitForEvent }
+
 pub enum StepResult {
-    Ok(CycleCount),    // Instruction executed successfully
-    Halted(CoreError), // Execution halted
-    Svc(u8),           // Supervisor call (SVC)
-    Branch(u32),       // Branch taken to address (for instruction tracing)
+    Ok,                                       // executed, one cycle
+    SvCall(u8),                               // SVC
+    Breakpoint(u8),                           // BKPT
+    BranchTaken,                              // new PC written
+    Sleep(SleepKind),                         // WFI/WFE: the core decides whether to suspend
+    SendEvent { local: bool },                // SEV (local = false) / SEVL (local = true)
+    ExceptionReturn,                          // PC written with an EXC_RETURN value
+    Undefined,                                // reported through `note_undefined`
 }
 ```
+
+The wait hints only *report* which instruction ran; the core applies the
+wake/suspend decision after the instruction retires, using live NVIC, mask and
+event state (see "Sleep, events and blocked loads"). `SEV`/`SEVL` likewise only
+report the event request.
 
 **Supported instruction groups / 支持的指令组** (~90 instructions):
 - **Data processing**: `MOV`, `ADD`, `SUB`, `CMP`, `AND`, `ORR`, `EOR`, `MVN`, `ADC`, `SBC`, `LSL`, `LSR`, `ASR`, `ROR`, `TST`, `NEG`, `MUL`, `MRS`, `MSR`

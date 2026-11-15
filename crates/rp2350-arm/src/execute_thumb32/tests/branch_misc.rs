@@ -1,7 +1,7 @@
 //! Branch, miscellaneous, plain-immediate, and bitfield tests
 //! 分支、杂项、纯二进制立即数与位域测试
 
-use crate::execute_thumb16::StepResult;
+use crate::execute_thumb16::{SleepKind, StepResult};
 use crate::execute_thumb32::test_support::execute;
 use crate::registers::CortexM33Registers;
 
@@ -155,9 +155,22 @@ fn hint_instructions() {
     let mut r = CortexM33Registers::new();
     assert_eq!(execute(0xF3AF_8000, &mut r), StepResult::Ok); // NOP
     assert_eq!(execute(0xF3AF_8001, &mut r), StepResult::Ok); // YIELD
-    assert_eq!(execute(0xF3AF_8002, &mut r), StepResult::Sleep); // WFE
-    assert_eq!(execute(0xF3AF_8003, &mut r), StepResult::Sleep); // WFI
-    assert_eq!(execute(0xF3AF_8004, &mut r), StepResult::Ok); // SEV
+    assert_eq!(
+        execute(0xF3AF_8002, &mut r),
+        StepResult::Sleep(SleepKind::WaitForEvent)
+    ); // WFE
+    assert_eq!(
+        execute(0xF3AF_8003, &mut r),
+        StepResult::Sleep(SleepKind::WaitForInterrupt)
+    ); // WFI
+    assert_eq!(
+        execute(0xF3AF_8004, &mut r),
+        StepResult::SendEvent { local: false }
+    ); // SEV
+    assert_eq!(
+        execute(0xF3AF_8005, &mut r),
+        StepResult::SendEvent { local: true }
+    ); // SEVL
 }
 
 // === Plain-binary immediate ===

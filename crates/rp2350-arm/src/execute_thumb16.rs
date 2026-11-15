@@ -184,6 +184,15 @@ fn sbc(result: u64, regs: &mut CortexM33Registers, setflags: bool) -> u32 {
 
 // === Decoder/Executor ===
 
+/// Which wait instruction asked for the sleep / 哪条等待指令请求了睡眠
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepKind {
+    /// `WFI` — resume on the next interrupt / 等待中断后继续
+    WaitForInterrupt,
+    /// `WFE` — resume on the next event / 等待事件后继续
+    WaitForEvent,
+}
+
 /// Result of executing one Thumb-16 instruction
 /// 执行一条 Thumb-16 指令的结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +209,24 @@ pub enum StepResult {
     /// Branch taken (new PC set)
     /// 分支已执行（设置了新 PC）
     BranchTaken,
-    /// WFI/WFE — enter sleep state
-    /// WFI/WFE — 进入睡眠状态
-    Sleep,
+    /// WFI/WFE — the core decides whether to sleep
+    /// WFI/WFE — 由核心决定是否真的进入睡眠
+    ///
+    /// The decoder only reports *which* wait instruction ran. Whether the core
+    /// suspends depends on live NVIC/mask/event state, which the core applies
+    /// after the instruction retires, so the instruction is never skipped and
+    /// `PC` already points at its successor when the sleep begins.
+    /// 译码器只报告**哪条**等待指令被执行；是否真的挂起取决于实时的 NVIC、屏蔽与事件
+    /// 状态，由核心在该指令退役之后判定，因此指令绝不会被跳过，进入睡眠时 `PC` 已经
+    /// 指向后继指令。
+    Sleep(SleepKind),
+    /// SEV/SEVL — set the event register (and the peer's for `SEV`)
+    /// SEV/SEVL — 置位事件寄存器（`SEV` 还要置位对端的）
+    SendEvent {
+        /// Whether only this core's event register is set (`SEVL`)
+        /// 是否只置位本核的事件寄存器（`SEVL`）
+        local: bool,
+    },
     /// Exception return (any PC write carrying an EXC_RETURN value)
     /// 异常返回（任意写 PC 的指令携带 EXC_RETURN 值）
     ExceptionReturn,
@@ -1153,7 +1177,10 @@ mod tests {
         bus.write_u32(0x2000_1004, 0x1000_0001, &mut cycles)
             .unwrap();
         let mut it = ITBlockState::new();
-        assert_eq!(step16(0xBF40, &mut regs, &mut bus, &mut it), StepResult::Ok);
+        assert_eq!(
+            step16(0xBF40, &mut regs, &mut bus, &mut it),
+            StepResult::SendEvent { local: false }
+        );
         assert!(!it.in_it_block());
         assert_eq!(
             step16(0xBD10, &mut regs, &mut bus, &mut it),
@@ -1187,13 +1214,30 @@ mod tests {
         let mut it = ITBlockState::new();
         assert_eq!(
             step16(0xBF20, &mut regs, &mut bus, &mut it),
-            StepResult::Sleep
+            StepResult::Sleep(SleepKind::WaitForEvent)
         );
         assert_eq!(
             step16(0xBF30, &mut regs, &mut bus, &mut it),
-            StepResult::Sleep
+            StepResult::Sleep(SleepKind::WaitForInterrupt)
         );
         assert!(!it.in_it_block());
+    }
+
+    #[test]
+    fn sev_and_sevl_report_an_event_request() {
+        // 0xBF40 SEV 必须报告「置位所有核的事件寄存器」，0xBF50 SEVL 只置位本核。
+        // SEV must report a broadcast event and SEVL a local one.
+        let mut regs = CortexM33Registers::new();
+        let mut bus = rp2350_core::memory::SimpleBus::new();
+        let mut it = ITBlockState::new();
+        assert_eq!(
+            step16(0xBF40, &mut regs, &mut bus, &mut it),
+            StepResult::SendEvent { local: false }
+        );
+        assert_eq!(
+            step16(0xBF50, &mut regs, &mut bus, &mut it),
+            StepResult::SendEvent { local: true }
+        );
     }
 
     #[test]

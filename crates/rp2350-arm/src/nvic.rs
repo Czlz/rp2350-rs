@@ -344,9 +344,23 @@ impl Nvic {
         }
     }
 
-    /// Find the highest-priority pending enabled interrupt
-    /// 查找最高优先级的挂起已使能中断
+    /// Whether `irq` passes a `BASEPRI` mask / `irq` 是否通过 `BASEPRI` 屏蔽
     ///
+    /// `BASEPRI == 0` disables the mask. Otherwise an interrupt is masked when its
+    /// priority is numerically at or above the `BASEPRI` value, which is the
+    /// ARMv8-M rule; the stored `BASEPRI` value only uses its top priority bits,
+    /// so the comparison happens on the same width as [`Self::get_priority`].
+    /// `BASEPRI == 0` 表示关闭屏蔽。否则优先级数值大于等于 `BASEPRI` 值的中断被屏蔽，
+    /// 这是 ARMv8-M 的规则；`BASEPRI` 只使用其高位优先级字段，因此比较与
+    /// [`Self::get_priority`] 使用相同宽度。
+    #[must_use]
+    pub fn basepri_allows(&self, irq: IrqNumber, basepri: u32) -> bool {
+        let basepri = (basepri & 0xFF) as u8;
+        basepri == 0 || self.get_priority(irq) < (basepri >> (8 - PRIORITY_BITS))
+    }
+
+    /// Find the highest-priority pending enabled interrupt
+    /// 查找最高优先级的挂起已使能中断    ///
     /// Active interrupts are skipped: an interrupt cannot preempt itself, so a
     /// level still asserted by its peripheral must wait for exception return.
     /// 活跃中断会被跳过：中断不能抢占自身，因此外设仍保持的电平必须等到

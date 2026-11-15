@@ -241,17 +241,68 @@ Typical `mcause` values produced by the core / 核心产生的典型 `mcause`：
 ## External interrupts / 外部中断
 
 `signal_interrupt(irq)` sets bit `irq` in a 64-bit `pending_irqs` mask (IRQs ≥
-64 are ignored) and sets `mip.MEIP`; it also wakes the core if it is
-`CpuState::Sleeping`. On the next step, when both `mstatus.MIE` and
+64 are ignored) and sets `mip.MEIP`. Signalling does **not** change the core
+state: a sleeping core wakes on the next step because `wfi` resumes as
+soon as `pending_interrupt()` reports a takeable IRQ (the same rule that decides
+whether the interrupt is entered). On the next step, when both `mstatus.MIE` and
 `mie.MEIE` are set, the core enters the handler: the interrupt bit is cleared
 from `pending_irqs` (and `mip.MEIP` when nothing else is pending),
 `meipa` records the IRQ number, and a trap with
 `mcause = 0x8000_000B` is taken.
 `signal_interrupt(irq)` 在 64 位 `pending_irqs` 掩码中置位（IRQ ≥ 64 被忽略）
-并置 `mip.MEIP`；若核心处于 `CpuState::Sleeping` 还会将其唤醒。在下一次 step
-时，若 `mstatus.MIE` 与 `mie.MEIE` 均已置位，核心进入处理程序：从
-`pending_irqs` 清除该中断位（无其他挂起时同时清 `mip.MEIP`），`meipa` 记录
-IRQ 编号，然后以 `mcause = 0x8000_000B` 进入陷阱。
+并置 `mip.MEIP`。断言**不会**改变核心状态：睡眠核在下一步被唤醒，因为
+`wfi` 只要 `pending_interrupt()` 报告可进入的中断就恢复（与「是否进入
+中断」使用同一条规则）。在下一次 step 时，若 `mstatus.MIE` 与 `mie.MEIE` 均已
+置位，核心进入处理程序：从 `pending_irqs` 清除该中断位（无其他挂起时同时清
+`mip.MEIP`），`meipa` 记录 IRQ 编号，然后以 `mcause = 0x8000_000B` 进入陷阱。
+
+### Sleep, events and blocked loads / 睡眠、事件与阻塞载入
+
+```rust
+pub enum SleepReason { WaitForInterrupt, BlockedRead }
+
+impl Hazard3Core {
+    pub fn sleep_reason(&self) -> Option<SleepReason>;
+    /// Host event source (FIFO traffic, peer SEV). / 宿主事件源（FIFO 流量、对端 SEV）。
+    pub fn signal_event(&mut self);
+    pub fn event_pending(&self) -> bool;
+}
+```
+
+* **`WFI`** retires normally and then suspends unless an enabled interrupt is
+  already pending (`pending_interrupt()` agrees with the entry path, so the core
+  never sleeps while the interrupt it waits for could be taken). A sleeping core
+  advances `csr.tick()` and `total_cycles` every step, wakes on a takeable
+  interrupt (which is then entered in the same step) or on a host event, and
+  resumes at `PC` — the instruction after `WFI`.
+  Hazard3 has no architectural `WFE`, but the pico-sdk compiles `__wfe()` to
+  `wfi` on RISC-V, so the inter-core mailbox needs a wake source that is not an
+  interrupt: `signal_event()` is that source, and the CLI drives it from the SIO
+  event generation.
+* **Blocked load**: a load that raises
+  `CoreError::BusError { kind: BusErrorKind::Stall }` (an empty blocking FIFO
+  read) is **not** turned into a guest-visible exception. The core keeps `PC`
+  and the destination register unchanged, reports `CpuState::Sleeping` with
+  `SleepReason::BlockedRead`, and replays the same instruction once the data
+  arrives; then it retires exactly once. Stores never stall.
+* Not modelled: the RISC-V machine timer (`sio_mtime`/`mtimecmp`) and the
+  `mip.MTIP` wake source, `WFI`'s "resume after any enabled interrupt even if
+  masked" nuance (this model requires the interrupt to be takeable), and any
+  power/clock-gating entry.
+
+`WFI` 正常退役后，只要没有已使能中断挂起就挂起（`pending_interrupt()` 与进入路径
+一致，因此绝不会在「等待的中断本可进入」时睡下）。睡眠核每步推进 `csr.tick()` 与
+`total_cycles`，在可进入中断（并在同一步进入）或宿主事件到来时唤醒，并从 `PC`
+（`WFI` 之后那条指令）继续。Hazard3 没有架构 `WFE`，但 pico-sdk 在 RISC-V 上把
+`__wfe()` 编译为 `wfi`，因此核间信箱需要一个非中断唤醒源：`signal_event()` 就是
+它，CLI 依据 SIO 事件世代驱动。
+
+**阻塞载入**：抛出 `CoreError::BusError { kind: BusErrorKind::Stall }`（空阻塞
+FIFO 读）的载入**不会**变成客户机可见异常：核心保持 `PC` 与目的寄存器不变，以
+`SleepReason::BlockedRead` 报告 `CpuState::Sleeping`，数据到达后重放同一条指令并
+恰好退役一次。存储永不 stall。未建模：RISC-V 机器定时器
+（`sio_mtime`/`mtimecmp`）与 `mip.MTIP` 唤醒源、`WFI`「即使被屏蔽也可被使能中断
+唤醒」的细节（本模型要求中断可进入），以及任何功耗/时钟门控进入。
 
 Xh3irq model: 16-bit `meiea` windows gate external IRQs on top of
 `mstatus.MIE` && `mie.MEIE`; `meipa` derives from pending/force state and
@@ -285,7 +336,7 @@ MicroPython RISC-V 的中断链，但并非完整 Xh3irq 控制器（缺少外�
   address (no bus-side reservation), plus the full AMO family (`AMOSWAP`,
   `AMOADD`, `AMOXOR`, `AMOAND`, `AMOOR`, `AMOMIN/U/MAX/U`).
 - **SYSTEM**: `ECALL` (cause 11), `EBREAK` (cause 3), `MRET`, `WFI`
-  (treated as a NOP so single-core bring-up does not deadlock), and the
+  (real sleep unless an enabled interrupt is pending, see above), and the
   `CSRR*` family including immediate forms; writes to read-only
   (`(csr >> 10) & 3 == 3`, plus `misa`) CSRs and any access to an
   unimplemented CSR are illegal-instruction traps with the CSR address in
@@ -299,7 +350,7 @@ MicroPython RISC-V 的中断链，但并非完整 Xh3irq 控制器（缺少外�
   （不在总线侧保留），外加完整的 AMO 家族（`AMOSWAP`、`AMOADD`、`AMOXOR`、
   `AMOAND`、`AMOOR`、`AMOMIN/U/MAX/U`）。
 - **SYSTEM**：`ECALL`（cause 11）、`EBREAK`（cause 3）、`MRET`、`WFI`
-  （视为 NOP，避免单核引导死锁），以及含立即数形式的 `CSRR*` 家族；写只读
+  （无待处理使能中断时真正睡眠，见上文），以及含立即数形式的 `CSRR*` 家族；写只读
   （`(csr >> 10) & 3 == 3`，外加 `misa`）CSR 与访问任何未实现 CSR 都会触发
   非法指令陷阱，`mtval` 为 CSR 地址。
 

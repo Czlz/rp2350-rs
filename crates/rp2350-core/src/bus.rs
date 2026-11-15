@@ -46,6 +46,23 @@ pub trait MemoryRegion: Send + Sync {
         addr >= self.base() && addr < self.end()
     }
 
+    /// Whether a read of `addr` would currently stall
+    /// 读取 `addr` 目前是否会 stall
+    ///
+    /// A region that can block (a blocking FIFO, a mailbox) reports `true` here
+    /// while the data is missing. [`AddressBus`] then fails the read with
+    /// [`BusErrorKind::Stall`] **before** the region is touched, so a stalled
+    /// access can never consume, clear or advance device state; the CPU retries
+    /// the identical access once an event arrives. The default is `false`, so
+    /// every existing region keeps exactly its previous behaviour.
+    /// 可能阻塞的区域（阻塞 FIFO、信箱）在数据缺失时返回 `true`。[`AddressBus`] 随后
+    /// 在触碰区域**之前**以 [`BusErrorKind::Stall`] 结束读取，因此被 stall 的访问绝不
+    /// 会消费、清除或推进设备状态；事件到来后 CPU 重试完全相同的访问。默认值为
+    /// `false`，因此所有既有区域的行为逐字节不变。
+    fn read_would_stall(&self, _addr: Address) -> bool {
+        false
+    }
+
     /// Read a single byte / 读取一个字节
     ///
     /// # Errors
@@ -159,43 +176,59 @@ pub trait AddressBus: Send + Sync {
     /// Read from the bus (auto-routes to correct region) / 从总线读取（自动路由到正确区域）
     ///
     /// # Errors
-    /// Returns `BusError` if no device is mapped at the given address.
-    /// 如果给定地址没有映射设备，返回 `BusError`。
+    /// Returns `BusError` if no device is mapped at the given address, or
+    /// [`BusErrorKind::Stall`] when the region reports a blocking read.
+    /// 如果给定地址没有映射设备，返回 `BusError`；区域报告阻塞读时返回
+    /// [`BusErrorKind::Stall`]。
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
-        self.find_region_mut(addr)
-            .ok_or(CoreError::BusError {
+        self.resolve_readable(addr)?.read_u8(addr, cycles)
+    }
+
+    /// Resolve `addr` to a region that can serve a read right now
+    /// 把 `addr` 解析到当前可服务读取的区域
+    ///
+    /// A region whose [`MemoryRegion::read_would_stall`] is `true` is rejected
+    /// with [`BusErrorKind::Stall`] before any device code runs.
+    /// [`MemoryRegion::read_would_stall`] 为 `true` 的区域会在任何设备代码运行前以
+    /// [`BusErrorKind::Stall`] 拒绝。
+    ///
+    /// # Errors
+    /// Returns `NoDevice` when nothing is mapped and `Stall` for a blocked read.
+    /// 未映射返回 `NoDevice`，阻塞读返回 `Stall`。
+    fn resolve_readable(&mut self, addr: Address) -> BusResult<&mut dyn MemoryRegion> {
+        let region = self.find_region_mut(addr).ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::NoDevice,
+        })?;
+        if region.read_would_stall(addr) {
+            return Err(CoreError::BusError {
                 addr,
-                kind: BusErrorKind::NoDevice,
-            })?
-            .read_u8(addr, cycles)
+                kind: BusErrorKind::Stall,
+            });
+        }
+        Ok(region)
     }
 
     /// Read a 16-bit halfword / 读取 16 位半字
     ///
     /// # Errors
-    /// Returns `BusError` if no device is mapped at the given address.
-    /// 如果给定地址没有映射设备，返回 `BusError`。
+    /// Returns `BusError` if no device is mapped at the given address, or
+    /// [`BusErrorKind::Stall`] when the region reports a blocking read.
+    /// 如果给定地址没有映射设备，返回 `BusError`；区域报告阻塞读时返回
+    /// [`BusErrorKind::Stall`]。
     fn read_u16(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u16> {
-        self.find_region_mut(addr)
-            .ok_or(CoreError::BusError {
-                addr,
-                kind: BusErrorKind::NoDevice,
-            })?
-            .read_u16(addr, cycles)
+        self.resolve_readable(addr)?.read_u16(addr, cycles)
     }
 
     /// Read a 32-bit word / 读取 32 位字
     ///
     /// # Errors
-    /// Returns `BusError` if no device is mapped at the given address.
-    /// 如果给定地址没有映射设备，返回 `BusError`。
+    /// Returns `BusError` if no device is mapped at the given address, or
+    /// [`BusErrorKind::Stall`] when the region reports a blocking read.
+    /// 如果给定地址没有映射设备，返回 `BusError`；区域报告阻塞读时返回
+    /// [`BusErrorKind::Stall`]。
     fn read_u32(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u32> {
-        self.find_region_mut(addr)
-            .ok_or(CoreError::BusError {
-                addr,
-                kind: BusErrorKind::NoDevice,
-            })?
-            .read_u32(addr, cycles)
+        self.resolve_readable(addr)?.read_u32(addr, cycles)
     }
 
     /// Write to the bus (auto-routes to correct region) / 写入总线（自动路由到正确区域）
@@ -283,5 +316,148 @@ pub trait AddressBus: Send + Sync {
             self.load_u8(addr.wrapping_add(offset), *byte, cycles)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    //! Bus-stall contract tests / 总线 stall 契约测试
+    //!
+    //! They prove the two properties the sleep path depends on: the default is
+    //! "never stalls" (no behaviour change for existing regions) and a stalled
+    //! read is rejected **before** the region is touched.
+    //! 它们验证睡眠路径依赖的两条性质：默认「永不 stall」（既有区域零行为变化），
+    //! 以及被 stall 的读取在触碰区域**之前**就被拒绝。
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    use super::*;
+    use crate::memory::{RamRegion, SimpleBus};
+
+    /// RAM region that reports a stall while `blocked` is set
+    /// 在 `blocked` 置位时报告 stall 的 RAM 区域
+    struct BlockingRegion {
+        ram: RamRegion,
+        blocked: Arc<AtomicBool>,
+        reads: Arc<AtomicU32>,
+    }
+
+    impl MemoryRegion for BlockingRegion {
+        fn name(&self) -> &str {
+            self.ram.name()
+        }
+
+        fn base(&self) -> Address {
+            self.ram.base()
+        }
+
+        fn size(&self) -> usize {
+            self.ram.size()
+        }
+
+        fn read_would_stall(&self, _addr: Address) -> bool {
+            self.blocked.load(Ordering::Relaxed)
+        }
+
+        fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.ram.read_u8(addr, cycles)
+        }
+
+        fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
+            self.ram.write_u8(addr, value, cycles)
+        }
+    }
+
+    fn blocking_bus() -> (SimpleBus, Arc<AtomicBool>, Arc<AtomicU32>) {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicU32::new(0));
+        let mut bus = SimpleBus::new();
+        bus.register_region(Box::new(BlockingRegion {
+            ram: RamRegion::new("blocking", 0x1000_0000, 0x100),
+            blocked: Arc::clone(&blocked),
+            reads: Arc::clone(&reads),
+        }))
+        .expect("region");
+        (bus, blocked, reads)
+    }
+
+    #[test]
+    fn default_region_never_stalls() {
+        let ram = RamRegion::new("ram", 0x2000_0000, 16);
+        assert!(
+            !ram.read_would_stall(0x2000_0000),
+            "the trait default must never stall / trait 默认必须永不 stall"
+        );
+    }
+
+    #[test]
+    fn default_bus_read_path_is_unchanged() {
+        // 一个从不 stall 的总线上，32 位读仍是成功的一字读取。
+        // On a bus whose region never stalls, a word read is one successful read.
+        let (mut bus, _blocked, reads) = blocking_bus();
+        let mut cycles = 0u64;
+        assert_eq!(bus.read_u32(0x1000_0000, &mut cycles).expect("read"), 0);
+        assert_eq!(reads.load(Ordering::Relaxed), 4);
+        assert_eq!(cycles, 4, "one word read books four byte cycles");
+    }
+
+    #[test]
+    fn stalled_read_reports_the_stall_kind() {
+        let (mut bus, blocked, _reads) = blocking_bus();
+        blocked.store(true, Ordering::Relaxed);
+        let mut cycles = 0u64;
+        let error = bus.read_u32(0x1000_0000, &mut cycles).expect_err("stall");
+        assert!(error.is_stall());
+        assert!(matches!(
+            error,
+            CoreError::BusError {
+                kind: BusErrorKind::Stall,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("Stall"));
+    }
+
+    #[test]
+    fn stalled_read_never_touches_the_region() {
+        // stall 必须在任何区域代码之前拒绝读取，否则设备会被消费或锁存错误。
+        // A stall must reject the read before any region code, otherwise the
+        // device would be consumed or latch an error flag.
+        let (mut bus, blocked, reads) = blocking_bus();
+        blocked.store(true, Ordering::Relaxed);
+        let mut cycles = 0u64;
+        for _ in 0..3 {
+            let _ = bus.read_u32(0x1000_0000, &mut cycles);
+            let _ = bus.read_u16(0x1000_0000, &mut cycles);
+            let _ = bus.read_u8(0x1000_0000, &mut cycles);
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "no region read may run while stalled / stall 期间不得执行区域读"
+        );
+        assert_eq!(cycles, 0, "a stalled access books no cycles");
+    }
+
+    #[test]
+    fn releasing_the_stall_serves_the_read() {
+        let (mut bus, blocked, _reads) = blocking_bus();
+        blocked.store(true, Ordering::Relaxed);
+        let mut cycles = 0u64;
+        assert!(bus.read_u32(0x1000_0000, &mut cycles).is_err());
+        blocked.store(false, Ordering::Relaxed);
+        assert!(bus.read_u32(0x1000_0000, &mut cycles).is_ok());
+    }
+
+    #[test]
+    fn other_error_kinds_are_not_stalls() {
+        let error = CoreError::BusError {
+            addr: 0,
+            kind: BusErrorKind::NoDevice,
+        };
+        assert!(!error.is_stall());
+        assert!(!CoreError::InvalidIrq(300).is_stall());
     }
 }

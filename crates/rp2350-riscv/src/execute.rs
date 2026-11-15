@@ -2,8 +2,10 @@
 
 use super::Hazard3Core;
 use super::execute_c::{ZcmpOp, decompress, zcmp_op};
+use crate::SleepReason;
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
+use rp2350_cpu::CpuState;
 
 /// Opcode: load / 加载指令
 const OP_LOAD: u32 = 0x03;
@@ -40,6 +42,15 @@ struct Trap {
     cause: u32,
     /// `mtval` value / 陷阱值
     tval: u32,
+    /// Whether the access is retryable instead of trapping / 该访问是否应重试而非触发陷阱
+    ///
+    /// A device that blocks (an empty FIFO read) reports a bus stall. The guest
+    /// must never observe an exception for it, so the flag makes
+    /// [`Hazard3Core::execute_one`] put the core to sleep with `PC` unchanged and
+    /// replay the same instruction later.
+    /// 阻塞设备（空 FIFO 读）会报告总线 stall。客户机绝不能因此看到异常，因此该标志让
+    /// [`Hazard3Core::execute_one`] 保持 `PC` 不变并把核心置为睡眠，稍后重放同一条指令。
+    retry: bool,
 }
 
 impl Trap {
@@ -48,6 +59,7 @@ impl Trap {
         Self {
             cause: 2,
             tval: instr,
+            retry: false,
         }
     }
 
@@ -63,6 +75,38 @@ impl Trap {
         Self {
             cause: 2,
             tval: csr,
+            retry: false,
+        }
+    }
+
+    /// Build a retryable load trap / 构造可重试的加载陷阱
+    fn retry(addr: u32) -> Self {
+        Self {
+            cause: 5,
+            tval: addr,
+            retry: true,
+        }
+    }
+
+    /// Build a load access fault / 构造加载访问错误
+    fn load_fault(addr: u32, error: &CoreError) -> Self {
+        if error.is_stall() {
+            Self::retry(addr)
+        } else {
+            Self {
+                cause: 5,
+                tval: addr,
+                retry: false,
+            }
+        }
+    }
+
+    /// Build a store access fault / 构造存储访问错误
+    fn store_fault(addr: u32) -> Self {
+        Self {
+            cause: 7,
+            tval: addr,
+            retry: false,
         }
     }
 }
@@ -89,6 +133,15 @@ impl Hazard3Core {
                         self.registers.pc = target;
                         Ok(())
                     }
+                    Err(trap) if trap.retry => {
+                        // 重试时重新执行整个宏；被 stall 的载入尚未写入任何寄存器。
+                        // The whole macro is replayed; the stalled load has not
+                        // written any register yet.
+                        self.registers.pc = pc;
+                        self.state = CpuState::Sleeping;
+                        self.sleep_kind = Some(SleepReason::BlockedRead);
+                        Ok(())
+                    }
                     Err(trap) => {
                         self.registers.pc = self.enter_trap(trap.cause, trap.tval, pc);
                         Ok(())
@@ -110,6 +163,15 @@ impl Hazard3Core {
         match self.execute_instr(instr, bus, pc, next_pc) {
             Ok(target) => {
                 self.registers.pc = target;
+                Ok(())
+            }
+            // 可重试的总线 stall 不是客户机可见异常：保持 PC 不变并睡眠，稍后重放。
+            // A retryable bus stall is not a guest-visible exception: keep PC
+            // unchanged, sleep, and replay later.
+            Err(trap) if trap.retry => {
+                self.registers.pc = pc;
+                self.state = CpuState::Sleeping;
+                self.sleep_kind = Some(SleepReason::BlockedRead);
                 Ok(())
             }
             Err(trap) => {
@@ -135,10 +197,7 @@ impl Hazard3Core {
                 for &reg in op.registers() {
                     let mut cycles = 0u64;
                     bus.write_u32(addr, self.registers.read(reg), &mut cycles)
-                        .map_err(|_| Trap {
-                            cause: 7,
-                            tval: addr,
-                        })?;
+                        .map_err(|_| Trap::store_fault(addr))?;
                     addr = addr.wrapping_sub(4);
                 }
                 self.registers.write(2, sp.wrapping_sub(stack_adj));
@@ -148,10 +207,9 @@ impl Hazard3Core {
                 let mut addr = sp.wrapping_add(stack_adj).wrapping_sub(4);
                 for &reg in op.registers() {
                     let mut cycles = 0u64;
-                    let value = bus.read_u32(addr, &mut cycles).map_err(|_| Trap {
-                        cause: 5,
-                        tval: addr,
-                    })?;
+                    let value = bus
+                        .read_u32(addr, &mut cycles)
+                        .map_err(|error| Trap::load_fault(addr, &error))?;
                     self.registers.write(reg, value);
                     addr = addr.wrapping_sub(4);
                 }
@@ -458,12 +516,34 @@ impl Hazard3Core {
         next_pc: u32,
     ) -> ExecResult {
         match instr {
-            0x0000_0073 => return Err(Trap { cause: 11, tval: 0 }),
-            0x0010_0073 => return Err(Trap { cause: 3, tval: 0 }),
+            0x0000_0073 => {
+                return Err(Trap {
+                    cause: 11,
+                    tval: 0,
+                    retry: false,
+                });
+            }
+            0x0010_0073 => {
+                return Err(Trap {
+                    cause: 3,
+                    tval: 0,
+                    retry: false,
+                });
+            }
             0x3020_0073 => return Ok(self.csr.mret()),
-            // WFI is treated as a NOP so single-core bring-up does not deadlock.
-            // WFI 视为 NOP，避免单核引导时死锁。
-            0x1050_0073 => return Ok(next_pc),
+            // WFI: suspend unless an enabled interrupt is already pending. The
+            // Hazard3 core exposes no architectural sleep state beyond this, and
+            // the pico-sdk maps `__wfe()` to `wfi`, so a host-signalled event
+            // (`signal_event`) also resumes it.
+            // WFI：若已有使能中断挂起则立即继续，否则挂起。Hazard3 除此外没有架构睡眠
+            // 状态；pico-sdk 把 `__wfe()` 映射到 `wfi`，因此宿主事件（`signal_event`）
+            // 也能恢复它。
+            0x1050_0073 => {
+                if self.pending_interrupt().is_none() {
+                    self.sleep_requested = true;
+                }
+                return Ok(next_pc);
+            }
             _ => {}
         }
         if !matches!(funct3, 1..=3 | 5..=7) {
@@ -511,33 +591,32 @@ impl Hazard3Core {
 /// Read a load value by `funct3` / 按 `funct3` 读取加载值
 fn load_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32) -> Result<u32, Trap> {
     let mut cycles = 0u64;
-    let fault = Trap {
-        cause: 5,
-        tval: addr,
-    };
     match funct3 {
         // LB/LH sign-extend to XLEN; LBU/LHU below zero-extend.
         // LB/LH 符号扩展到 XLEN；下面的 LBU/LHU 做零扩展。
         0 => bus
             .read_u8(addr, &mut cycles)
             .map(|v| v as i8 as u32)
-            .map_err(|_| fault),
+            .map_err(|error| Trap::load_fault(addr, &error)),
         1 => bus
             .read_u16(addr, &mut cycles)
             .map(|v| v as i16 as u32)
-            .map_err(|_| fault),
-        2 => bus.read_u32(addr, &mut cycles).map_err(|_| fault),
+            .map_err(|error| Trap::load_fault(addr, &error)),
+        2 => bus
+            .read_u32(addr, &mut cycles)
+            .map_err(|error| Trap::load_fault(addr, &error)),
         4 => bus
             .read_u8(addr, &mut cycles)
             .map(u32::from)
-            .map_err(|_| fault),
+            .map_err(|error| Trap::load_fault(addr, &error)),
         5 => bus
             .read_u16(addr, &mut cycles)
             .map(u32::from)
-            .map_err(|_| fault),
+            .map_err(|error| Trap::load_fault(addr, &error)),
         _ => Err(Trap {
             cause: 2,
             tval: funct3,
+            retry: false,
         }),
     }
 }
@@ -545,10 +624,7 @@ fn load_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32) -> Result<u32, T
 /// Write a store value by `funct3` / 按 `funct3` 写入存储值
 fn store_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32, value: u32) -> Result<(), Trap> {
     let mut cycles = 0u64;
-    let fault = Trap {
-        cause: 7,
-        tval: addr,
-    };
+    let fault = Trap::store_fault(addr);
     match funct3 {
         0 => bus
             .write_u8(addr, value as u8, &mut cycles)
@@ -560,6 +636,7 @@ fn store_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32, value: u32) -> 
         _ => Err(Trap {
             cause: 2,
             tval: funct3,
+            retry: false,
         }),
     }
 }
@@ -567,19 +644,15 @@ fn store_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32, value: u32) -> 
 /// Load a 32-bit word for atomics / 为原子操作加载 32 位字
 fn load_word(bus: &mut dyn AddressBus, addr: u32) -> Result<u32, Trap> {
     let mut cycles = 0u64;
-    bus.read_u32(addr, &mut cycles).map_err(|_| Trap {
-        cause: 5,
-        tval: addr,
-    })
+    bus.read_u32(addr, &mut cycles)
+        .map_err(|error| Trap::load_fault(addr, &error))
 }
 
 /// Store a 32-bit word for atomics / 为原子操作存储 32 位字
 fn store_word(bus: &mut dyn AddressBus, addr: u32, value: u32) -> Result<(), Trap> {
     let mut cycles = 0u64;
-    bus.write_u32(addr, value, &mut cycles).map_err(|_| Trap {
-        cause: 7,
-        tval: addr,
-    })
+    bus.write_u32(addr, value, &mut cycles)
+        .map_err(|_| Trap::store_fault(addr))
 }
 
 /// Arithmetic/logical right shift / 算术或逻辑右移
@@ -658,6 +731,7 @@ fn multiply_divide(a: u32, b: u32, funct3: u32) -> Result<u32, Trap> {
             return Err(Trap {
                 cause: 2,
                 tval: funct3,
+                retry: false,
             });
         }
     };

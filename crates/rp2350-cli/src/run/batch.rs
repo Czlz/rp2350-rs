@@ -89,9 +89,19 @@ impl Machine {
 
             let mut retired = 0u64;
             while retired < chunk {
+                // 核心之间的 SIO 事件与 SEV 转发：事件到达后同一步即可唤醒睡眠核。
+                // SIO events and SEV forwarding between cores, so a core woken by an
+                // event resumes within the same step.
+                self.sync_core_events();
                 // ---- core 0: one instruction -------------------------------
                 let pc = self.core.pc();
-                self.recent.push(steps, pc);
+                // 睡眠核不执行指令，也不进入「已执行 PC」回溯缓冲。
+                // A sleeping core executes nothing and stays out of the
+                // executed-PC post-mortem ring.
+                let core0_running = self.core.state() == CpuState::Running;
+                if core0_running {
+                    self.recent.push(steps, pc);
+                }
                 // 合成 boot ROM 的全部陷阱桩都位于 ROM 窗口内，窗口外的 PC 无需
                 // 线性扫描桩表；与逐指令路径使用同一个门控。
                 // Every synthetic boot ROM trap stub lives inside the ROM window,
@@ -136,8 +146,15 @@ impl Machine {
                     }
                 }
                 if !trapped {
+                    // 睡眠步：不退役指令，但时间照常推进（`steps` 仍 +1），且
+                    // 继续执行本步的边界工作，使中断投递/泵送仍能唤醒它。
+                    // A sleep step retires nothing while time advances (`steps`
+                    // still increments) and keeps this step's boundary work, so
+                    // interrupt delivery and peripheral pumps can still wake it.
+                    let mut sleeping = false;
                     match self.core.step(&mut self.bus) {
                         Ok(CpuState::Running) => {}
+                        Ok(CpuState::Sleeping) => sleeping = true,
                         Ok(state) => {
                             self.steps = steps;
                             self.halt = Some(format!("core entered state {state:?}"));
@@ -156,34 +173,39 @@ impl Machine {
                         }
                     }
                     steps += 1;
-                    if tracks_traps {
-                        self.steps = steps;
-                        self.record_sync_trap();
-                    }
-                    // 紧凑自旋检测：PC 连续停留在同一小窗口内达到阈值时告警一次。
-                    // Tight-spin detection: warn once when the PC stays inside one
-                    // small window for the threshold number of steps.
-                    let pc = self.core.pc();
-                    if pc.wrapping_sub(spin_base) < SPIN_WINDOW_BYTES {
-                        spin_steps += 1;
-                        if spin_steps == SPIN_REPORT_STEPS && self.spin_reports < SPIN_REPORT_LIMIT
-                        {
-                            self.spin_reports += 1;
-                            self.emit_spin_notice(spin_base, spin_steps);
-                        }
+                    if sleeping {
+                        self.note_sleep_step(0);
                     } else {
-                        spin_base = pc;
-                        spin_steps = 0;
-                    }
-                    // PPB 系统写入必须在下一条指令前生效。世代未推进时回放队列
-                    // 必然为空，直接跳过（省去一次互斥锁）。
-                    // System-control writes must land before the next instruction.
-                    // An unchanged epoch proves the replay queue is empty, so the
-                    // drain (and its mutex) is skipped entirely.
-                    let epoch = self.bus.ppb_write_epoch();
-                    if epoch != self.ppb_epoch_seen {
-                        self.ppb_epoch_seen = epoch;
-                        replay_system_writes(&mut self.core, &self.peripherals);
+                        if tracks_traps {
+                            self.steps = steps;
+                            self.record_sync_trap();
+                        }
+                        // 紧凑自旋检测：PC 连续停留在同一小窗口内达到阈值时告警一次。
+                        // Tight-spin detection: warn once when the PC stays inside one
+                        // small window for the threshold number of steps.
+                        let pc = self.core.pc();
+                        if pc.wrapping_sub(spin_base) < SPIN_WINDOW_BYTES {
+                            spin_steps += 1;
+                            if spin_steps == SPIN_REPORT_STEPS
+                                && self.spin_reports < SPIN_REPORT_LIMIT
+                            {
+                                self.spin_reports += 1;
+                                self.emit_spin_notice(spin_base, spin_steps);
+                            }
+                        } else {
+                            spin_base = pc;
+                            spin_steps = 0;
+                        }
+                        // PPB 系统写入必须在下一条指令前生效。世代未推进时回放队列
+                        // 必然为空，直接跳过（省去一次互斥锁）。
+                        // System-control writes must land before the next instruction.
+                        // An unchanged epoch proves the replay queue is empty, so the
+                        // drain (and its mutex) is skipped entirely.
+                        let epoch = self.bus.ppb_write_epoch();
+                        if epoch != self.ppb_epoch_seen {
+                            self.ppb_epoch_seen = epoch;
+                            replay_system_writes(&mut self.core, &self.peripherals);
+                        }
                     }
                 }
 
@@ -229,6 +251,20 @@ impl Machine {
                     core1_live = core1_running(self);
                 }
 
+                // 睡眠/唤醒统计与「双核都在睡」诊断必须覆盖批量路径，否则
+                // `run`/`repl`/`perfbench` 的睡眠统计会漏记。
+                // Sleep/wake accounting and the "both cores asleep" diagnostic
+                // must cover the batched path too, otherwise `run`, `repl` and
+                // `perfbench` would under-report sleep steps.
+                let core0_sleeping = self.core.is_sleeping();
+                let core1_sleeping = self
+                    .core1
+                    .as_ref()
+                    .is_some_and(|core| core.state() == CpuState::Sleeping);
+                self.note_core_sleep_state(0, core0_sleeping);
+                self.note_core_sleep_state(1, core1_sleeping);
+                self.note_both_sleeping(core0_sleeping && core1_sleeping, !core0_sleeping);
+
                 retired += 1;
                 if trapped {
                     break;
@@ -245,7 +281,10 @@ impl Machine {
     }
 }
 
-/// Whether core 1 can retire an instruction right now / core1 当前是否可推进
+/// Whether core 1 can be stepped right now / core1 当前是否可推进
 fn core1_running(machine: &Machine) -> bool {
-    machine.core1.as_ref().map(CpuCore::state) == Some(CpuState::Running)
+    matches!(
+        machine.core1.as_ref().map(CpuCore::state),
+        Some(CpuState::Running | CpuState::Sleeping)
+    )
 }

@@ -64,15 +64,18 @@ impl DualCoreM33 {
         }
     }
 
-    /// Report whether core1 has been released and is currently running
-    /// 报告 core1 是否已释放且当前正在运行
+    /// Report whether core1 has been released and can still make progress
+    /// 报告 core1 是否已释放且仍可继续推进
     ///
-    /// Returns `false` before the first successful release and also after
-    /// core1 faults or halts on its own.
-    /// 首次成功释放前返回 `false`；core1 自身故障或停机后同样返回 `false`。
+    /// A released core 1 counts as live while it is `Running` **or**
+    /// `Sleeping`: a sleeping core must still be stepped so its wake condition
+    /// can be checked. Returns `false` before the first successful release and
+    /// after core1 faults, halts or resets.
+    /// 已释放的 core1 在 `Running` **或** `Sleeping` 时都算活跃：睡眠核仍须被推进，
+    /// 才能检查其唤醒条件。首次成功释放前以及 core1 故障、停机或复位后返回 `false`。
     #[must_use]
     pub fn is_core1_running(&self) -> bool {
-        self.core1_released && self.core1.state() == CpuState::Running
+        self.core1_released && matches!(self.core1.state(), CpuState::Running | CpuState::Sleeping)
     }
 
     /// Initialize core1 registers and start its execution
@@ -143,11 +146,13 @@ impl DualCoreM33 {
     /// Run up to `cycles` [`Self::step`] calls and return the actual count
     /// 最多执行 `cycles` 次 [`Self::step`]，返回实际执行次数
     ///
-    /// One step counts as one cycle regardless of the instruction width. The
-    /// loop stops early once both cores report a non-[`CpuState::Running`]
-    /// state; a halted core1 alone never stops a running core0.
-    /// 每次 step 计 1 个周期，与指令宽度无关。当两个核心都报告非
-    /// [`CpuState::Running`] 状态时提前结束；仅 core1 停机不会阻止 core0 运行。
+    /// One step counts as one cycle regardless of the instruction width. A
+    /// sleeping core keeps the loop alive (its clock still advances and an event
+    /// or interrupt can wake it), so only `Halted`/`Faulted`/`Reset` stop the
+    /// loop; a stopped core1 alone never stops a running core0.
+    /// 每次 step 计 1 个周期，与指令宽度无关。睡眠核仍保持循环（时钟继续推进，
+    /// 事件或中断可将其唤醒），因此只有 `Halted`/`Faulted`/`Reset` 会结束循环；
+    /// 仅 core1 停机不会阻止 core0 运行。
     ///
     /// # Errors
     /// Propagates the first [`CoreError`]; the partially executed count is
@@ -158,7 +163,9 @@ impl DualCoreM33 {
         while executed < cycles {
             let states = self.step(bus)?;
             executed += 1;
-            if states.iter().all(|state| *state != CpuState::Running) {
+            let runnable =
+                |state: CpuState| matches!(state, CpuState::Running | CpuState::Sleeping);
+            if !states.iter().copied().any(runnable) {
                 break;
             }
         }

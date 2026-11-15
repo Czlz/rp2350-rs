@@ -56,6 +56,20 @@ use rp2350_cpu::{CpuArch, CpuCore, CpuState};
 
 use csr::CsrFile;
 
+/// Why a core is in [`CpuState::Sleeping`] / 核心处于 [`CpuState::Sleeping`] 的原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepReason {
+    /// `WFI` with no enabled interrupt pending / 无使能挂起中断时的 `WFI`
+    WaitForInterrupt,
+    /// A load hit a retryable bus stall (blocking FIFO read)
+    /// 载入遇到可重试的总线 stall（阻塞 FIFO 读）
+    ///
+    /// No guest-visible exception is raised: `PC` and the destination register
+    /// keep their pre-instruction values and the load is replayed later.
+    /// 不会产生客户机可见异常：`PC` 与目的寄存器保持指令执行前的值，载入稍后重放。
+    BlockedRead,
+}
+
 /// Picobin header magic at the start of an RP2350 RISC-V image
 /// RP2350 RISC-V 映像起始处的 picobin 头魔数
 pub const RISCV_BOOT_MAGIC_ADDR: u32 = 0x1000_0000;
@@ -103,6 +117,14 @@ pub struct Hazard3Core {
     /// Optional host-installed vector table for fatal exceptions
     /// 宿主可选安装的致命异常向量表基地址
     fatal_trap_vector: Option<u32>,
+    /// Reason the core is sleeping, `None` while running
+    /// 核心睡眠原因，运行时为 `None`
+    sleep_kind: Option<SleepReason>,
+    /// Event signalled by the host (FIFO traffic, peer `SEV`) while asleep
+    /// 宿主机在睡眠期间发出的事件（FIFO 流量、对端 `SEV`）
+    sleep_event: bool,
+    /// A `WFI` retired and asked for a sleep / 已退役的 `WFI` 请求睡眠
+    sleep_requested: bool,
 }
 
 impl Hazard3Core {
@@ -118,6 +140,9 @@ impl Hazard3Core {
             total_cycles: 0,
             reservation: None,
             fatal_trap_vector: None,
+            sleep_kind: None,
+            sleep_event: false,
+            sleep_requested: false,
         }
     }
 
@@ -229,6 +254,9 @@ impl Hazard3Core {
         self.csr = CsrFile::new();
         self.total_cycles = 0;
         self.reservation = None;
+        self.sleep_kind = None;
+        self.sleep_event = false;
+        self.sleep_requested = false;
     }
 
     /// Apply cached boot vectors / 应用缓存的启动向量
@@ -283,9 +311,63 @@ impl Hazard3Core {
             return Ok(());
         }
         self.execute_one(bus)?;
+        if self.state == CpuState::Sleeping {
+            // 被 stall 的载入已经让核心睡眠；本步不重复计时（睡眠步由
+            // `CpuState::Sleeping` 的推进路径计时）。
+            // A stalled load already put the core to sleep; this step books no
+            // extra time (the sleeping path advances the clock instead).
+            return Ok(());
+        }
+        if std::mem::take(&mut self.sleep_requested) {
+            self.state = CpuState::Sleeping;
+            self.sleep_kind = Some(SleepReason::WaitForInterrupt);
+        }
         self.csr.tick();
         self.total_cycles += 1;
         Ok(())
+    }
+
+    /// Whether a sleeping core has a reason to resume / 睡眠核心是否有理由恢复
+    ///
+    /// RISC-V `wfi` resumes on any enabled interrupt (taken at the next step) and
+    /// on a host-signalled event, which models the pico-sdk mapping of `__wfe()`
+    /// to `wfi` for the inter-core mailbox. A blocked load is always retried
+    /// because the retry is side-effect free.
+    /// RISC-V 的 `wfi` 在任一使能中断（下一步被响应）或宿主事件到来时恢复，后者用于
+    /// 建模 pico-sdk 把 `__wfe()` 映射为 `wfi` 的核间信箱握手。阻塞载入总是重试，因为
+    /// 重试没有副作用。
+    fn wake_ready(&self) -> bool {
+        match self.sleep_kind {
+            Some(SleepReason::BlockedRead) | None => true,
+            Some(SleepReason::WaitForInterrupt) => {
+                self.pending_interrupt().is_some() || self.sleep_event
+            }
+        }
+    }
+
+    /// Reason the core is sleeping, if it is / 核心的睡眠原因（若在睡眠）
+    #[must_use]
+    pub fn sleep_reason(&self) -> Option<SleepReason> {
+        self.sleep_kind
+    }
+
+    /// Set the host event flag (FIFO traffic, peer `SEV`)
+    /// 置位宿主事件标志（FIFO 流量、对端 `SEV`）
+    ///
+    /// Hazard3 has no architectural WFE event register, but the pico-sdk builds
+    /// `__wfe()` into `wfi` for RISC-V, so the inter-core mailbox handshake needs
+    /// a wake source that is not an interrupt.
+    /// Hazard3 没有架构层面的 WFE 事件寄存器，但 pico-sdk 在 RISC-V 上把 `__wfe()` 编译
+    /// 为 `wfi`，因此核间信箱握手需要一个非中断的唤醒源。
+    pub fn signal_event(&mut self) {
+        self.sleep_event = true;
+    }
+
+    /// Whether the host event flag is pending (diagnostics)
+    /// 宿主事件标志是否挂起（诊断）
+    #[must_use]
+    pub fn event_pending(&self) -> bool {
+        self.sleep_event
     }
 }
 
@@ -309,7 +391,7 @@ impl CpuCore for Hazard3Core {
     ) -> (CycleCount, CpuState) {
         let mut remaining = cycles;
         let mut consumed: CycleCount = 0;
-        while remaining > 0 && self.state == CpuState::Running {
+        while remaining > 0 && matches!(self.state, CpuState::Running | CpuState::Sleeping) {
             match self.step_internal(bus) {
                 Ok(()) => {
                     consumed += 1;
@@ -326,7 +408,19 @@ impl CpuCore for Hazard3Core {
     }
 
     fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError> {
-        if self.state != CpuState::Running {
+        if self.state == CpuState::Sleeping {
+            // 睡眠期间时间照常推进：CSR 计数与总周期都前进。
+            // Time keeps moving while asleep: the CSR clock and the total cycle
+            // counter advance.
+            self.csr.tick();
+            self.total_cycles = self.total_cycles.saturating_add(1);
+            if !self.wake_ready() {
+                return Ok(CpuState::Sleeping);
+            }
+            self.sleep_kind = None;
+            self.sleep_event = false;
+            self.state = CpuState::Running;
+        } else if self.state != CpuState::Running {
             return Ok(self.state);
         }
         match self.step_internal(bus) {
@@ -344,9 +438,10 @@ impl CpuCore for Hazard3Core {
             self.csr.xh3irq.pending[window] |= 1u16 << (irq % 16);
             self.csr.refresh_xh3irq();
         }
-        if self.state == CpuState::Sleeping {
-            self.state = CpuState::Running;
-        }
+        // 挂起位本身不会改状态：`step` 在睡眠时按 `pending_interrupt` 判定唤醒，
+        // 与 `wfi` 的「中断使能才唤醒」规则一致。
+        // Signalling only marks the bit: `step` decides the wake from
+        // `pending_interrupt`, matching wfi's "only enabled interrupts wake" rule.
     }
 
     fn servicing_irq(&self) -> Option<IrqNumber> {
@@ -412,3 +507,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests_csr.rs"]
 mod tests_csr;
+
+#[cfg(test)]
+#[path = "tests_sleep.rs"]
+mod tests_sleep;

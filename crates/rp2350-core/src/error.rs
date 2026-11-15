@@ -17,6 +17,17 @@ pub enum BusErrorKind {
     Overlap,
     /// Device returned an error / 设备返回错误
     DeviceError,
+    /// Retryable access: the device cannot complete it yet / 可重试访问：设备暂无法完成
+    ///
+    /// Unlike the other kinds this is **not** a fault. A device raises it when the
+    /// access must be replayed later (for example a blocking FIFO read while the
+    /// receive queue is empty). The access has no side effects, so the CPU may
+    /// retry the same instruction once an event makes progress possible; a
+    /// frontend must never report it as a bus fault to the guest.
+    /// 与其它类型不同，这**不是**故障。设备在访问必须稍后重放时抛出它（例如接收队列
+    /// 为空时的阻塞 FIFO 读）。该访问没有副作用，因此 CPU 可以在事件使进展成为可能
+    /// 后重试同一条指令；前端绝不能把它当作总线故障报告给客户机。
+    Stall,
 }
 
 impl std::fmt::Display for BusErrorKind {
@@ -27,6 +38,7 @@ impl std::fmt::Display for BusErrorKind {
             Self::AccessDenied => write!(f, "AccessDenied"),
             Self::Overlap => write!(f, "Overlap"),
             Self::DeviceError => write!(f, "DeviceError"),
+            Self::Stall => write!(f, "Stall"),
         }
     }
 }
@@ -77,4 +89,27 @@ pub enum CoreError {
         /// Instruction width in bytes / 指令宽度（字节）
         width: u8,
     },
+}
+
+impl CoreError {
+    /// Whether this error is a retryable bus stall rather than a fault
+    /// 该错误是可重试的总线 stall（而非故障）
+    ///
+    /// This is the single query API for [`BusErrorKind::Stall`]. A scratch flag
+    /// on the bus (`take_stall()`-style) would be worse: it could leak a stale
+    /// stall from an earlier access into an unrelated instruction. Carrying the
+    /// kind inside the error keeps the retry decision local to one access.
+    /// 这是 [`BusErrorKind::Stall`] 的唯一查询接口。在总线里放一个「上次是否 stall」
+    /// 的粘滞标志（`take_stall()` 之类）更糟：早先访问遗留的标志可能被无关指令读到。
+    /// 把类型放在错误里，重试决策只属于这一次访问。
+    #[must_use]
+    pub fn is_stall(&self) -> bool {
+        matches!(
+            self,
+            Self::BusError {
+                kind: BusErrorKind::Stall,
+                ..
+            }
+        )
+    }
 }

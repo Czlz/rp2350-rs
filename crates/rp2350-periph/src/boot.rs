@@ -510,6 +510,20 @@ impl BootPeripherals {
         &self.sio
     }
 
+    /// Monotonic SIO event generation / SIO 单调事件世代号
+    ///
+    /// A machine driver that puts cores to sleep compares this value with its
+    /// own snapshot: any change means a FIFO frame arrived or was consumed, a
+    /// doorbell moved, or a per-core SIO interrupt level changed, which is what
+    /// an ARM event (and therefore a `WFE` wake-up) must reflect.
+    /// 让核心睡眠的机器驱动器把它与自身快照比较：任何变化都意味着 FIFO 帧到达或被消费、
+    /// 门铃移动，或按核 SIO 中断电平变化，而这些正是 ARM 事件（因此也是 `WFE` 唤醒）
+    /// 必须反映的内容。
+    #[must_use]
+    pub fn sio_event_generation(&self) -> u32 {
+        self.sio.event_generation()
+    }
+
     /// Shared pad electrical state (pulls and external levels)
     /// 共享的 pad 电气状态（上下拉与外部电平）
     #[must_use]

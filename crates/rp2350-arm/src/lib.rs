@@ -19,7 +19,13 @@
     clippy::cast_lossless,
     clippy::identity_op,
     clippy::module_name_repetitions,
-    clippy::missing_errors_doc
+    clippy::missing_errors_doc,
+    // 核心状态机用多个布尔标志描述等待/事件/缓存开关，这些是硬件状态的直接映射，
+    // 拆成枚举反而会让 `step` 热路径多一次匹配。
+    // The core state machine uses several boolean flags for wait/event/cache
+    // switches; they map hardware bits directly, and folding them into enums
+    // would add a match to the `step` hot path.
+    clippy::struct_excessive_bools
 )]
 
 pub mod conditions;
@@ -51,7 +57,7 @@ use rp2350_cpu::{CpuArch, CpuCore, CpuState};
 
 use conditions::ITBlockState;
 use exceptions::EXC_SYSTICK;
-use execute_thumb16::{StepResult, execute_thumb16};
+use execute_thumb16::{SleepKind, StepResult, execute_thumb16};
 use execute_thumb32::execute_thumb32;
 use nvic::Nvic;
 use systick::SysTick;
@@ -79,6 +85,28 @@ const FIRST_EXTERNAL_EXCEPTION: u32 = 16;
 /// Address of the initial stack pointer in the boot vector table
 /// 启动向量表中初始栈指针的地址
 const BOOT_SP_ADDR: u32 = 0x0000_0000;
+
+/// Why a core is in [`CpuState::Sleeping`] / 核心处于 [`CpuState::Sleeping`] 的原因
+///
+/// The reason decides what can wake the core and is reported to frontends so a
+/// sleeping machine can be diagnosed without guessing.
+/// 原因决定什么能唤醒核心，并报告给前端，使睡眠中的机器无需猜测即可诊断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepReason {
+    /// `WFI` with no interrupt pending / 无挂起中断时的 `WFI`
+    WaitForInterrupt,
+    /// `WFE` with the event register clear / 事件寄存器为空时的 `WFE`
+    WaitForEvent,
+    /// A load hit a retryable bus stall (blocking FIFO read)
+    /// 载入遇到可重试的总线 stall（阻塞 FIFO 读）
+    ///
+    /// The instruction did **not** retire: `PC` and every register keep their
+    /// pre-instruction values, so the exact same load is replayed once the
+    /// device can serve it.
+    /// 该指令**未**退役：`PC` 与所有寄存器保持指令执行前的值，因此设备能服务时重放的
+    /// 是完全相同的载入。
+    BlockedRead,
+}
 
 /// Cortex-M33 processor core
 /// Cortex-M33 处理器核心
@@ -126,6 +154,20 @@ pub struct CortexM33Core {
     decode_cache: decode_cache::DecodeCache,
     /// Whether the decoded-instruction cache may serve steps / 是否允许译码缓存服务单步
     decode_cache_enabled: bool,
+    /// Reason the core is sleeping, `None` while running
+    /// 核心睡眠原因，运行时为 `None`
+    sleep_reason: Option<SleepReason>,
+    /// WFE event register / WFE 事件寄存器
+    ///
+    /// Set by `SEV` (this core and the peer), `SEVL`, exception entry and
+    /// exception return, exactly the ARMv8-M event sources. A `WFE` that finds it
+    /// set clears it and continues without sleeping.
+    /// 由 `SEV`（本核与对端）、`SEVL`、异常进入与异常返回置位，正是 ARMv8-M 的事件源。
+    /// `WFE` 发现它已置位时清除并继续执行，不进入睡眠。
+    event_register: bool,
+    /// `SEV` instructions executed since the last host query
+    /// 自上次宿主查询以来执行的 `SEV` 指令数
+    events_sent: u32,
 }
 
 impl CortexM33Core {
@@ -153,6 +195,9 @@ impl CortexM33Core {
             fetch_cache_enabled: false,
             decode_cache: decode_cache::DecodeCache::new(),
             decode_cache_enabled: false,
+            sleep_reason: None,
+            event_register: false,
+            events_sent: 0,
         }
     }
 
@@ -265,6 +310,9 @@ impl CortexM33Core {
         self.active_exceptions.clear();
         self.total_cycles = 0;
         self.undefined_seen.clear();
+        self.sleep_reason = None;
+        self.event_register = false;
+        self.events_sent = 0;
     }
 
     /// Apply cached boot vectors, entering Running only if they exist
@@ -397,6 +445,54 @@ impl CortexM33Core {
             self.nvic.set_pending(EXC_SYSTICK);
         }
 
+        // 被 stall 的载入必须完整回滚：PC 与 IT 状态回到指令前，寄存器由访问本身保证
+        // 未被写入（所有载入都是先取值再写回目的寄存器）。
+        // A stalled load must roll back completely: PC and IT state return to the
+        // pre-instruction values, and the registers are untouched because every
+        // load evaluates the access before writing its destination.
+        let saved_pc = self.registers.pc;
+        let saved_it = self.it_state;
+
+        let result = self.execute_current(bus, cycles);
+
+        match result {
+            Err(error) if error.is_stall() => {
+                self.registers.pc = saved_pc;
+                self.it_state = saved_it;
+                // 重放的指令只付一次周期：本次尝试不计入任何周期。
+                // The replayed instruction pays once: this attempt books nothing.
+                *cycles = 0;
+                self.sleep_reason = Some(SleepReason::BlockedRead);
+                self.state = CpuState::Sleeping;
+                Ok(StepResult::Ok)
+            }
+            Ok(result) => {
+                match result {
+                    // 等待指令在退役之后才决定是否挂起，因此它本身绝不会被跳过。
+                    // A wait instruction decides on suspension only after it
+                    // retires, so it is never skipped.
+                    StepResult::Sleep(kind) => self.apply_sleep_request(kind),
+                    StepResult::SendEvent { local } => {
+                        self.event_register = true;
+                        if !local {
+                            self.events_sent = self.events_sent.saturating_add(1);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Run the cached or fully decoded path for the instruction at `PC`
+    /// 执行 `PC` 处指令的缓存或完整译码路径
+    fn execute_current(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        cycles: &mut u64,
+    ) -> Result<StepResult, CoreError> {
         // 译码缓存命中：一次查表取代两次取指、宽度判定与分发链。仅在 IT 块之外
         // 使用，块内指令仍走完整译码器以保留槽位消费与标志抑制语义。
         // A decode-cache hit replaces the two fetches, the width decision and the
@@ -411,6 +507,164 @@ impl CortexM33Core {
         }
 
         self.step_decoded(bus, cycles)
+    }
+
+    /// Apply the ARMv8-M wait semantics for a retired `WFI`/`WFE`
+    /// 对刚退役的 `WFI`/`WFE` 应用 ARMv8-M 等待语义
+    ///
+    /// `WFI` never suspends while an enabled interrupt is pending (the ARM ARM
+    /// guarantees it wakes on a pending interrupt even when `PRIMASK` masks it),
+    /// `WFE` continues immediately when the event register is set and clears it,
+    /// and both continue immediately when an exception is already pending
+    /// because exception entry itself is an event source.
+    /// 只要存在已使能的挂起中断，`WFI` 就不会挂起（ARM ARM 保证即使 `PRIMASK` 屏蔽它，
+    /// 挂起中断也会唤醒 `WFI`）；`WFE` 在事件寄存器已置位时立即继续并清除它；两者在
+    /// 已有挂起异常时都立即继续，因为异常进入本身就是一个事件源。
+    fn apply_sleep_request(&mut self, kind: SleepKind) {
+        match kind {
+            SleepKind::WaitForInterrupt => {
+                if self.nvic.has_runnable() {
+                    return;
+                }
+                self.sleep_reason = Some(SleepReason::WaitForInterrupt);
+                self.state = CpuState::Sleeping;
+            }
+            SleepKind::WaitForEvent => {
+                if self.event_register {
+                    self.event_register = false;
+                    return;
+                }
+                if self.nvic.has_runnable() {
+                    return;
+                }
+                self.sleep_reason = Some(SleepReason::WaitForEvent);
+                self.state = CpuState::Sleeping;
+            }
+        }
+    }
+
+    /// Whether a sleeping core has a reason to resume / 睡眠核心是否有理由恢复
+    ///
+    /// `WFI` ignores the event register (a `SEV` never wakes it) but resumes as
+    /// soon as any enabled interrupt is pending, masked or not. `WFE` resumes on
+    /// an event or a pending interrupt. A blocked load is always retried: the
+    /// retry is side-effect free, so a missing event cannot deadlock it.
+    /// `WFI` 忽略事件寄存器（`SEV` 不会唤醒它），但只要有已使能的挂起中断就恢复，无论
+    /// 是否被屏蔽。`WFE` 在事件或挂起中断到来时恢复。阻塞载入总是重试：重试没有副作用，
+    /// 因此缺少事件也不会死锁。
+    fn wake_ready(&self) -> bool {
+        match self.sleep_reason {
+            Some(SleepReason::WaitForInterrupt) => self.nvic.has_runnable(),
+            Some(SleepReason::WaitForEvent) => self.event_register || self.nvic.has_runnable(),
+            Some(SleepReason::BlockedRead) | None => true,
+        }
+    }
+
+    /// Whether an enabled interrupt may be taken right now
+    /// 当前是否允许进入已使能的中断
+    ///
+    /// `PRIMASK`, `FAULTMASK` and `BASEPRI` all gate exception entry; the same
+    /// gate decides whether a wake-up turns into exception entry, so a sleeping
+    /// core never takes an interrupt it should keep masked.
+    /// `PRIMASK`、`FAULTMASK` 与 `BASEPRI` 都会门控异常进入；唤醒是否变成异常进入也用
+    /// 同一门控，因此睡眠核心绝不会进入本应保持屏蔽的中断。
+    fn irq_gate_open(&self, irq: IrqNumber) -> bool {
+        if self.registers.primask & 1 != 0 || self.registers.faultmask & 1 != 0 {
+            return false;
+        }
+        // BASEPRI == 0 表示不屏蔽；否则优先级数值 >= BASEPRI 的中断被屏蔽。
+        // BASEPRI == 0 disables the mask; otherwise priorities numerically at or
+        // above BASEPRI are masked.
+        self.nvic.basepri_allows(irq, self.registers.basepri)
+    }
+
+    /// Advance a sleeping core by one cycle without retiring an instruction
+    /// 让睡眠核心推进一个周期而不退役指令
+    ///
+    /// Time keeps moving: `SysTick` and the cumulative cycle counter advance, so
+    /// a sleeping core still generates the timer exception a real one would.
+    /// Returns `true` when the core resumed and the caller must execute the
+    /// instruction at `PC`; returns `false` while it stays asleep. When the wake
+    /// is caused by a takeable interrupt the exception is entered here and the
+    /// caller must not execute another instruction in the same step.
+    /// 时间照常推进：`SysTick` 与累计周期计数都前进，因此睡眠核心仍会产生真实硬件会产生的
+    /// 定时异常。核心恢复时返回 `true`，调用方必须执行 `PC` 处的指令；仍在睡眠时返回
+    /// `false`。若唤醒来自可进入的中断，这里直接进入异常，调用方不得在同一步再执行指令。
+    fn service_sleep(&mut self, bus: &mut dyn AddressBus) -> Result<bool, CoreError> {
+        let mut cycles = 0u64;
+        self.total_cycles = self.total_cycles.saturating_add(1);
+        if self.systick.tick(1) {
+            self.nvic.set_pending(EXC_SYSTICK);
+        }
+        if !self.wake_ready() {
+            return Ok(false);
+        }
+        let reason = self.sleep_reason.take();
+        self.state = CpuState::Running;
+        // WFE/阻塞载入消费掉唤醒它的事件；WFI 不消费（它根本不看事件寄存器）。
+        // WFE and a blocked load consume the event that woke them; WFI does not
+        // look at the event register at all.
+        if !matches!(reason, Some(SleepReason::WaitForInterrupt)) {
+            self.event_register = false;
+        }
+        if self.nvic.has_runnable() {
+            if let Some(irq) = self.nvic.find_highest_priority() {
+                if self.irq_gate_open(irq) {
+                    let exception_number = FIRST_EXTERNAL_EXCEPTION + u32::from(irq);
+                    exceptions::enter_exception(
+                        bus,
+                        &mut self.registers,
+                        &mut self.nvic,
+                        exception_number,
+                        self.vtor,
+                        &mut self.it_state,
+                        &mut cycles,
+                    )?;
+                    self.active_exceptions.push(exception_number as u16);
+                    // 异常进入是事件源；进入后事件寄存器置位（ARMv8-M）。
+                    // Exception entry is an event source: set the register.
+                    self.event_register = true;
+                    self.total_cycles = self.total_cycles.saturating_add(cycles);
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Reason the core is sleeping, if it is / 核心的睡眠原因（若在睡眠）
+    #[must_use]
+    pub fn sleep_reason(&self) -> Option<SleepReason> {
+        self.sleep_reason
+    }
+
+    /// Set this core's event register (an ARMv8-M event, e.g. `SEV` or FIFO I/O)
+    /// 置位本核的事件寄存器（ARMv8-M 事件，例如 `SEV` 或 FIFO I/O）
+    ///
+    /// A host calls this when an event source outside the core changed state — a
+    /// FIFO frame, a doorbell, a peer `SEV`. It never wakes a `WFI` sleeper,
+    /// which is exactly the ARM ARM rule that only `WFE` consumes events.
+    /// 宿主在核外事件源改变状态时调用它——FIFO 帧、门铃、对端 `SEV`。它绝不唤醒 `WFI`
+    /// 睡眠者，这正是 ARM ARM「只有 `WFE` 消费事件」的规则。
+    pub fn signal_event(&mut self) {
+        self.event_register = true;
+    }
+
+    /// Whether the event register is set (diagnostics) / 事件寄存器是否置位（诊断）
+    #[must_use]
+    pub fn event_register(&self) -> bool {
+        self.event_register
+    }
+
+    /// Take the number of `SEV` instructions executed since the last call
+    /// 取走自上次调用以来执行的 `SEV` 指令数
+    ///
+    /// `SEV` sets the event register of *every* core in the multiprocessor; a
+    /// host forwards this count to the peer core so its `signal_event` runs.
+    /// `SEV` 置位多处理器中**每个**核心的事件寄存器；宿主把这个计数转发给对端核心，使
+    /// 其执行 `signal_event`。
+    pub fn take_events_sent(&mut self) -> u32 {
+        std::mem::take(&mut self.events_sent)
     }
 
     /// Full fetch/decode/execute path, used on a decode-cache miss
@@ -577,10 +831,6 @@ impl CortexM33Core {
         bus: &mut dyn AddressBus,
         cycles: &mut u64,
     ) -> Result<(), CoreError> {
-        // Only check if PRIMASK is 0 / 仅在 PRIMASK 为 0 时检查
-        if self.registers.primask & 1 != 0 {
-            return Ok(());
-        }
         // 没有「已使能且挂起」的中断时无需构造候选位图。
         // Nothing enabled is pending, so building the candidate bitmaps is wasted.
         if !self.nvic.has_runnable() {
@@ -588,6 +838,14 @@ impl CortexM33Core {
         }
 
         if let Some(irq) = self.nvic.find_highest_priority() {
+            // PRIMASK/FAULTMASK/BASEPRI 都门控异常进入；睡眠唤醒使用同一个门控，
+            // 因此睡眠核心不会进入本应保持屏蔽的中断。
+            // PRIMASK/FAULTMASK/BASEPRI all gate exception entry, and the sleep
+            // wake path uses the same gate, so a sleeping core never takes an
+            // interrupt it should keep masked.
+            if !self.irq_gate_open(irq) {
+                return Ok(());
+            }
             // 外部中断 n 对应异常号 16 + n，向量位于 VTOR + (16 + n) * 4。
             // External interrupt n maps to exception number 16 + n, so its
             // vector lives at VTOR + (16 + n) * 4.
@@ -602,6 +860,8 @@ impl CortexM33Core {
                 cycles,
             )?;
             self.active_exceptions.push(exception_number as u16);
+            // 异常进入是 ARMv8-M 的事件源。 / Exception entry is an event source.
+            self.event_register = true;
         }
 
         Ok(())
@@ -628,7 +888,55 @@ impl CortexM33Core {
             u32::from(active),
             &mut self.it_state,
             cycles,
-        )
+        )?;
+        // 异常返回同样是 ARMv8-M 的事件源。 / Exception return is an event source.
+        self.event_register = true;
+        Ok(())
+    }
+
+    /// Execute one instruction, or advance a sleeping core by one cycle
+    /// 执行一条指令，或让睡眠核心推进一个周期
+    ///
+    /// This is the single body shared by [`CpuCore::step`] and
+    /// [`CpuCore::run_cycles`], so both entry points have identical sleep,
+    /// stall-retry and interrupt semantics.
+    /// 这是 [`CpuCore::step`] 与 [`CpuCore::run_cycles`] 共享的唯一实现，因此两个入口
+    /// 的睡眠、stall 重试与中断语义完全一致。
+    fn advance(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError> {
+        if self.state == CpuState::Sleeping {
+            if !self.service_sleep(bus)? {
+                // 仍在睡眠，或刚刚在唤醒时进入了中断：本步不退役指令。
+                // Still asleep, or an exception was entered on wake: no
+                // instruction retires in this step.
+                return Ok(self.state);
+            }
+        } else if self.state != CpuState::Running {
+            return Ok(self.state);
+        }
+
+        let mut cycle_count: u64 = 0;
+        let result = match self.step_instruction(bus, &mut cycle_count) {
+            Ok(result) => result,
+            Err(error) => {
+                self.state = CpuState::Halted;
+                return Err(error);
+            }
+        };
+        // 被 stall 的载入把核心置为 Sleeping 并保持 PC 不变；此时不能做异常返回或
+        // 中断投递，否则会在「未执行的指令」上叠加异常。
+        // A stalled load puts the core to sleep with PC unchanged; no exception
+        // return or interrupt delivery may then run on top of an unexecuted
+        // instruction.
+        if self.state == CpuState::Running {
+            if result == StepResult::ExceptionReturn {
+                self.return_from_exception(bus, &mut cycle_count)?;
+            }
+            if self.state == CpuState::Running {
+                self.check_pending_exceptions(bus, &mut cycle_count)?;
+            }
+        }
+        self.total_cycles = self.total_cycles.saturating_add(cycle_count);
+        Ok(self.state)
     }
 }
 
@@ -654,31 +962,17 @@ impl CpuCore for CortexM33Core {
         let mut consumed: CycleCount = 0;
 
         while remaining > 0 {
-            if self.state != CpuState::Running {
+            if !matches!(self.state, CpuState::Running | CpuState::Sleeping) {
                 break;
             }
-
-            let mut step_cycles: u64 = 0;
-            match self.step_instruction(bus, &mut step_cycles) {
-                Ok(result) => {
-                    if result == StepResult::ExceptionReturn {
-                        if let Err(e) = self.return_from_exception(bus, &mut step_cycles) {
-                            self.state = CpuState::Halted;
-                            log::error!("CPU halted: {e:?}");
-                            break;
-                        }
-                    }
-                    if let Err(e) = self.check_pending_exceptions(bus, &mut step_cycles) {
-                        self.state = CpuState::Halted;
-                        log::error!("CPU halted: {e:?}");
-                        break;
-                    }
-                    self.total_cycles += step_cycles;
+            match self.advance(bus) {
+                Ok(_) => {
+                    // 睡眠步同样推进机器时间，因此也计入一个周期槽。
+                    // A sleep step still advances machine time, so it takes a slot.
                     consumed += 1;
                     remaining -= 1;
                 }
                 Err(e) => {
-                    self.state = CpuState::Halted;
                     log::error!("CPU halted: {e:?}");
                     break;
                 }
@@ -689,31 +983,7 @@ impl CpuCore for CortexM33Core {
     }
 
     fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError> {
-        if self.state != CpuState::Running {
-            return Ok(self.state);
-        }
-
-        let mut cycle_count: u64 = 0;
-        match self.step_instruction(bus, &mut cycle_count) {
-            Ok(result) => {
-                if result == StepResult::ExceptionReturn {
-                    if let Err(e) = self.return_from_exception(bus, &mut cycle_count) {
-                        self.state = CpuState::Halted;
-                        return Err(e);
-                    }
-                }
-                if let Err(e) = self.check_pending_exceptions(bus, &mut cycle_count) {
-                    self.state = CpuState::Halted;
-                    return Err(e);
-                }
-                self.total_cycles += cycle_count;
-                Ok(self.state)
-            }
-            Err(e) => {
-                self.state = CpuState::Halted;
-                Err(e)
-            }
-        }
+        self.advance(bus)
     }
 
     fn signal_interrupt(&mut self, irq: IrqNumber) {

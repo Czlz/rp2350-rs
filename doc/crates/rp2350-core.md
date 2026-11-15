@@ -50,6 +50,7 @@ pub trait AddressBus: Send + Sync {
     // Default-implemented routing accessors, all taking `&mut u64 cycles`:
     //   read_u8/u16/u32(addr, cycles) -> BusResult<T>        (BusError::NoDevice if unmapped)
     //   write_u8/u16/u32(addr, value, cycles) -> BusResult<()>
+    //   resolve_readable(addr) -> BusResult<&mut dyn MemoryRegion>  (Stall for blocked reads)
     /// Host-side byte write that bypasses guest write protection (loaders).
     /// 宿主侧字节写入，绕过客户机写保护（加载器路径）。
     fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()>;
@@ -64,6 +65,9 @@ pub trait MemoryRegion: Send + Sync {
     fn size(&self) -> usize;
     fn end(&self) -> Address;                 // default: base + size
     fn contains(&self, addr: Address) -> bool;
+    /// Whether a read of `addr` would block; default `false` (never stalls).
+    /// 读取 `addr` 是否阻塞；默认 `false`（永不 stall）。
+    fn read_would_stall(&self, addr: Address) -> bool;
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8>;
     fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()>;
     // read_u16/u32, write_u16/u32: default implementations compose byte access
@@ -71,6 +75,34 @@ pub trait MemoryRegion: Send + Sync {
     fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()>;
 }
 ```
+
+#### Retryable stalls / 可重试 stall
+
+`BusErrorKind::Stall` is a **retryable** access, not a fault: a device raises it
+when the access must be replayed later (an empty blocking FIFO read). The query
+API is `CoreError::is_stall()`; it travels with the error instead of a sticky
+"last access stalled" flag, so a retry can never pick up a stale stall from an
+earlier instruction.
+
+The gate is `MemoryRegion::read_would_stall`, consulted by
+`AddressBus::resolve_readable` **before** the region is touched, so a stalled
+read consumes nothing and latches no flag. `MmioRegion` forwards it to
+`MmioDevice::stall_on_read32` (default `false`), and `MmioRouter` forwards it to
+the owning child, so every existing device and region keeps its exact previous
+behaviour. A CPU that sees a stall must leave `PC`, the registers and any IT
+state unchanged, report `CpuState::Sleeping` and replay the identical access once
+an event arrives.
+
+`BusErrorKind::Stall` 是**可重试**访问而非故障：设备在访问必须稍后重放时（空阻塞
+FIFO 读）抛出它。查询接口是 `CoreError::is_stall()`；它随错误一起传递，而不是用
+「上次访问 stall」的粘滞标志，因此重试绝不会读到早先指令留下的过期 stall。
+
+门控是 `MemoryRegion::read_would_stall`，由 `AddressBus::resolve_readable` 在触碰
+区域**之前**查询，因此被 stall 的读不消费任何东西、也不锁存标志。`MmioRegion` 把
+它转发给 `MmioDevice::stall_on_read32`（默认 `false`），`MmioRouter` 转发给拥有该
+地址的子设备，因此所有既有设备/区域行为逐字节不变。看到 stall 的 CPU 必须保持
+`PC`、寄存器与 IT 状态不变，报告 `CpuState::Sleeping`，并在事件到来后重放完全
+相同的访问。
 
 `write_u32` on the bus calls `watch::check_write` so the `RP2350_WATCH`
 diagnostic sees every word store.
@@ -532,7 +564,12 @@ disarming its own watch must not make another thread skip its checks.
 ## Errors / 错误类型
 
 ```rust
-pub enum BusErrorKind { NoDevice, Unaligned, AccessDenied, Overlap, DeviceError }
+pub enum BusErrorKind {
+    NoDevice, Unaligned, AccessDenied, Overlap, DeviceError,
+    /// Retryable: the device cannot complete the access yet (blocking read).
+    /// 可重试：设备暂无法完成访问（阻塞读）。
+    Stall,
+}
 pub enum CoreError {
     BusError { addr: Address, kind: BusErrorKind },
     InvalidGpio(String),
@@ -541,6 +578,12 @@ pub enum CoreError {
     FirmwareError(String),
     UnsupportedChip(String),
     UndefinedInstruction { pc: Address, opcode: u32, width: u8 },
+}
+
+impl CoreError {
+    /// `true` for `BusErrorKind::Stall`, `false` for every real fault.
+    /// `BusErrorKind::Stall` 返回 `true`，其它真实故障返回 `false`。
+    pub fn is_stall(&self) -> bool;
 }
 ```
 

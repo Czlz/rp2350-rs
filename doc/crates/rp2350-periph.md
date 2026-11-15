@@ -1628,6 +1628,12 @@ impl Sio {
     pub fn core1_irq_mask(&self) -> u64;
     pub fn spinlock_state(&self) -> u32;             // held-lock bitmap / 已占用锁位图
     pub fn refresh_irq(&self);
+    // FIFO blocking reads and sleep wake-up sources / FIFO 阻塞读与睡眠唤醒源
+    pub fn fifo_rx_ready(&self, core: CpuId) -> bool;
+    pub fn fifo_read_blocking(&self, core: CpuId) -> Option<u32>;
+    pub fn fifo_status(&self, core: CpuId) -> u32;
+    pub fn fifo_irq_asserted(&self, core: CpuId) -> bool;
+    pub fn event_generation(&self) -> u32;
 }
 ```
 
@@ -1711,14 +1717,75 @@ FIFO frame pushed by core 0 only pends core 1 and vice versa.
 `irq_mask`，core1 用 `core1_irq_mask`），因此 core0 压入的 FIFO 帧只会挂起
 core1，反之亦然。
 
+### FIFO blocking reads, sticky status and sleep events / FIFO 阻塞读、粘滞状态与睡眠事件
+
+`FIFO_ST` implements the datasheet fields exactly (`SIO_FIFO_ST_BITS = 0x0F`):
+
+| Bit | Field | Meaning / 含义 |
+|-----|-------|----------------|
+| 0 | `VLD` | RX FIFO not empty / 接收 FIFO 非空 |
+| 1 | `RDY` | TX FIFO not full (reset value 1) / 发送 FIFO 未满（复位值 1） |
+| 2 | `WOF` | sticky: wrote while full / 粘滞：写满 |
+| 3 | `ROE` | sticky: read while empty / 粘滞：读空 |
+
+`WOF` and `ROE` are `WC`: writing 1 clears them, writing 0 leaves them set, and
+every other bit of the register is read-only. `SIO_IRQ_FIFO` for a core is the
+logical OR of **its own** `VLD`, `WOF` and `ROE`, exactly as the datasheet
+defines it, so a dropped write or a dropped read also raises the line. The NVIC
+`ISER` bit is the enable/mask stage; there is no separate SIO interrupt-enable
+register in the RP2350 register map (verified against the SDK's
+`hardware/regs/sio.h`: the only SIO endpoints are `SIO_IRQ_FIFO` and
+`SIO_IRQ_BELL`, and there is no `PROC0_INTE`/`PROC0_INTS` pair).
+
+A read of `FIFO_RD` is a **blocking read**: while the receiving FIFO is empty the
+bus reports `BusErrorKind::Stall` (through `MmioDevice::stall_on_read32` →
+`MemoryRegion::read_would_stall`) and the access never reaches the device, so no
+frame is consumed and no flag is latched. The CPU retries the same load when the
+data arrives (see `rp2350-arm` / `rp2350-riscv`). A sub-word read bypasses the
+word gate and keeps the datasheet's "ignored read + ROE" behaviour, which is
+also what a direct `Sio::read32` call does.
+
+`event_generation()` is a monotonic counter bumped by every state change that can
+complete a blocked access or wake a sleeping core: a FIFO push or pop, a
+doorbell change, and any change of the two per-core interrupt levels. A driver
+that sleeps cores compares it against its own snapshot and turns a change into an
+ARM event (`CortexM33Core::signal_event`), which is what makes the SDK's
+`while (!multicore_fifo_rvalid()) __wfe();` handshake work.
+`fifo_read_blocking(core)` is the host-side contract of the same operation: it
+pops one frame when available and returns `None` **without** latching `ROE` or
+consuming anything when the queue is empty.
+
+`FIFO_ST` 精确实现数据手册字段（`SIO_FIFO_ST_BITS = 0x0F`）：`VLD`、`RDY`、
+`WOF`、`ROE`。`WOF`/`ROE` 是写 1 清除的粘滞位，寄存器其余位只读。某核的
+`SIO_IRQ_FIFO` 是该核**自身** `VLD`、`WOF`、`ROE` 的逻辑或，与数据手册一致，
+因此被丢弃的写或读同样拉高该线。使能/屏蔽阶段由 NVIC `ISER` 承担；RP2350 寄存器
+表中没有独立的 SIO 中断使能寄存器（已用 SDK `hardware/regs/sio.h` 核对：SIO 只有
+`SIO_IRQ_FIFO` 与 `SIO_IRQ_BELL` 两个端点，并不存在 `PROC0_INTE`/`PROC0_INTS`）。
+
+`FIFO_RD` 的读是**阻塞读**：接收 FIFO 为空时总线报告 `BusErrorKind::Stall`
+（经 `MmioDevice::stall_on_read32` → `MemoryRegion::read_would_stall`），访问根本
+不会到达设备，因此不消费帧、也不锁存任何标志。数据到达后 CPU 重放同一条载入
+（见 `rp2350-arm` / `rp2350-riscv`）。非整字读绕过整字门控，保持数据手册的
+「忽略空读 + ROE」行为，直接调用 `Sio::read32` 时也是如此。
+
+`event_generation()` 是单调计数器，任何可能完成阻塞访问或唤醒睡眠核的状态变化都会
+递增它：FIFO 压入/弹出、门铃变化，以及两条按核中断电平的任何变化。让核心睡眠的
+驱动器把它与自身快照比较，并把变化转成 ARM 事件
+（`CortexM33Core::signal_event`），这正是 SDK 的
+`while (!multicore_fifo_rvalid()) __wfe();` 握手能工作的原因。
+`fifo_read_blocking(core)` 是同一操作的宿主侧契约：有帧时弹出，队列为空时返回
+`None` 且**不**锁存 `ROE`、不消费任何东西。
+
 ### Not modelled yet / 尚未建模
 
-`INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, and exclusive/`LDREX`/`STREX`
-monitors. The FIFO is 8 entries deep per direction with sticky `WOF`/`ROE`; the
-spinlocks are 32 bits wide because the RP2350 block exposes exactly
-`SPINLOCK0..31`.
-`INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新，以及独占访问/`LDREX`/`STREX` 监视器
-均未建模。每方向 FIFO 深度 8，带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350
+`INTERP0/1`, the TMDS encoder (`TMDS_CTRL`/`TMDS_WDATA`/`TMDS_*POP*`),
+`PERI_NONSEC`, `RISCV_SOFTIRQ`, the RISC-V `MTIME*` block, and
+exclusive/`LDREX`/`STREX` monitors. The FIFO is 8 entries deep per direction with
+sticky `WOF`/`ROE`; the spinlocks are 32 bits wide because the RP2350 block
+exposes exactly `SPINLOCK0..31`.
+`INTERP0/1`、TMDS 编码器（`TMDS_CTRL`/`TMDS_WDATA`/`TMDS_*POP*`）、
+`PERI_NONSEC`、`RISCV_SOFTIRQ`、RISC-V `MTIME*` 块，以及独占访问监视器均未
+建模。每方向 FIFO 深度 8，带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350
 该块只提供 `SPINLOCK0..31`。
 
 ---

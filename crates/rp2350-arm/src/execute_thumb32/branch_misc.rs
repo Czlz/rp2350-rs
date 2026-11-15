@@ -8,7 +8,7 @@
 //! 立即数（ADDW/SUBW/MOVW/MOVT）以及位域指令（SBFX/UBFX/BFI/BFC）。
 
 use crate::conditions::Condition;
-use crate::execute_thumb16::StepResult;
+use crate::execute_thumb16::{SleepKind, StepResult};
 use crate::registers::CortexM33Registers;
 
 use super::sign_extend;
@@ -203,11 +203,14 @@ fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult 
             }
             _ => StepResult::Undefined,
         },
-        // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4).
-        // 提示指令：NOP（0）、YIELD（1）、WFE（2）、WFI（3）、SEV（4）。
+        // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4), SEVL (5).
+        // 提示指令：NOP（0）、YIELD（1）、WFE（2）、WFI（3）、SEV（4）、SEVL（5）。
         0xA => match instr & 0xF {
-            0x0 | 0x1 | 0x4 => StepResult::Ok,
-            0x2 | 0x3 => StepResult::Sleep,
+            0x0 | 0x1 => StepResult::Ok,
+            0x2 => StepResult::Sleep(SleepKind::WaitForEvent),
+            0x3 => StepResult::Sleep(SleepKind::WaitForInterrupt),
+            0x4 => StepResult::SendEvent { local: false },
+            0x5 => StepResult::SendEvent { local: true },
             _ => StepResult::Undefined,
         },
         _ => StepResult::Undefined,

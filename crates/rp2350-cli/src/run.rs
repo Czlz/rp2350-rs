@@ -72,6 +72,16 @@ const TAIL_TRACE_STEPS: usize = 32;
 /// 指令预算耗尽时报告的原因
 const BUDGET_REASON: &str = "instruction budget exhausted / 指令预算耗尽";
 
+/// Consecutive steps with both cores asleep before a diagnostic is printed
+/// 双核同时睡眠多少步后打印诊断
+///
+/// A machine where every existing core sleeps and no event arrives can only
+/// advance its clock, so it would silently burn the budget. The threshold turns
+/// that into one visible notice instead of an inexplicable `[run] halt`.
+/// 所有存在的核心都在睡眠且没有事件到达时，机器只能推进时钟，会静默耗尽预算。该阈值把
+/// 这种情况变成一条可见通知，而不是莫名其妙的 `[run] halt`。
+const SLEEP_STALL_STEPS: u64 = 1_000_000;
+
 /// CPU architecture selection for `run` / `run` 的 CPU 架构选择
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchArg {
@@ -208,6 +218,41 @@ macro_rules! core_dispatch {
             CoreHandle::RiscV(core) => core.$method($($arg),*),
         }
     };
+}
+
+impl CoreHandle {
+    /// Signal an ARMv8-M / Hazard3 event (host-side wake source)
+    /// 发出 ARMv8-M / Hazard3 事件（宿主侧唤醒源）
+    ///
+    /// Both cores are reached through their architecture-specific inherent
+    /// methods because [`CpuCore`] has no event concept; only `WFE`-style waits
+    /// consume it, so a `WFI` sleeper is unaffected.
+    /// 两个核心都通过各自的架构专有入口访问，因为 [`CpuCore`] 没有事件概念；只有
+    /// `WFE` 类等待会消费它，因此 `WFI` 睡眠者不受影响。
+    fn signal_event(&mut self) {
+        match self {
+            Self::Arm(core) => core.signal_event(),
+            Self::RiscV(core) => core.signal_event(),
+        }
+    }
+
+    /// Take the number of `SEV` instructions executed since the last call
+    /// 取走自上次调用以来执行的 `SEV` 指令数
+    fn take_events_sent(&mut self) -> u32 {
+        match self {
+            Self::Arm(core) => core.take_events_sent(),
+            // RISC-V has no `SEV`; `signal_event` only models the pico-sdk
+            // `__wfe()` → `wfi` mailbox wake.
+            // RISC-V 没有 `SEV`；`signal_event` 只建模 pico-sdk 的
+            // `__wfe()` → `wfi` 信箱唤醒。
+            Self::RiscV(_) => 0,
+        }
+    }
+
+    /// Whether this core reports the sleeping state / 该核心是否报告睡眠状态
+    fn is_sleeping(&self) -> bool {
+        self.state() == CpuState::Sleeping
+    }
 }
 
 impl CpuCore for CoreHandle {
@@ -415,6 +460,16 @@ pub struct Machine {
     recent: RecentSteps,
     /// PPB write epoch already replayed into the core / 已回放到核的 PPB 写世代
     ppb_epoch_seen: u64,
+    /// Sleep steps taken by core 0 and core 1 / core0 与 core1 的睡眠步数
+    sleep_steps: [u64; 2],
+    /// Wake-ups observed on core 0 and core 1 / core0 与 core1 观察到的唤醒次数
+    sleep_wakes: [u64; 2],
+    /// Whether each core was asleep after the previous step / 上一步之后各核是否在睡眠
+    was_sleeping: [bool; 2],
+    /// Last SIO event generation delivered to the cores / 上次送达核心的 SIO 事件世代
+    sio_events_seen: u32,
+    /// Consecutive steps with both cores asleep / 双核同时睡眠的连续步数
+    both_sleeping_steps: u64,
 }
 
 impl Machine {
@@ -563,6 +618,11 @@ impl Machine {
             spin_reports: 0,
             recent: RecentSteps::new(),
             ppb_epoch_seen: 0,
+            sleep_steps: [0; 2],
+            sleep_wakes: [0; 2],
+            was_sleeping: [false; 2],
+            sio_events_seen: 0,
+            both_sleeping_steps: 0,
         })
     }
 
@@ -640,6 +700,102 @@ impl Machine {
     #[must_use]
     pub fn hstx_words(&self) -> u64 {
         self.hstx_words
+    }
+
+    /// Failure counters per core / 按核的失败计数（睡眠步数与唤醒次数）
+    ///
+    /// Layout is `[steps, wakes]` for core 0 and then core 1, so a test can read
+    /// one core without parsing the diagnostic line.
+    /// 布局为 core0 的 `[睡眠步数, 唤醒次数]`，随后是 core1，测试可直接取用某核数据。
+    #[must_use]
+    pub fn sleep_counters(&self) -> ([u64; 2], [u64; 2]) {
+        (self.sleep_steps, self.sleep_wakes)
+    }
+
+    /// One-line sleep diagnostic / 单行睡眠诊断
+    ///
+    /// Format is stable: `sleep core0 steps=<n> wakes=<n> core1 steps=<n> wakes=<n>`.
+    /// 格式稳定：`sleep core0 steps=<n> wakes=<n> core1 steps=<n> wakes=<n>`。
+    #[must_use]
+    pub fn sleep_state(&self) -> String {
+        format!(
+            "sleep core0 steps={} wakes={} core1 steps={} wakes={}",
+            self.sleep_steps[0], self.sleep_wakes[0], self.sleep_steps[1], self.sleep_wakes[1]
+        )
+    }
+
+    /// Record that `index` slept for one step / 记录 `index` 睡眠了一步
+    fn note_sleep_step(&mut self, index: usize) {
+        self.sleep_steps[index] = self.sleep_steps[index].saturating_add(1);
+    }
+
+    /// Track sleep/wake transitions for `index` / 跟踪 `index` 的睡眠/唤醒切换
+    fn note_core_sleep_state(&mut self, index: usize, sleeping: bool) {
+        if self.was_sleeping[index] && !sleeping {
+            self.sleep_wakes[index] = self.sleep_wakes[index].saturating_add(1);
+        }
+        self.was_sleeping[index] = sleeping;
+    }
+
+    /// Forward SIO events and `SEV` between the cores
+    /// 在核心之间转发 SIO 事件与 `SEV`
+    ///
+    /// The SIO block bumps its event generation on every FIFO push/pop, doorbell
+    /// change and per-core interrupt change. A generation change is an ARM event
+    /// for **both** cores (a FIFO frame is a mailbox event even to the core that
+    /// did not receive it), and `SEV` additionally broadcasts to the peer, which
+    /// is the ARM ARM rule. Interrupt pending bits need no forwarding here: the
+    /// cores see them through their own NVIC / `Xh3irq` state.
+    /// SIO 块在每次 FIFO 压入/弹出、门铃变化与按核中断变化时递增事件世代。世代变化对
+    /// **两个**核心都是一次 ARM 事件（FIFO 帧即使不是本核收到也是信箱事件），`SEV` 还会
+    /// 额外广播给对端，这是 ARM ARM 的规则。中断挂起位无需在此转发：核心通过自己的
+    /// NVIC / `Xh3irq` 状态看到它们。
+    fn sync_core_events(&mut self) {
+        let generation = self.peripherals.sio_event_generation();
+        if generation != self.sio_events_seen {
+            self.sio_events_seen = generation;
+            self.core.signal_event();
+            if let Some(core1) = self.core1.as_mut() {
+                core1.signal_event();
+            }
+        }
+        if self.core.take_events_sent() > 0 {
+            if let Some(core1) = self.core1.as_mut() {
+                core1.signal_event();
+            }
+        }
+        let peer_sev = self
+            .core1
+            .as_mut()
+            .is_some_and(|core1| core1.take_events_sent() > 0);
+        if peer_sev {
+            self.core.signal_event();
+        }
+    }
+
+    /// Emit the "both cores asleep" diagnostic at most once
+    /// 至多打印一次「双核睡眠」诊断
+    ///
+    /// Called from every step path, so a deadlocked idle machine reports itself
+    /// instead of quietly exhausting its budget.
+    /// 由每个步进路径调用，使死锁的空闲机器自我报告，而不是静默耗尽预算。
+    fn note_both_sleeping(&mut self, both_sleeping: bool, did_work: bool) {
+        if !both_sleeping || did_work {
+            self.both_sleeping_steps = 0;
+            return;
+        }
+        self.both_sleeping_steps = self.both_sleeping_steps.saturating_add(1);
+        if self.both_sleeping_steps == SLEEP_STALL_STEPS {
+            // 计数器只在连续睡眠时递增，因此该分支每个死锁窗口只触发一次，
+            // 不需要额外的「已报告」标志。
+            // The counter only grows while both cores stay asleep, so this fires
+            // once per deadlock window and needs no extra "reported" flag.
+            self.notices.push(format!(
+                "[run] sleep stall: both cores slept for {} steps with no event; \
+                 only the clock advanced / 双核无事件睡眠 {} 步，仅时钟推进",
+                self.both_sleeping_steps, self.both_sleeping_steps
+            ));
+        }
     }
 
     /// One-line HSTX diagnostic / 单行 HSTX 诊断
@@ -1163,6 +1319,11 @@ impl Machine {
         if self.halt.is_some() || self.budget_exhausted() {
             return Ok(CpuState::Halted);
         }
+        // 核心之间的 SIO 事件与 SEV 转发必须在推进任何核心之前发生，使同一步内
+        // 被唤醒的核立即继续（0 步唤醒延迟）。
+        // SIO events and SEV forwarding must happen before any core steps so a
+        // core woken in this step resumes immediately (zero-step wake latency).
+        self.sync_core_events();
         let state = if core0 {
             self.execute_core0_step(trace)?
         } else {
@@ -1228,7 +1389,10 @@ impl Machine {
         let Some(core1) = self.core1.as_mut() else {
             return false;
         };
-        if core1.state() != CpuState::Running {
+        // 睡眠的 core1 也必须被推进：`step` 会先看唤醒条件，因此这一步不会被浪费。
+        // A sleeping core 1 must still be stepped: `step` checks its wake
+        // condition first, so the step is never wasted.
+        if !matches!(core1.state(), CpuState::Running | CpuState::Sleeping) {
             return false;
         }
         self.peripherals.sio().select_core(CpuId::Core1);
@@ -1260,6 +1424,12 @@ impl Machine {
         }
         match result {
             Ok(CpuState::Running) => {}
+            // 睡眠的 core1 不是故障：机器时间照常推进，唤醒条件在下一步检查。
+            // A sleeping core 1 is not a fault: machine time keeps advancing and
+            // the wake condition is re-checked on the next step.
+            Ok(CpuState::Sleeping) => {
+                self.note_sleep_step(1);
+            }
             Ok(state) => {
                 self.core1_halt = Some(format!("core1 entered state {state:?}"));
             }
@@ -1305,7 +1475,12 @@ impl Machine {
             return Ok(CpuState::Halted);
         }
         let pc = self.core.pc();
-        self.record_step(pc);
+        // 睡眠核不执行指令，因此也不进入「已执行 PC」回溯缓冲。
+        // A sleeping core executes nothing, so it never enters the executed-PC
+        // post-mortem ring.
+        if self.core.state() == CpuState::Running {
+            self.record_step(pc);
+        }
         // 合成 boot ROM 的全部陷阱桩都位于 ROM 窗口内，窗口外的 PC 无需线性扫描
         // 桩表；这一步把每步的桩查询降为一次范围比较。
         // Every synthetic boot ROM trap stub lives inside the ROM window, so a PC
@@ -1378,6 +1553,21 @@ impl Machine {
                 }
                 Ok(CpuState::Running)
             }
+            // 睡眠核不退役指令，但机器时间照常推进：步数、DMA/PIO 批次、中断投递
+            // 与时基都继续，因此唤醒源仍能到达。对外状态仍是 Running，因为机器
+            // 本身没有停机。
+            // A sleeping core retires nothing while machine time keeps moving: the
+            // step counter, DMA/PIO batches, interrupt delivery and the timebase
+            // all continue, so a wake source can still arrive. The machine state
+            // stays Running because the machine itself is alive.
+            Ok(CpuState::Sleeping) => {
+                self.steps += 1;
+                self.note_sleep_step(0);
+                self.pump_dma_batch();
+                self.pump_pio_batch();
+                self.after_running_step(None);
+                Ok(CpuState::Running)
+            }
             Ok(state) => {
                 self.halt = Some(format!("core entered state {state:?}"));
                 self.finalize();
@@ -1422,6 +1612,19 @@ impl Machine {
                 self.spin_steps = 0;
             }
         }
+        // 睡眠/唤醒统计与「双核都在睡」诊断。睡眠步的 PC 冻结不算自旋，因此由调用方
+        // 传 `None`，这里只更新状态机。
+        // Sleep/wake accounting plus the "both cores asleep" diagnostic. A frozen
+        // PC on a sleeping core is not a spin, which is why callers pass `None`;
+        // only the state machine is updated here.
+        let core0_sleeping = self.core.is_sleeping();
+        let core1_sleeping = self
+            .core1
+            .as_ref()
+            .is_some_and(|core| core.state() == CpuState::Sleeping);
+        self.note_core_sleep_state(0, core0_sleeping);
+        self.note_core_sleep_state(1, core1_sleeping);
+        self.note_both_sleeping(core0_sleeping && core1_sleeping, core0_pc.is_some());
         // 系统控制寄存器写入必须在下一条指令前生效：固件写 CPACR 后紧跟
         // `mrc p4`/VFP 指令，按 64 步批量回放会让核误判协处理器未使能并触发
         // NOCP UsageFault。中断线保持节流，避免电平中断被每一步重复投递。
@@ -1676,6 +1879,10 @@ fn print_post_mortem(machine: &mut Machine, stdout: &mut impl Write) -> Result<(
     // stdout semantics stay unchanged.
     writeln!(stdout, "[run] {}", machine.dma_state())?;
     writeln!(stdout, "[run] {}", machine.hstx_state())?;
+    // 睡眠统计是新增的宿主诊断行，`repl --exec` 的 stdout 不受影响。
+    // The sleep counters are a new host diagnostic line; `repl --exec` stdout is
+    // unaffected.
+    writeln!(stdout, "[run] {}", machine.sleep_state())?;
     if let Some(state) = machine.core1_state() {
         writeln!(
             stdout,
@@ -2001,5 +2208,7 @@ fn log_irq(irq_log: &mut Vec<String>, core: &str, irq: u16, pc: u32) {
 }
 
 mod batch;
+#[cfg(test)]
+mod sleep_tests;
 #[cfg(test)]
 mod tests;

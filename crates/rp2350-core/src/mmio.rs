@@ -223,6 +223,23 @@ pub trait MmioDevice: Send + Sync {
     fn irq_number(&self) -> Option<u16> {
         None
     }
+
+    /// Whether a 32-bit read of `offset` must be retried later
+    /// 对 `offset` 的 32 位读取是否必须稍后重试
+    ///
+    /// A device with a blocking register (a FIFO read that has no data) reports
+    /// `true` while the access cannot complete. The bus adapter then fails the
+    /// read with [`BusErrorKind::Stall`] *before* [`Self::read32`] runs, so a
+    /// stalled access never consumes data or latches an error flag; the CPU
+    /// replays the same load once an event makes progress possible. The default
+    /// is `false`, so every existing device keeps its behaviour exactly.
+    /// 拥有阻塞寄存器的设备（无数据的 FIFO 读）在访问无法完成时返回 `true`。总线适配器
+    /// 随后在 [`Self::read32`] 运行**之前**以 [`BusErrorKind::Stall`] 结束读取，因此被
+    /// stall 的访问绝不消费数据、也不锁存错误标志；事件使进展成为可能后 CPU 重放同一条
+    /// 载入指令。默认值为 `false`，因此所有既有设备的行为逐字节不变。
+    fn stall_on_read32(&self, _offset: u32) -> bool {
+        false
+    }
 }
 
 /// A flat 32-bit register file used by simple peripheral stubs
@@ -326,6 +343,13 @@ impl MmioRegion {
         0
     }
 
+    /// Offset of `addr` rounded down to its containing register word
+    /// `addr` 向下取整到所属寄存器字的偏移
+    fn word_offset(&self, addr: Address) -> u32 {
+        let offset = addr - self.window().base;
+        offset - offset % MMIO_REGISTER_SIZE
+    }
+
     /// Write a full word and log unmodelled offsets once / 写入整字并对未建模偏移记录一次
     fn write_word(&mut self, addr: Address, value: u32) {
         let offset = addr - self.window().base;
@@ -346,6 +370,13 @@ impl MemoryRegion for MmioRegion {
 
     fn size(&self) -> usize {
         self.window().size
+    }
+
+    fn read_would_stall(&self, addr: Address) -> bool {
+        // 别名窗口与直接访问共用同一寄存器，因此按所属寄存器字询问设备。
+        // Alias windows address the same register, so ask the device about the
+        // register word that contains `addr`.
+        self.device.stall_on_read32(self.word_offset(addr))
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
@@ -585,6 +616,15 @@ impl MemoryRegion for MmioRouter {
 
     fn size(&self) -> usize {
         self.window.size
+    }
+
+    fn read_would_stall(&self, addr: Address) -> bool {
+        // 只有直接落在子设备窗口内（非别名）的读才可能阻塞；别名窗口在本模型中
+        // 从不承载阻塞寄存器。
+        // Only a read landing directly in a child window (not an alias) can
+        // block; alias windows never carry a blocking register in this model.
+        self.child_index(addr)
+            .is_some_and(|index| self.regions[index].read_would_stall(addr))
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {

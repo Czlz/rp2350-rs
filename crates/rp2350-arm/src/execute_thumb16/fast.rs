@@ -14,7 +14,7 @@
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
-use super::{StepResult, adc, asr_c, lsl_c, lsr_c, ror_c, sbc, sign_extend};
+use super::{SleepKind, StepResult, adc, asr_c, lsl_c, lsr_c, ror_c, sbc, sign_extend};
 use crate::conditions::Condition;
 use crate::registers::CortexM33Registers;
 
@@ -233,12 +233,18 @@ pub(crate) fn hint_space(
     let mask = (opcode & 0xF) as u8;
     if mask == 0 {
         return Some(match firstcond {
-            // WFE / WFI：显式进入等待状态，不能顺带跳过下一条。
-            // WFE / WFI: a real wait state, never a silent skip.
-            0x2 | 0x3 => StepResult::Sleep,
-            // NOP / YIELD / SEV / SEVL 以及手册保留的 hint 编码（0x6..=0xF）均按 NOP 执行。
-            // NOP / YIELD / SEV / SEVL, plus the reserved hint encodings
-            // (0x6..=0xF), all execute as NOP.
+            // WFE / WFI：显式请求等待，由核心按实时事件/NVIC 状态决定是否挂起。
+            // WFE / WFI: an explicit wait request; the core decides whether to
+            // suspend from live event/NVIC state.
+            0x2 => StepResult::Sleep(SleepKind::WaitForEvent),
+            0x3 => StepResult::Sleep(SleepKind::WaitForInterrupt),
+            // SEV 置位所有核心的事件寄存器；SEVL 只置位本核。
+            // SEV sets every core's event register; SEVL only this core's.
+            0x4 => StepResult::SendEvent { local: false },
+            0x5 => StepResult::SendEvent { local: true },
+            // NOP / YIELD 以及手册保留的 hint 编码（0x6..=0xF）均按 NOP 执行。
+            // NOP / YIELD and the reserved hint encodings (0x6..=0xF) all
+            // execute as NOP.
             _ => StepResult::Ok,
         });
     }

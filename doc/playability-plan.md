@@ -99,14 +99,14 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 3. **Wave 3 ✅**：P0-3a（arm+core）‖ P1-1（cli lib + `play` worker + headless `--frames`）
 4. **Wave 4 ✅**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2（egui PlayView 已接线到真实 `PlaySession`）
 5. **Wave 5 ✅**：P0-3c（arm 译码缓存）‖ P2-3（GUI 音频）+ 示例配置整改（`profile.conf` / CLI `--profile` / GUI 无默认值）
-6. **Wave 6 🚧**：GAP-07（`WFI`/`WFE`/`SEV` + 阻塞 FIFO + 睡眠调度，**正确性**）‖ GAP-11（DMA `SNIFF`/`PERFCTR`）
+6. **Wave 6 🚧**：GAP-07 ✅（`WFI`/`WFE`/`SEV` + 阻塞 FIFO + 睡眠调度，**正确性**）‖ GAP-11（DMA `SNIFF`/`PERFCTR`）
 7. **Wave 7**：GAP-08b（CLI 挂载 PSRAM）+ P3-2（存档/复位）+ GAP-12（文档）；P3-3（soak）最后
 
 ## 3.5 通用性任务（与帧率无关，必须推进）/ Generality tasks
 
 | ID | 任务 | 归属 | 状态 |
 |----|------|------|------|
-| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | 🚧 Wave 6（正确性） |
+| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ✅ 已完成（`BusErrorKind::Stall` + `MemoryRegion::read_would_stall`、`SIO_FIFO_ST` 粘滞位与写 1 清除、事件世代号、ARM/RISC-V 睡眠状态机、`[run] sleep` 统计） |
 | GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ⏳ |
 | GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | 🚧 Wave 6 |
 | GAP-10 | MCP TLS 传输 | mcp | ⏳ |
@@ -114,7 +114,7 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 
 ## 4. 风险 / Risks
 
-- **性能**：五轮后 **29.5–34.0 M steps/s**（累计 ≈10×），`play` 实测 **12.9 fps**；30 fps 需 ≥75 M steps/s，60 fps 需 ≥150 M。P0-3c 结论：20 fps 可靠补齐 16 位快路径达到，30 fps 需块级执行，**60 fps 必须 JIT**（Flash 只读 + 世代号、SRAM 继续解释、差分测试可作对照，预计 4–8×）；
+- **性能（更正）**：总步数吞吐 29.5–34 M/s 主要来自启动段（睡眠/自旋）；**真实游戏段只有 8.0–8.5 M steps/s ≈ 3.3 fps**（见 `doc/performance.md` §9）。60 fps 需约 18×、30 fps 需约 9×，解释器微优化最多再 1.5–2×，**必须 JIT**（或 JIT + 帧级并行）；度量口径改为 300–500 M 窗口；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
 - **GUI 架构**：`rp2350-cli` 提供 lib target（`rp2350_cli::run::Machine` +
