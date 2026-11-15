@@ -93,6 +93,21 @@ const RV_DATA_LOOKUP_STUB: u32 = 0x75FE;
 const RV_STUB_BASE: u32 = 0x7600;
 /// Distance between RISC-V function trap stubs / RISC-V 函数陷阱桩间距
 const RV_STUB_STRIDE: u32 = 0x10;
+/// First address of the zero-returning RISC-V stubs
+/// 返回 0 的 RISC-V 占位桩起始地址
+///
+/// These back the RP2350 ROM functions this image does not implement. The
+/// pointer must be valid (so `rom_func_lookup` succeeds and a caller's NULL
+/// check does not misfire), but the call itself returns 0 and has no effect.
+/// 这些桩服务于本镜像未实现的 RP2350 ROM 函数。指针必须有效（使
+/// `rom_func_lookup` 成功、调用者的 NULL 检查不会误判），但调用本身返回 0
+/// 且没有副作用。
+const RV_ZERO_STUB_BASE: u32 = 0x7700;
+/// Distance between zero-returning RISC-V stubs / 返回 0 的 RISC-V 占位桩间距
+const RV_ZERO_STUB_STRIDE: u32 = 0x10;
+/// Offset of the 32-bit zero literal named by the RISC-V data tags
+/// RISC-V 数据标签所指向的 32 位零字面量的偏移
+const RV_ZERO_DATA_PTR_OFFSET: usize = 0x7D08;
 
 /// Base of the synthetic RISC-V fatal-exception vector table
 /// 合成 RISC-V 致命异常向量表基地址
@@ -123,6 +138,47 @@ const TRAP_RV_LOOKUP: u16 = 0x0100;
 /// Trap identifier of the RISC-V `rom_data_lookup` value wrapper
 /// RISC-V `rom_data_lookup` 取值包装的陷阱标识
 const TRAP_RV_DATA_LOOKUP: u16 = 0x0101;
+/// Trap identifier of the zero-returning RISC-V stubs
+/// 返回 0 的 RISC-V 占位桩的陷阱标识
+const TRAP_RV_ZERO_STUB: u16 = 0x0102;
+
+/// RP2350 RISC-V function tags that resolve to a zero-returning stub
+/// 解析为返回 0 占位桩的 RP2350 RISC-V 函数标签
+///
+/// Every tag below exists in the real RP2350 `bootrom_constants.h` table; this
+/// image only implements the flash helpers and `rom_get_sys_info` for real, so
+/// the rest map to stubs. Tags already implemented by [`Trap`] are listed there,
+/// not here. / 以下标签都存在于真实 RP2350 的 `bootrom_constants.h` 表中；本镜像
+/// 只真实实现 flash 辅助函数与 `rom_get_sys_info`，其余映射为桩。已由 [`Trap`]
+/// 实现的标签列在那里，不在此处。
+const RV_STUB_FUNC_TAGS: [TableCode; 18] = [
+    code(b'A', b'B'), // _pick_ab_partition
+    code(b'C', b'I'), // _chain_image
+    code(b'E', b'B'), // _explicit_buy
+    code(b'F', b'A'), // _flash_runtime_to_storage_addr
+    code(b'F', b'O'), // _flash_op
+    code(b'G', b'B'), // _get_b_partition
+    code(b'G', b'P'), // _get_partition_table_info
+    code(b'G', b'U'), // _get_uf2_target_partition
+    code(b'L', b'P'), // _load_partition_table
+    code(b'O', b'A'), // _otp_access
+    code(b'R', b'A'), // _flash_reset_address_trans
+    code(b'R', b'C'), // _set_rom_callback
+    code(b'S', b'C'), // _secure_call
+    code(b'S', b'P'), // _set_ns_api_permission
+    code(b'S', b'S'), // _set_bootrom_stack
+    code(b'U', b'B'), // _reset_to_usb_boot (RP2040 name, still in the ROM)
+    code(b'X', b'M'), // _flash_select_xip_read_mode
+    code(b'V', b'B'), // _validate_ns_buffer
+];
+
+/// RP2350 RISC-V data tags that resolve to a zero literal
+/// 解析为零字面量的 RP2350 RISC-V 数据标签
+const RV_STUB_DATA_TAGS: [TableCode; 3] = [
+    code(b'G', b'R'), // _software_git_revision
+    code(b'P', b'T'), // _partition_table
+    code(b'X', b'F'), // _saved_xip_setup_func_ptr
+];
 /// Flash device info: CS0 = 16 MB, CS1 absent / Flash 设备信息：CS0 = 16 MB，无 CS1
 ///
 /// pico-sdk `hardware/flash.h` encodes sizes as `4096 << code` with
@@ -316,6 +372,9 @@ impl Rp2350Bootrom {
             dispatcher.register(trap.stub(), TrapId(trap.id()));
             dispatcher.register(trap.rv_stub(), TrapId(trap.id()));
         }
+        for index in 0..RV_STUB_FUNC_TAGS.len() {
+            dispatcher.register(rv_zero_stub(index), TrapId(TRAP_RV_ZERO_STUB));
+        }
         Self { image, dispatcher }
     }
 
@@ -411,6 +470,12 @@ fn riscv_jal_x0(from: u32, to: u32) -> u32 {
         | (((value >> 12) & 0xFF) << 12)
 }
 
+/// Address of the zero-returning stub for [`RV_STUB_FUNC_TAGS`] entry `index`
+/// 返回 0 的占位桩地址（对应 [`RV_STUB_FUNC_TAGS`] 的第 `index` 项）
+fn rv_zero_stub(index: usize) -> u32 {
+    RV_ZERO_STUB_BASE + RV_ZERO_STUB_STRIDE * index as u32
+}
+
 /// Build the 32 KB synthetic image / 构建 32 KB 合成镜像
 fn build_image() -> Vec<u8> {
     let mut image = RomImageBuilder::new(ROM_SIZE);
@@ -429,6 +494,12 @@ fn build_image() -> Vec<u8> {
         image.trap_stub(trap.stub() as usize, trap.id());
         image.riscv_trap_stub(trap.rv_stub() as usize);
     }
+    // 未实现的 RP2350 ROM 函数共用同一组「返回 0」桩；地址有效，调用无副作用。
+    // Unimplemented RP2350 ROM functions share a set of zero-returning stubs:
+    // the addresses are valid and the calls have no side effects.
+    for index in 0..RV_STUB_FUNC_TAGS.len() {
+        image.riscv_trap_stub(rv_zero_stub(index) as usize);
+    }
     // RISC-V fatal-exception vectors: every slot jumps to the common handler,
     // which is a `ebreak` stub the host dispatcher intercepts.
     // RISC-V 致命异常向量：每个槽位跳到公共处理程序，后者是宿主分发器拦截的
@@ -442,15 +513,28 @@ fn build_image() -> Vec<u8> {
     let mut table = RomTableBuilder::new();
     for trap in ALL_TRAPS {
         let pointer = (trap.stub() as u16) | 1;
-        table.push_func(trap.tag(), pointer, pointer);
+        // 同一表项同时给出 ARM 安全/非安全与 RISC-V 指针，与真实 ROM 布局一致。
+        // One entry carries the ARM secure/non-secure and RISC-V pointers, as the
+        // real ROM does.
+        table.push_func_rv(trap.tag(), pointer, pointer, trap.rv_stub() as u16);
+    }
+    for (index, tag) in RV_STUB_FUNC_TAGS.iter().enumerate() {
+        table.push_riscv_func(*tag, rv_zero_stub(index) as u16);
     }
     table.push_data(code(b'F', b'D'), DEVINFO_PTR_OFFSET as u16);
+    for tag in RV_STUB_DATA_TAGS {
+        table.push_data(tag, RV_ZERO_DATA_PTR_OFFSET as u16);
+    }
     image.write_slice(TABLE_OFFSET, &table.finish());
     // 与真实 ROM 相同的两级间接：表项指向字面量，字面量再指向 16 位信息字。
     // Same two-level indirection as the real ROM: the entry points at the
     // literal, the literal points at the 16-bit info word.
     image.write_u32(DEVINFO_PTR_OFFSET, DEVINFO_OFFSET as u32);
     image.write_u16(DEVINFO_OFFSET, DEVINFO_VALUE);
+    // 未实现的数据标签指向一个零字面量，使调用者拿到有效指针而非 NULL。
+    // Unimplemented data tags point at a zero literal so callers get a valid
+    // pointer instead of NULL.
+    image.write_u32(RV_ZERO_DATA_PTR_OFFSET, 0);
     image.finish()
 }
 
@@ -472,15 +556,23 @@ impl Rp2350TrapHandler {
     /// Answer the RISC-V `rom_func_lookup(code, mask)` call
     /// 应答 RISC-V `rom_func_lookup(code, mask)` 调用
     ///
-    /// The real RISC-V ROM searches a table of 16-bit tags; only the
-    /// functions used by boot2 and the `MicroPython` runtime are present here.
-    /// They are all host traps, so the returned addresses never execute guest
-    /// instructions.
-    /// 真实 RISC-V ROM 会搜索 16 位标签表；这里仅提供 boot2 与 `MicroPython`
-    /// 运行时使用的函数。它们全部是宿主陷阱，返回地址不会执行客户机指令。
+    /// The real RISC-V ROM searches a table of 16-bit tags. Functions used by
+    /// boot2 and the `MicroPython` runtime are host traps with real behaviour;
+    /// the remaining RP2350 tags resolve to zero-returning stubs so callers see
+    /// a valid pointer. Unknown tags return 0, which is the ROM's own "not
+    /// found" result.
+    /// 真实 RISC-V ROM 会搜索 16 位标签表。boot2 与 `MicroPython` 运行时使用的
+    /// 函数是有真实行为的宿主陷阱；其余 RP2350 标签解析为返回 0 的占位桩，使
+    /// 调用者拿到有效指针。未知标签返回 0，与 ROM 自身的「未找到」结果一致。
     fn rv_table_lookup(args: [u32; 4]) -> u32 {
         let tag = args[0] as u16;
-        Trap::from_tag(tag).map_or(0, Trap::rv_stub)
+        if let Some(trap) = Trap::from_tag(tag) {
+            return trap.rv_stub();
+        }
+        RV_STUB_FUNC_TAGS
+            .iter()
+            .position(|candidate| *candidate == tag)
+            .map_or(0, rv_zero_stub)
     }
 
     /// Answer the RISC-V `rom_data_lookup` wrapper / 应答 RISC-V `rom_data_lookup` 包装
@@ -488,15 +580,20 @@ impl Rp2350TrapHandler {
     /// The real wrapper calls the table lookup and then loads the 16-bit value.
     /// Function tags return their trap stub directly; `FD` points at the 32-bit
     /// literal that in turn points at the 16-bit `FLASH_DEVINFO` word, matching
-    /// the two-level indirection used by the Arm API.
+    /// the two-level indirection used by the Arm API. The unmodelled data tags
+    /// point at a zero literal.
     /// 真实包装先查表再读取 16 位值。函数标签直接返回陷阱桩；`FD` 指向那个再
     /// 指向 16 位 `FLASH_DEVINFO` 字的 32 位字面量，与 Arm API 的两级间接一致。
+    /// 未建模的数据标签指向零字面量。
     fn rv_data_lookup(args: [u32; 4]) -> u32 {
         let tag = args[0] as u16;
         if tag == code(b'F', b'D') {
             return DEVINFO_PTR_OFFSET as u32;
         }
-        Trap::from_tag(tag).map_or(0, Trap::rv_stub)
+        if RV_STUB_DATA_TAGS.contains(&tag) {
+            return RV_ZERO_DATA_PTR_OFFSET as u32;
+        }
+        Self::rv_table_lookup(args)
     }
 
     /// Erase `count` bytes rounded up to `block_size` / 按 `block_size` 上取整擦除 `count` 字节
@@ -598,6 +695,12 @@ impl TrapHandler for Rp2350TrapHandler {
         }
         if call.id.0 == TRAP_RV_DATA_LOOKUP {
             return Ok(TrapOutcome::value(Self::rv_data_lookup(call.args), 8));
+        }
+        // 未实现的 ROM 函数：指针有效但调用返回 0、无副作用。
+        // Unimplemented ROM functions: the pointer is valid, the call returns 0
+        // and has no side effects.
+        if call.id.0 == TRAP_RV_ZERO_STUB {
+            return Ok(TrapOutcome::void(8));
         }
 
         let [addr, arg1, arg2, arg3] = call.args;

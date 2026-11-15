@@ -50,6 +50,21 @@ impl Trap {
             tval: instr,
         }
     }
+
+    /// Build an illegal-CSR trap: `mtval` carries the CSR address
+    /// 构造非法 CSR 陷阱：`mtval` 携带 CSR 地址
+    ///
+    /// Both an unimplemented CSR and an illegal access (write to a read-only CSR)
+    /// raise cause 2. The faulting CSR address is far more useful in `mtval` than
+    /// the raw encoding, because the instruction is always a `csr*` form.
+    /// 未实现的 CSR 与非法访问（写只读 CSR）都触发 cause 2。出错指令必然是
+    /// `csr*` 形式，因此把 CSR 地址放进 `mtval` 比原始编码更有诊断价值。
+    fn illegal_csr(csr: u32) -> Self {
+        Self {
+            cause: 2,
+            tval: csr,
+        }
+    }
 }
 
 /// Result of executing one instruction: next PC or a trap
@@ -465,18 +480,26 @@ impl Hazard3Core {
         // and the upper 16 bits as data, so the read needs the raw operand.
         // Xh3irq 数组 CSR 使用操作数低 5 位作为窗口索引、高 16 位作为数据，
         // 因此读取时需要原始操作数。
-        let old = self.csr.read(csr_addr, source);
+        //
+        // 读取未实现的 CSR 必须触发非法指令陷阱（cause 2），而不是返回 0：
+        // 静默返回 0 会让固件把「不存在的 CSR」当成合法读值继续执行。
+        // Reading an unimplemented CSR must raise illegal-instruction (cause 2)
+        // rather than return zero; a silent zero makes firmware believe the CSR
+        // exists and is readable.
+        let Some(old) = self.csr.try_read(csr_addr, source) else {
+            return Err(Trap::illegal_csr(csr_addr));
+        };
         let operation = funct3 & 3;
         let new_value = match operation {
             1 => source,
             2 => old | source,
             3 => old & !source,
-            _ => return Err(Trap::illegal(instr)),
+            _ => return Err(Trap::illegal(csr_addr)),
         };
         let should_write = operation == 1 || rs1 != 0;
         if should_write {
-            if (csr_addr >> 10) & 3 == 3 {
-                return Err(Trap::illegal(instr));
+            if !self.csr.is_writable(csr_addr) {
+                return Err(Trap::illegal_csr(csr_addr));
             }
             self.csr.write_raw(csr_addr, new_value, source);
         }

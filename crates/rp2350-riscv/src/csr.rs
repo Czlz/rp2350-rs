@@ -15,8 +15,25 @@ pub(crate) const MIE_MEIE: u32 = 1 << 11;
 /// Machine external interrupt pending in `mip` / `mip` 机器外部中断挂起位
 pub(crate) const MIP_MEIP: u32 = 1 << 11;
 
-/// Machine identifier / 机器标识
-const MISA_RV32IMAC: u32 = 0x4000_1105;
+/// Machine ISA register value: RV32IMAC plus the `B` bit manipulation extension
+/// 机器 ISA 寄存器值：RV32IMAC 加 `B` 位操作扩展
+///
+/// Bitmap: `A` = bit 0, `B` = bit 1, `C` = bit 2, `I` = bit 8, `M` = bit 12,
+/// `MXL` = bits 31:30 = `0b01` (32-bit). The Zba/Zbb/Zbs subsets implemented by
+/// the core are advertised through the single `B` bit, as the unified bitmanip
+/// specification requires.
+/// 位图：`A` = 位 0、`B` = 位 1、`C` = 位 2、`I` = 位 8、`M` = 位 12，
+/// `MXL` = 位 31:30 = `0b01`（32 位）。核心实现的 Zba/Zbb/Zbs 子集统一通过
+/// 单个 `B` 位宣传，这是统一位操作规范的要求。
+const MISA_RV32IMACB: u32 = 0x4000_1107;
+
+/// `mhartid` value: hart 0 / `mhartid` 值：hart 0
+///
+/// Both RP2350 Hazard3 cores report hart 0 to the guest: firmware uses the value
+/// only as a boot-time sanity check, and the SIO mailbox identifies the core.
+/// 两个 RP2350 Hazard3 核心都向客户机报告 hart 0：固件只把它当作启动期的一致性
+/// 检查，核心身份由 SIO 邮箱区分。
+const MHARTID: u32 = 0;
 
 /// Number of 16-bit Xh3irq windows / Xh3irq 16 位窗口数量
 const XH3IRQ_WINDOWS: usize = 4;
@@ -259,12 +276,20 @@ pub(crate) struct CsrFile {
     pub mtval: u32,
     /// `mip` pending interrupt bits / `mip` 挂起中断位
     pub mip: u32,
+    /// `mstatush` high half of `mstatus` (storage only)
+    /// `mstatush`：`mstatus` 的高半部分（仅存储）
+    pub mstatush: u32,
     /// `mcounteren` counter enable / `mcounteren` 计数器使能
     pub mcounteren: u32,
     /// `mcountinhibit` counter inhibit / `mcountinhibit` 计数器抑制
     pub mcountinhibit: u32,
-    /// `pmpcfg0` PMP configuration / `pmpcfg0` PMP 配置
-    pub pmpcfg0: u32,
+    /// `pmpcfg0`/`pmpcfg2`/`pmpcfg4`/`pmpcfg6` PMP configuration
+    /// `pmpcfg0`/`pmpcfg2`/`pmpcfg4`/`pmpcfg6` PMP 配置
+    ///
+    /// RV32 only defines the even-numbered configuration registers, each holding
+    /// four 8-bit entry descriptors. / RV32 只定义偶数编号的配置寄存器，每个持有
+    /// 四个 8 位条目描述符。
+    pub pmpcfg: [u32; 4],
     /// `pmpaddr0..15` PMP address registers / `pmpaddr0..15` PMP 地址寄存器
     pub pmpaddr: [u32; 16],
     /// Xh3irq external interrupt controller / Xh3irq 外部中断控制器
@@ -287,9 +312,10 @@ impl CsrFile {
             mcause: 0,
             mtval: 0,
             mip: 0,
+            mstatush: 0,
             mcounteren: 0,
             mcountinhibit: 0,
-            pmpcfg0: 0,
+            pmpcfg: [0; 4],
             pmpaddr: [0; 16],
             xh3irq: Xh3Irq::new(),
             minstret: 0,
@@ -303,32 +329,45 @@ impl CsrFile {
         self.minstret = self.minstret.wrapping_add(1);
     }
 
-    /// Read a CSR by address / 按地址读取 CSR
+    /// Read a CSR by address, or report that it is not implemented
+    /// 按地址读取 CSR，或报告该 CSR 未实现
     ///
-    /// Unmodelled CSRs read as zero, which keeps vendor firmware polling loops
-    /// running without pretending to implement unimplemented features.
-    /// 未建模的 CSR 读为 0，使厂商固件的轮询循环可继续运行，同时不假装实现了
-    /// 尚未实现的功能。
-    pub(crate) fn read(&self, addr: u32, raw: u32) -> u32 {
-        match addr {
+    /// `None` means the address names no CSR of this core; the caller must raise
+    /// an illegal-instruction trap (cause 2) rather than fabricate a value.
+    /// `raw` is the instruction's raw source operand, used by the Xh3irq 16-bit
+    /// arrays to select a window.
+    /// `None` 表示该地址不对应本核心的任何 CSR，调用方必须触发非法指令陷阱
+    /// （cause 2）而不是伪造数值。`raw` 是指令的原始源操作数，供 Xh3irq 的
+    /// 16 位数组选择窗口。
+    pub(crate) fn try_read(&self, addr: u32, raw: u32) -> Option<u32> {
+        let value = match addr {
             0x300 => self.mstatus,
-            0x301 => MISA_RV32IMAC,
+            0x301 => MISA_RV32IMACB,
             0x304 => self.mie,
             0x305 => self.mtvec,
             0x306 => self.mcounteren,
-            0x310 => 0, // mstatush
+            0x310 => self.mstatush,
             0x320 => self.mcountinhibit,
             0x340 => self.mscratch,
             0x341 => self.mepc,
             0x342 => self.mcause,
             0x343 => self.mtval,
             0x344 => self.mip,
-            0x3A0 => self.pmpcfg0,
+            // RV32 defines pmpcfg0/2/4/6 only; the odd-numbered registers do not
+            // exist and stay unimplemented. / RV32 只定义 pmpcfg0/2/4/6，奇数
+            // 编号的寄存器不存在，保持未实现。
+            0x3A0 | 0x3A2 | 0x3A4 | 0x3A6 => self.pmpcfg[((addr - 0x3A0) >> 1) as usize],
             addr if (0x3B0..=0x3EF).contains(&addr) => self.pmpaddr[((addr - 0x3B0) >> 2) as usize],
             0xB00 | 0xC00 => self.mcycle as u32,
             0xB02 | 0xC02 => self.minstret as u32,
             0xB80 | 0xC80 => (self.mcycle >> 32) as u32,
             0xB82 | 0xC82 => (self.minstret >> 32) as u32,
+            // mvendorid/marchid/mimpid/mhartid are read-only identification CSRs
+            // with constant values in the Hazard3 configuration.
+            // mvendorid/marchid/mimpid/mhartid 是只读识别 CSR，在 Hazard3 配置中
+            // 取常量值。
+            0xF11..=0xF13 => 0,
+            0xF14 => MHARTID,
             0xBE0 => Xh3Irq::read_window(self.xh3irq.enable, raw),
             // MEIPA is the OR of the hardware pending array and MEIFA, as
             // required by the Xh3irq specification.
@@ -341,8 +380,40 @@ impl CsrFile {
             }
             0xBE4 => self.xh3irq.next,
             0xBE5 => self.xh3irq.context,
-            _ => 0,
-        }
+            _ => return None,
+        };
+        Some(value)
+    }
+
+    /// Read a CSR for host diagnostics / 供宿主诊断读取 CSR
+    ///
+    /// Unimplemented addresses read as zero here so host-side reports never
+    /// fault; the instruction path uses [`Self::try_read`] and raises cause 2.
+    /// 此处未实现的地址读为 0，使宿主侧报告不会出错；指令路径改用
+    /// [`Self::try_read`] 并触发 cause 2。
+    pub(crate) fn read(&self, addr: u32, raw: u32) -> u32 {
+        self.try_read(addr, raw).unwrap_or(0)
+    }
+
+    /// Report whether a CSR address is architecturally read-only
+    /// 报告某个 CSR 地址是否为架构只读
+    ///
+    /// CSR address bits `[11:10] == 0b11` select the read-only space (`cycle` and
+    /// friends); `misa` sits in the read/write encoding space but is hard-wired
+    /// in Hazard3.
+    /// CSR 地址位 `[11:10] == 0b11` 表示只读空间（`cycle` 等）；`misa` 位于读写
+    /// 编码空间，但在 Hazard3 中是硬连线只读。
+    pub(crate) fn is_read_only(addr: u32) -> bool {
+        (addr >> 10) & 0b11 == 0b11 || addr == 0x301
+    }
+
+    /// Report whether a write to `addr` is legal / 报告对 `addr` 的写是否合法
+    ///
+    /// A write is illegal when the CSR is unimplemented or read-only; both raise
+    /// illegal-instruction, as the privileged specification requires.
+    /// CSR 未实现或只读时写操作非法；两者都按特权规范触发非法指令陷阱。
+    pub(crate) fn is_writable(&self, addr: u32) -> bool {
+        !Self::is_read_only(addr) && self.try_read(addr, 0).is_some()
     }
 
     /// Recompute `meinext` and `mip.MEIP` after an Xh3irq state change
@@ -358,8 +429,11 @@ impl CsrFile {
 
     /// Write a CSR by address / 按地址写入 CSR
     ///
-    /// Read-only and unmodelled CSRs ignore writes.
-    /// 只读与未建模的 CSR 忽略写入。
+    /// Read-only and unmodelled CSRs ignore writes. Instruction execution never
+    /// reaches those cases: [`Self::is_writable`] gates every guest write and
+    /// raises illegal-instruction instead.
+    /// 只读与未建模的 CSR 忽略写入。指令执行不会走到这些分支：
+    /// [`Self::is_writable`] 会拦截所有客户机写操作并改为触发非法指令陷阱。
     #[cfg(test)]
     pub(crate) fn write(&mut self, addr: u32, value: u32) {
         self.write_raw(addr, value, value);
@@ -385,13 +459,16 @@ impl CsrFile {
             0x304 => self.mie = value,
             0x305 => self.mtvec = value,
             0x306 => self.mcounteren = value,
+            0x310 => self.mstatush = value,
             0x320 => self.mcountinhibit = value & 0x7,
             0x340 => self.mscratch = value,
             0x341 => self.mepc = value & !1,
             0x342 => self.mcause = value,
             0x343 => self.mtval = value,
             0x344 => self.mip = value & MIP_MEIP,
-            0x3A0 => self.pmpcfg0 = value,
+            0x3A0 | 0x3A2 | 0x3A4 | 0x3A6 => {
+                self.pmpcfg[((addr - 0x3A0) >> 1) as usize] = value;
+            }
             addr if (0x3B0..=0x3EF).contains(&addr) => {
                 self.pmpaddr[((addr - 0x3B0) >> 2) as usize] = value;
             }

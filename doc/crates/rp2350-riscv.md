@@ -1,18 +1,20 @@
 # rp2350-riscv — Public API / 公共 API
 
-> Hazard3 RISC-V (RV32IMAC) core emulation. Implements the `CpuCore` trait,
-> including the machine-mode integer subset, compressed instructions and a
-> minimal external-interrupt path.
-> Hazard3 RISC-V（RV32IMAC）核心仿真。实现 `CpuCore` trait，包含机器模式整数
-> 子集、压缩指令与最小的外部中断通路。
+> Hazard3 RISC-V (RV32IMAC + Zba/Zbb/Zbs, advertised as `misa.B`) core emulation.
+> Implements the `CpuCore` trait, including the machine-mode integer subset,
+> compressed instructions and a minimal external-interrupt path.
+> Hazard3 RISC-V（RV32IMAC + Zba/Zbb/Zbs，通过 `misa.B` 宣传）核心仿真。实现
+> `CpuCore` trait，包含机器模式整数子集、压缩指令与最小的外部中断通路。
 >
-> **Status**: implemented — RV32I/M/A/C + Zb\* (Zba/Zbb/Zbs) + Zcb, machine
-> CSRs, Xh3irq external interrupts, exception/interrupt trap entry, picobin
+> **Status**: implemented — RV32I/M/A/C + Zb\* (Zba/Zbb/Zbs, advertised through
+> `misa.B`) + Zcb, machine CSRs with architectural illegal-CSR traps,
+> Xh3irq external interrupts, exception/interrupt trap entry, picobin
 > `IMAGE_DEF` boot, `lr.w`/`sc.w` reservation. Not implemented: F/D floating
 > point, PMP enforcement.
-> **状态**: 已实现 — RV32I/M/A/C + Zb\*（Zba/Zbb/Zbs）+ Zcb、机器模式 CSR、
-> Xh3irq 外部中断、异常/中断陷阱入口、picobin `IMAGE_DEF` 启动、
-> `lr.w`/`sc.w` 保留区。未实现：F/D 浮点、PMP 强制访问检查。
+> **状态**: 已实现 — RV32I/M/A/C + Zb\*（Zba/Zbb/Zbs，通过 `misa.B` 宣传）
+> + Zcb、带架构非法 CSR 陷阱的机器模式 CSR、Xh3irq 外部中断、
+> 异常/中断陷阱入口、picobin `IMAGE_DEF` 启动、`lr.w`/`sc.w` 保留区。
+> 未实现：F/D 浮点、PMP 强制访问检查。
 
 ---
 
@@ -127,36 +129,81 @@ impl Rv32Registers {
 
 `CsrFile` is `pub(crate)`; it is reached through CSR instructions and the
 interrupt path, not through the public API. Modeled registers:
-`mstatus` / `mie` / `mtvec` / `mscratch` / `mepc` / `mcause` / `mtval` / `mip`
-/ `mcounteren` / `mcountinhibit` / `pmpcfg0` / `pmpaddr[0..15]`, the Hazard3
-`Xh3irq` set `meiea` / `meipa` / `meifa` / `meipra`, and the counters
-`minstret` / `mcycle` (both `u64`, low and high halves readable/writable via
-`0xB00/0xB80` and `0xB02/0xB82` mirrors). `misa` reads the constant
-`0x4000_1105` (RV32IMAC, MXL = 32-bit).
+`mstatus` / `mstatush` / `misa` / `mie` / `mtvec` / `mscratch` / `mepc` /
+`mcause` / `mtval` / `mip` / `mcounteren` / `mcountinhibit` / `pmpcfg0/2/4/6` /
+`pmpaddr[0..15]`, the read-only identification registers
+`mvendorid`/`marchid`/`mimpid`/`mhartid` (all read 0), the Hazard3 `Xh3irq` set
+`meiea` / `meipa` / `meifa` / `meipra` / `meinext` / `meicontext`, and the
+counters `minstret` / `mcycle` (both `u64`, low and high halves readable/writable
+via `0xB00/0xB80` and `0xB02/0xB82` mirrors, read-only aliases at
+`0xC00/0xC80` and `0xC02/0xC82`).
 
 `CsrFile` 是 `pub(crate)`，只能通过 CSR 指令与中断路径访问，不属于公共 API。
-已建模寄存器：`mstatus`、`mie`、`mtvec`、`mscratch`、`mepc`、`mcause`、
-`mtval`、`mip`、`mcounteren`、`mcountinhibit`、`pmpcfg0`、`pmpaddr[0..15]`、
-Hazard3 `Xh3irq` 组 `meiea`、`meipa`、`meifa`、`meipra`，以及计数器
+已建模寄存器：`mstatus`、`mstatush`、`misa`、`mie`、`mtvec`、`mscratch`、
+`mepc`、`mcause`、`mtval`、`mip`、`mcounteren`、`mcountinhibit`、
+`pmpcfg0/2/4/6`、`pmpaddr[0..15]`，只读识别寄存器
+`mvendorid`/`marchid`/`mimpid`/`mhartid`（均读 0），Hazard3 `Xh3irq` 组
+`meiea`、`meipa`、`meifa`、`meipra`、`meinext`、`meicontext`，以及计数器
 `minstret` / `mcycle`（均为 `u64`，可通过 `0xB00/0xB80` 与 `0xB02/0xB82`
-镜像读写低/高 32 位）。`misa` 读出常量 `0x4000_1105`（RV32IMAC，MXL = 32 位）。
+镜像读写低/高 32 位，并在 `0xC00/0xC80`、`0xC02/0xC82` 提供只读别名）。
+
+`misa` reads the constant `0x4000_1107`; the bitmap is:
+
+| Bits | Value | Meaning / 含义 |
+|------|-------|----------------|
+| 31:30 | `0b01` | `MXL` = 32-bit / 32 位 |
+| 12 | 1 | `M` multiply/divide / 乘除 |
+| 8 | 1 | `I` base integer / 基础整数 |
+| 2 | 1 | `C` compressed / 压缩指令 |
+| 1 | 1 | `B` bit manipulation (Zba/Zbb/Zbs) / 位操作 |
+| 0 | 1 | `A` atomics / 原子 |
+
+All other extension bits are zero, so `F`/`D`/`V` are absent. `misa` sits in the
+read/write encoding space but is hard-wired: writing it raises
+illegal-instruction.
+
+`misa` 读出常量 `0x4000_1107`，位图见上表。其他扩展位全为 0，因此 `F`/`D`/`V`
+均不存在。`misa` 位于读写编码空间但为硬连线只读：写入会触发非法指令陷阱。
 
 ### CSR read/write semantics / CSR 读写语义
 
-- Unmodelled CSRs **read as zero** so vendor polling loops keep running; they
-  silently ignore writes. `mstatush` (0x310) always reads 0.
-  未建模的 CSR **读为 0**，让厂商固件的轮询循环得以继续；对它们的写被静默
-  忽略。`mstatush`（0x310）恒读 0。
+- **Unimplemented CSR** addresses raise illegal-instruction (`mcause = 2`) on
+  both read and write; `mtval` carries the **CSR address** and `mepc` points at
+  the faulting `csr*` instruction. They are never silently read as zero.
+  **未实现的 CSR** 地址在读写时都触发非法指令（`mcause = 2`）；`mtval` 携带
+  **CSR 地址**，`mepc` 指向出错的 `csr*` 指令。绝不静默读 0。
+- **Read-only CSRs** (address bits `[11:10] == 0b11`, i.e. `cycle`/`instret` and
+  the identification registers) trap on write; a `csrrs`/`csrrc` whose source is
+  `x0` performs no write and therefore does not trap. `csrrw` always writes, so
+  it traps even with `x0` as the source.
+  **只读 CSR**（地址位 `[11:10] == 0b11`，即 `cycle`/`instret` 与识别寄存器）
+  写入即陷阱；源为 `x0` 的 `csrrs`/`csrrc` 不执行写操作，因此不触发。`csrrw`
+  总是写，即使源为 `x0` 也会触发。
+- `mstatush` (0x310) is storage only: writes are kept and reads return the stored
+  value, but no high-half `mstatus` bit is interpreted.
+  `mstatush`（0x310）仅作存储：写入被保留、读取返回存储值，但不解释任何
+  `mstatus` 高半部分语义。
 - `mstatus` only models the bits `MIE` (bit 3), `MPIE` (bit 7) and `MPP`
   (bits 12:11); a write masks the value to those fields.
   `mstatus` 只建模 `MIE`（位 3）、`MPIE`（位 7）与 `MPP`（位 12:11）；
   写入会被掩码到这几个字段。
-- `mepc` writes clear the low 2 bits; `mip` writes only the `MEIP` bit is
-  kept; `mcountinhibit` keeps bits 2:0.
-  写 `mepc` 清除低 2 位；写 `mip` 只保留 `MEIP` 位；写 `mcountinhibit`
-  保留位 2:0。
-- PMP registers are storage only — no access checking is enforced.
-  PMP 寄存器仅作存储 —— 不实施访问检查。
+- `mepc` writes clear bit 0 (bit 1 stays writable because `C` allows 2-byte
+  alignment); `mip` writes only keep the `MEIP` bit; `mcountinhibit` keeps
+  bits 2:0. Writing `mip`'s read-only pending bits is ignored, not trapped,
+  matching Hazard3's writable-mask behaviour.
+  写 `mepc` 清除位 0（因支持 `C`，位 1 保持可写）；写 `mip` 只保留 `MEIP` 位；
+  写 `mcountinhibit` 保留位 2:0。写 `mip` 的只读挂起位被忽略而非触发陷阱，
+  与 Hazard3 的可写掩码行为一致。
+- `mcycle`/`minstret` advance once per executed instruction, so firmware polling
+  them sees monotonic progress; the high halves read 0 on RV32 within any
+  realistic run. `mhartid` is 0 for both cores.
+  `mcycle`/`minstret` 每执行一条指令递增一次，固件轮询时看到单调增长；在任何
+  现实运行时长的 RV32 运行中高半部分读 0。两个核心的 `mhartid` 都是 0。
+- PMP registers (`pmpcfg0/2/4/6`, `pmpaddr0..15`) are storage only — no access
+  checking is enforced. Odd-numbered `pmpcfg` registers do not exist on RV32 and
+  raise illegal-instruction.
+  PMP 寄存器（`pmpcfg0/2/4/6`、`pmpaddr0..15`）仅作存储 —— 不实施访问检查。
+  RV32 上奇数编号的 `pmpcfg` 不存在，访问会触发非法指令陷阱。
 
 ### Traps / 陷阱
 
@@ -182,7 +229,7 @@ Typical `mcause` values produced by the core / 核心产生的典型 `mcause`：
 
 | Cause | Source / 来源 |
 |-------|--------------|
-| 2 | Illegal / unsupported instruction (`mtval` = opcode) |
+| 2 | Illegal instruction, or illegal/unimplemented CSR (`mtval` = opcode for a decode failure, **CSR address** for a CSR fault) / 非法指令，或非法/未实现 CSR（解码失败时 `mtval` 为操作码，CSR 故障时为 **CSR 地址**） |
 | 3 | `EBREAK` (`mtval` = 0) |
 | 5 | Load bus error (`mtval` = address) |
 | 7 | Store bus error (`mtval` = address) |
@@ -240,7 +287,9 @@ MicroPython RISC-V 的中断链，但并非完整 Xh3irq 控制器（缺少外�
 - **SYSTEM**: `ECALL` (cause 11), `EBREAK` (cause 3), `MRET`, `WFI`
   (treated as a NOP so single-core bring-up does not deadlock), and the
   `CSRR*` family including immediate forms; writes to read-only
-  (`(csr >> 10) & 3 == 3`) CSRs are illegal-instruction traps.
+  (`(csr >> 10) & 3 == 3`, plus `misa`) CSRs and any access to an
+  unimplemented CSR are illegal-instruction traps with the CSR address in
+  `mtval`.
 - **RV32I**：`LUI`、`AUIPC`、`JAL`、`JALR`、6 条条件分支、
   `LB`/`LH`/`LW`/`LBU`/`LHU`（加载总线错误触发 cause 5，存储为 cause 7）、
   存储指令、OP-IMM、OP（含算术右移）、`FENCE`（空操作）。
@@ -251,7 +300,8 @@ MicroPython RISC-V 的中断链，但并非完整 Xh3irq 控制器（缺少外�
   `AMOAND`、`AMOOR`、`AMOMIN/U/MAX/U`）。
 - **SYSTEM**：`ECALL`（cause 11）、`EBREAK`（cause 3）、`MRET`、`WFI`
   （视为 NOP，避免单核引导死锁），以及含立即数形式的 `CSRR*` 家族；写只读
-  （`(csr >> 10) & 3 == 3`）CSR 会触发非法指令陷阱。
+  （`(csr >> 10) & 3 == 3`，外加 `misa`）CSR 与访问任何未实现 CSR 都会触发
+  非法指令陷阱，`mtval` 为 CSR 地址。
 
 ### Compressed (RV32C + Zcb) / 压缩指令（RV32C + Zcb）
 
@@ -320,22 +370,71 @@ bit-count group, the immediate bit ops and `orc.b`/`rev8` during startup.
   **完整 picobin `IMAGE_DEF` 解析**：解析器定位 `0xFFFF_DED3` 标记与 `0x44`
   入口点条目（boot2 入口 + SP）；不解析 load-map、哈希、签名、分区表或
   hash-value 条目。
-- **RISC-V boot ROM coverage**: the synthetic ROM implements the data/function
-  lookup slots used by boot2 (`0x7DF8` → `rom_data_lookup` at `0x75FE`,
-  `0x7DFA` → `rom_func_lookup` at `0x75C2`) and the flash helpers; other
-  RISC-V ROM table entries are not modelled.
-  **RISC-V boot ROM 覆盖**：合成 ROM 实现了 boot2 使用的数据/函数查找槽
-  （`0x7DF8` → `0x75FE` 的 `rom_data_lookup`、`0x7DFA` → `0x75C2` 的
-  `rom_func_lookup`）与 flash 辅助函数；其余 RISC-V ROM 表项未建模。
+- **RISC-V boot ROM function behaviour**: the table itself is complete for
+  RP2350 (see below). What is *not* modelled is the behaviour behind the
+  zero-returning stubs, and tags outside the RP2350 `bootrom_constants.h` set
+  resolve to 0 (the ROM's "not found" result).
+  **RISC-V boot ROM 函数行为**：表项本身对 RP2350 已完备（见下）。*未建模*的是
+  返回 0 占位桩背后的函数行为；RP2350 `bootrom_constants.h` 集合之外的标签解析
+  为 0（ROM 的「未找到」结果）。
+  The synthetic ROM (`rp2350-bootrom`) exposes the two well-known entry slots
+  and a full RP2350 function/data table.
+  合成 ROM（`rp2350-bootrom`）暴露两个 well-known 入口槽与完整的 RP2350
+  函数/数据表。
+
+  Well-known slots / well-known 槽位:
+
+  | Slot | Value | Role / 作用 |
+  |------|-------|-------------|
+  | `0x7DFA` | `0x75C2` | `rom_func_lookup(code, mask)` trap stub / 函数查询桩 |
+  | `0x7DF8` | `0x75FE` | `rom_data_lookup(code)` value wrapper / 数据查询包装 |
+  | `0x0014` | `0x7C00` | `_bootrom_func_table` pointer / 函数表指针 |
+
+  Function tags with **real behaviour** (host trap) / 有**真实行为**的函数标签
+  （宿主陷阱）: `IF` `_connect_internal_flash`, `EX` (also `IX`)
+  `_flash_exit_xip`, `RE` `_flash_range_erase`, `RP` `_flash_range_program`,
+  `FC` `_flash_flush_cache`, `CX` `_flash_enter_cmd_xip`, `GS`
+  `_get_sys_info`, `RB` `_reboot`, `SR` `_bootrom_state_reset`.
+
+  Function tags resolving to a **zero-returning stub** (valid pointer, call
+  returns 0 and has no side effects) / 解析为**返回 0 占位桩**的函数标签（指针
+  有效，调用返回 0 且无副作用）: `UB` `_reset_to_usb_boot`, `AB`
+  `_pick_ab_partition`, `CI` `_chain_image`, `EB` `_explicit_buy`, `FA`
+  `_flash_runtime_to_storage_addr`, `FO` `_flash_op`, `GB` `_get_b_partition`,
+  `GP` `_get_partition_table_info`, `GU` `_get_uf2_target_partition`, `LP`
+  `_load_partition_table`, `OA` `_otp_access`, `RA`
+  `_flash_reset_address_trans`, `RC` `_set_rom_callback`, `SC` `_secure_call`,
+  `SP` `_set_ns_api_permission`, `SS` `_set_bootrom_stack`, `XM`
+  `_flash_select_xip_read_mode`, `VB` `_validate_ns_buffer`.
+
+  Data tags / 数据标签: `FD` `_flash_device_info` (two-level pointer to the
+  16-bit `FLASH_DEVINFO` word, `CS0` = 16 MB); `GR` `_software_git_revision`,
+  `PT` `_partition_table`, `XF` `_saved_xip_setup_func_ptr` (valid pointer to a
+  zero literal) /（前者的两级指针指向 16 位 `FLASH_DEVINFO` 字，`CS0` = 16 MB；
+  后三者指向零字面量）.
+
+  **Stub vs unmodelled / 桩与未建模的区别**: a *stub* has a valid table entry
+  and stub address — lookups succeed and callers' NULL checks pass — but the
+  call performs no work and returns 0. An *unmodelled tag* has no table entry;
+  `rom_func_lookup`/`rom_data_lookup` return `0`, which is the ROM's own
+  "not found" result. Fatal RISC-V exceptions are additionally routed through
+  the synthetic vector table at `0x7E00` (cause 2/5 → `0x7F00`).
+  **桩与未建模的区别**：*桩*有有效的表项与桩地址 —— 查询成功、调用者的 NULL
+  检查通过 —— 但调用不做任何工作并返回 0。*未建模标签*没有表项，
+  `rom_func_lookup`/`rom_data_lookup` 返回 `0`，即 ROM 自身的「未找到」结果。
+  致命 RISC-V 异常另经 `0x7E00` 的合成向量表路由（cause 2/5 → `0x7F00`）。
 - **`mstatus`**: only `MIE`/`MPIE`/`MPP` are modeled; other status bits
   (FS, VS, UXL …) do not exist.
   **`mstatus`**：仅建模 `MIE`/`MPIE`/`MPP`；其他状态位（FS、VS、UXL 等）
   不存在。
 - **PMP enforcement**: configuration and address registers are storage only.
   **PMP 强制检查**：配置与地址寄存器仅作存储。
-- **Unmodelled CSRs** read 0 and ignore writes; the architecture's illegal-CSR
-  exception for such reads is not raised.
-  **未建模 CSR** 读 0 且忽略写；读取这类 CSR 不触发架构规定的非法 CSR 异常。
+- **`mstatush`/`mcountinhibit` semantics**: both keep written values, but the
+  high-half `mstatus` fields and the counter-inhibit mask (`CY`/`IR`/`HPM` gating
+  of `mcycle`/`minstret`) are not interpreted; the counters always advance.
+  **`mstatush`/`mcountinhibit` 语义**：两者保留写入值，但不解释 `mstatus`
+  高半字段与计数器抑制掩码（`CY`/`IR`/`HPM` 对 `mcycle`/`minstret` 的门控）；
+  计数器始终递增。
 - **Misaligned accesses** and bus-side atomics/reservations are not modeled.
   **非对齐访问**与总线侧原子/保留机制未建模。
 

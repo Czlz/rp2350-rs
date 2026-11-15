@@ -408,3 +408,7 @@ fn log_fault(error: &CoreError) {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_csr.rs"]
+mod tests_csr;

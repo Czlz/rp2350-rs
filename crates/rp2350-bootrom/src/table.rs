@@ -21,6 +21,9 @@ pub mod flags {
     pub const FUNC_ARM_SEC: u16 = 0x0004;
     /// ARM non-secure function pointer present / 存在 ARM 非安全态函数指针
     pub const FUNC_ARM_NONSEC: u16 = 0x0010;
+    /// RISC-V function pointer present (`RT_FLAG_FUNC_RISCV`)
+    /// 存在 RISC-V 函数指针（`RT_FLAG_FUNC_RISCV`）
+    pub const FUNC_RISCV: u16 = 0x0020;
     /// Data pointer present / 存在数据指针
     pub const DATA: u16 = 0x0040;
 }
@@ -52,6 +55,26 @@ impl RomTableBuilder {
             flags::FUNC_ARM_SEC | flags::FUNC_ARM_NONSEC,
             &[secure, nonsecure],
         );
+    }
+
+    /// Append a function entry with ARM secure, ARM non-secure and RISC-V pointers
+    /// 追加一个携带 ARM 安全态、ARM 非安全态与 RISC-V 指针的函数表项
+    ///
+    /// The values are written in ascending flag-bit order (`0x04`, `0x10`,
+    /// `0x20`), which is the order [`lookup`] consumes them.
+    /// 取值按标志位升序（`0x04`、`0x10`、`0x20`）写入，与 [`lookup`] 的消费顺序
+    /// 一致。
+    pub fn push_func_rv(&mut self, tag: TableCode, secure: u16, nonsecure: u16, riscv: u16) {
+        self.push(
+            tag,
+            flags::FUNC_ARM_SEC | flags::FUNC_ARM_NONSEC | flags::FUNC_RISCV,
+            &[secure, nonsecure, riscv],
+        );
+    }
+
+    /// Append a RISC-V-only function entry / 追加仅含 RISC-V 指针的函数表项
+    pub fn push_riscv_func(&mut self, tag: TableCode, riscv: u16) {
+        self.push(tag, flags::FUNC_RISCV, &[riscv]);
     }
 
     /// Append a data entry / 追加一个数据表项
@@ -143,5 +166,29 @@ mod tests {
         // 请求函数标志不会命中纯数据表项。
         // A function mask never matches a data-only entry.
         assert_eq!(lookup(&table, code(b'F', b'D'), flags::FUNC_ARM_SEC), None);
+    }
+
+    #[test]
+    fn riscv_pointer_is_selected_by_its_own_flag() {
+        let mut builder = RomTableBuilder::new();
+        builder.push_func_rv(code(b'E', b'X'), 0x0085, 0x0085, 0x7600);
+        builder.push_riscv_func(code(b'U', b'B'), 0x7700);
+        let table = builder.finish();
+
+        assert_eq!(
+            lookup(&table, code(b'E', b'X'), flags::FUNC_RISCV),
+            Some(0x7600)
+        );
+        assert_eq!(
+            lookup(&table, code(b'E', b'X'), flags::FUNC_ARM_SEC),
+            Some(0x0085)
+        );
+        assert_eq!(
+            lookup(&table, code(b'U', b'B'), flags::FUNC_RISCV),
+            Some(0x7700)
+        );
+        // ARM 查询不得命中仅含 RISC-V 指针的表项。
+        // An ARM query never matches a RISC-V-only entry.
+        assert_eq!(lookup(&table, code(b'U', b'B'), flags::FUNC_ARM_SEC), None);
     }
 }
