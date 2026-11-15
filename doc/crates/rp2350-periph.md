@@ -633,6 +633,7 @@ pub struct Dma { /* shared register file + IrqAssert */ }
 impl Dma {
     pub fn new(irq: IrqAssert) -> Self;
     pub fn run(&mut self, bus: &mut dyn AddressBus, max_transfers: u64) -> u64;
+    pub fn advance(&mut self, cycles: u64);
     pub fn set_dreq(&self, dreq: u8, asserted: bool);
     pub fn set_dreq_bank(&self, first: u8, levels: u32);
     pub fn dreq(&self, dreq: u8) -> Option<bool>;
@@ -646,6 +647,7 @@ pub struct DmaChannelState {
     pub read_addr: u32,
     pub write_addr: u32,
     pub trans_count: u32,
+    pub trans_count_mode: u8,
     pub ctrl: u32,
     pub busy: bool,
     pub enabled: bool,
@@ -663,16 +665,16 @@ pub struct DmaChannelState {
 | `0x000..=0x3FF` | `CH0..CH15` | 16 channels × `0x40` bytes / 16 通道 × `0x40` 字节 |
 | `+0x00` | `READ_ADDR` | read address / 读地址 |
 | `+0x04` | `WRITE_ADDR` | write address / 写地址 |
-| `+0x08` | `TRANS_COUNT` | remaining count (`[27:0]`) / 剩余计数（`[27:0]`） |
+| `+0x08` | `TRANS_COUNT` | remaining count (`[27:0]`) + transfer mode (`[31:28]`) / 剩余计数（`[27:0]`）+ 传输模式（`[31:28]`） |
 | `+0x0C` | `CTRL_TRIG` | control + trigger / 控制 + 触发 |
 | `+0x10..=0x3C` | `AL1_*`/`AL2_*`/`AL3_*` | read/write/count/control aliases. Only `CTRL_TRIG` and the `*_TRIG` aliases (`AL1_TRANS_COUNT_TRIG`, `AL2_WRITE_ADDR_TRIG`, `AL3_READ_ADDR_TRIG`) trigger; `AL1_CTRL`/`AL2_CTRL`/`AL3_CTRL` are plain, non-triggering writes / 读/写/计数/控制别名。只有 `CTRL_TRIG` 与 `*_TRIG` 别名（`AL1_TRANS_COUNT_TRIG`、`AL2_WRITE_ADDR_TRIG`、`AL3_READ_ADDR_TRIG`）会触发；`AL1_CTRL`/`AL2_CTRL`/`AL3_CTRL` 是普通的非触发写入 |
 | `0x400` | `INTR` | raw 16-bit status, W1C / 16 位原始状态，写 1 清零 |
 | `0x404`/`0x414`/`0x424`/`0x434` | `INTE0..3` | per-line enable / 每条线的使能 |
 | `0x408`/`0x418`/`0x428`/`0x438` | `INTF0..3` | per-line force / 每条线的强制位 |
 | `0x40C`/`0x41C`/`0x42C`/`0x43C` | `INTS0..3` | `(INTR & INTEn) \| INTFn`, also W1C through `INTR` / 状态，写 `INTR` 同样可清 |
-| `0x440..=0x44C` | `TIMER0..3` | pacing X/Y storage / 节拍 X/Y 存储 |
+| `0x440..=0x44C` | `TIMER0..3` | pacing timers: `X` dividend in `[31:16]`, `Y` divisor in `[15:0]` / 节拍定时器：`[31:16]` 为被除数 `X`，`[15:0]` 为除数 `Y` |
 | `0x450` | `MULTI_CHAN_TRIGGER` | start the selected channels / 启动选中通道 |
-| `0x454`/`0x458` | `SNIFF_CTRL`/`SNIFF_DATA` | storage only / 仅存储 |
+| `0x454`/`0x458` | `SNIFF_CTRL`/`SNIFF_DATA` | `EN[0]`, `DMACH[4:1]`, `CALC[8:5]`, `BSWAP[9]`, `OUT_REV[10]`, `OUT_INV[11]`; seed + accumulator / 控制与种子兼累加器 |
 | `0x460` | `FIFO_LEVELS` | reads 0 / 读 0 |
 | `0x464` | `CHAN_ABORT` | clear `BUSY` on the selected channels / 清除选中通道的 `BUSY` |
 | `0x468` | `N_CHANNELS` | reads 16 / 读 16 |
@@ -685,21 +687,28 @@ pub struct DmaChannelState {
 writable bit is replaced on a `CTRL_TRIG` write. `EN` is retained after
 completion (the SDK clears it explicitly); writing `CTRL_TRIG` with `EN = 0`
 clears both `EN` and `BUSY`.
-`CTRL_TRIG` 位域遵循 RP2350 布局……`BUSY` 只读；其余可写位在写 `CTRL_TRIG`
+`CTRL_TRIG` 位域遵循 RP2350 布局：`EN[0]`、`HIGH_PRIORITY[1]`、`DATA_SIZE[3:2]`、
+`INCR_READ[4]`、`INCR_WRITE[6]`、`RING_SIZE[11:8]`、`RING_SEL[12]`、
+`CHAIN_TO[16:13]`、`TREQ_SEL[22:17]`、`IRQ_QUIET[23]`、`BSWAP[24]`、
+`SNIFF_EN[25]`、`BUSY[26]`、`WRITE_ERROR[29]`（写 1 清零）、`READ_ERROR[30]`
+（写 1 清零）、`AHB_ERROR[31]`。`BUSY` 只读；其余可写位在写 `CTRL_TRIG`
 时被替换。完成传输后 `EN` 保留（SDK 会显式清除）；写 `EN = 0` 会同时清除
 `EN` 与 `BUSY`。
 
 ### Transfer semantics / 传输语义
 
 - `TRANS_COUNT` (`0x08`) and the non-triggering count aliases (`AL2_TRANS_COUNT`,
-  `AL3_TRANS_COUNT`) latch a **rewrite** value. A trigger copies it into the
-  working count that `Dma::run` decrements; reads of `TRANS_COUNT` and
-  `DmaChannelState::trans_count` return the working count. Writing the count
-  while a channel is busy therefore only changes the value used by the next
-  start, exactly like the hardware reload register.
+  `AL3_TRANS_COUNT`) latch a **rewrite** value together with the `[31:28]`
+  transfer mode. A trigger copies the count into the working count that
+  `Dma::run` decrements; reads of `TRANS_COUNT` and
+  `DmaChannelState::trans_count` return the working count, while
+  `DmaChannelState::trans_count_mode` exposes the latched mode. Writing the
+  count while a channel is busy therefore only changes the value used by the
+  next start, exactly like the hardware reload register.
   `TRANS_COUNT`（`0x08`）与非触发计数别名（`AL2_TRANS_COUNT`、`AL3_TRANS_COUNT`）
-  锁存**重载**值。触发器把它装载到 `Dma::run` 递减的工作计数；读 `TRANS_COUNT`
-  与 `DmaChannelState::trans_count` 返回工作计数。因此通道忙碌时写计数只改变
+  锁存**重载**值以及 `[31:28]` 传输模式。触发器把计数装载到 `Dma::run` 递减的
+  工作计数；读 `TRANS_COUNT` 与 `DmaChannelState::trans_count` 返回工作计数，
+  `DmaChannelState::trans_count_mode` 暴露锁存的模式。因此通道忙碌时写计数只改变
   下一次启动使用的值，与硬件重载寄存器一致。
 - Triggers are `CTRL_TRIG`, `AL1_TRANS_COUNT_TRIG`, `AL2_WRITE_ADDR_TRIG`,
   `AL3_READ_ADDR_TRIG` and `MULTI_CHAN_TRIGGER`. A trigger starts only a channel
@@ -743,6 +752,59 @@ clears both `EN` and `BUSY`.
   `TRANS_COUNT` 每个单元后递减并在零处饱和；到零时清除 `BUSY`、在未置
   `IRQ_QUIET` 时置位 `INTR[channel]`，并启动 `CHAIN_TO`。`run` 的返回值是
   尝试的单元数，驱动可据此限制每个 CPU 时间片内的 DMA 工作量。
+- `TRANS_COUNT.MODE` (`[31:28]`) selects the completion behaviour:
+  `0x0` **NORMAL** (above), `0x1` **TRIGGER_SELF** re-triggers the channel from
+  the reload count after the completion IRQ and `CHAIN_TO` have been handled
+  (so a single trigger keeps a self-paced channel alive), and `0xF` **ENDLESS**
+  freezes the working count: it never decrements, never completes, never chains
+  and never raises an interrupt until `CHAN_ABORT`. Addresses and the ring wrap
+  keep advancing in ENDLESS mode. Any other value is treated as NORMAL.
+  `TRANS_COUNT.MODE`（`[31:28]`）选择完成行为：`0x0` **NORMAL**（同上）、
+  `0x1` **TRIGGER_SELF** 在处理完成中断与 `CHAIN_TO` 后用重载计数重新触发自身
+  （因此一次触发即可让自节拍通道持续运行）、`0xF` **ENDLESS** 冻结工作计数：
+  不递减、永不完成、不链式、不产生中断，直到 `CHAN_ABORT`。ENDLESS 下地址与
+  环绕仍继续推进。其它值按 NORMAL 处理。
+- `CTRL_TRIG.BSWAP` transforms every unit on the write side: byte transfers are
+  unaffected, halfwords swap their two bytes (`0x1234` → `0x3412`) and words
+  reverse all four bytes (`0x1122_3344` → `0x4433_2211`).
+  `CTRL_TRIG.BSWAP` 在写侧变换每个单元：字节传输不受影响，半字交换两个字节
+  （`0x1234` → `0x3412`），字反转四个字节（`0x1122_3344` → `0x4433_2211`）。
+- `CTRL_TRIG.SNIFF_EN` feeds the observed channel's read units into the checksum
+  engine. All three conditions are required: `SNIFF_CTRL.EN[0]` is set, the
+  channel carries `CTRL_TRIG.SNIFF_EN`, and the channel index equals
+  `SNIFF_CTRL.DMACH[4:1]`. `SNIFF_DATA` (`0x458`) is both the seed written by
+  software (for example `0xFFFF_FFFF` before CRC-32) and the running
+  accumulator: each observed unit updates it, and a read applies only
+  `OUT_REV[10]` (bit reverse) and `OUT_INV[11]` (complement) to the presented
+  value, never to the stored state. `SNIFF_CTRL.CALC[8:5]` selects `0x0`
+  CRC-32/IEEE (reflected polynomial `0xEDB8_8320`), `0x1` the same CRC with
+  bit-reversed input bytes, `0x2` CRC-16-CCITT (`0x1021`), `0x3` CRC-16-CCITT
+  with bit-reversed input, `0xE` the XOR reduction (parity of all data bits,
+  result 0 or 1) and `0xF` a 32-bit addition checksum. `BSWAP[9]` byte-reverses
+  the sniffed unit before the checksum. With seed `0xFFFF_FFFF`, the bytes of
+  `"123456789"`, `CALC = 0` and `OUT_INV = 1`, `SNIFF_DATA` reads
+  `0xCBF4_3926`; CRC-16 with seed `0xFFFF` reads `0x29B1`. `CALC` values
+  `0x4..=0xD` leave the accumulator unchanged.
+  `CTRL_TRIG.SNIFF_EN` 把被观察通道读出的数据送入校验引擎。需要同时满足三个
+  条件：`SNIFF_CTRL.EN[0]` 置位、通道置 `CTRL_TRIG.SNIFF_EN`、且通道号等于
+  `SNIFF_CTRL.DMACH[4:1]`。`SNIFF_DATA`（`0x458`）既是软件写入的种子（例如
+  CRC-32 前写 `0xFFFF_FFFF`），也是运行累加器：每次观察到的单元都会更新它；
+  读出只对展示值应用 `OUT_REV[10]`（位反转）与 `OUT_INV[11]`（取反），不改变
+  存储状态。`SNIFF_CTRL.CALC[8:5]` 取值：`0x0` CRC-32/IEEE（反射多项式
+  `0xEDB8_8320`）、`0x1` 同上但输入字节位反转、`0x2` CRC-16-CCITT（`0x1021`）、
+  `0x3` 输入位反转的 CRC-16-CCITT、`0xE` 全部数据位异或折叠（奇偶，结果 0/1）、
+  `0xF` 32 位加法校验和。`BSWAP[9]` 在送入校验器前把嗅探单元按字节反转。种子
+  `0xFFFF_FFFF`、数据 `"123456789"`、`CALC = 0`、`OUT_INV = 1` 时，
+  `SNIFF_DATA` 读回 `0xCBF4_3926`；CRC-16 种子 `0xFFFF` 时读回 `0x29B1`。
+  `CALC` 的 `0x4..=0xD` 使累加器保持不变。
+- `CTRL_TRIG.HIGH_PRIORITY` changes arbitration: in every scheduling round all
+  eligible high-priority channels are served before any normal channel, while
+  channels of the same priority keep round-robin order. A busy high-priority
+  channel therefore starves normal channels (this model does not limit the
+  number of high-priority issues per round).
+  `CTRL_TRIG.HIGH_PRIORITY` 改变仲裁：每个调度轮次中所有合格的高优先级通道
+  都先于任何普通通道被服务，同优先级通道保持轮转顺序。因此忙碌的高优先级通道
+  会让普通通道饿死（本模型不限制每轮的高优先级发射次数）。
 - `CHAN_ABORT` / `Dma::abort(mask)` clears `BUSY` but keeps `EN`, the addresses
   and the remaining count, matching the datasheet; a new trigger restarts the
   channel and reloads `TRANS_COUNT` from the rewrite value (the partial count is
@@ -758,35 +820,59 @@ clears both `EN` and `BUSY`.
 ### DREQ / DREQ 请求
 
 `TREQ_SEL = 0x3F` (`TREQ_PERMANENT`) always transfers. Every other selector
-samples the host-driven level array; all 64 inputs reset asserted so firmware
-that never programs a DREQ still progresses. `set_dreq(sel, false)` pauses
+samples the host-driven level array; all inputs reset asserted except the pacing
+timer selectors, so firmware that never programs a DREQ still progresses. `set_dreq(sel, false)` pauses
 channels using that selector and `set_dreq(sel, true)` resumes them on the next
 `run`; selectors `>= 64` are ignored. `set_dreq_bank(first, levels)` writes
 eight consecutive inputs from one bitmask and one lock, which is how the PIO
 blocks publish four TX and four RX levels at once. The levels are sampled per
 `Dma::run` call (and per unit inside `BootPeripherals::pump_dma` for PIO-paced
-channels), not continuously. Selectors `0x3B..=0x3E` are the pacing timers and
-are stored but do not gate transfers yet.
+channels), not continuously. Selectors `0x3B..=0x3E` (`DREQ_DMA_TIMER0..3`)
+are driven by the four pacing timers described below.
 `TREQ_SEL = 0x3F`（`TREQ_PERMANENT`）始终可传输。其他选择器采样宿主驱动的
-电平数组；64 个输入复位时均断言，因此未编程 DREQ 的固件仍能推进。
+电平数组；除节拍定时器选择器外，输入复位时均断言，因此未编程 DREQ 的固件仍能
+推进。
 `set_dreq(sel, false)` 暂停使用该选择器的通道，`set_dreq(sel, true)` 在下一次
 `run` 时恢复；`>= 64` 的选择被忽略。`set_dreq_bank(first, levels)` 用一次加锁从
 位掩码写入连续八个输入，PIO 块据此一次发布四个 TX 与四个 RX 电平。电平在每次
 `Dma::run` 调用时采样（PIO 节拍的通道在 `BootPeripherals::pump_dma` 内逐单元
-采样），不是连续采样。`0x3B..=0x3E` 是节拍定时器选择器，仅存储，尚未门控传输。
+采样），不是连续采样。`0x3B..=0x3E`（`DREQ_DMA_TIMER0..3`）由下述四个节拍
+定时器驱动。
+
+The pacing timers are `TIMER0..3` (`0x440..=0x44C`): `X` (dividend) is in
+`bits[31:16]` and `Y` (divisor) in `bits[15:0]`, giving a request rate of
+`(X / Y) * sys_clk` — `X == Y` requests every DMA cycle and `X = 1, Y = 4`
+every four cycles. `Dma::advance(cycles)` adds `X * cycles` to a fractional
+accumulator, queues `accumulator / Y` pulses and keeps the remainder for the
+next call. The asserted level carries one queued pulse per transfer: the first
+channel transfer that samples `DREQ_DMA_TIMER0..3` (`59..=62`) consumes one
+pulse, and the level stays asserted while pulses remain. `X = 0` or `Y = 0`
+never asserts (the latter also avoids a division by zero); both fields reset to
+zero, so firmware that never programs a timer sees no request.
+Writing `TIMERx` clears the fractional accumulator and queued pulses.
+节拍定时器为 `TIMER0..3`（`0x440..=0x44C`）：`X`（被除数）在 `bits[31:16]`，
+`Y`（除数）在 `bits[15:0]`，请求速率为 `(X / Y) * sys_clk`——`X == Y` 时每个
+DMA 周期一次，`X = 1, Y = 4` 时每四个周期一次。`Dma::advance(cycles)` 把
+`X * cycles` 累加到小数累加器，排队 `累加器 / Y` 个脉冲并保留余数供下次调用。
+断言电平每放行一次传输消费一个排队脉冲：第一个采样到 `DREQ_DMA_TIMER0..3`
+（`59..=62`）的通道传输消费一个，仍有剩余脉冲时电平保持断言。`X = 0` 或
+`Y = 0` 时永不断言（后者同时避免除零）；两个字段的复位值都是 0，因此从未编程
+定时器的固件不会看到请求。写 `TIMERx` 会清空小数累加器与已排队脉冲。
 
 The RP2350 PIO selectors are `0..=23` (`PIO0_TX0` … `PIO2_RX3`), with
 `PIOx_TXy` asserted while the TX FIFO is not full and `PIOx_RXy` while the RX
 FIFO is not empty; the numbering and join behaviour are documented under
 *PIO → DMA requests*. `BootPeripherals::sync_pio_dreqs()` publishes them and
 `BootPeripherals::pump_dma()` uses `busy_selects_dreq(0, 23)` to refresh the
-levels between single units. Non-PIO selectors are still reset-asserted and are
-not driven by SPI/UART/ADC/HSTX/timers.
+levels between single units. `DREQ_HSTX` (52) is published by
+`sync_hstx_dreq()` and the pacing timers drive `59..=62`; the SPI/UART/ADC
+selectors stay reset-asserted and are not driven by their peripherals.
 RP2350 的 PIO 选择器为 `0..=23`（`PIO0_TX0` … `PIO2_RX3`）：`PIOx_TXy` 在 TX
 FIFO 未满时断言，`PIOx_RXy` 在 RX FIFO 非空时断言；编号与 join 行为见
 *PIO → DMA requests*。`BootPeripherals::sync_pio_dreqs()` 负责发布，
 `BootPeripherals::pump_dma()` 用 `busy_selects_dreq(0, 23)` 在逐单元之间刷新
-电平。非 PIO 选择器仍为复位断言状态，尚未由 SPI/UART/ADC/HSTX/定时器驱动。
+电平。`DREQ_HSTX`(52) 由 `sync_hstx_dreq()` 发布，节拍定时器驱动 `59..=62`；
+SPI/UART/ADC 选择器仍为复位断言状态，尚未由对应外设驱动。
 
 ### Chaining and interrupts / 链式与中断
 
@@ -827,18 +913,16 @@ HSTX 扫描输出使用 SDK 经典的三通道环，模型端到端复现
 
 ### Not modelled / 未建模项
 
-`BSWAP` byte swapping, `SNIFF_EN`/`SNIFF_CTRL`, `HIGH_PRIORITY` arbitration,
-the `TRANS_COUNT` transfer modes (`[31:28]`: self-trigger and endless
-transfers), the per-channel debug registers at `0x800..=0xBFF`, DMA pacing
-timers, AHB error recovery beyond clearing `BUSY` and the APB SET/CLR/XOR global
-aliases. Reads of unmodelled offsets return zero with a one-shot warning and
+The per-channel debug registers at `0x800..=0xBFF`, AHB error recovery beyond
+clearing `BUSY`, cycle-exact bus and arbitration timing, and the
+`SNIFF_CTRL.CALC` values `0x4..=0xD` (the accumulator is left unchanged there)
+are not modelled. `PERFCTR` and the other extended registers read as zero;
 writes are ignored. The DMA device never intercepts CPU bus traffic: transfers
 happen only inside `Dma::run`.
-`BSWAP` 字节交换、`SNIFF_EN`/`SNIFF_CTRL`、`HIGH_PRIORITY` 仲裁、
-`TRANS_COUNT` 传输模式（`[31:28]`：自触发与无限传输）、`0x800..=0xBFF` 的通道
-调试寄存器、DMA 节拍定时器、除清除 `BUSY` 之外的 AHB 错误恢复，以及 APB
-SET/CLR/XOR 全局别名均未建模。未建模偏移读出 0 并只警告一次，写入被忽略。
-DMA 设备不拦截 CPU 总线流量：传输只在 `Dma::run` 内部发生。
+`0x800..=0xBFF` 的通道调试寄存器、除清除 `BUSY` 之外的 AHB 错误恢复、周期精确的
+总线与仲裁时序，以及 `SNIFF_CTRL.CALC` 的 `0x4..=0xD`（累加器保持不变）未建模。
+`PERFCTR` 等扩展寄存器读出 0、写入被忽略。DMA 设备不拦截 CPU 总线流量：传输只在
+`Dma::run` 内部发生。
 
 ### Host driving / 宿主驱动方式
 
@@ -872,6 +956,16 @@ while the TX FIFO has room.
   `enabled_selects_dreq` 有意忽略 `BUSY`：通道在 `dma.run` 置 busy 之前就已使能，
   若用 busy 判定，整批会用陈旧 DREQ 电平执行、灌满 FIFO、丢字（`WOF`）并让 HSTX
   命令/数据相位失步。
+
+`pump_dma` also advances the pacing timers at the start of every call with
+`Dma::advance(64)` (the fixed `DMA_PUMP_CYCLES` budget), so `TIMER0..3` queue
+`(X * 64) / Y` pulses per pump without the host threading CPU cycle deltas
+through the hook. The cadence is approximate but deterministic, and a reset
+timer (`X = 0`) never asserts, so timer-less firmware is unaffected.
+`pump_dma` 还在每次调用开始时用 `Dma::advance(64)`（固定的 `DMA_PUMP_CYCLES`
+预算）推进节拍定时器，因此 `TIMER0..3` 每次泵送排队 `(X * 64) / Y` 个脉冲，
+无需宿主把 CPU 周期差传入钩子。节奏是近似但确定的；复位的定时器（`X = 0`）
+永不断言，因此不使用定时器的固件不受影响。
 
 ```rust
 use rp2350_core::memory::SimpleBus;

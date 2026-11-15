@@ -957,3 +957,6 @@ fn zero_length_trigger_completes_chains_and_honours_irq_quiet() {
     assert!(!f.channel(2).busy);
     assert_eq!(f.reg_read(INTR) & (1 << 2), 1 << 2);
 }
+
+#[path = "dma_feature_tests.rs"]
+mod feature;

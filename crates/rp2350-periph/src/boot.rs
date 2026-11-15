@@ -115,6 +115,16 @@ impl Timebase {
 /// 表、栈指针与入口点。
 pub const CORE1_LAUNCH_WORDS: usize = 6;
 
+/// DMA cycles advanced per [`BootPeripherals::pump_dma`] call
+/// 每次 [`BootPeripherals::pump_dma`] 调用推进的 DMA 周期数
+///
+/// A fixed budget keeps the pacing timers ticking without threading the CPU
+/// cycle delta through the host pump hook. Reset pacing timers (`X == 0`) never
+/// assert, so this is invisible to firmware that does not use them.
+/// 固定预算让节拍定时器无需宿主把 CPU 周期差传入泵送钩子；复位的节拍定时器
+/// （`X == 0`）永不断言，因此不使用它的固件看不到差异。
+const DMA_PUMP_CYCLES: u64 = 64;
+
 /// Boot vectors handed to a launcher after the FIFO launch handshake
 /// FIFO 启动握手完成后交给启动器的启动向量
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,6 +629,11 @@ impl BootPeripherals {
     ///
     /// 返回尝试的单元数。
     pub fn pump_dma(&mut self, bus: &mut dyn AddressBus, max_units: u64) -> u64 {
+        // 先推进节拍定时器：复位值 X == 0 时请求永不断言，因此未使用定时器的
+        // 固件行为不变。Advance the pacing timers first: with the reset value
+        // X == 0 no request is asserted, so firmware that never programs a
+        // timer is unaffected.
+        self.dma.advance(DMA_PUMP_CYCLES);
         let mut total = 0u64;
         while total < max_units {
             self.sync_pio_dreqs();

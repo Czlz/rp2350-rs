@@ -44,38 +44,82 @@
 //! `TREQ_SEL = 0x3F` is the permanent request and always runs. Every other
 //! selector reads the host-driven level array exposed by [`Dma::set_dreq`];
 //! unmodelled selectors default to asserted so firmware that never programs a
-//! DREQ still makes progress. Selectors `0x3B..=0x3E` (pacing timers) are
-//! stored but the timers do not pace transfers yet. The PIO FIFO selectors
-//! `0..=23` and their level semantics are documented in [`crate::dreq`] and
-//! published by [`crate::BootPeripherals::sync_pio_dreqs`].
+//! DREQ still makes progress. The PIO FIFO selectors `0..=23` and their level
+//! semantics are documented in [`crate::dreq`] and published by
+//! [`crate::BootPeripherals::sync_pio_dreqs`]. Selectors `0x3B..=0x3E` are
+//! driven by the four pacing timers: `TIMERx` uses `X[31:16]` as dividend and
+//! `Y[15:0]` as divisor, and [`Dma::advance`] queues `(X / Y) * cycles` requests.
+//! [`Dma::run`] consumes one queued pulse per sampled transfer (see
+//! `dma_pacing`).
 //! `TREQ_SEL = 0x3F` 为永久请求，始终可运行。其它选择读取 [`Dma::set_dreq`]
 //! 暴露的宿主侧电平数组；未建模的选择默认断言，使未编程 DREQ 的固件仍能推进。
-//! `0x3B..=0x3E`（节拍定时器）仅存储寄存器，定时器尚未驱动传输节奏。PIO FIFO
-//! 选择器 `0..=23` 及其电平语义见 [`crate::dreq`]，由
-//! [`crate::BootPeripherals::sync_pio_dreqs`] 发布。
+//! PIO FIFO 选择器 `0..=23` 及其电平语义见 [`crate::dreq`]，由
+//! [`crate::BootPeripherals::sync_pio_dreqs`] 发布。`0x3B..=0x3E` 由四个节拍
+//! 定时器驱动：`TIMERx` 以 `X[31:16]` 为被除数、`Y[15:0]` 为除数，
+//! [`Dma::advance`] 排队 `(X / Y) * cycles` 个请求；[`Dma::run`] 每次采样到的
+//! 传输消费一个排队脉冲（见 `dma_pacing`）。
+//!
+//! # Transfer modes, byte swap, sniffing and priority / 传输模式、字节交换、嗅探与优先级
+//!
+//! `TRANS_COUNT[31:28]` selects the transfer mode and is latched together with
+//! the reload count. `0x0` NORMAL counts down and completes; `0x1`
+//! TRIGGER_SELF behaves like NORMAL but re-triggers the channel from the reload
+//! count after the completion interrupt and `CHAIN_TO` have been handled; `0xF`
+//! ENDLESS freezes the working count, so the channel never completes, never
+//! chains and never raises an interrupt until `CHAN_ABORT`. Any other mode is
+//! treated as NORMAL. `CTRL_TRIG.BSWAP` swaps the two bytes of a halfword and
+//! reverses the four bytes of a word on the write side (byte transfers are
+//! unaffected). `CTRL_TRIG.SNIFF_EN` feeds every unit read by the observed
+//! channel into the checksum engine documented in `dma_sniff`: sniffing also
+//! requires `SNIFF_CTRL.EN` and a matching `SNIFF_CTRL.DMACH`, and the
+//! `SNIFF_DATA` register is both the seed written by software (for example
+//! `0xFFFF_FFFF` before CRC-32) and the running accumulator. `SNIFF_CTRL.CALC`
+//! selects CRC-32/IEEE (reflected input), CRC-32 with bit-reversed input bytes,
+//! CRC-16-CCITT in both bit orders, the XOR reduction (parity) or the 32-bit
+//! addition checksum; `BSWAP`, `OUT_REV` (bit reverse) and `OUT_INV`
+//! (complement) apply as described in `dma_sniff`. `CTRL_TRIG.HIGH_PRIORITY`
+//! channels are served before any normal channel in each scheduling round;
+//! channels of the same priority keep round-robin order.
+//! `TRANS_COUNT[31:28]` 选择传输模式，并与重载计数一起锁存。`0x0` NORMAL 递减
+//! 计数并完成；`0x1` TRIGGER_SELF 与 NORMAL 相同，但在处理完成中断与 `CHAIN_TO`
+//! 之后用重载计数重新触发自身；`0xF` ENDLESS 冻结工作计数，因此通道永不完成、
+//! 不链式、也不产生中断，直到 `CHAN_ABORT`。其它模式按 NORMAL 处理。
+//! `CTRL_TRIG.BSWAP` 在写侧交换半字的两字节、反转字的四字节（字节传输不受影响）。
+//! `CTRL_TRIG.SNIFF_EN` 把被观察通道每次读出的数据送入 `dma_sniff` 记录的校验
+//! 引擎：嗅探还要求 `SNIFF_CTRL.EN` 置位且 `SNIFF_CTRL.DMACH` 匹配；`SNIFF_DATA`
+//! 既是软件写入的种子（例如 CRC-32 前写 `0xFFFF_FFFF`），也是运行累加器。
+//! `SNIFF_CTRL.CALC` 选择 CRC-32/IEEE（反射输入）、输入字节位反转的 CRC-32、
+//! 两种位序的 CRC-16-CCITT、异或折叠（奇偶）或 32 位加法校验和；`BSWAP`、
+//! `OUT_REV`（位反转）与 `OUT_INV`（取反）的语义见 `dma_sniff`。
+//! `CTRL_TRIG.HIGH_PRIORITY` 通道在每个调度轮次中先于任何普通通道被服务；
+//! 同优先级的通道保持轮转顺序。
 //!
 //! # Not modelled / 未建模项
 //!
-//! `BSWAP` (byte swapping), `SNIFF_EN`/`SNIFF_CTRL` sniffing, `HIGH_PRIORITY`
-//! arbitration, `TRANS_COUNT` transfer modes (`[31:28]`), AHB error recovery
-//! beyond clearing `BUSY`, and the APB SET/CLR/XOR global aliases are accepted
-//! but have no behavioural effect. `REGISTER` reads still return the stored
-//! values. The DMA window also does not intercept CPU buses, so transfers are
-//! only performed when the host calls [`Dma::run`].
-//! `BSWAP`（字节交换）、`SNIFF_EN`/`SNIFF_CTRL` 嗅探、`HIGH_PRIORITY` 仲裁、
-//! `TRANS_COUNT` 传输模式（`[31:28]`）、除清除 `BUSY` 之外的 AHB 错误恢复，
-//! 以及 APB SET/CLR/XOR 全局别名均接受写入但无行为效果；读取仍返回存储值。
-//! DMA 窗口也不拦截 CPU 总线，只有宿主调用 [`Dma::run`] 时才执行传输。
+//! The per-channel debug registers at `0x800..=0xBFF`, AHB error recovery
+//! beyond clearing `BUSY`, and the `SNIFF_CTRL.CALC` values `0x4..=0xD` (the
+//! accumulator is left unchanged there) are not modelled. Bus timing is not
+//! cycle-exact and the DMA window does not intercept CPU buses, so transfers
+//! are only performed when the host calls [`Dma::run`].
+//! `0x800..=0xBFF` 的通道调试寄存器、除清除 `BUSY` 之外的 AHB 错误恢复，以及
+//! `SNIFF_CTRL.CALC` 的 `0x4..=0xD`（累加器保持不变）未建模。总线时序不是
+//! 周期精确的，DMA 窗口也不拦截 CPU 总线，因此只有宿主调用 [`Dma::run`] 时才
+//! 执行传输。
+
+#[path = "dma_mmio.rs"]
+mod mmio;
+#[path = "dma_pacing.rs"]
+mod pacing;
+#[path = "dma_sniff.rs"]
+mod sniff;
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rp2350_core::bus::{AddressBus, BusResult};
-use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
 use super::irq::IrqAssert;
 use super::map;
-use crate::alias::{apply_alias, split_alias};
 
 /// Number of DMA channels / DMA 通道数量
 pub const CHANNELS: usize = 16;
@@ -86,10 +130,17 @@ pub const DREQ_COUNT: usize = 64;
 /// `TREQ_SEL` value selecting the permanent request / 选择永久请求的 `TREQ_SEL` 值
 pub const TREQ_PERMANENT: u8 = 0x3F;
 
+/// First pacing timer DREQ selector (`DREQ_DMA_TIMER0`) / 首个节拍定时器 DREQ 选择器
+pub const DREQ_TIMER0: u8 = 59;
+
+/// Number of pacing timers / 节拍定时器数量
+pub const TIMER_COUNT: usize = 4;
+
 /// `CTRL_TRIG.EN` — channel enable / 通道使能
 pub const CTRL_EN: u32 = 1 << 0;
 
-/// `CTRL_TRIG.HIGH_PRIORITY` — stored, arbitration not modelled / 仅存储，仲裁未建模
+/// `CTRL_TRIG.HIGH_PRIORITY` — served before normal channels
+/// `CTRL_TRIG.HIGH_PRIORITY` — 先于普通通道被服务
 pub const CTRL_HIGH_PRIORITY: u32 = 1 << 1;
 
 /// `CTRL_TRIG.DATA_SIZE` shift / 数据宽度字段移位
@@ -128,10 +179,12 @@ pub const CTRL_TREQ_SEL_MASK: u32 = 0x3F << CTRL_TREQ_SEL_SHIFT;
 /// `CTRL_TRIG.IRQ_QUIET` — suppress the completion IRQ / 抑制完成中断
 pub const CTRL_IRQ_QUIET: u32 = 1 << 23;
 
-/// `CTRL_TRIG.BSWAP` — stored, byte swap not modelled / 仅存储，字节交换未建模
+/// `CTRL_TRIG.BSWAP` — swap bytes of the transferred unit
+/// `CTRL_TRIG.BSWAP` — 交换传输单元的字节顺序
 pub const CTRL_BSWAP: u32 = 1 << 24;
 
-/// `CTRL_TRIG.SNIFF_EN` — stored, sniffing not modelled / 仅存储，嗅探未建模
+/// `CTRL_TRIG.SNIFF_EN` — feed read units into the checksum engine
+/// `CTRL_TRIG.SNIFF_EN` — 把读出的数据送入校验引擎
 pub const CTRL_SNIFF_EN: u32 = 1 << 25;
 
 /// `CTRL_TRIG.BUSY` — read-only transfer-in-progress flag / 只读传输进行中标志
@@ -154,6 +207,74 @@ const CTRL_WRITE_MASK: u32 = 0x03FF_FFFF;
 /// `TRANS_COUNT` count field mask (transfer mode bits excluded)
 /// `TRANS_COUNT` 计数字段掩码（不含传输模式位）
 const TRANS_COUNT_MASK: u32 = 0x0FFF_FFFF;
+
+/// `TRANS_COUNT.MODE` shift / `TRANS_COUNT.MODE` 移位
+pub const TRANS_COUNT_MODE_SHIFT: u32 = 28;
+
+/// `TRANS_COUNT.MODE` mask / `TRANS_COUNT.MODE` 掩码
+pub const TRANS_COUNT_MODE_MASK: u32 = 0xF << TRANS_COUNT_MODE_SHIFT;
+
+/// `MODE = 0x0` — count down and complete / `MODE = 0x0`：递减计数并完成
+pub const TRANS_COUNT_MODE_NORMAL: u8 = 0x0;
+
+/// `MODE = 0x1` — retrigger the channel on completion
+/// `MODE = 0x1`：完成时重新触发自身
+pub const TRANS_COUNT_MODE_TRIGGER_SELF: u8 = 0x1;
+
+/// `MODE = 0xF` — endless: count frozen, never completes
+/// `MODE = 0xF`：无限模式，计数冻结、永不完成
+pub const TRANS_COUNT_MODE_ENDLESS: u8 = 0xF;
+
+/// `SNIFF_CTRL.EN` — sniffer master enable / 嗅探器总开关
+pub const SNIFF_EN: u32 = 1 << 0;
+
+/// `SNIFF_CTRL.DMACH` shift / `SNIFF_CTRL.DMACH` 移位
+pub const SNIFF_DMACH_SHIFT: u32 = 1;
+
+/// `SNIFF_CTRL.DMACH` mask / `SNIFF_CTRL.DMACH` 掩码
+pub const SNIFF_DMACH_MASK: u32 = 0xF << SNIFF_DMACH_SHIFT;
+
+/// `SNIFF_CTRL.CALC` shift / `SNIFF_CTRL.CALC` 移位
+pub const SNIFF_CALC_SHIFT: u32 = 5;
+
+/// `SNIFF_CTRL.CALC` mask / `SNIFF_CTRL.CALC` 掩码
+pub const SNIFF_CALC_MASK: u32 = 0xF << SNIFF_CALC_SHIFT;
+
+/// `CALC = 0x0` — CRC-32/IEEE with reflected input / CRC-32/IEEE（反射输入）
+pub const SNIFF_CALC_CRC32: u32 = 0x0;
+
+/// `CALC = 0x1` — CRC-32/IEEE with bit-reversed input bytes
+/// `CALC = 0x1`：CRC-32/IEEE（输入字节位反转）
+pub const SNIFF_CALC_CRC32R: u32 = 0x1;
+
+/// `CALC = 0x2` — CRC-16-CCITT (`0x1021`) / CRC-16-CCITT（`0x1021`）
+pub const SNIFF_CALC_CRC16: u32 = 0x2;
+
+/// `CALC = 0x3` — CRC-16-CCITT (`0x8408`) with bit-reversed input
+/// `CALC = 0x3`：CRC-16-CCITT（`0x8408`，输入位反转）
+pub const SNIFF_CALC_CRC16R: u32 = 0x3;
+
+/// `CALC = 0xE` — XOR reduction over all data bits (result 0 or 1)
+/// `CALC = 0xE`：全部数据位异或折叠（结果 0 或 1）
+pub const SNIFF_CALC_XOR: u32 = 0xE;
+
+/// `CALC = 0xF` — 32-bit addition checksum / 32 位加法校验和
+pub const SNIFF_CALC_SUM: u32 = 0xF;
+
+/// `SNIFF_CTRL.BSWAP` — byte-reverse the sniffed data before the checksum
+/// `SNIFF_CTRL.BSWAP` — 送入校验器前把嗅探数据按字节反转
+pub const SNIFF_BSWAP: u32 = 1 << 9;
+
+/// `SNIFF_CTRL.OUT_REV` — bit-reverse the presented result
+/// `SNIFF_CTRL.OUT_REV` — 对读出的结果做位反转
+pub const SNIFF_OUT_REV: u32 = 1 << 10;
+
+/// `SNIFF_CTRL.OUT_INV` — complement the presented result
+/// `SNIFF_CTRL.OUT_INV` — 对读出的结果取反
+pub const SNIFF_OUT_INV: u32 = 1 << 11;
+
+/// Writable `SNIFF_CTRL` bits (`EN` through `OUT_INV`) / `SNIFF_CTRL` 可写位
+const SNIFF_WRITE_MASK: u32 = 0x0000_0FFF;
 
 /// Channel register stride / 通道寄存器步长
 const CHANNEL_STRIDE: u32 = 0x40;
@@ -251,6 +372,8 @@ pub struct DmaChannelState {
     pub write_addr: u32,
     /// Working transfer count (not the rewrite value) / 工作传输计数（非重载值）
     pub trans_count: u32,
+    /// Latched `TRANS_COUNT.MODE` / 锁存的 `TRANS_COUNT.MODE`
+    pub trans_count_mode: u8,
     /// Stored `CTRL_TRIG` value including `BUSY` / 存储的 `CTRL_TRIG` 值（含 `BUSY`）
     pub ctrl: u32,
     /// Transfer currently in progress / 当前是否有传输进行中
@@ -278,6 +401,8 @@ struct Channel {
     /// `trans_count` by the next trigger / 写 `TRANS_COUNT` 锁存的重载值，
     /// 由下一次触发装载到 `trans_count`
     trans_count_reload: u32,
+    /// Transfer mode latched with the reload value / 与重载值一起锁存的传输模式
+    trans_count_mode: u8,
     ctrl: u32,
     busy: bool,
 }
@@ -291,6 +416,12 @@ struct DmaState {
     intf: [u16; 4],
     dreq: [bool; DREQ_COUNT],
     timer: [u32; 4],
+    /// Fractional pacing accumulator (`X` fraction carried across calls)
+    /// 小数节拍累加器（`X` 的余数跨调用结转）
+    timer_acc: [u128; 4],
+    /// Queued pacing pulses, consumed one per sampled transfer
+    /// 已排队的节拍脉冲，每次采样到的传输消费一个
+    timer_pending: [u32; 4],
     sniff_ctrl: u32,
     sniff_data: u32,
     cursor: usize,
@@ -298,16 +429,23 @@ struct DmaState {
 
 impl Default for DmaState {
     fn default() -> Self {
+        // 复位时 TIMERx 的 X == 0，按硬件语义永不断言；其余未建模选择器默认断言。
+        // At reset TIMERx has X == 0 and never asserts; the other unmodelled
+        // selectors default to asserted.
+        let mut dreq = [true; DREQ_COUNT];
+        let first = usize::from(DREQ_TIMER0);
+        for level in &mut dreq[first..first + TIMER_COUNT] {
+            *level = false;
+        }
         Self {
             channels: [Channel::default(); CHANNELS],
             intr: 0,
             inte: [0; 4],
             intf: [0; 4],
-            // 未建模的 DREQ 选择默认断言，仅永久请求与宿主门控例外。
-            // Unmodelled DREQ selectors default to asserted; only the permanent
-            // request and host gating change that.
-            dreq: [true; DREQ_COUNT],
+            dreq,
             timer: [0; 4],
+            timer_acc: [0; 4],
+            timer_pending: [0; 4],
             sniff_ctrl: 0,
             sniff_data: 0,
             cursor: 0,
@@ -333,6 +471,9 @@ struct DmaJob {
     read_addr: u32,
     write_addr: u32,
     data_size: u8,
+    /// Snapshot of `CTRL_TRIG` for byte swap / sniff gating
+    /// 用于字节交换与嗅探门控的 `CTRL_TRIG` 快照
+    ctrl: u32,
 }
 
 /// Which side of a transfer hit a bus error / 传输哪一侧遇到总线错误
@@ -367,6 +508,26 @@ impl Dma {
         }
     }
 
+    /// Advance the four pacing timers by `cycles` DMA cycles
+    /// 按 `cycles` 个 DMA 周期推进四个节拍定时器
+    ///
+    /// `TIMERx` `<31:16>` (X) is the dividend and `<15:0>` (Y) the divisor, so a
+    /// timer requests at `(X / Y) * sys_clk`: `X == Y` yields one request per
+    /// cycle and `X = 1, Y = 4` one every four cycles. Pulses are queued, and a
+    /// [`Self::run`] transfer that samples the asserted `DREQ_DMA_TIMERn`
+    /// selector (`59..=62`) consumes one. `X == 0` or `Y == 0` never asserts.
+    /// [`crate::BootPeripherals::pump_dma`] calls this with a fixed 64-cycle
+    /// budget per pump.
+    /// `TIMERx` 的 `<31:16>`（X）是被除数，`<15:0>`（Y）是除数，因此定时器以
+    /// `(X / Y) * sys_clk` 的速率请求：`X == Y` 每个周期一次，`X = 1, Y = 4`
+    /// 每四个周期一次。脉冲进入队列，[`Self::run`] 中采样到 `DREQ_DMA_TIMERn`
+    /// （`59..=62`）电平的传输消费一个。`X == 0` 或 `Y == 0` 永不断言。
+    /// [`crate::BootPeripherals::pump_dma`] 每次泵送用固定的 64 周期预算调用本方法。
+    pub fn advance(&mut self, cycles: u64) {
+        let mut state = self.state.lock();
+        pacing::advance(&mut state, cycles);
+    }
+
     /// Execute at most `max_transfers` data units across all channels
     /// 在所有通道上最多执行 `max_transfers` 个数据单元
     ///
@@ -388,14 +549,45 @@ impl Dma {
                 break;
             };
             let outcome = match read_unit(bus, job.read_addr, job.data_size, &mut cycles) {
-                Ok(value) => write_unit(bus, job.write_addr, job.data_size, value, &mut cycles)
-                    .map_err(|_| BusFault::Write),
+                Ok(value) => {
+                    // 嗅探观察读侧原始数据（字节交换之前），写侧再应用 BSWAP。
+                    // The sniffer observes the raw read data (before BSWAP);
+                    // the write side applies the byte swap afterwards.
+                    self.sniff_unit(job.channel, job.ctrl, value, job.data_size);
+                    let value = apply_bswap(job.ctrl, value, job.data_size);
+                    write_unit(bus, job.write_addr, job.data_size, value, &mut cycles)
+                        .map_err(|_| BusFault::Write)
+                }
                 Err(_) => Err(BusFault::Read),
             };
             self.finish_job(job.channel, outcome.err());
             performed += 1;
         }
         performed
+    }
+
+    /// Feed one observed read unit into the sniff accumulator
+    /// 把一个观察到的读单元送入嗅探累加器
+    ///
+    /// Accumulation requires all three conditions: `SNIFF_CTRL.EN` is set, the
+    /// channel carries `CTRL_TRIG.SNIFF_EN`, and the channel index equals
+    /// `SNIFF_CTRL.DMACH`.
+    /// 累加需要同时满足三个条件：`SNIFF_CTRL.EN` 置位、通道置
+    /// `CTRL_TRIG.SNIFF_EN`、且通道号等于 `SNIFF_CTRL.DMACH`。
+    fn sniff_unit(&self, channel: usize, ctrl: u32, value: u32, data_size: u8) {
+        if ctrl & CTRL_SNIFF_EN == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        let sniff_ctrl = state.sniff_ctrl;
+        if sniff_ctrl & SNIFF_EN == 0 {
+            return;
+        }
+        let dmach = ((sniff_ctrl & SNIFF_DMACH_MASK) >> SNIFF_DMACH_SHIFT) as usize;
+        if dmach != channel {
+            return;
+        }
+        sniff::accumulate(sniff_ctrl, &mut state.sniff_data, value, data_size);
     }
 
     /// Drive one host DREQ input; selectors `>= 64` are ignored
@@ -526,6 +718,7 @@ impl Dma {
             read_addr: channel.read_addr,
             write_addr: channel.write_addr,
             trans_count: channel.trans_count,
+            trans_count_mode: channel.trans_count_mode,
             ctrl: channel.ctrl | busy,
             busy: channel.busy,
             enabled: channel.ctrl & CTRL_EN != 0,
@@ -537,34 +730,44 @@ impl Dma {
     }
 
     /// Pick the next eligible channel / 选择下一个可执行通道
+    ///
+    /// High-priority channels are considered first; normal channels are then
+    /// visited round-robin. Within one priority class the cursor keeps the
+    /// existing rotation order.
+    /// 先考虑高优先级通道，随后轮转普通通道；同一优先级内游标保持原有轮转顺序。
     fn claim_job(&self) -> Option<DmaJob> {
         let mut state = self.state.lock();
         let start = state.cursor;
-        for step in 0..CHANNELS {
-            let index = (start + step) % CHANNELS;
-            let (busy, enabled, treq) = {
+        for high_priority in [true, false] {
+            for step in 0..CHANNELS {
+                let index = (start + step) % CHANNELS;
                 let channel = &state.channels[index];
-                (
-                    channel.busy,
-                    channel.ctrl & CTRL_EN != 0,
-                    ((channel.ctrl & CTRL_TREQ_SEL_MASK) >> CTRL_TREQ_SEL_SHIFT) as u8,
-                )
-            };
-            if !busy || !enabled {
-                continue;
+                let eligible = channel.busy
+                    && channel.ctrl & CTRL_EN != 0
+                    && (channel.ctrl & CTRL_HIGH_PRIORITY != 0) == high_priority;
+                if !eligible {
+                    continue;
+                }
+                let treq = ((channel.ctrl & CTRL_TREQ_SEL_MASK) >> CTRL_TREQ_SEL_SHIFT) as u8;
+                if treq != TREQ_PERMANENT && !state.dreq[usize::from(treq)] {
+                    continue;
+                }
+                let job = DmaJob {
+                    channel: index,
+                    read_addr: channel.read_addr,
+                    write_addr: channel.write_addr,
+                    data_size: ((channel.ctrl & CTRL_DATA_SIZE_MASK) >> CTRL_DATA_SIZE_SHIFT) as u8,
+                    ctrl: channel.ctrl,
+                };
+                // 定时器节拍是单次脉冲：被通道接受后立即撤销并重载 Y。
+                // A pacing tick is a one-shot pulse: accepting it deasserts the
+                // request and reloads the countdown from Y.
+                if let Some(timer) = pacing::timer_index(treq) {
+                    pacing::consume(&mut state, timer);
+                }
+                state.cursor = (index + 1) % CHANNELS;
+                return Some(job);
             }
-            if treq != TREQ_PERMANENT && !state.dreq[usize::from(treq)] {
-                continue;
-            }
-            let channel = &state.channels[index];
-            let job = DmaJob {
-                channel: index,
-                read_addr: channel.read_addr,
-                write_addr: channel.write_addr,
-                data_size: ((channel.ctrl & CTRL_DATA_SIZE_MASK) >> CTRL_DATA_SIZE_SHIFT) as u8,
-            };
-            state.cursor = (index + 1) % CHANNELS;
-            return Some(job);
         }
         None
     }
@@ -572,55 +775,66 @@ impl Dma {
     /// Commit one unit: advance addresses, decrement the count, chain and IRQ
     /// 提交一个数据单元：推进地址、递减计数、链式启动与中断
     fn finish_job(&self, index: usize, fault: Option<BusFault>) {
+        let mut state = self.state.lock();
+        let mut completed = false;
+        let mut quiet = true;
+        let mut chain = index;
+        let mut retrigger = false;
         {
-            let mut state = self.state.lock();
-            let completed;
-            let quiet;
-            let chain;
-            {
-                let channel = &mut state.channels[index];
-                if let Some(fault) = fault {
-                    // 总线错误会终止通道并记录错误位，不再产生完成中断。
-                    // A bus error stops the channel and latches the error bit;
-                    // it does not raise a completion interrupt.
-                    channel.ctrl |= match fault {
-                        BusFault::Read => CTRL_READ_ERROR,
-                        BusFault::Write => CTRL_WRITE_ERROR,
-                    };
-                    channel.busy = false;
-                    completed = false;
-                    quiet = true;
-                    chain = index;
-                } else {
-                    let ring_size = (channel.ctrl & CTRL_RING_SIZE_MASK) >> CTRL_RING_SIZE_SHIFT;
-                    let ring_sel = channel.ctrl & CTRL_RING_SEL != 0;
-                    // 数据宽度 0/1/2 = 1/2/4 字节；保留值 3 按字处理。
-                    // Data size 0/1/2 = 1/2/4 bytes; reserved 3 is treated as word.
-                    let step = 1u32 << u32::min(data_size_field(channel.ctrl), 2);
-                    if channel.ctrl & CTRL_INCR_READ != 0 {
-                        channel.read_addr = advance(channel.read_addr, step, ring_size, !ring_sel);
-                    }
-                    if channel.ctrl & CTRL_INCR_WRITE != 0 {
-                        channel.write_addr = advance(channel.write_addr, step, ring_size, ring_sel);
-                    }
+            let channel = &mut state.channels[index];
+            if let Some(fault) = fault {
+                // 总线错误会终止通道并记录错误位，不再产生完成中断。
+                // A bus error stops the channel and latches the error bit;
+                // it does not raise a completion interrupt.
+                channel.ctrl |= match fault {
+                    BusFault::Read => CTRL_READ_ERROR,
+                    BusFault::Write => CTRL_WRITE_ERROR,
+                };
+                channel.busy = false;
+            } else {
+                let ring_size = (channel.ctrl & CTRL_RING_SIZE_MASK) >> CTRL_RING_SIZE_SHIFT;
+                let ring_sel = channel.ctrl & CTRL_RING_SEL != 0;
+                // 数据宽度 0/1/2 = 1/2/4 字节；保留值 3 按字处理。
+                // Data size 0/1/2 = 1/2/4 bytes; reserved 3 is treated as word.
+                let step = 1u32 << u32::min(data_size_field(channel.ctrl), 2);
+                if channel.ctrl & CTRL_INCR_READ != 0 {
+                    channel.read_addr = advance(channel.read_addr, step, ring_size, !ring_sel);
+                }
+                if channel.ctrl & CTRL_INCR_WRITE != 0 {
+                    channel.write_addr = advance(channel.write_addr, step, ring_size, ring_sel);
+                }
+                // ENDLESS 冻结计数：永不完成、不链式、不产生中断，直到 CHAN_ABORT。
+                // ENDLESS freezes the count: no completion, chaining or IRQ until
+                // CHAN_ABORT.
+                if channel.trans_count_mode != TRANS_COUNT_MODE_ENDLESS {
                     channel.trans_count = channel.trans_count.saturating_sub(1);
                     completed = channel.trans_count == 0;
                     quiet = channel.ctrl & CTRL_IRQ_QUIET != 0;
                     chain = ((channel.ctrl & CTRL_CHAIN_TO_MASK) >> CTRL_CHAIN_TO_SHIFT) as usize;
                     if completed {
                         channel.busy = false;
+                        retrigger = channel.trans_count_mode == TRANS_COUNT_MODE_TRIGGER_SELF;
                     }
                 }
             }
-            if completed {
-                if !quiet {
-                    state.intr |= 1u16 << index;
-                }
-                if chain != index {
-                    trigger_channel(&mut state, chain);
-                }
+        }
+        if completed {
+            if !quiet {
+                state.intr |= 1u16 << index;
+            }
+            if chain != index {
+                trigger_channel(&mut state, chain);
+            }
+            if retrigger {
+                // 自触发：用重载计数立即重启；重载为 0 时保持空闲。
+                // Self-trigger: restart immediately from the reload count; a
+                // zero reload leaves the channel idle.
+                let channel = &mut state.channels[index];
+                channel.trans_count = channel.trans_count_reload;
+                channel.busy = channel.trans_count != 0;
             }
         }
+        drop(state);
         self.refresh_irq();
     }
 
@@ -646,17 +860,6 @@ fn advance(address: u32, step: u32, ring_size: u32, ring: bool) -> u32 {
     }
     let mask = (1u32 << ring_size) - 1;
     (address & !mask) | (address.wrapping_add(step) & mask)
-}
-
-/// Side effect of a channel register write / 通道寄存器写入的副作用
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteEffect {
-    /// The register is only stored / 仅存储寄存器值
-    Plain,
-    /// A non-zero value starts the channel; a zero value raises the
-    /// "null trigger" interrupt when `IRQ_QUIET` is set
-    /// 非零值启动通道；零值在置位 `IRQ_QUIET` 时产生“空触发”中断
-    Trigger,
 }
 
 /// Start a channel from a trigger, reloading its working count
@@ -739,226 +942,20 @@ fn write_unit(
     }
 }
 
-/// Apply one per-channel register write, returning its side effect
-/// 应用一次通道寄存器写入，并返回其副作用
+/// Apply the `BSWAP` byte transformation to one data unit
+/// 对一个数据单元应用 `BSWAP` 字节变换
 ///
-/// The destination register is addressed by its offset inside the channel
-/// block (`0x00..=0x3C`). Trigger policy lives in the caller so that a single
-/// `WriteEffect` decides between a plain store and a channel start.
-/// 目标寄存器由通道块内偏移（`0x00..=0x3C`）指定。触发策略留在调用方，用一个
-/// `WriteEffect` 区分普通存储与启动通道。
-fn write_channel_register(
-    state: &mut DmaState,
-    index: usize,
-    register: u32,
-    value: u32,
-) -> Option<WriteEffect> {
-    let channel = state.channels.get_mut(index)?;
-    let effect = match register {
-        CH_READ_ADDR | CH_AL1_READ_ADDR | CH_AL2_READ_ADDR => {
-            channel.read_addr = value;
-            WriteEffect::Plain
-        }
-        CH_AL3_READ_ADDR_TRIG => {
-            channel.read_addr = value;
-            WriteEffect::Trigger
-        }
-        CH_WRITE_ADDR | CH_AL1_WRITE_ADDR | CH_AL3_WRITE_ADDR => {
-            channel.write_addr = value;
-            WriteEffect::Plain
-        }
-        CH_AL2_WRITE_ADDR_TRIG => {
-            channel.write_addr = value;
-            WriteEffect::Trigger
-        }
-        // 计数别名只锁存重载值，由触发器装载到工作计数。
-        // The count aliases only latch the rewrite value; a trigger copies it
-        // into the working count.
-        CH_TRANS_COUNT | CH_AL2_TRANS_COUNT | CH_AL3_TRANS_COUNT => {
-            channel.trans_count_reload = value & TRANS_COUNT_MASK;
-            WriteEffect::Plain
-        }
-        CH_AL1_TRANS_COUNT_TRIG => {
-            channel.trans_count_reload = value & TRANS_COUNT_MASK;
-            WriteEffect::Trigger
-        }
-        CH_CTRL_TRIG => {
-            write_ctrl(channel, value);
-            WriteEffect::Trigger
-        }
-        // AL1/AL2/AL3_CTRL 是**非触发**控制别名：Pico SDK 的
-        // dma_channel_configure(..., false) 正是写 al1_ctrl 来配置通道而不启动。
-        // The AL1/AL2/AL3_CTRL aliases are non-triggering control writes;
-        // dma_channel_configure(..., false) relies on that.
-        CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
-            write_ctrl(channel, value);
-            WriteEffect::Plain
-        }
-        _ => return None,
-    };
-    Some(effect)
-}
-
-/// Apply a `CTRL_TRIG` write to a channel / 将 `CTRL_TRIG` 写入应用到通道
-fn write_ctrl(channel: &mut Channel, value: u32) {
-    // 错误位为写 1 清零，其余可写位按写入值覆盖。
-    // Error flags are write-one-to-clear; every other writable bit is replaced.
-    let errors = channel.ctrl & CTRL_ERROR_MASK & !(value & CTRL_ERROR_MASK);
-    channel.ctrl = (value & CTRL_WRITE_MASK) | errors;
-    if channel.ctrl & CTRL_EN == 0 {
-        channel.busy = false;
+/// Byte units are unaffected, halfwords swap their two bytes and words reverse
+/// all four; the reserved `DATA_SIZE = 3` follows the word path.
+/// 字节单元不受影响，半字交换两个字节，字反转四个字节；保留的 `DATA_SIZE = 3`
+/// 跟随字路径。
+fn apply_bswap(ctrl: u32, value: u32, data_size: u8) -> u32 {
+    if ctrl & CTRL_BSWAP == 0 {
+        return value;
     }
-}
-
-/// Compute `INTSn` for one interrupt line / 计算某条中断线的 `INTSn`
-fn line_status(state: &DmaState, line: usize) -> u32 {
-    u32::from(state.intr & state.inte[line]) | u32::from(state.intf[line])
-}
-
-impl MmioDevice for Dma {
-    fn name(&self) -> &str {
-        "DMA"
-    }
-
-    fn window(&self) -> MmioWindow {
-        MmioWindow::new(map::DMA_BASE, map::DMA_SIZE)
-    }
-
-    fn read32(&mut self, offset: u32) -> Option<u32> {
-        let (offset, _alias) = split_alias(offset);
-        let state = self.state.lock();
-        match offset {
-            0x000..CHANNEL_REGION_END => {
-                let index = (offset / CHANNEL_STRIDE) as usize;
-                let register = offset % CHANNEL_STRIDE;
-                let channel = state.channels.get(index)?;
-                Some(match register {
-                    CH_READ_ADDR | CH_AL1_READ_ADDR | CH_AL2_READ_ADDR | CH_AL3_READ_ADDR_TRIG => {
-                        channel.read_addr
-                    }
-                    CH_WRITE_ADDR
-                    | CH_AL1_WRITE_ADDR
-                    | CH_AL2_WRITE_ADDR_TRIG
-                    | CH_AL3_WRITE_ADDR => channel.write_addr,
-                    CH_TRANS_COUNT
-                    | CH_AL1_TRANS_COUNT_TRIG
-                    | CH_AL2_TRANS_COUNT
-                    | CH_AL3_TRANS_COUNT => channel.trans_count,
-                    CH_CTRL_TRIG | CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
-                        channel.ctrl | (u32::from(channel.busy) * CTRL_BUSY)
-                    }
-                    _ => return None,
-                })
-            }
-            GLOBAL_INTR => Some(u32::from(state.intr)),
-            0x404..=0x43C => {
-                let line = ((offset - GLOBAL_INTE0) / INT_LINE_STRIDE) as usize;
-                match (offset - GLOBAL_INTE0) % INT_LINE_STRIDE {
-                    0 => Some(u32::from(state.inte[line])),
-                    4 => Some(u32::from(state.intf[line])),
-                    8 => Some(line_status(&state, line)),
-                    _ => None,
-                }
-            }
-            GLOBAL_TIMER0..=0x44C => Some(state.timer[((offset - GLOBAL_TIMER0) / 4) as usize]),
-            GLOBAL_MULTI_CHAN_TRIGGER | GLOBAL_FIFO_LEVELS | GLOBAL_CHAN_ABORT => Some(0),
-            GLOBAL_SNIFF_CTRL => Some(state.sniff_ctrl),
-            GLOBAL_SNIFF_DATA => Some(state.sniff_data),
-            GLOBAL_N_CHANNELS => Some(CHANNELS as u32),
-            _ => None,
-        }
-    }
-
-    fn write32(&mut self, offset: u32, value: u32) -> bool {
-        // The Pico SDK uses hw_set_bits/hw_clear_bits/hw_xor_bits on DMA
-        // registers (e.g. INTE1 via 0x5000_2414), so fold the alias first.
-        // Pico SDK 会对 DMA 寄存器使用 hw_set_bits/hw_clear_bits/hw_xor_bits
-        // （例如经 0x5000_2414 写 INTE1），因此先合并别名。
-        let (offset, alias) = split_alias(offset);
-        let value = apply_alias(self.read32(offset).unwrap_or(0), value, alias);
-        let handled;
-        {
-            let mut state = self.state.lock();
-            handled = match offset {
-                0x000..CHANNEL_REGION_END => {
-                    let index = (offset / CHANNEL_STRIDE) as usize;
-                    let register = offset % CHANNEL_STRIDE;
-                    let Some(effect) = write_channel_register(&mut state, index, register, value)
-                    else {
-                        return false;
-                    };
-                    match effect {
-                        WriteEffect::Plain => {}
-                        WriteEffect::Trigger if value != 0 => {
-                            trigger_channel(&mut state, index);
-                        }
-                        WriteEffect::Trigger => {
-                            // 零值写入是“空触发”：置位 IRQ_QUIET 时仍会产生完成中断。
-                            // A zero write is a null trigger: it still raises the
-                            // completion interrupt when IRQ_QUIET is set.
-                            if state.channels[index].ctrl & CTRL_IRQ_QUIET != 0 {
-                                state.intr |= 1u16 << index;
-                            }
-                        }
-                    }
-                    true
-                }
-                GLOBAL_INTR | GLOBAL_INTS0 | 0x41C | 0x42C | 0x43C => {
-                    // INTR 与 INTSn 均为写 1 清零。INTR and INTSn are W1C.
-                    state.intr &= !(value as u16);
-                    true
-                }
-                0x404..=0x43C => {
-                    let line = ((offset - GLOBAL_INTE0) / INT_LINE_STRIDE) as usize;
-                    match (offset - GLOBAL_INTE0) % INT_LINE_STRIDE {
-                        0 => state.inte[line] = value as u16,
-                        4 => state.intf[line] = value as u16,
-                        _ => return false,
-                    }
-                    true
-                }
-                GLOBAL_TIMER0..=0x44C => {
-                    state.timer[((offset - GLOBAL_TIMER0) / 4) as usize] = value;
-                    true
-                }
-                GLOBAL_MULTI_CHAN_TRIGGER => {
-                    for index in 0..CHANNELS {
-                        if value & (1u32 << index) != 0 {
-                            trigger_channel(&mut state, index);
-                        }
-                    }
-                    true
-                }
-                GLOBAL_SNIFF_CTRL => {
-                    state.sniff_ctrl = value;
-                    true
-                }
-                GLOBAL_SNIFF_DATA => {
-                    state.sniff_data = value;
-                    true
-                }
-                GLOBAL_CHAN_ABORT => {
-                    for index in 0..CHANNELS {
-                        if value & (1u32 << index) != 0 {
-                            state.channels[index].busy = false;
-                        }
-                    }
-                    true
-                }
-                GLOBAL_FIFO_LEVELS | GLOBAL_N_CHANNELS => true,
-                _ => false,
-            };
-        }
-        self.refresh_irq();
-        handled
-    }
-
-    fn reset(&mut self) {
-        self.state.lock().reset();
-        self.refresh_irq();
-    }
-
-    fn irq_number(&self) -> Option<u16> {
-        Some(map::DMA_IRQ_0)
+    match data_size {
+        0 => value,
+        1 => u32::from((value as u16).swap_bytes()),
+        _ => value.swap_bytes(),
     }
 }
