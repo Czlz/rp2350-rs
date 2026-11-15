@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use rp2350_cli::{play, run};
 
 mod devices;
 mod gdb_target;
 mod mcp_serve;
 mod perfbench;
 mod repl;
-mod run;
 #[cfg(test)]
 mod test_support;
 
@@ -154,6 +154,56 @@ enum Commands {
         strict_decode: bool,
     },
 
+    /// Play a guest frame buffer in a background worker
+    /// 在后台 worker 中播放客户机帧缓冲
+    Play {
+        /// Firmware file (UF2 or ELF) / 固件文件（UF2 或 ELF）
+        #[arg(short, long)]
+        file: String,
+
+        /// Frame buffer spec `ADDR:WxH[:STRIDE]` / 帧缓冲规格
+        #[arg(long, value_name = "ADDR:WxH[:STRIDE]", value_parser = play::FrameSpec::parse)]
+        fb: play::FrameSpec,
+
+        /// Guest steps executed per published frame / 每发布一帧执行的客户机步数
+        #[arg(long, default_value_t = 2_500_000)]
+        steps_per_frame: u64,
+
+        /// Stop after this many frames (headless test mode)
+        /// 跑满该帧数后停止（无 GUI 测试模式）
+        #[arg(long)]
+        frames: Option<u64>,
+
+        /// Button pin bitmap (bit set = pressed = pin low)
+        /// 按键引脚位图（置位 = 按下 = 引脚低电平）
+        #[arg(long, value_name = "MASK", default_value = "0x3FF", value_parser = play::parse_button_mask)]
+        buttons: u16,
+
+        /// Capture I2S audio words through an `AudioTap`
+        /// 通过 `AudioTap` 捕获 I2S 音频字
+        #[arg(long)]
+        audio: bool,
+
+        /// Leading steps of the first frame printed as `[trace]` lines
+        /// 第一帧开头以 `[trace]` 行打印的步数
+        #[arg(long, default_value_t = 0)]
+        trace_steps: usize,
+
+        /// Total instruction budget (`u64::MAX` = unlimited)
+        /// 总指令预算（`u64::MAX` 表示不限制）
+        #[arg(long, default_value_t = u64::MAX)]
+        max_cycles: u64,
+
+        /// CPU architecture override / CPU 架构覆盖
+        #[arg(long, value_enum)]
+        arch: Option<run::ArchArg>,
+
+        /// Halt on undefined instructions instead of skipping them
+        /// 遇到未定义指令时停机而不是跳过
+        #[arg(long)]
+        strict_decode: bool,
+    },
+
     /// Start GDB server / 启动 GDB 服务器
     Gdb {
         /// Firmware file (ELF) / 固件文件（ELF）
@@ -215,6 +265,10 @@ enum Commands {
     },
 }
 
+// 子命令分发是纯样板代码，行数由 CLI 表面决定，拆分反而降低可读性。
+// Subcommand dispatch is boilerplate whose length follows the CLI surface;
+// splitting it would only hurt readability.
+#[allow(clippy::too_many_lines)]
 fn main() {
     rp2350_core::watch::init();
     let cli = Cli::parse();
@@ -285,6 +339,32 @@ fn main() {
                 strict_decode,
             };
             finish(perfbench::run(&options), "perfbench failed / 基准测试失败");
+        }
+        Commands::Play {
+            file,
+            fb,
+            steps_per_frame,
+            frames,
+            buttons,
+            audio,
+            trace_steps,
+            max_cycles,
+            arch,
+            strict_decode,
+        } => {
+            let options = play::PlayOptions {
+                file: file.into(),
+                frame: fb,
+                steps_per_frame,
+                max_frames: frames,
+                buttons,
+                audio,
+                arch,
+                strict_decode,
+                max_cycles,
+                trace_steps,
+            };
+            finish(play::run(&options), "play failed / 播放失败");
         }
         Commands::Gdb { file, port } => {
             let options = gdb_target::GdbOptions {
@@ -431,5 +511,36 @@ mod tests {
         let error = parse(&["list-devices", "--reload", "--watch"])
             .expect_err("--reload must conflict with --watch");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn play_parses_frame_spec_and_headless_frame_limit() {
+        let cli = parse(&[
+            "play",
+            "--file",
+            "emerald.uf2",
+            "--fb",
+            "0x20063DF4:240x160",
+            "--frames",
+            "2",
+        ])
+        .expect("parse play");
+        let Commands::Play {
+            fb,
+            frames,
+            buttons,
+            steps_per_frame,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the play subcommand");
+        };
+        assert_eq!(fb.base, 0x2006_3DF4);
+        assert_eq!(fb.width, 240);
+        assert_eq!(fb.height, 160);
+        assert_eq!(fb.stride_bytes, 480);
+        assert_eq!(frames, Some(2));
+        assert_eq!(buttons, play::DEFAULT_BUTTON_PINS);
+        assert_eq!(steps_per_frame, 2_500_000);
     }
 }

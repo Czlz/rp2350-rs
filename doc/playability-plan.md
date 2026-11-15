@@ -37,8 +37,8 @@ keyboard/gamepad input, audio output, and no crashes.
                  └──────────────┘  (AudioSink)      └──────────────┘
 ```
 
-- 为让 GUI 复用 `Machine`，`rp2350-cli` 需要新增 **lib target**（现在只有 bin），
-  `rp2350-egui` 依赖它（`rp2350_cli::run::Machine`）。
+- `rp2350-cli` 已拆出 **lib target**（`rp2350_cli::run::Machine`），`rp2350-egui`
+  依赖即可复用同一台机器；`PlaySession`（`rp2350_cli::play`）提供后台帧与输入。
 - 帧源用**示例配置**（帧缓冲地址/格式）而不是 HSTX 像素流：HSTX 无扫描线/帧边界模型，
   而 `g_fb` 是固件每帧完整渲染的最终图像（已被 1.2 G 步的 Game Freak 帧验证）。
 - 输入走 `GpioPads::set_external_pin`（GP0..9，低有效），与固件的 `gpio_get_all()` 一致。
@@ -59,7 +59,7 @@ keyboard/gamepad input, audio output, and no crashes.
 
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
-| P1-1 | `play` worker：独占线程运行 `Machine`，按墙钟节拍推进；发布 RGB565 帧（三缓冲）；接收按钮掩码；`--headless --frames N` 测试模式 | `rp2350-cli`（新增 lib target + `play.rs`） | 无 GUI 也能跑：headless 模式产出 N 帧、帧间隔符合墙钟、输入掩码生效；测试 ≥8 |
+| P1-1 ✅ | `play` worker：独占线程运行 `Machine`，按墙钟节拍推进；发布 RGB565 帧（单槽最新帧/三缓冲语义）；接收按钮掩码；`--frames N` 无 GUI 测试模式 | `rp2350-cli`（新增 lib target + `play.rs`） | **实测 6.1–7.0 fps / 15.3–17.5 M steps/s**（emerald，`--steps-per-frame 2500000 --frames 20`，两次运行，退出码 0，20 帧记录 + 汇总）；按钮掩码单测（按下→低 / 松开→高 / 只动配置引脚）；`cargo test -p rp2350-cli` 126 passed / 1 ignored（新增 16 项 `play` 测试 + 1 项 CLI 解析） |
 | P1-2 | egui PlayView：纹理上传 + 缩放（保持 3:2）+ 键盘映射（方向键/Z/X/Enter/Backspace）；标签页「游戏」 | `rp2350-egui` | 80×60/320×240/1280×720 无头渲染；键盘→掩码单测；`cargo test -p rp2350-egui` 全绿 |
 | P1-3 | 示例配置：`example/gba/profile.toml`（固件路径、帧缓冲/格式、按钮引脚、音频 SM）与 `README` 游玩步骤 | `example/gba` + 主会话 | 一条命令启动示例；文档含按键表 |
 
@@ -93,6 +93,7 @@ keyboard/gamepad input, audio output, and no crashes.
 - **性能**：两轮后 14.8 M steps/s（累计 4.6×）。按每游戏帧 ≈2.5 M 步计算约 **6 fps**；30 fps 需 ≥75 M steps/s，60 fps 需 ≥150 M。P0-3a/b 之后若仍 <30 fps，实时游玩只能降级演示，需要 P0-3c 决策是否投入 JIT/帧级并行；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
-- **GUI 架构**：`Machine` 目前只在 `rp2350-cli` bin 内部；P1-1 的 lib 化是必要前置。
+- **GUI 架构**：`rp2350-cli` 已提供 lib target（`rp2350_cli::run::Machine` +
+  `rp2350_cli::play::PlaySession`），P1-2 的 egui PlayView 直接依赖即可。
 - **音频**：`cpal` 在无声卡/CI 环境会失败；插件必须可选、可静默。
 - **示例耦合**：帧缓冲地址与按钮引脚属于示例配置，必须放 `example/gba/`，不写死进模拟器。

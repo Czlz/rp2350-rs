@@ -8,10 +8,10 @@
 > RISC-V 固件，并按三种模式驱动：带轨迹的 `run`、交互式 USB CDC raw REPL
 > （`repl`）、基准测试（`perfbench`）。
 >
-> **Status**: implemented — `run` / `repl` / `perfbench` / `gdb` /
+> **Status**: implemented — `run` / `repl` / `perfbench` / `play` / `gdb` /
 > `list-devices` / `wire` / `mcp-serve`.
-> **状态**: 已实现 — `run` / `repl` / `perfbench` / `gdb` / `list-devices` /
-> `wire` / `mcp-serve`。
+> **状态**: 已实现 — `run` / `repl` / `perfbench` / `play` / `gdb` /
+> `list-devices` / `wire` / `mcp-serve`。
 
 ---
 
@@ -238,6 +238,95 @@ The script is assembled by
 脚本由 `rp2350_usb_host::assemble_bench_script`（基准 + benchrun +
 `bm_run(N, M)`）拼装，并经与 `repl` 相同的枚举 + raw REPL 路径执行；设备的
 `time norm result` 行被解析为 `BenchResult`（`SKIP` 直接短路）。
+
+### `play` — background frame and input worker / 后台帧与输入 worker
+
+```text
+rp2350 play --file <FIRMWARE> --fb <ADDR:WxH[:STRIDE]> [--steps-per-frame N]
+            [--frames N] [--buttons MASK] [--audio] [--trace-steps N]
+            [--max-cycles N] [--arch arm|riscv] [--strict-decode]
+```
+
+| Option / 选项 | Default / 默认 | Meaning / 含义 |
+|---------------|----------------|----------------|
+| `--file` | required | Firmware (UF2 or ELF) / 固件 |
+| `--fb` | required | Guest frame buffer `ADDR:WxH[:STRIDE]`; `STRIDE` defaults to `W*2` / 客户机帧缓冲；跨度默认为 `W*2` |
+| `--steps-per-frame` | `2500000` | Guest steps executed per published frame / 每发布一帧执行的步数 |
+| `--frames` | unlimited | Stop after N frames (headless test mode) / 跑满 N 帧后停止（无头测试模式） |
+| `--buttons` | `0x3FF` | Bitmap of pins that act as buttons (GP0..GP9) / 作为按键的引脚位图 |
+| `--audio` | off | Install an `AudioTap` on PIO2 SM0 (the example firmware's I2S) / 在 PIO2 SM0 安装 `AudioTap` |
+| `--trace-steps` | `0` | Leading steps of the first frame printed as `[trace]` lines / 第一帧开头打印的 `[trace]` 步数 |
+| `--max-cycles` | `u64::MAX` | Total instruction budget; `u64::MAX` = unlimited / 总指令预算，`u64::MAX` 表示不限制 |
+| `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions / 架构覆盖 / 未定义指令即停机 |
+
+The subcommand boots the firmware on a worker thread, advances it by
+`--steps-per-frame` steps per frame, copies the guest frame buffer and prints
+one line per published frame:
+
+```text
+[play] frame=1 steps=2500000 fps=6.37 steps/s=15931096
+[play] frame=2 steps=5000000 fps=6.33 steps/s=15820247
+...
+[play] summary frames=20 steps=50000000 fps=7.00 steps/s=17501742 halted=none
+```
+
+`--frames N` exits with status 0 after N frames. Without it the worker runs
+until the machine halts or the process is killed. A frame buffer that cannot be
+read completely (unmapped window) prints `[play] warn: frame buffer unreadable`
+once and the affected pixels are black; nothing panics.
+
+Measured on `emerald.uf2` (`--fb 0x20063DF4:240x160 --steps-per-frame 2500000
+--frames 20`): **6.1–7.0 fps / 15.3–17.5 M steps/s** (two runs), 20 frames in
+3.7–4.1 s wall clock.
+该子命令在 worker 线程上启动固件，每帧推进 `--steps-per-frame` 步，拷贝客户机
+帧缓冲并为每帧打印一行。`--frames N` 跑满 N 帧后以状态码 0 退出；不带该参数时
+运行到机器停机或进程被杀。帧缓冲读不全（窗口未映射）时只打印一次
+`[play] warn: frame buffer unreadable`，缺失像素为黑色，不会 panic。
+`emerald.uf2` 实测：**6.1–7.0 fps / 15.3–17.5 M steps/s**（两次运行），20 帧约
+3.7–4.1 秒墙钟。
+
+#### Frame format and button semantics / 帧格式与按键语义
+
+- **Frame format / 帧格式**：row-major little-endian RGB565, one `u16` per
+  pixel, exactly as the guest stores it (`bytes[0]` is the low byte). Rows are
+  `stride_bytes` apart, so a firmware that pads rows can be described with
+  `:STRIDE`; the padding is skipped. `240x160` is `0x12C00` bytes at stride
+  `480`.
+  按行优先的小端 RGB565，每像素一个 `u16`，与客户机存储形式一致（`bytes[0]`
+  为低字节）。行间距离为 `stride_bytes`，因此固件的行填充可用 `:STRIDE` 描述并
+  被跳过。`240x160` 在跨度 `480` 下为 `0x12C00` 字节。
+- **Buttons / 按键**：the mask is a `u16` bitmap (bit `n` = GP`n`). A set bit
+  means *pressed*, which drives the pin **low** through
+  `GpioPads::set_external_pin`; a clear bit means released and drives it
+  **high** (the firmware enables internal pull-ups). Only pins present in
+  `button_pins`/`--buttons` are driven, so other injected inputs are untouched.
+  掩码为 `u16` 位图（位 `n` = GP`n`）。置位表示**按下**，通过
+  `GpioPads::set_external_pin` 把引脚拉**低**；清零表示松开并把引脚拉**高**
+  （固件启用内部上拉）。只驱动 `button_pins`/`--buttons` 中置位的引脚，其它注入
+  输入不受影响。
+- **Triple buffer / 三缓冲**：the worker publishes `Arc<Frame>` into a
+  single-slot "latest frame" mailbox. The producer never blocks; a frame the
+  consumer has not taken is replaced and counted (`replaced_frames`).
+  worker 把 `Arc<Frame>` 发布到单槽「最新帧」信箱。生产者永不阻塞；消费者未取走
+  的帧被替换并计数（`replaced_frames`）。
+- **Pacing / 节拍**：if a frame finishes in less than 1/60 s the worker sleeps
+  until the 60 fps boundary; a slower frame runs at full speed (no sleep).
+  一帧耗时小于 1/60 秒时 worker 睡到 60 fps 边界；更慢的帧全速运行（不 sleep）。
+
+#### Why ~7 fps / 为什么只有约 7 fps
+
+The measured throughput is ~17.5 M steps/s while one game frame needs ~2.5 M
+steps (dual core + software PPU), so a frame takes ~0.14 s → ~7 fps. Playability
+needs 30 fps (≥75 M steps/s) or 60 fps (≥150 M steps/s); closing that gap is the
+P0 performance track in `doc/playability-plan.md` (interpreter hot paths,
+batched stepping, JIT or frame-parallel evaluation). The play worker deliberately
+adds no extra per-step work: the only per-frame costs are one `read_block`
+(76.8 KB) and one RGB565 conversion, both far below one frame of emulation.
+实测吞吐约 17.5 M steps/s，而一个游戏帧约需 2.5 M 步（双核 + 软件 PPU），因此
+一帧约 0.14 秒 → 约 7 fps。可玩需要 30 fps（≥75 M steps/s）或 60 fps
+（≥150 M steps/s），差距由 `doc/playability-plan.md` 的 P0 性能线负责（解释器
+热路径、批量步进、JIT 或帧级并行）。play worker 刻意不增加每步开销：每帧仅一次
+`read_block`（76.8 KB）与一次 RGB565 转换，都远低于一帧仿真成本。
 
 ### `gdb` — GDB remote debug server / GDB 远程调试服务器
 
@@ -701,6 +790,145 @@ impl MemoryDump {
 pub fn register_snapshot(machine: &Machine) -> String;  // R0..R12/SP/LR/PC line
 pub fn fault_tail_lines(machine: &mut Machine) -> Vec<String>; // [regs]+[mem]+[tail]
 ```
+
+`Machine` lives in the library target (`rp2350_cli::run::Machine`), so a GUI or
+another host links it directly instead of shelling out to the binary. The
+frame/input worker below is the supported way to drive it from a frontend that
+must not block on emulation.
+`Machine` 位于库目标（`rp2350_cli::run::Machine`），因此 GUI 或其它宿主可以直接
+链接，而不必调用可执行文件。下面的帧/输入 worker 是「前端不能被仿真阻塞」时受支持
+的驱动方式。
+
+## `PlaySession` — background frame worker / 后台帧 worker
+
+```rust
+pub struct FrameSpec { pub base: u32, pub width: u16, pub height: u16, pub stride_bytes: u32 }
+impl FrameSpec {
+    pub fn new(base: u32, width: u16, height: u16) -> Self;      // stride = width * 2
+    pub fn parse(spec: &str) -> Result<Self, String>;            // "ADDR:WxH[:STRIDE]"
+    pub fn buffer_len(&self) -> usize;                           // height * stride
+    pub fn decode(&self, bytes: &[u8]) -> Vec<u16>;              // little-endian RGB565
+    pub fn frame(&self, index: u64, steps: u64, bytes: &[u8]) -> Frame;
+}
+
+pub struct Frame {
+    pub index: u64,              // 1-based
+    pub steps: u64,              // guest steps at capture
+    pub width: u16,
+    pub height: u16,
+    pub rgb565: Vec<u16>,        // row-major, width * height
+    pub readable: bool,          // false when the window was partly unmapped
+}
+impl Frame { pub fn is_blank(&self) -> bool; }
+
+pub struct PlayConfig {
+    pub frame: FrameSpec,
+    pub steps_per_frame: u64,
+    pub max_frames: Option<u64>,   // None = run until shutdown
+    pub button_pins: u16,          // GP0..GP9 by default (0x3FF)
+    pub audio: bool,               // install AudioTap on PIO2 SM0
+    pub trace_steps: usize,        // [trace] lines at the first frame
+}
+impl PlayConfig { pub fn new(frame: FrameSpec, steps_per_frame: u64) -> Self; }
+
+pub struct PlayStats {
+    pub frames: u64,
+    pub steps: u64,
+    pub steps_per_second: f64,     // rolling 1 s window (cumulative until it closes)
+    pub fps: f64,
+    pub halted: Option<String>,    // budget exhausted or machine halt
+}
+
+pub struct PlaySession { /* worker handle */ }
+impl PlaySession {
+    pub fn start(image: Vec<u8>, options: MachineOptions, config: PlayConfig)
+        -> Result<Self, String>;
+    pub fn latest_frame(&self) -> Option<Arc<Frame>>;
+    pub fn set_buttons(&self, mask: u16);
+    pub fn buttons(&self) -> u16;
+    pub fn button_pins(&self) -> u16;
+    pub fn stats(&self) -> PlayStats;
+    pub fn replaced_frames(&self) -> u64;
+    pub fn is_running(&self) -> bool;
+    pub fn audio_tap(&self) -> Option<rp2350_periph::AudioTap>;
+    pub fn shutdown(self) -> PlayStats;   // stop + join + final stats
+}
+pub fn parse_button_mask(spec: &str) -> Result<u16, String>;
+pub fn run(options: &PlayOptions) -> anyhow::Result<()>;   // CLI implementation
+```
+
+### Threading model / 线程模型
+
+`Machine` is **not** `Send`, so `PlaySession::start` moves the image bytes and
+`MachineOptions` into a dedicated worker thread (`rp2350-play`) that builds the
+machine itself; `start` waits for a one-shot ready message so a boot failure is
+reported as `Err` instead of disappearing on the worker. Everything crossing the
+thread boundary is plain data behind `Arc`:
+
+| Shared state | Type | Direction |
+|---|---|---|
+| button mask | `Arc<AtomicU16>` | host → worker |
+| latest frame | `Arc<Mutex<Option<Arc<Frame>>>>` | worker → host |
+| statistics | `Arc<Mutex<PlayStats>>` | worker → host |
+| stop flag / running flag | `Arc<AtomicBool>` | both |
+| audio tap | `Option<AudioTap>` (`Arc<Mutex<AudioSink>>`) | worker + host |
+
+The producer never waits for the consumer: publishing overwrites the single
+"latest frame" slot and increments `replaced_frames`, so a slow renderer drops
+frames instead of stalling the emulator. `shutdown` (or `Drop`) sets the stop
+flag, joins the thread and returns the final statistics; a poisoned lock is
+recovered instead of panicking, so a worker panic cannot bring the host down
+during teardown.
+`Machine` **不是** `Send`，因此 `PlaySession::start` 把映像字节与
+`MachineOptions` 移入专用 worker 线程（`rp2350-play`），由线程自行构造机器；
+`start` 等待一次就绪消息，因此启动失败会以 `Err` 返回而不是在 worker 上消失。
+跨线程共享的只有 `Arc` 包着的纯数据：按键掩码（host → worker）、最新帧与统计
+（worker → host）、停止/运行标志（双向）与音频 tap。生产者从不等待消费者：发布
+直接覆盖单槽「最新帧」并递增 `replaced_frames`，慢渲染只会丢帧而不会卡住仿真。
+`shutdown`（或 `Drop`）置停止标志、join 线程并返回最终统计；锁中毒会被恢复而不
+panic，因此 worker panic 不会在收尾阶段拖垮宿主。
+
+### egui usage / egui 用法示例
+
+```rust
+use std::sync::Arc;
+use rp2350_cli::play::{Frame, FrameSpec, PlayConfig, PlaySession, PlayStats};
+use rp2350_cli::run::MachineOptions;
+
+let image = std::fs::read("emerald.uf2")?;
+let frame = FrameSpec::parse("0x20063DF4:240x160")?;
+let config = PlayConfig::new(frame, 2_500_000);      // ~2.5 M steps per game frame
+let session = PlaySession::start(image, MachineOptions::default(), config)?;
+
+// once per egui update:
+session.set_buttons(keys_to_button_mask(&ctx.input(|i| i.clone())));
+if let Some(frame) = session.latest_frame() {
+    upload_texture(&frame);                          // frame.rgb565: &[u16], width, height
+}
+let stats: PlayStats = session.stats();
+ctx.request_repaint_after(std::time::Duration::from_millis(16));
+```
+
+Keyboard-to-mask mapping belongs to the frontend (P1-2); the worker only
+consumes the mask. `PlaySession::audio_tap()` returns the same tap the machine
+installed, so a playback plugin can drain `i16` samples concurrently.
+按键到掩码的映射属于前端（P1-2），worker 只消费掩码。
+`PlaySession::audio_tap()` 返回机器实际安装的同一个 tap，因此播放插件可并发取走
+`i16` 样本。
+
+### Limitations / 限制
+
+- Active frame source is the guest frame buffer, not the HSTX pixel stream (no
+  scanline/frame boundary model). A firmware that never writes its frame buffer
+  yields black frames.
+  活动帧源是客户机帧缓冲，而不是 HSTX 像素流（无扫描线/帧边界模型）。从不写帧
+  缓冲的固件只会得到黑帧。
+- One session owns one machine: no save-states, no rewind, no stepping API. Stop
+  and start a new session to reload firmware.
+  一个会话独占一台机器：无存档、无回退、无单步接口。需要更换固件时停止并新建会话。
+- Audio capture is installed but not consumed here; `rp2350-audio` provides the
+  host output backend.
+  这里只安装音频捕获、不消费样本；宿主输出后端由 `rp2350-audio` 提供。
 
 ### Bus assembly / 总线组装
 

@@ -7,6 +7,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "rp2350_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rp2350-cli"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }

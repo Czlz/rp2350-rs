@@ -714,6 +714,66 @@ impl Machine {
         self.halt.as_deref()
     }
 
+    /// Boot peripheral handles / 启动外设句柄
+    ///
+    /// Read-only view of the peripherals mounted by [`Self::new`], so a host can
+    /// inspect pads, PIO blocks, DMA and HSTX without reaching into the bus.
+    /// [`Self::new`] 挂载的外设的只读视图，使宿主无需操作总线即可检查 pad、
+    /// PIO 块、DMA 与 HSTX。
+    #[must_use]
+    pub fn peripherals(&self) -> &BootPeripherals {
+        &self.peripherals
+    }
+
+    /// Mutable boot peripheral handles / 可变启动外设句柄
+    ///
+    /// Needed by hosts that install a capture tap through
+    /// [`BootPeripherals::set_audio_tap`]; everything else uses the shared
+    /// handles from [`Self::peripherals`].
+    /// 供通过 [`BootPeripherals::set_audio_tap`] 安装捕获 tap 的宿主使用；其余场景
+    /// 使用 [`Self::peripherals`] 返回的共享句柄。
+    pub fn peripherals_mut(&mut self) -> &mut BootPeripherals {
+        &mut self.peripherals
+    }
+
+    /// Drive the external level of one pad / 驱动一个 pad 的外部电平
+    ///
+    /// Unlike [`Self::set_pad_levels`] this only claims the requested pin, so an
+    /// input injected on one pin never disturbs another.
+    /// 与 [`Self::set_pad_levels`] 不同，这里只声明目标引脚，因此为单个引脚注入
+    /// 的输入不会影响其它引脚。
+    pub fn set_pad_pin(&self, pin: u32, high: bool) {
+        self.peripherals.pads().set_external_pin(pin, high);
+    }
+
+    /// Drive pads `0..=63` from one level mask / 按电平掩码驱动 `0..=63` 号 pad
+    pub fn set_pad_levels(&self, levels: u64) {
+        self.peripherals.pads().set_external(levels);
+    }
+
+    /// Read up to `len` bytes starting at `addr` / 从 `addr` 起读取最多 `len` 字节
+    ///
+    /// Unlike [`Self::dump_memory`] this is a flat byte copy meant for frame
+    /// buffers: it stops at the first unmapped address instead of substituting a
+    /// marker word, so the caller sees the readable prefix.
+    /// `read_block(addr, len).len() == len` therefore proves the whole block was
+    /// readable.
+    /// 与 [`Self::dump_memory`] 不同，这是面向帧缓冲的连续字节拷贝：遇到首个未映射
+    /// 地址即停止，而不是填充标记字，因此调用方看到的是可读前缀。
+    /// `read_block(addr, len).len() == len` 即可证明整块可读。
+    pub fn read_block(&mut self, addr: u32, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut cycles = 0u64;
+        for offset in 0..len {
+            let address = addr.wrapping_add(offset as u32);
+            match self.bus.read_u8(address, &mut cycles) {
+                Ok(byte) => out.push(byte),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
     /// Shared USB controller / 共享 USB 控制器
     #[must_use]
     pub fn usb(&self) -> &Controller {
@@ -1705,11 +1765,11 @@ fn memory_line(machine: &mut Machine, label: &str, addr: u32, count: usize) -> S
 ///
 /// `repl` and `perfbench` do not print a step trace, so without this hook a
 /// guest-side bus fault is only visible as a final PC. Showing the last
-/// [`TAIL_TRACE_STEPS`] instructions makes the offending branch locatable, the
+/// `TAIL_TRACE_STEPS` instructions makes the offending branch locatable, the
 /// register snapshot shows how its operands were produced, and the memory dump
 /// of `R4`/`SP` reveals corrupted structures.
 /// `repl` 与 `perfbench` 不输出逐步轨迹，客户机总线故障只剩一个最终 PC；
-/// 打印停机前 [`TAIL_TRACE_STEPS`] 条指令即可定位罪魁分支，寄存器快照说明
+/// 打印停机前 `TAIL_TRACE_STEPS` 条指令即可定位罪魁分支，寄存器快照说明
 /// 操作数从何而来，`R4`/`SP` 的内存转储则暴露被破坏的结构体。
 pub fn fault_tail_lines(machine: &mut Machine) -> Vec<String> {
     let (object, stack, object_label) = match machine.core.arch() {
