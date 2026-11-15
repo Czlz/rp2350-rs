@@ -33,6 +33,32 @@
 > 状态标记：✅ 完成（P1 范围） · 🚧 部分完成 · ⏳ 未开始。
 > Status markers: ✅ done for P1 scope · 🚧 partial · ⏳ not started.
 
+> **P1 任务队列 / Task queue（主会话拆分，子会话实现）**
+>
+> 规则见 `.trae/rules/project.md` 的「角色边界」与「子会话使用规则」：主会话只做分析、
+> 拆分、派发与验收；**一个任务 = 一个全新子会话**，禁止复用已完成的会话。
+>
+> | ID | 任务 / Task | 归属 / Crates | 依赖 / Depends | 状态 |
+> |----|-------------|---------------|----------------|------|
+> | GAP-01a | `IO_BANK0` `FUNCSEL` 寄存器语义与访问器 | periph | — | 🚧 进行中（wave 1） |
+> | GAP-01b | PIO/SIO 引脚按 `FUNCSEL` 路由到 pad | periph | GAP-01a | ⏳ |
+> | GAP-02 | GDB 多核线程表与 `vCont`/`thread:` | gdb + cli | — | 🚧 进行中（wave 1） |
+> | GAP-03 | ARM `SMLALxy` + `FPCCR` 惰性压栈剩余位 | arm | — | ⏳ wave 2 |
+> | GAP-04 | RISC-V 非法 CSR 陷阱 + ROM 表项 + `misa.B` | riscv | — | ⏳ wave 2 |
+> | GAP-05 | USB 主机 1 ms SOF 调度 + 双缓冲 OUT | usb-host + usb | — | ⏳ wave 3 |
+> | GAP-06 | HSTX TMDS/像素捕获 API + 原始路径计时 | periph | — | ⏳ wave 3 |
+> | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ，重新落地 `WFI`/`WFE` | periph → arm/cli | GAP-07a | ⏳ wave 4 |
+> | GAP-08 | PSRAM XIP 接入 QMI | virt-periph + periph | — | ⏳ wave 4 |
+> | GAP-09 | egui 设备调色板 + 画布持久化 | egui | — | ⏳ wave 5 |
+> | GAP-10 | MCP TLS 传输 | mcp | — | ⏳ wave 5 |
+> | GAP-11 | DMA `SNIFF` 其余模式 / 周期精确仲裁 / PERFCTR | periph | — | ⏳ wave 6 |
+> | GAP-12 | 文档陈旧段落同步 | doc | — | 🚧 主会话直接改 |
+>
+> 并发上限 2（crate 不相交）；每波完成后主会话复跑四道门禁 + FV-1/2/3 + emerald
+> 300M 冒烟，再派下一波。Concurrency is capped at 2 disjoint crates per wave; the main
+> session re-runs the four gates plus FV-1/2/3 and the 300M-step emerald smoke after
+> every wave before dispatching the next one.
+
 ---
 
 ## 固件验证清单 / Firmware Verification Checklist（内核门禁 / core gate）

@@ -764,18 +764,23 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   **PSM 复位语义**：置位 `PSM_FRCE_OFF.PROC1` 会硬复位 core1 —— 机器丢弃其
   上下文、重新启用 boot ROM 回显桩并清除启动状态；清除该位会再次释放，对端回送
   一帧 `0`（`multicore_reset_core1()` 等待的确认），除非已记录新的启动信息。
-- **Not modelled / 未建模项**：SIO hardware spinlocks (`SPINLOCKn` registers are
-  unmapped and `SPINLOCK_ST` always reads free), exclusive/`LDREX`/`STREX`
-  monitors, DMA arbitration between cores, `WFI`/`WFE`/`SEV` as scheduling
-  points (they are no-ops), core-1 debug attachment and a multi-core GDB
-  `vCont`/thread model. Core 1 has no modelled mask ROM: a launch jumps straight
-  to `entry`, reproducing the post-ROM state, and only the trap stubs
-  (`rom_table_lookup` at `0x74`, the ROM function table) are dispatched.
-  **未建模项**：SIO 硬件自旋锁（`SPINLOCKn` 寄存器未映射，`SPINLOCK_ST` 恒读
-  空闲）、独占访问/`LDREX`/`STREX` 监视器、双核之间的 DMA 仲裁、作为调度点的
-  `WFI`/`WFE`/`SEV`（当前为空操作）、core1 调试接入与多核 GDB
-  `vCont`/线程模型。core1 不建模掩膜 ROM：启动直接跳到 `entry` 并复现
-  post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与 ROM 函数表）。
+- **Modelled / 已建模**：SIO hardware spinlocks (`SPINLOCK0..31` at `0x100+4n`,
+  claim-on-read / release-on-write, real `SPINLOCK_ST`) and the per-core
+  `LDREX`/`STREX` exclusive monitor with `CLREX`.
+  **已建模**：SIO 硬件自旋锁（`SPINLOCK0..31` 位于 `0x100+4n`，读即取/写即放，
+  `SPINLOCK_ST` 为真实位图）与每核 `LDREX`/`STREX` 独占监视器 + `CLREX`。
+- **Not modelled / 未建模项**：DMA arbitration between cores, `WFI`/`WFE`/`SEV`
+  as scheduling points (still no-ops in the current tree; the sleep work landed as
+  `9a6b088` and was reverted pending blocking `SIO_FIFO_RD`/FIFO-IRQ semantics),
+  core-1 debug attachment and a multi-core GDB `vCont`/thread model. Core 1 has no
+  modelled mask ROM: a launch jumps straight to `entry`, reproducing the post-ROM
+  state, and only the trap stubs (`rom_table_lookup` at `0x74`, the ROM function
+  table) are dispatched.
+  **未建模项**：双核之间的 DMA 仲裁、作为调度点的 `WFI`/`WFE`/`SEV`（当前仍为空
+  操作；睡眠语义曾以 `9a6b088` 落地但因缺少阻塞式 `SIO_FIFO_RD`/FIFO IRQ 而回退）、
+  core1 调试接入与多核 GDB `vCont`/线程模型。core1 不建模掩膜 ROM：启动直接跳到
+  `entry` 并复现 post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与
+  ROM 函数表）。
 
 ### DMA pump / DMA 泵送
 
