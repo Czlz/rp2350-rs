@@ -22,7 +22,7 @@ use rp2350_usb_host::{
     UsbHostBridge,
 };
 
-use crate::run::{ArchArg, Machine, MachineOptions, fault_tail_lines};
+use crate::run::{ArchArg, Machine, MachineOptions, PsramOptions, fault_tail_lines};
 
 /// Default total instruction budget for `repl` / `repl` 的默认总指令预算
 pub const DEFAULT_MAX_CYCLES: u64 = 300_000_000;
@@ -73,6 +73,8 @@ pub struct ReplOptions {
     /// Halt on undefined instructions instead of skipping them
     /// 遇到未定义指令时停机而不是跳过
     pub strict_decode: bool,
+    /// PSRAM window to mount behind XIP chip select 1 / 在 XIP 片选 1 后挂载的 PSRAM 窗口
+    pub psram: Option<PsramOptions>,
 }
 
 /// An open USB CDC raw REPL session borrowing the machine
@@ -480,6 +482,7 @@ pub fn run(options: &ReplOptions) -> Result<()> {
         arch: options.arch,
         max_cycles: effective_max_cycles(options.max_cycles),
         strict_decode: options.strict_decode,
+        psram: options.psram,
     };
     let mut machine = Machine::new(&bytes, &machine_options)?;
     // TinyUSB 的 EP0 没有端点控制寄存器，`hw_endpoint_start_next_buffer()` 每次
@@ -697,6 +700,7 @@ mod tests {
             arch: Some(ArchArg::Arm),
             max_cycles: 100_000,
             strict_decode: false,
+            psram: None,
         };
         let mut machine = Machine::new(&elf, &options).expect("machine");
         let Err(error) = open_session(&mut machine, 5_000) else {

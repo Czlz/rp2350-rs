@@ -662,6 +662,23 @@ impl RateWindow {
     }
 }
 
+/// Machine construction options implied by resolved `play` options
+/// 由解析后的 `play` 选项推导出的机器构造选项
+///
+/// Every field is a straight copy: the PSRAM size travels from `--psram`/the
+/// profile through [`PlayOptions`] into [`MachineOptions`], so `play` mounts the
+/// same window as `run`.
+/// 每个字段都是直接拷贝：PSRAM 大小从 `--psram`/profile 经 [`PlayOptions`] 传到
+/// [`MachineOptions`]，因此 `play` 与 `run` 挂载同一个窗口。
+fn machine_options(options: &PlayOptions) -> MachineOptions {
+    MachineOptions {
+        arch: options.arch,
+        max_cycles: options.max_cycles,
+        strict_decode: options.strict_decode,
+        psram: options.psram,
+    }
+}
+
 /// Run the CLI `play` subcommand / 运行 CLI 的 `play` 子命令
 ///
 /// Merges the raw arguments with an optional profile (see [`options::resolve`])
@@ -686,11 +703,7 @@ pub fn run(args: &PlayArgs) -> Result<()> {
             options.file.display()
         )
     })?;
-    let machine_options = MachineOptions {
-        arch: options.arch,
-        max_cycles: options.max_cycles,
-        strict_decode: options.strict_decode,
-    };
+    let machine_options = machine_options(&options);
     let config = PlayConfig {
         frame: options.frame,
         steps_per_frame: options.steps_per_frame,

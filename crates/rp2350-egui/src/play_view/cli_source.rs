@@ -174,6 +174,9 @@ impl PlayStarter for CliPlayStarter {
             arch: None,
             max_cycles: UNLIMITED_CYCLES,
             strict_decode: false,
+            // 图形前端不挂载 PSRAM：与未给出 `--psram` 的 CLI 行为一致。
+            // The GUI mounts no PSRAM, matching the CLI without `--psram`.
+            psram: None,
         };
         let session = PlaySession::start(request.image, options, config)?;
         Ok(Box::new(CliPlaySource::new(session)))

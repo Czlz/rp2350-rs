@@ -92,6 +92,7 @@ pub fn run(options: &PerfbenchOptions) -> Result<()> {
         arch: None,
         max_cycles: options.max_cycles,
         strict_decode: options.strict_decode,
+        psram: None,
     };
     let mut machine = Machine::new(&firmware, &machine_options)?;
     println!("[perfbench] {}", machine.image_description());

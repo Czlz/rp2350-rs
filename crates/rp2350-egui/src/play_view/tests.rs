@@ -499,6 +499,8 @@ const ADAPTER_OPTIONS: MachineOptions = MachineOptions {
     arch: None,
     max_cycles: u64::MAX,
     strict_decode: false,
+    // 适配器不挂载 PSRAM。 / The adapter mounts no PSRAM.
+    psram: None,
 };
 
 /// Start a real session wrapped by [`CliPlaySource`] / 启动被 [`CliPlaySource`] 包装的真实会话

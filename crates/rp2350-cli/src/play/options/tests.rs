@@ -76,6 +76,38 @@ fn explicit_arguments_resolve_with_generic_defaults() {
     assert!(!options.strict_decode);
     assert_eq!(options.max_cycles, DEFAULT_MAX_CYCLES);
     assert_eq!(options.trace_steps, DEFAULT_TRACE_STEPS);
+    // 默认不挂载 PSRAM。 / No PSRAM window by default.
+    assert_eq!(options.psram, None);
+}
+
+#[test]
+fn psram_comes_from_the_profile_and_the_command_line_wins() {
+    let path = write_profile(
+        "psram",
+        "firmware = fw.uf2\nframe = 0x20000000:4x4\nsteps_per_frame = 100\npsram = 8M\n",
+    );
+    let from_profile = resolve(&profile_args(&path)).expect("profile psram");
+    assert_eq!(
+        from_profile.psram,
+        Some(crate::run::PsramOptions {
+            size_bytes: 8 * 1024 * 1024
+        })
+    );
+
+    let args = PlayArgs {
+        psram: Some(crate::run::PsramOptions {
+            size_bytes: 16 * 1024 * 1024,
+        }),
+        ..profile_args(&path)
+    };
+    let options = resolve(&args).expect("cli psram");
+    assert_eq!(
+        options.psram,
+        Some(crate::run::PsramOptions {
+            size_bytes: 16 * 1024 * 1024
+        })
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

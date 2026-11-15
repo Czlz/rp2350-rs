@@ -29,6 +29,7 @@ fn target() -> MachineTarget {
         arch: Some(ArchArg::Arm),
         max_cycles: u64::MAX,
         strict_decode: false,
+        psram: None,
     };
     MachineTarget::new(Machine::new(&elf, &options).expect("machine"))
 }
@@ -915,8 +916,49 @@ fn riscv_target() -> MachineTarget {
         arch: None,
         max_cycles: u64::MAX,
         strict_decode: false,
+        psram: None,
     };
     MachineTarget::new(Machine::new(&block, &options).expect("riscv machine"))
+}
+
+#[test]
+fn gdb_options_forward_the_psram_window_to_the_machine() {
+    // `gdb` 路径把 `--psram` 原样转给机器，同时保持「GDB 自己决定停机」的预算。
+    // The `gdb` path forwards `--psram` unchanged while keeping GDB's `u64::MAX`
+    // stop budget.
+    let without = machine_options(&GdbOptions {
+        file: std::path::PathBuf::from("fw.elf"),
+        port: 3333,
+        psram: None,
+    });
+    assert_eq!(without.max_cycles, u64::MAX);
+    assert!(without.psram.is_none());
+
+    let sized = MachineOptions {
+        psram: Some(PsramOptions {
+            size_bytes: 8 * 1024 * 1024,
+        }),
+        ..without
+    };
+    let forwarded = machine_options(&GdbOptions {
+        file: std::path::PathBuf::from("fw.elf"),
+        port: 3333,
+        psram: sized.psram,
+    });
+    assert_eq!(forwarded.psram, sized.psram);
+
+    // 真实机器：带该选项时 `0x1100_0000` 可读写，不带时未映射。
+    // Real machine: the window serves accesses with the option, unmapped without.
+    let mut machine = Machine::new(&cpacr_write_elf(), &sized).expect("machine");
+    let mut cycles = 0u64;
+    machine
+        .bus
+        .write_u8(0x1100_0000, 0x42, &mut cycles)
+        .expect("psram write");
+    assert_eq!(
+        machine.bus.read_u8(0x1100_0000, &mut cycles).expect("read"),
+        0x42
+    );
 }
 
 #[test]

@@ -56,6 +56,7 @@ fn spin_options(max_cycles: u64) -> MachineOptions {
         arch: Some(crate::run::ArchArg::Arm),
         max_cycles,
         strict_decode: false,
+        psram: None,
     }
 }
 
@@ -568,4 +569,82 @@ fn buttons_are_resampled_inside_a_frame() {
     // the press and left the pin low.
     let levels = machine.peripherals().pads().input_levels();
     assert_eq!(levels & (1 << 4), 0, "press sampled inside the frame");
+}
+
+/// UF2 image whose reset handler stores one byte into the PSRAM window
+/// 复位处理程序向 PSRAM 窗口写入一个字节的 UF2 映像
+///
+/// Thumb program / Thumb 程序: `ldr r0, [pc, #4]` → `0x1100_0000`,
+/// `movs r1, #0x5A`, `strb r1, [r0]`, `b .`, then the literal. Without a mounted
+/// PSRAM window the `strb` faults immediately and stops the worker, so the
+/// session statistics distinguish "mounted" from "unmounted" by themselves.
+/// 未挂载 PSRAM 时这条 `strb` 立即触发总线错误并让 worker 停机，因此「是否挂载」
+/// 可以直接由会话统计区分。
+fn psram_store_uf2() -> Vec<u8> {
+    let mut vectors = Vec::with_capacity(8);
+    vectors.extend_from_slice(&0x2008_2000u32.to_le_bytes());
+    vectors.extend_from_slice(&(FLASH_BASE + 0x09).to_le_bytes());
+    // ldr r0,[pc,#4] / movs r1,#0x5A / strb r1,[r0] / b . / literal
+    let mut code = Vec::with_capacity(12);
+    code.extend_from_slice(&[0x01, 0x48, 0x5A, 0x21, 0x01, 0x70, 0xFE, 0xE7]);
+    code.extend_from_slice(&0x1100_0000u32.to_le_bytes());
+    let mut image = uf2_block(0, 2, FLASH_BASE, &vectors);
+    image.extend(uf2_block(1, 2, FLASH_BASE + 8, &code));
+    image
+}
+
+#[test]
+fn play_options_forward_the_psram_size_to_the_machine() {
+    let psram = Some(crate::run::PsramOptions {
+        size_bytes: 8 * 1024 * 1024,
+    });
+    let options = PlayOptions {
+        file: "fw.uf2".into(),
+        frame: FrameSpec::new(SRAM_BASE + 0x1000, 4, 4),
+        steps_per_frame: 200,
+        max_frames: None,
+        buttons: 0,
+        audio: None,
+        arch: None,
+        strict_decode: false,
+        max_cycles: 1000,
+        trace_steps: 0,
+        psram,
+    };
+    let mapped = machine_options(&options);
+    assert_eq!(mapped.psram, psram);
+    assert_eq!(mapped.max_cycles, 1000);
+}
+
+#[test]
+fn psram_option_reaches_the_play_worker() {
+    // 固件向 `0x1100_0000` 写一个字节：挂载 PSRAM 时会话正常发布帧，未挂载时
+    // 同一条 `strb` 就是总线错误。这是 play 路径的端到端接线测试。
+    // The firmware stores one byte at `0x1100_0000`: with PSRAM the session
+    // publishes frames normally, without it the same `strb` is a bus error.
+    // This is the end-to-end wiring test for the `play` path.
+    let config = PlayConfig {
+        max_frames: Some(2),
+        ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 200)
+    };
+    let mut options = spin_options(u64::MAX);
+    options.psram = Some(crate::run::PsramOptions {
+        size_bytes: 64 * 1024,
+    });
+    let session = PlaySession::start(psram_store_uf2(), options, config).expect("session");
+    let stats = wait_for(&session, |stats| {
+        stats.frames >= 2 || stats.halted.is_some()
+    });
+    assert_eq!(stats.halted, None, "the PSRAM window must absorb the store");
+    let _ = session.shutdown();
+
+    let session = PlaySession::start(psram_store_uf2(), spin_options(u64::MAX), config)
+        .expect("unmounted session");
+    let stats = wait_for(&session, |stats| stats.halted.is_some());
+    let reason = stats.halted.as_deref().unwrap_or_default().to_uppercase();
+    assert!(
+        reason.contains("11000000"),
+        "the fixture must fault on the unmapped window: {reason}"
+    );
+    let _ = session.shutdown();
 }

@@ -66,6 +66,7 @@ fn machine_with_budget(max_cycles: u64) -> Machine {
         arch: Some(ArchArg::Arm),
         max_cycles,
         strict_decode: false,
+        psram: None,
     };
     Machine::new(&elf, &options).expect("machine")
 }
@@ -453,6 +454,7 @@ fn machine_boots_and_stops_at_the_budget() {
         arch: Some(ArchArg::Arm),
         max_cycles: 5,
         strict_decode: false,
+        psram: None,
     };
     let mut machine = Machine::new(&elf, &options).expect("machine");
     assert_eq!(
@@ -495,6 +497,7 @@ fn trace_step_reports_the_branch_opcode() {
         arch: Some(ArchArg::Arm),
         max_cycles: 10,
         strict_decode: false,
+        psram: None,
     };
     let mut machine = Machine::new(&elf, &options).expect("machine");
     let state = machine.trace_step(0).expect("trace step");
@@ -511,6 +514,7 @@ fn recent_steps_keep_a_bounded_pc_history() {
         arch: Some(ArchArg::Arm),
         max_cycles: 40,
         strict_decode: false,
+        psram: None,
     };
     let mut machine = Machine::new(&elf, &options).expect("machine");
     machine.run_cycles(40);
@@ -541,6 +545,7 @@ fn ppb_writes_reach_the_core_before_the_next_instruction() {
         arch: Some(ArchArg::Arm),
         max_cycles: 8,
         strict_decode: false,
+        psram: None,
     };
     let mut machine = Machine::new(&elf, &options).expect("machine");
     assert_eq!(
@@ -1195,6 +1200,7 @@ fn emerald_runs_core1_hstx_without_bus_errors() {
         arch: None,
         max_cycles: 500_000_000,
         strict_decode: false,
+        psram: None,
     };
     let mut machine = Machine::new(&bytes, &options).expect("machine");
     while machine.halt_reason().is_none() && !machine.budget_exhausted() {
@@ -1287,6 +1293,7 @@ fn batched_steps_match_single_steps_over_a_counter_loop() {
         arch: Some(ArchArg::Arm),
         max_cycles: 100_000,
         strict_decode: false,
+        psram: None,
     };
     let mut single = Machine::new(&elf, &options).expect("single machine");
     let mut batched = Machine::new(&elf, &options).expect("batched machine");
@@ -1333,6 +1340,7 @@ fn batched_steps_keep_interrupt_delivery_on_the_same_step() {
         arch: Some(ArchArg::Arm),
         max_cycles: 100_000,
         strict_decode: false,
+        psram: None,
     };
     let mut single = Machine::new(&elf, &options).expect("single machine");
     let mut batched = Machine::new(&elf, &options).expect("batched machine");
@@ -1406,6 +1414,7 @@ fn fault_tail_survives_batched_stepping() {
         arch: Some(ArchArg::Arm),
         max_cycles: 1_000,
         strict_decode: false,
+        psram: None,
     };
     let mut single = Machine::new(&elf, &options).expect("single machine");
     let mut batched = Machine::new(&elf, &options).expect("batched machine");

@@ -31,6 +31,7 @@
 //! arch = arm
 //! strict_decode = false
 //! max_cycles = 0
+//! psram = 8M
 //! ```
 
 use std::collections::HashSet;
@@ -39,7 +40,7 @@ use std::path::PathBuf;
 
 use super::FrameSpec;
 use super::parse_button_mask;
-use crate::run::ArchArg;
+use crate::run::{ArchArg, PsramOptions};
 
 /// One malformed profile line / 一行 profile 的解析错误
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,8 @@ pub struct Profile {
     pub strict_decode: Option<bool>,
     /// Total instruction budget / 总指令预算
     pub max_cycles: Option<u64>,
+    /// PSRAM window behind XIP chip select 1 / XIP 片选 1 后的 PSRAM 窗口
+    pub psram: Option<PsramOptions>,
 }
 
 /// Parse a profile document / 解析 profile 文本
@@ -184,6 +187,14 @@ fn assign(profile: &mut Profile, key: &str, value: &str, line: usize) -> Result<
         "arch" => profile.arch = Some(parse_arch(value, line)?),
         "strict_decode" => profile.strict_decode = Some(parse_bool(value, key, line)?),
         "max_cycles" => profile.max_cycles = Some(parse_u64(value, key, line)?),
+        "psram" => {
+            profile.psram = Some(PsramOptions::parse(value).map_err(|reason| {
+                ProfileError::new(
+                    line,
+                    format!("bad psram `{value}`: {reason} / PSRAM 大小非法"),
+                )
+            })?);
+        }
         other => {
             return Err(ProfileError::new(
                 line,

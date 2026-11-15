@@ -19,7 +19,7 @@ use rp2350_core::{
     SimpleBus, Uf2Arch, Uf2Image, XipMaintenanceRegion,
 };
 use rp2350_cpu::{CpuCore, CpuState};
-use rp2350_periph::{BootPeripherals, Core1Launch};
+use rp2350_periph::{BootPeripherals, Core1Launch, psram::mount_psram};
 use rp2350_riscv::Hazard3Core;
 use rp2350_usb::{Controller, USBCTRL_IRQ};
 
@@ -108,6 +108,8 @@ pub struct RunOptions {
     pub trace_steps: usize,
     /// Halt on undefined instructions instead of skipping / 遇到未定义指令即停机
     pub strict_decode: bool,
+    /// PSRAM window to mount behind XIP chip select 1 / 在 XIP 片选 1 后挂载的 PSRAM 窗口
+    pub psram: Option<PsramOptions>,
     /// Memory ranges written to disk after the run / 运行结束后写入磁盘的内存区间
     pub dumps: Vec<MemoryDump>,
 }
@@ -163,8 +165,83 @@ fn parse_number(text: &str) -> Option<u32> {
     }
 }
 
-/// Construction options shared by `run`, `repl` and `perfbench`
-/// `run`、`repl` 与 `perfbench` 共用的机器构造选项
+/// PSRAM window requested on the XIP chip-select-1 port
+/// 在 XIP 片选 1 端口上请求的 PSRAM 窗口
+///
+/// `size_bytes` is the requested window length. [`Machine::new`] hands it to
+/// [`rp2350_periph::psram::mount_psram`], which accepts any 4 KiB aligned size
+/// in `1..=PSRAM_MAX_SIZE` (16 MiB) and clamps every other value with a one-shot
+/// warning instead of failing the boot.
+/// `size_bytes` 是请求的窗口长度。[`Machine::new`] 把它交给
+/// [`rp2350_periph::psram::mount_psram`]；该函数接受 `1..=PSRAM_MAX_SIZE`
+/// （16 MiB）内任意 4 KiB 对齐大小，其它值只警告一次并钳制，而不是让启动失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PsramOptions {
+    /// Requested window length in bytes / 请求的窗口长度（字节）
+    pub size_bytes: usize,
+}
+
+impl PsramOptions {
+    /// Parse a size written as bytes or with a `K`/`M` (`KiB`/`MiB`) suffix
+    /// 解析以字节或 `K`/`M`（也可 `KiB`/`MiB`）后缀书写的大小
+    ///
+    /// Accepted forms are `8388608`, `0x800000`, `8192K`, `8M`, `8MiB` and
+    /// `16MB`. Suffixes are case-insensitive and always mean a power of two
+    /// (1 K = 1024 bytes). Zero, negative values, unknown suffixes and values
+    /// that overflow `u64`/`usize` are rejected.
+    /// 接受 `8388608`、`0x800000`、`8192K`、`8M`、`8MiB`、`16MB` 等写法。后缀
+    /// 不区分大小写，且一律按 2 的幂解释（1 K = 1024 字节）。0、负数、未知后缀
+    /// 以及溢出 `u64`/`usize` 的值都会被拒绝。
+    ///
+    /// # Errors
+    /// Returns a message describing the malformed size.
+    /// 返回描述大小非法的消息。
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let text = spec.trim().to_ascii_lowercase();
+        if text.is_empty() {
+            return Err("empty PSRAM size / PSRAM 大小为空".to_owned());
+        }
+        let (digits, unit) = if let Some(stem) = strip_unit(&text, &["kib", "kb", "k"]) {
+            (stem, 1024u64)
+        } else if let Some(stem) = strip_unit(&text, &["mib", "mb", "m"]) {
+            (stem, 1024 * 1024)
+        } else {
+            (text.as_str(), 1u64)
+        };
+        let digits = digits.trim();
+        let parsed = if let Some(hex) = digits.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16)
+        } else {
+            digits.parse::<u64>()
+        };
+        let value = parsed.map_err(|_| {
+            format!(
+                "bad PSRAM size `{spec}` (expected bytes, K or M) / PSRAM 大小非法，\
+                 应为字节数或带 K/M 后缀"
+            )
+        })?;
+        let bytes = value.checked_mul(unit).ok_or_else(|| {
+            format!("PSRAM size `{spec}` overflows u64 / PSRAM 大小超出 u64 范围")
+        })?;
+        let size_bytes = usize::try_from(bytes).map_err(|_| {
+            format!("PSRAM size `{spec}` does not fit in usize / PSRAM 大小超出 usize 范围")
+        })?;
+        if size_bytes == 0 {
+            return Err(format!(
+                "PSRAM size `{spec}` must be greater than zero / PSRAM 大小必须大于 0"
+            ));
+        }
+        Ok(Self { size_bytes })
+    }
+}
+
+/// Strip one of `units` from the end of `text` / 从 `text` 末尾去掉任一 `units`
+fn strip_unit<'a>(text: &'a str, units: &[&str]) -> Option<&'a str> {
+    units.iter().find_map(|unit| text.strip_suffix(unit))
+}
+
+/// Construction options shared by `run`, `repl`, `play` and `gdb`
+/// `run`、`repl`、`play` 与 `gdb` 共用的机器构造选项
 #[derive(Debug, Clone, Copy)]
 pub struct MachineOptions {
     /// Architecture override / 架构覆盖
@@ -173,6 +250,9 @@ pub struct MachineOptions {
     pub max_cycles: u64,
     /// Halt on undefined instructions instead of skipping / 遇到未定义指令即停机
     pub strict_decode: bool,
+    /// PSRAM window to mount at `0x1100_0000`, or `None` to leave it unmapped
+    /// 要在 `0x1100_0000` 挂载的 PSRAM 窗口；`None` 表示保持未映射
+    pub psram: Option<PsramOptions>,
 }
 
 impl Default for MachineOptions {
@@ -181,6 +261,7 @@ impl Default for MachineOptions {
             arch: None,
             max_cycles: DEFAULT_RUN_MAX_CYCLES,
             strict_decode: false,
+            psram: None,
         }
     }
 }
@@ -507,6 +588,18 @@ impl Machine {
         bus.register_region(Box::new(XipMaintenanceRegion::new("xip-maintenance")))?;
         bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, SRAM_SIZE)))?;
         let peripherals = BootPeripherals::mount(&mut bus)?;
+        // PSRAM 挂在 XIP 片选 1 的 `0x1100_0000`；未请求时不注册该区域，客户机
+        // 访问保持 `NoDevice`。挂载顺序与 `BootPeripherals::mount` 无关（两者不
+        // 触碰同一地址），这里放在外设之后、核心启动之前，使首条取指前窗口已就绪。
+        // PSRAM is mounted on the XIP chip-select-1 window at `0x1100_0000`; without
+        // a request the region stays unregistered and guest accesses keep reporting
+        // `NoDevice`. Mounting is order-independent of `BootPeripherals::mount` (they
+        // never share an address) and runs here, after the peripherals and before the
+        // core boots, so the window exists before the first fetch.
+        if let Some(psram) = options.psram {
+            mount_psram(&mut bus, psram.size_bytes)
+                .context("PSRAM mount failed / PSRAM 挂载失败")?;
+        }
         // USBCTRL 挂载后，DPSRAM（0x5010_0000）与寄存器窗口（0x5011_0000，含
         // XOR/SET/CLR 别名）由控制器建模，固件对 SIE_CTRL（0x5011_004C）的
         // 读-改-写不再落到 NoDevice。控制器句柄保留到机器生命周期结束，供
@@ -1808,6 +1901,7 @@ pub fn run(options: &RunOptions) -> Result<()> {
         arch: options.arch,
         max_cycles: options.max_cycles,
         strict_decode: options.strict_decode,
+        psram: options.psram,
     };
     let mut machine = Machine::new(&bytes, &machine_options)?;
 
@@ -2208,6 +2302,8 @@ fn log_irq(irq_log: &mut Vec<String>, core: &str, irq: u16, pc: u32) {
 }
 
 mod batch;
+#[cfg(test)]
+mod psram_tests;
 #[cfg(test)]
 mod sleep_tests;
 #[cfg(test)]

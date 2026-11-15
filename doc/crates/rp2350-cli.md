@@ -22,11 +22,55 @@ Global flags: `--verbose` (log level `debug` instead of `info`) and
 全局标志：`--verbose`（日志级别从 `info` 变为 `debug`）与 `--headless`
 （所有子命令都接受；目前 CLI 本身没有 GUI）。
 
+#### PSRAM window and size syntax / PSRAM 窗口与大小语法
+
+`run`, `repl`, `play` and `gdb` accept `--psram <SIZE>`, which mounts the
+built-in PSRAM model on the XIP chip-select-1 window at `0x1100_0000`
+(`XIP_MAIN1`; it is **not** an alias of the CS0 flash window at `0x1000_0000`).
+The window is guest-writable RAM, while flash stays read-only and untouched.
+`run`、`repl`、`play`、`gdb` 都接受 `--psram <SIZE>`，在 XIP 片选 1 的
+`0x1100_0000`（`XIP_MAIN1`，**不是** `0x1000_0000` 处 CS0 Flash 窗口的别名）
+挂载内置 PSRAM 模型。窗口对客户机可写，Flash 保持只读且不受影响。
+
+- **Syntax / 语法**：plain bytes (`8388608`, `0x800000`) or a `K`/`M` suffix
+  (`8192K`, `8M`), with optional `B`/`iB` (`16MB`, `16MiB`). Suffixes are
+  case-insensitive and always powers of two: 1 K = 1024 B, 1 M = 1024 K.
+  纯字节数（`8388608`、`0x800000`）或带 `K`/`M` 后缀（`8192K`、`8M`），后缀可
+  加 `B`/`iB`（`16MB`、`16MiB`）。后缀不区分大小写，且一律按 2 的幂解释：
+  1 K = 1024 B，1 M = 1024 K。
+- **Validation / 校验**：`0`, negative numbers, unknown suffixes, empty values
+  and values that overflow `u64`/`usize` are rejected at parse time (clap exits
+  with status 2 before any firmware is read). A value above the 16 MiB
+  architectural ceiling, or one that is not 4 KiB aligned, is **clamped to
+  16 MiB** by the model with a single `psram:` warning — the run still starts,
+  nothing is truncated to zero.
+  `0`、负数、未知后缀、空值以及溢出 `u64`/`usize` 的值在解析阶段即被拒绝（clap 在
+  读取固件前就以退出码 2 结束）。超过 16 MiB 架构上限或未按 4 KiB 对齐的值由模型
+  **钳制到 16 MiB** 并只打印一次 `psram:` 警告：运行照常开始，窗口绝不会被截断
+  成 0。
+- **Not enabled / 未启用**：without `--psram` (and without `psram` in a profile)
+  the window is **not** registered, so guest accesses to `0x1100_0000` report
+  `BusErrorKind::NoDevice` exactly as before the option existed.
+  不给 `--psram`（profile 中也没有 `psram`）时该窗口**不注册**，客户机访问
+  `0x1100_0000` 仍报 `BusErrorKind::NoDevice`，与该选项存在前完全一致。
+- **Not modelled / 未建模**：QMI CS1 timing/format registers (`M1_TIMING`,
+  `M1_RFMT`, `M1_RCMD`) stay plain storage; the non-cached PSRAM alias at
+  `0x1500_0000` is not mapped. See `doc/crates/rp2350-periph.md`.
+  QMI 的 CS1 时序/格式寄存器（`M1_TIMING`、`M1_RFMT`、`M1_RCMD`）仍是普通存储；
+  `0x1500_0000` 处的非缓存 PSRAM 别名未映射。详见 `doc/crates/rp2350-periph.md`。
+
+```bash
+# 8 MB PSRAM behind CS1 / 在 CS1 后挂载 8 MB PSRAM
+rp2350 run --file firmware.uf2 --psram 8M
+# same size in bytes / 以字节书写同一大小
+rp2350 run --file firmware.uf2 --psram 8388608
+```
+
 ### `run` — traced execution / 带轨迹运行
 
 ```text
 rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
-           [--trace-steps N] [--strict-decode]
+           [--trace-steps N] [--strict-decode] [--psram SIZE]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
@@ -36,6 +80,7 @@ rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
 | `--max-cycles` | `20_000_000` | Instruction budget / 指令预算 |
 | `--trace-steps` | `16` | Boot-trace steps printed / 打印的启动轨迹步数 |
 | `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
+| `--psram` | off (unmapped) | Mount an external PSRAM window at `0x1100_0000`; see “PSRAM window and size syntax” below / 在 `0x1100_0000` 挂载外部 PSRAM 窗口，见下文「PSRAM 窗口与大小语法」 |
 | `--dump` | none | `ADDR:LEN:PATH` memory dump written when the run stops (repeatable, decimal or `0x` hex) / 停机时写入的内存导出，可重复，支持十进制或 `0x` 十六进制 |
 
 `run` prints the image summary, core description and boot vectors, executes
@@ -85,7 +130,7 @@ target's framebuffer belongs to that example's README (see
 ```text
 rp2350 repl --file <FIRMWARE> [--exec "CODE" | --stdio] [--max-cycles N]
             [--enum-cycles N] [--no-soft-reset] [--strict-decode]
-            [--arch arm|riscv]
+            [--arch arm|riscv] [--psram SIZE]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
@@ -98,6 +143,7 @@ rp2350 repl --file <FIRMWARE> [--exec "CODE" | --stdio] [--max-cycles N]
 | `--no-soft-reset` | off | Skip the Ctrl-D soft reset on entry (ignored by `--stdio`) / 进入时跳过 Ctrl-D 软复位（`--stdio` 下忽略） |
 | `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
 | `--arch` | from UF2 family | Override the core architecture / 覆盖核心架构（`riscv` 为别名） |
+| `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`） |
 
 The subcommand boots the machine, runs the guest under the USB host bridge
 until `HostProgress::Configured` (within `--enum-cycles`), enters the raw
@@ -250,7 +296,7 @@ rp2350 play [--profile <FILE>] [--file <FIRMWARE>] [--fb <ADDR:WxH[:STRIDE]>]
             [--steps-per-frame N] [--frames N] [--buttons MASK]
             [--audio --audio-block N --audio-sm N] [--audio-rate HZ]
             [--audio-channels N] [--audio-capacity N] [--trace-steps N]
-            [--max-cycles N] [--arch arm|riscv] [--strict-decode]
+            [--max-cycles N] [--arch arm|riscv] [--strict-decode] [--psram SIZE]
 ```
 
 There are **no example-specific defaults** in the crate. The firmware path, the
@@ -278,6 +324,7 @@ profile 文件或命令行；两者都没有时命令直接失败并指出缺失
 | `--trace-steps` | `0` | Leading steps of the first frame printed as `[trace]` lines / 第一帧开头打印的 `[trace]` 步数 |
 | `--max-cycles` | `u64::MAX` | Total instruction budget; `u64::MAX` = unlimited / 总指令预算，`u64::MAX` 表示不限制 |
 | `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions / 架构覆盖 / 未定义指令即停机 |
+| `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`; a profile may set `psram = 8M` instead) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`；profile 也可用 `psram = 8M`） |
 
 #### Profile format / profile 格式
 
@@ -302,6 +349,7 @@ separates), LF and CRLF both parse, and unknown keys, duplicate keys, missing
 | `arch` | `arm` / `riscv` |
 | `strict_decode` | `true` / `false` |
 | `max_cycles` | Total instruction budget / 总指令预算 |
+| `psram` | PSRAM window size at `0x1100_0000` (`8M`, `1024K`, `8388608`); absent = unmapped / `0x1100_0000` 处 PSRAM 窗口大小；缺省表示不挂载 |
 
 Precedence is **command line > profile > built-in generic default**. A profile
 may set `audio = true` and still take `--audio-rate` from the command line; an
@@ -393,13 +441,14 @@ emulation.
 ### `gdb` — GDB remote debug server / GDB 远程调试服务器
 
 ```text
-rp2350 gdb --file <ELF> [--port 3333]
+rp2350 gdb --file <ELF> [--port 3333] [--psram SIZE]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
 |---------------|----------------|----------------|
 | `--file` | required | Firmware (ELF; `--arch` is not exposed here) / 固件（ELF；此处不提供 `--arch`） |
 | `--port` | `3333` | TCP listen port (`0.0.0.0`) / TCP 监听端口（绑定 `0.0.0.0`） |
+| `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` so a debugger can inspect CS1/PSRAM contents / 在 `0x1100_0000` 挂载 PSRAM 窗口，使调试器可检查 CS1/PSRAM 内容 |
 
 `gdb` reads the ELF, builds the same `Machine` as `run`, prints the image summary,
 core description and start vectors, then hands the machine to
@@ -821,6 +870,14 @@ pub struct MachineOptions {
     pub arch: Option<ArchArg>,               // architecture override
     pub max_cycles: u64,                     // instruction budget
     pub strict_decode: bool,
+    pub psram: Option<PsramOptions>,         // PSRAM window at 0x1100_0000
+}
+
+pub struct PsramOptions {
+    pub size_bytes: usize,
+}
+impl PsramOptions {
+    pub fn parse(spec: &str) -> Result<Self, String>;  // `8M`, `1024K`, `8388608`
 }
 
 pub struct Machine { /* bus, bootrom, core, core1, peripherals, usb … */ }
@@ -1058,14 +1115,26 @@ with the flash handle, mounted at `0x0000_0000`), the flash XIP window at
 `0x1000_0000` plus its non-cached alias at `0x1400_0000` (one shared backing
 store), the write-absorbing XIP maintenance window at `0x1800_0000`,
 520 KB SRAM at `0x2000_0000`, `BootPeripherals` (GPIO, UART0, timer, three
-shared PIO block handles, etc.), and `rp2350_usb::mount` for the USB controller
-(DPSRAM + register windows).
+shared PIO block handles, etc.), the optional PSRAM window at `0x1100_0000`
+(only when `MachineOptions::psram` is `Some`), and `rp2350_usb::mount` for the
+USB controller (DPSRAM + register windows).
 `Machine::new` 依次构建：合成 boot ROM（`Rp2350Bootrom::new` 持有 flash
 句柄，挂载于 `0x0000_0000`）、`0x1000_0000` 的 Flash XIP 窗口与
 `0x1400_0000` 的非缓存别名（共享同一份底层存储）、`0x1800_0000` 吸收写入的
 XIP 维护窗口、`0x2000_0000` 的 520 KB SRAM、`BootPeripherals`（GPIO、UART0、
-定时器、三个共享 PIO 块句柄等），以及 USB 控制器的 `rp2350_usb::mount`
+定时器、三个共享 PIO 块句柄等）、可选的 `0x1100_0000` PSRAM 窗口（仅当
+`MachineOptions::psram` 为 `Some`），以及 USB 控制器的 `rp2350_usb::mount`
 （DPSRAM + 寄存器窗口）。
+
+The PSRAM mount is order-independent of `BootPeripherals::mount` (neither touches
+`0x1100_0000`); it runs after the peripherals and before the core boots, so the
+window exists before the first fetch. A registration failure (for example a
+second window overlapping the first) is reported as a startup error
+(`PSRAM mount failed / PSRAM 挂载失败`) instead of a panic.
+PSRAM 挂载与 `BootPeripherals::mount` 顺序无关（两者都不触碰 `0x1100_0000`）；
+它在外设之后、核心启动之前执行，因此首条取指前窗口已存在。注册失败（例如第二个
+窗口与第一个重叠）会作为启动错误（`PSRAM mount failed / PSRAM 挂载失败`）上报，
+而不是 panic。
 
 ### Firmware formats / 固件格式
 

@@ -27,7 +27,7 @@ use rp2350_gdb::{
     WatchKind,
 };
 
-use crate::run::{Machine, MachineOptions};
+use crate::run::{Machine, MachineOptions, PsramOptions};
 
 /// Default instruction budget for one GDB `Continue`
 /// 单次 GDB `Continue` 的默认指令预算
@@ -103,6 +103,8 @@ pub struct GdbOptions {
     pub file: PathBuf,
     /// GDB listen port / GDB 监听端口
     pub port: u16,
+    /// PSRAM window to mount behind XIP chip select 1 / 在 XIP 片选 1 后挂载的 PSRAM 窗口
+    pub psram: Option<PsramOptions>,
 }
 
 /// Debug target backed by a booted [`Machine`] / 由已启动 [`Machine`] 支撑的调试目标
@@ -799,6 +801,23 @@ impl GdbTarget for MachineTarget {
     }
 }
 
+/// Machine construction options implied by `gdb` options
+/// 由 `gdb` 选项推导出的机器构造选项
+///
+/// GDB owns the stop decision, so the instruction budget is `u64::MAX`; the
+/// PSRAM size is forwarded unchanged, making `0x1100_0000` inspectable from a
+/// debugger session exactly as it is under `run`/`play`.
+/// GDB 自己决定何时停止，因此指令预算为 `u64::MAX`；PSRAM 大小原样转发，使调试
+/// 会话中的 `0x1100_0000` 与 `run`/`play` 下完全一致。
+fn machine_options(options: &GdbOptions) -> MachineOptions {
+    MachineOptions {
+        arch: None,
+        max_cycles: u64::MAX,
+        strict_decode: false,
+        psram: options.psram,
+    }
+}
+
 /// Load the firmware, boot a machine and serve GDB clients until the listener fails
 /// 加载固件、启动机器并提供 GDB 客户端服务，直到监听器出错
 ///
@@ -818,11 +837,7 @@ pub fn run(options: &GdbOptions) -> Result<()> {
     // when to stop, and each `Continue` has its own instruction cap.
     // `u64::MAX` 避免机器因自身预算停机：由 GDB 决定何时停止，单次 `Continue`
     // 另有指令上限。
-    let machine_options = MachineOptions {
-        arch: None,
-        max_cycles: u64::MAX,
-        strict_decode: false,
-    };
+    let machine_options = machine_options(options);
     let machine = Machine::new(&bytes, &machine_options)?;
 
     println!("[gdb] {}", machine.image_description());

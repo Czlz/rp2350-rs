@@ -145,6 +145,7 @@ fn wfi_machine(max_cycles: u64) -> Machine {
         arch: Some(ArchArg::Arm),
         max_cycles,
         strict_decode: false,
+        psram: None,
     };
     Machine::new(&wfi_uf2(), &options).expect("machine")
 }
@@ -409,6 +410,7 @@ fn a_blocked_fifo_load_wakes_on_a_peer_frame() {
         arch: Some(ArchArg::Arm),
         max_cycles: 1_000,
         strict_decode: false,
+        psram: None,
     };
     let mut machine = Machine::new(&image, &options).expect("machine");
 

@@ -66,6 +66,11 @@ enum Commands {
         /// 停止时导出内存：ADDR:LEN:PATH（可重复）
         #[arg(long = "dump", value_name = "ADDR:LEN:PATH", value_parser = run::MemoryDump::parse)]
         dump: Vec<run::MemoryDump>,
+
+        /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
+        /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
+        #[arg(long, value_name = "SIZE", value_parser = run::PsramOptions::parse)]
+        psram: Option<run::PsramOptions>,
     },
 
     /// Open the USB CDC raw REPL of a booted firmware
@@ -108,6 +113,11 @@ enum Commands {
         /// 遇到未定义指令时停机而不是跳过
         #[arg(long)]
         strict_decode: bool,
+
+        /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
+        /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
+        #[arg(long, value_name = "SIZE", value_parser = run::PsramOptions::parse)]
+        psram: Option<run::PsramOptions>,
     },
 
     /// Run a `MicroPython` benchmark through the USB CDC raw REPL
@@ -229,6 +239,11 @@ enum Commands {
         /// 遇到未定义指令时停机而不是跳过
         #[arg(long)]
         strict_decode: bool,
+
+        /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
+        /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
+        #[arg(long, value_name = "SIZE", value_parser = run::PsramOptions::parse)]
+        psram: Option<run::PsramOptions>,
     },
 
     /// Start GDB server / 启动 GDB 服务器
@@ -240,6 +255,11 @@ enum Commands {
         /// GDB listen port / GDB 监听端口
         #[arg(short, long, default_value = "3333")]
         port: u16,
+
+        /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
+        /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
+        #[arg(long, value_name = "SIZE", value_parser = run::PsramOptions::parse)]
+        psram: Option<run::PsramOptions>,
     },
 
     /// Wire a device port to a GPIO pin / 将设备端口连接到 GPIO 引脚
@@ -310,6 +330,7 @@ fn main() {
             trace_steps,
             strict_decode,
             dump,
+            psram,
         } => {
             let options = run::RunOptions {
                 file: file.into(),
@@ -317,6 +338,7 @@ fn main() {
                 max_cycles,
                 trace_steps,
                 strict_decode,
+                psram,
                 dumps: dump,
             };
             finish(run::run(&options), "run failed / 运行失败");
@@ -330,6 +352,7 @@ fn main() {
             enum_cycles,
             no_soft_reset,
             strict_decode,
+            psram,
         } => {
             let options = repl::ReplOptions {
                 file: file.into(),
@@ -340,6 +363,7 @@ fn main() {
                 enum_cycles,
                 soft_reset: !no_soft_reset,
                 strict_decode,
+                psram,
             };
             finish(repl::run(&options), "repl failed / REPL 失败");
         }
@@ -384,6 +408,7 @@ fn main() {
             max_cycles,
             arch,
             strict_decode,
+            psram,
         } => {
             let args = play::PlayArgs {
                 profile,
@@ -402,13 +427,15 @@ fn main() {
                 strict_decode,
                 max_cycles,
                 trace_steps,
+                psram,
             };
             finish(play::run(&args), "play failed / 播放失败");
         }
-        Commands::Gdb { file, port } => {
+        Commands::Gdb { file, port, psram } => {
             let options = gdb_target::GdbOptions {
                 file: file.into(),
                 port,
+                psram,
             };
             finish(gdb_target::run(&options), "gdb failed / GDB 失败");
         }
@@ -606,6 +633,7 @@ mod tests {
             audio_rate,
             max_cycles,
             trace_steps,
+            psram,
             ..
         } = cli.command
         else {
@@ -621,6 +649,65 @@ mod tests {
         assert!(audio_rate.is_none());
         assert!(max_cycles.is_none());
         assert!(trace_steps.is_none());
+        assert!(psram.is_none());
+    }
+
+    #[test]
+    fn run_and_repl_parse_the_psram_size() {
+        let cli = parse(&["run", "--file", "fw.uf2", "--psram", "8M"]).expect("parse run");
+        let Commands::Run { psram, .. } = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(
+            psram,
+            Some(run::PsramOptions {
+                size_bytes: 8 * 1024 * 1024
+            })
+        );
+
+        let cli = parse(&["repl", "--file", "fw.uf2", "--psram", "1024K"]).expect("parse repl");
+        let Commands::Repl { psram, .. } = cli.command else {
+            panic!("expected the repl subcommand");
+        };
+        assert_eq!(
+            psram,
+            Some(run::PsramOptions {
+                size_bytes: 1024 * 1024
+            })
+        );
+    }
+
+    #[test]
+    fn play_and_gdb_parse_the_psram_size() {
+        let cli = parse(&["play", "--psram", "8388608"]).expect("parse play");
+        let Commands::Play { psram, .. } = cli.command else {
+            panic!("expected the play subcommand");
+        };
+        assert_eq!(psram.map(|psram| psram.size_bytes), Some(8_388_608));
+
+        let cli = parse(&["gdb", "--file", "fw.elf", "--psram", "16MiB"]).expect("parse gdb");
+        let Commands::Gdb { psram, .. } = cli.command else {
+            panic!("expected the gdb subcommand");
+        };
+        assert_eq!(psram.map(|psram| psram.size_bytes), Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn psram_rejects_zero_and_misspelled_sizes() {
+        let cases: [&[&str]; 4] = [
+            &["run", "--file", "fw.uf2", "--psram", "0"],
+            &["repl", "--file", "fw.uf2", "--psram=-8M"],
+            &["play", "--psram", "8G"],
+            &["gdb", "--file", "fw.elf", "--psram", "eight"],
+        ];
+        for args in cases {
+            let error = parse(args).expect_err("PSRAM size must be validated");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "args={args:?}"
+            );
+        }
     }
 
     #[test]

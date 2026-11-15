@@ -1,7 +1,7 @@
 //! Profile parser tests / profile 解析器测试
 
 use super::*;
-use crate::run::ArchArg;
+use crate::run::{ArchArg, PsramOptions};
 
 /// A profile that sets every supported key / 设置全部受支持键的 profile
 const FULL: &str = "\
@@ -20,6 +20,7 @@ audio_capacity = 48000
 arch = riscv
 strict_decode = true
 max_cycles = 0x1000
+psram = 8M
 ";
 
 #[test]
@@ -46,6 +47,43 @@ fn parses_every_supported_key() {
     assert_eq!(profile.strict_decode, Some(true));
     // `0x1000` 十六进制预算。 / Hex budget.
     assert_eq!(profile.max_cycles, Some(0x1000));
+    assert_eq!(
+        profile.psram,
+        Some(PsramOptions {
+            size_bytes: 8 * 1024 * 1024
+        })
+    );
+}
+
+#[test]
+fn psram_accepts_bytes_suffixes_and_hex() {
+    for (text, expected) in [
+        ("psram = 8388608\n", 8 * 1024 * 1024),
+        ("psram = 1024K\n", 1024 * 1024),
+        ("psram = 16MiB\n", 16 * 1024 * 1024),
+        ("psram = 0x10000\n", 0x1_0000),
+    ] {
+        let profile = parse(text).expect(text);
+        assert_eq!(
+            profile.psram.map(|psram| psram.size_bytes),
+            Some(expected),
+            "text={text}"
+        );
+    }
+}
+
+#[test]
+fn psram_rejects_zero_and_misspelled_sizes() {
+    for text in [
+        "psram = 0\n",
+        "psram = 8G\n",
+        "psram = -1\n",
+        "psram = 8x\n",
+    ] {
+        let error = parse(text).expect_err(text);
+        assert_eq!(error.line, 1, "text={text}");
+        assert!(error.message.contains("psram"), "{text}: {error}");
+    }
 }
 
 #[test]
