@@ -21,7 +21,10 @@
     clippy::unreadable_literal
 )]
 
-use super::{CortexM33Core, NVIC_BASE, SCB_CFSR, SCB_CPACR, SCB_VTOR, SYSTICK_BASE, fpu};
+use super::{CortexM33Core, NVIC_BASE, SCB_CFSR, SCB_CPACR, SCB_VTOR, SYSTICK_BASE, fpu, scr};
+
+/// Software Trigger Interrupt Register (`SCB_STIR`) / 软件触发中断寄存器
+const SCB_STIR: u32 = 0xE000_EF00;
 
 impl CortexM33Core {
     /// Handle SysTick register accesses via bus
@@ -97,6 +100,23 @@ impl CortexM33Core {
                 self.cfsr = value;
             }
             Some(self.cfsr)
+        } else if addr == scr::SCR {
+            // SLEEPONEXIT/SLEEPDEEP/SEVONPEND 是唯一建模的位；其余保留位读 0。
+            // SLEEPONEXIT/SLEEPDEEP/SEVONPEND are the only modeled bits; every
+            // reserved bit reads as zero.
+            if write {
+                self.scr = value & scr::MODELED_MASK;
+            }
+            Some(self.scr)
+        } else if addr == SCB_STIR {
+            // STIR 写入挂起一个外部中断；SEVONPEND 事件由打开挂起位的跳变产生。
+            // A STIR write pends an external interrupt; the SEVONPEND event comes
+            // from the 0-to-1 pending transition.
+            if write {
+                let irq = (value & 0x1FF) as u16;
+                self.set_pending_irq(irq);
+            }
+            Some(0)
         } else if let Some(value) = self.registers.fpu.system_access(addr, write, value) {
             // FPCCR / FPCAR / FPDSCR：LSPACT 只读，FPCAR 低 3 位保留，
             // FPDSCR 只保存 AHP/DN/FZ/RMode 字段。
@@ -146,7 +166,12 @@ impl CortexM33Core {
                 let reg_idx = ((o - 0x100) >> 2) as usize;
                 if reg_idx < 8 {
                     if write {
+                        // 只有 0→1 的位产生 SEVONPEND 事件；写已挂起位不产生。
+                        // Only 0-to-1 bits raise the SEVONPEND event; writing an
+                        // already-pending bit does not.
+                        let newly = value & !self.nvic.read_ispr(reg_idx);
                         self.nvic.write_ispr(reg_idx, value);
+                        self.note_pending_bits(newly);
                     }
                     Some(self.nvic.read_ispr(reg_idx))
                 } else {

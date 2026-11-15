@@ -117,7 +117,7 @@ fn execute_mrs(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
         0x10 => regs.primask & 1,        // PRIMASK
         0x11 | 0x12 => regs.basepri,     // BASEPRI / BASEPRI_MAX (reads current BASEPRI)
         0x13 => regs.faultmask & 1,      // FAULTMASK
-        0x14 => regs.control,            // CONTROL
+        0x14 => regs.control & 0x7,      // CONTROL (nPRIV/SPSEL/FPCA)
         0x0A => regs.msplim,             // MSPLIM
         0x0B => regs.psplim,             // PSPLIM
         _ => return StepResult::Undefined,
@@ -177,7 +177,12 @@ fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult 
                     }
                 }
                 0x13 => regs.faultmask = value & 1,
-                0x14 => regs.control = value & 0x3,
+                // CONTROL is nPRIV bit 0, SPSEL bit 1 and FPCA bit 2. FPCA is
+                // software writable in ARMv8-M; the exception-return path
+                // restores it from the frame type.
+                // CONTROL 为 nPRIV bit0、SPSEL bit1、FPCA bit2。ARMv8-M 中 FPCA
+                // 可由软件写入；异常返回路径按帧类型恢复它。
+                0x14 => regs.control = value & 0x7,
                 // Stack Pointer limits: bits[2:0] are reserved and read as zero.
                 // 栈指针下限：bits[2:0] 保留，读为 0。
                 0x0A => regs.msplim = value & !0x7,

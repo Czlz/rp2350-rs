@@ -472,7 +472,7 @@ fn clronret_clears_fpca_when_returning_a_basic_frame() {
 }
 
 #[test]
-fn fpca_survives_a_basic_frame_return_without_clronret() {
+fn basic_frame_return_clears_fpca_without_clronret() {
     let mut fixture = FpFixture::new();
     fixture.enter();
     fixture.regs.control |= CONTROL_FPCA;
@@ -483,8 +483,15 @@ fn fpca_survives_a_basic_frame_return_without_clronret() {
 
     fixture.exit();
 
-    assert_eq!(fixture.regs.control & CONTROL_FPCA, CONTROL_FPCA);
+    // ARMv8-M sets CONTROL.FPCA = !EXC_RETURN.FType on every exception return,
+    // so a basic frame always resumes without an active FP context. FPEXC.EN is
+    // not touched without CLRONRET, which keeps the fallback predicate true.
+    // ARMv8-M 在每次异常返回时置 CONTROL.FPCA = !EXC_RETURN.FType，因此基础帧
+    // 恢复出的上下文必然没有活跃浮点状态。没有 CLRONRET 时 FPEXC.EN 不变，回退
+    // 判据仍为真。
+    assert_eq!(fixture.regs.control & CONTROL_FPCA, 0);
     assert!(fixture.regs.fp_context_active());
+    assert_ne!(fixture.regs.fpu.fpexc & fpexc::EN, 0);
     assert_eq!(fixture.regs.msp, MSP_TOP);
 }
 

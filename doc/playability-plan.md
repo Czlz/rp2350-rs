@@ -106,15 +106,15 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 
 | ID | 任务 | 归属 | 状态 |
 |----|------|------|------|
-| P4-1 | `CLOCKS` 时钟树：XOSC/ROSC/PLL_SYS/PLL_USB（REFDIV/FBDIV/PDIV/VDIV/LOCK）、`CLK_*_CTRL`/`CLK_*_DIV`、源切换与实时频率 API + 已知向量测试（12 MHz→150 MHz、252 MHz 超频） | `rp2350-periph` | ⏳ 待派发 |
-| P4-2 | 动态频率接入全部计时消费者：`cycles→µs`、SysTick、TIMER、PIO `CLKDIV`、HSTX 像素时钟、UART 波特率、ADC/RTC、DMA 节拍；端到端固件验证（含 252 MHz 固件样例） | `rp2350-periph` + `rp2350-core` + `rp2350-cli` | ⏳ 待派发（依赖 P4-1） |
+| P4-1 ✅ | `CLOCKS` 时钟树：`ClockTree` 共享 XOSC/ROSC/PLL_SYS/PLL_USB（REFDIV/FBDIV/PDIV/VDIV/LOCK）、`CLK_*_CTRL`/`CLK_*_DIV`、`CLK_*_SELECTED`、源切换与实时频率 API（`sysclk_hz`/`refclk_hz`/`periclk_hz`/`usbclk_hz`/`adcclk_hz`/`rtcclk_hz`、`generation()`）；bootrom 等价初值（150 MHz）；`PERFCTR` 默认机器接线；已知向量 12 MHz→150 MHz、252 MHz 超频、REF/DIV 切换、PERI/USB、非法分频 0 Hz；`rp2350-periph` 404 测试（+27），总线级 252 MHz 一致 | `rp2350-periph` + `rp2350-core` | ✅ `cargo test -p rp2350-periph` 404 passed；`cargo test -p rp2350-core` 98 passed；emerald 启动后 `sysclk_hz() = 252000000` |
+| P4-2 | 动态频率接入全部计时消费者：`cycles→µs`、SysTick、TIMER、PIO `CLKDIV`、HSTX 像素时钟、UART 波特率、ADC/RTC、DMA 节拍；端到端固件验证（含 252 MHz 固件样例） | `rp2350-periph` + `rp2350-core` + `rp2350-cli` | ⏳ 待派发（P4-1 已提供 `ClockTree::generation`/实时频率 API） |
 | P4-3 | 时钟/频率回归与文档：超频/降频/源切换的 300M 计数器对照、`doc/architecture.md` 时钟章节 | 主会话 | ⏳ |
 
 ## 3.5 通用性任务（与帧率无关，必须推进）/ Generality tasks
 
 | ID | 任务 | 归属 | 状态 |
 |----|------|------|------|
-| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ✅ 已完成（`BusErrorKind::Stall` + `MemoryRegion::read_would_stall`、`SIO_FIFO_ST` 粘滞位与写 1 清除、事件世代号、ARM/RISC-V 睡眠状态机、`[run] sleep` 统计） |
+| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ✅ 已完成（`BusErrorKind::Stall` + `MemoryRegion::read_would_stall`、`SIO_FIFO_ST` 粘滞位与写 1 清除、事件世代号、ARM/RISC-V 睡眠状态机、`[run] sleep` 统计；补充：`SCR` 的 `SEVONPEND`/`SLEEPONEXIT`/`SLEEPDEEP` 已生效，`MSR/MRS CONTROL` 读写 `nPRIV/SPSEL/FPCA`，异常返回按帧类型恢复 `FPCA`；`SLEEPDEEP` 仅区分原因，无掉电电气效果） |
 | GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ✅ 已完成（`MachineOptions::psram` + `PsramOptions::parse`；`--psram`/profile `psram` 覆盖 `run`/`repl`/`play`/`gdb`；未启用时 `0x1100_0000` 仍 `NoDevice`；超限/未对齐按 periph 规则钳制到 16 MiB 并只警告一次；挂载失败映射为启动错误） |
 | GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | ✅ 部分完成（`SNIFF_CTRL.CALC` 已按 `dma.h` 核对：仅 `0x0..=0x3`/`0xE`/`0xF` 有定义并有标准向量，`0x4..=0xD` 为保留值；嗅探改为观察通道 BSWAP 之后的单元；`BUSCTRL.PERFCTR0/1`+`PERFSEL0/1` 按端口累加 DMA `ACCESS`/`STALL_UPSTREAM`；`DmaBusCounters` 记账 DMA 占用周期与授予；**剩余**：`STALL_DOWNSTREAM`/`ACCESS_CONTESTED`、CPU 主设备事件与真正抢占需周期精确模型，`BootPeripherals` 内 `Dma`↔`BusCtrl` 接线需 `boot.rs` 一行） |
 | GAP-10 | MCP TLS 传输 | mcp | ⏳ |

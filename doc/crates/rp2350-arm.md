@@ -22,8 +22,9 @@
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
+| `scr` | `SCR` sleep-control bits (`SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND`) |
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
-| `system_access` | System control space routing (`SCB_VTOR`/`SCB_CPACR`/`SCB_CFSR`, FPU system registers, NVIC/IPR aliases, SysTick) |
+| `system_access` | System control space routing (`SCB_VTOR`/`SCB_CPACR`/`SCB_CFSR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
 | `fetch_cache` | Direct-mapped flash XIP instruction fetch cache (private, enabled per core) |
 | `decode_cache` | Direct-mapped decoded-instruction cache: length, raw word, dispatch tag per flash `PC` |
 | `execute_thumb16::fast` | Hot Thumb-16 executors shared by the decoder and the decode-cache fast path |
@@ -293,9 +294,11 @@ hits a blocking device is retried instead of being skipped.
 
 ```rust
 pub enum SleepReason {
-    WaitForInterrupt, // WFI with nothing pending
-    WaitForEvent,     // WFE with the event register clear
-    BlockedRead,      // the last load hit a retryable bus stall
+    WaitForInterrupt,                    // WFI, SLEEPDEEP = 0
+    WaitForEvent,                        // WFE, SLEEPDEEP = 0
+    SleepDeep { wait_for_event: bool },  // WFI/WFE with SLEEPDEEP = 1
+    SleepOnExit { deep: bool },          // SCR.SLEEPONEXIT return-to-Thread sleep
+    BlockedRead,                         // the last load hit a retryable bus stall
 }
 
 impl CortexM33Core {
@@ -303,6 +306,10 @@ impl CortexM33Core {
     pub fn signal_event(&mut self);        // host event source (FIFO, doorbell, peer SEV)
     pub fn event_register(&self) -> bool;  // diagnostics
     pub fn take_events_sent(&mut self) -> u32; // SEV count for peer forwarding
+}
+
+impl SleepReason {
+    pub fn is_deep_sleep(self) -> bool;    // SleepDeep or SleepOnExit { deep: true }
 }
 ```
 
@@ -322,6 +329,35 @@ impl CortexM33Core {
   register. Exception entry and exception return also set the event register,
   which is the architectural event source that makes `while (!flag) __wfe();`
   loops correct.
+* **`SCR` sleep control (`0xE000_ED10`)**: only `SLEEPONEXIT`[1],
+  `SLEEPDEEP`[2] and `SEVONPEND`[4] are stored; every reserved bit reads as zero
+  and reset clears all three.
+  * `SEVONPEND` converts **each 0-to-1 transition of an exception pending bit**
+    into an event, whether the exception is enabled, disabled or masked by
+    `PRIMASK`. `CpuCore::signal_interrupt`, `NVIC_ISPR` writes, `STIR` and the
+    SysTick underflow all share one transition helper, so an already-pending
+    line never re-sends the event (otherwise `WFE` would stop waiting). `WFE`
+    consumes the event and continues; `WFI` ignores events and is never woken
+    by `SEVONPEND` alone.
+  * `SLEEPONEXIT` suspends the core after an exception return **to Thread
+    mode**: unstacking has already restored `PC`/SP, and the restored
+    instruction does not execute before the sleep. A Handler→Handler return
+    never triggers it. The wake condition is the `WFI` one, so a runnable
+    interrupt keeps the core awake and is taken in the same step.
+  * `SLEEPDEEP` changes only the reported reason (`SleepDeep { wait_for_event }`
+    for `WFI`/`WFE`, `SleepOnExit { deep: true }` for `SLEEPONEXIT`). This
+    model has no separately powered domain, so deep sleep has exactly the same
+    wake behaviour as shallow sleep; power-down and clock-gating electrical
+    effects are not modeled.
+  * The core-side register is reached through `CpuCore::system_write`
+    (`0xE000_ED10`). In a full machine the `rp2350-periph` PPB stub currently
+    replays only `VTOR`, `CPACR`, SysTick and NVIC writes, so a firmware `STR`
+    to `SCR` remains in PPB storage until that replay whitelist also forwards
+    `0xE000_ED10`; the unit tests drive the core register directly.
+  * 核心侧寄存器通过 `CpuCore::system_write`（`0xE000_ED10`）访问。完整机器中
+    `rp2350-periph` 的 PPB 桩当前只回放 `VTOR`、`CPACR`、SysTick 与 NVIC 写入，
+    因此固件对 `SCR` 的 `STR` 会留在 PPB 存储中，直到该回放白名单也转发
+    `0xE000_ED10`；单元测试直接驱动核心寄存器。
 * **Sleeping cores still age**: [`CpuCore::step`] on a sleeping core advances
   `SysTick` and `total_cycles` by one, then checks the wake condition. The first
   step whose condition holds executes the instruction at `PC` immediately
@@ -340,14 +376,26 @@ impl CortexM33Core {
   `PRIMASK`, and the sleep wake path uses the same gate, so a sleeping core never
   enters an interrupt it should keep masked.
 
-**Not modelled**: the `SEVONPEND` event from a disabled interrupt becoming
-pending, the `SCR.SLEEPONEXIT`/`SLEEPDEEP` power-down entry, deep-sleep state
-retention, `WFE`'s optional timeout (`-w`), and SysTick exception delivery
-(`nvic.set_pending(EXC_SYSTICK)` marks the external IRQ of the same number; a
-dedicated SysTick exception entry is still a gap). A host that never signals an
-event and never enables an interrupt will see a `WFE`/`WFI` sleeper stay asleep
-while the machine clock keeps running — that is the hardware behaviour, and the
-CLI reports it as a `[run] sleep stall` diagnostic instead of hanging silently.
+**Not modelled**: the electrical effect of `SLEEPDEEP` (power-down, clock
+gating, state retention), `WFE`'s optional timeout (`-w`), SysTick exception
+delivery (`nvic.set_pending(EXC_SYSTICK)` marks the external IRQ of the same
+number; a dedicated SysTick exception entry is still a gap), and the
+`SCB_ICSR` `PENDSVSET`/`PENDSTSET` paths. `SEVONPEND` therefore covers NVIC
+external interrupts (including `STIR`/`ISPR` writes) and the SysTick pending
+bit as modeled, but not pending transitions that would be initiated through an
+unimplemented `ICSR`. A host that never signals an event and never enables an
+interrupt will see a `WFE`/`WFI` sleeper stay asleep while the machine clock
+keeps running — that is the hardware behaviour, and the CLI reports it as a
+`[run] sleep stall` diagnostic instead of hanging silently.
+
+未建模：`SLEEPDEEP` 的电气效果（掉电、时钟门控、状态保持）、`WFE` 的可选超时
+（`-w`）、SysTick 异常投递（`nvic.set_pending(EXC_SYSTICK)` 目前标记同号外部
+IRQ，专用 SysTick 异常进入仍是缺口）以及 `SCB_ICSR` 的
+`PENDSVSET`/`PENDSTSET` 路径。因此 `SEVONPEND` 覆盖 NVIC 外部中断（含
+`STIR`/`ISPR` 写入）与已建模的 SysTick 挂起位，但不覆盖经未实现 `ICSR` 发起的
+挂起跳变。若宿主从不发送事件、也从不使能中断，`WFE`/`WFI` 睡眠者会保持睡眠而
+机器时钟继续推进——这正是硬件行为，CLI 以 `[run] sleep stall` 诊断报告，而不是
+静默耗尽预算。
 
 ### `SysTick`
 
@@ -865,8 +913,9 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   and `0xE000EF3C`; exception entry reserves or stacks the 17-word FP
   context according to `FPCCR.ASPEN`/`LSPEN`, exception return reclaims or
   restores it, and `FPCCR.CLRONRET`/`CLRONRETS` clear the caller-saved
-  context on return. `CONTROL.FPCA` is tracked and raised by every FPU
-  instruction.
+  context on return. `CONTROL.FPCA` is tracked, raised by every FPU
+  instruction, software-writable through `MSR CONTROL`, and restored from the
+  returned frame type.
 
 - **状态**：S0-S31，`D0-D15` 为 S 对别名；`FPSCR`、`FPEXC`；`CPACR`
   CP0-CP7 与 CP10-CP11 读写。
@@ -910,7 +959,8 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   `0xE000EF3C` 建模 `FPCCR`、`FPCAR`、`FPDSCR`；异常进入按
   `FPCCR.ASPEN`/`LSPEN` 预留或立即压入 17 字浮点上下文，异常返回按需
   回收或恢复，并由 `FPCCR.CLRONRET`/`CLRONRETS` 在返回时清除调用者保存
-  上下文。`CONTROL.FPCA` 被跟踪，并由每条浮点指令置位。
+  上下文。`CONTROL.FPCA` 被跟踪，由每条浮点指令置位，可经 `MSR CONTROL`
+  写入，并按返回帧类型恢复。
 
 ### Lazy FP Stacking and Extended Frames / 惰性浮点压栈与扩展帧
 
@@ -953,22 +1003,27 @@ aligned.
 舍入模式恒为就近偶数。`FPCAR` 保证预留的浮点上下文区按 8 字节对齐。
 
 **"FP is active" / 「浮点活跃」判据**: ARMv8-M uses `CONTROL.FPCA`. The core
-tracks it: `CortexM33Core::step_instruction` raises `FPCA` for every Thumb-32
-encoding that belongs to the FPU whenever `CPACR` grants access, exactly like
-the architectural rule, and the `CLRONRET` return path clears it again.
-`CortexM33Registers::fp_context_active` returns `CONTROL.FPCA ||
-FPEXC.EN`; `FPEXC.EN` (set by the same instructions, never cleared by
-`MSR CONTROL`) acts as a fallback so a context can never be silently lost.
-`MSR CONTROL` still stores only `bits[1:0]`, so software writes of `FPCA` are
-discarded — the bit is hardware-driven in this model.
+tracks it: `CortexM33Core::prepare_fpu_instruction` raises `FPCA` for every
+Thumb-32 encoding that belongs to the FPU whenever `CPACR` grants access,
+exactly like the architectural rule. `MRS CONTROL` returns all three modeled
+bits (`nPRIV`, `SPSEL`, `FPCA`) and `MSR CONTROL` stores `bits[2:0]`, so
+software can set or clear `FPCA` directly. An exception return restores it from
+the frame type (`FPCA = !EXC_RETURN[4]`: basic frame → 0, extended frame → 1),
+independent of what the handler wrote; `FPCCR.CLRONRET` additionally clears it
+when a basic frame is returned. `CortexM33Registers::fp_context_active` returns
+`CONTROL.FPCA || FPEXC.EN`; `FPEXC.EN` (set by the same instructions, never
+cleared by `MSR CONTROL`) acts as a fallback so a context can never be silently
+lost.
 
 ARMv8-M 用 `CONTROL.FPCA` 判定。本核心跟踪该位：当 `CPACR` 允许访问时，
-`CortexM33Core::step_instruction` 对每条属于浮点单元的 Thumb-32 编码置位
-`FPCA`，与架构规则一致；`CLRONRET` 返回路径会再次清除它。
+`CortexM33Core::prepare_fpu_instruction` 对每条属于浮点单元的 Thumb-32 编码置位
+`FPCA`，与架构规则一致。`MRS CONTROL` 返回建模的三位（`nPRIV`、`SPSEL`、
+`FPCA`），`MSR CONTROL` 保存 `bits[2:0]`，因此软件可直接置位/清除 `FPCA`。
+异常返回按帧类型恢复它（`FPCA = !EXC_RETURN[4]`：基础帧 → 0，扩展帧 → 1），
+与处理程序写入的值无关；返回基础帧时 `FPCCR.CLRONRET` 还会再次清除它。
 `CortexM33Registers::fp_context_active` 返回 `CONTROL.FPCA || FPEXC.EN`；
-`FPEXC.EN`（由同样的指令置位，且不会被 `MSR CONTROL` 清除）作为回退，
-保证上下文绝不会被静默丢弃。`MSR CONTROL` 仍只保存 `bits[1:0]`，因此软件
-写 `FPCA` 会被丢弃 —— 该位在本模型中由硬件驱动。
+`FPEXC.EN`（由同样的指令置位，且不会被 `MSR CONTROL` 清除）作为回退，保证
+上下文绝不会被静默丢弃。
 
 **Exception entry / 异常进入** (`exceptions::enter_exception`):
 
@@ -1059,6 +1114,15 @@ CP0 GPIO / CP4 DCP 等非浮点协处理器访问不会触发；判据为
   `EXC_RETURN` encodings therefore become `0xFFFF_FFF1`/`0xFFFF_FFE1`
   (handler), `0xFFFF_FFF9`/`0xFFFF_FFE9` (thread MSP) and
   `0xFFFF_FFFD`/`0xFFFF_FFED` (thread PSP), with bit 4 = 0 meaning extended.
+- Every exception return also assigns `CONTROL.FPCA = !EXC_RETURN[4]`
+  (ARMv8-M B3.4.4): a basic frame resumes with `FPCA = 0`, an extended frame
+  with `FPCA = 1`. Any value written by `MSR CONTROL` inside the handler is
+  therefore overridden by the returned frame type. `nPRIV` is not restored
+  (software owns it), and `SPSEL` follows `EXC_RETURN[2]` only on a return to
+  Thread mode.
+- A nested exception entered from Handler mode produces
+  `EXC_RETURN = 0xFFFF_FFF1` (bit 3 = 0), so it returns to the preempted
+  handler and never triggers `SLEEPONEXIT`.
 
 - `EXC_RETURN` bit4 = 0 且 `LSPACT = 1` → 处理程序从未使用浮点单元：仅回收
   0x48 字节预留区、清除 `LSPACT`，不写任何浮点寄存器。
@@ -1078,6 +1142,12 @@ CP0 GPIO / CP4 DCP 等非浮点协处理器访问不会触发；判据为
   `0xFFFF_FFF1`/`0xFFFF_FFE1`（Handler）、`0xFFFF_FFF9`/`0xFFFF_FFE9`
   （Thread MSP）、`0xFFFF_FFFD`/`0xFFFF_FFED`（Thread PSP），bit4 = 0 表示
   扩展帧。
+- 每次异常返回还会置 `CONTROL.FPCA = !EXC_RETURN[4]`（ARMv8-M B3.4.4）：
+  基础帧恢复后 `FPCA = 0`，扩展帧恢复后 `FPCA = 1`。因此处理程序内
+  `MSR CONTROL` 写入的值会被返回帧类型覆盖。`nPRIV` 不恢复（由软件负责），
+  `SPSEL` 仅在返回到 Thread 模式时跟随 `EXC_RETURN[2]`。
+- 从 Handler 模式进入的嵌套异常产生 `EXC_RETURN = 0xFFFF_FFF1`（bit3 = 0），
+  因此返回到被抢占的处理程序，绝不会触发 `SLEEPONEXIT`。
 
 **Nested exceptions / 嵌套异常**: if a lazy frame is still pending
 (`LSPACT = 1`) when another exception is taken, the pending context is
@@ -1095,19 +1165,16 @@ single architectural register pair.
 **Not modeled / 未建模**: `FPCCR.LSPENS`/`THREAD`/`USER` are storage only (no
 secure state for `LSPENS` to protect, and the core never allocates a frame
 from Handler or unprivileged mode so `THREAD`/`USER` have nothing to report);
-`ASPEN = 0` does not suppress `CONTROL.FPCA` in this model; software writes of
-`CONTROL.FPCA` through `MSR CONTROL` are discarded (the bit is hardware
-driven); `FPDSCR` does not influence arithmetic; double precision and FPSCR
-traps are absent. The secure/non-secure FP banks of the TrustZone
-configuration are not modeled, so `CLRONRETS` collapses onto the single
-non-secure state, and `TS` is hard-wired to 1 instead of following the
-Cortex-M33 reset value of 0.
+`ASPEN = 0` does not suppress `CONTROL.FPCA` in this model; `FPDSCR` does not
+influence arithmetic; double precision and FPSCR traps are absent. The
+secure/non-secure FP banks of the TrustZone configuration are not modeled, so
+`CLRONRETS` collapses onto the single non-secure state, and `TS` is hard-wired
+to 1 instead of following the Cortex-M33 reset value of 0.
 
 未建模：`FPCCR.LSPENS`/`THREAD`/`USER` 仅作存储（没有可供 `LSPENS` 保护的安全
 状态；核心也不会从 Handler 或非特权模式分配栈帧，因此 `THREAD`/`USER` 无内容
-可上报）；本模型中 `ASPEN = 0` 不会抑制 `CONTROL.FPCA`；软件经 `MSR CONTROL`
-写 `CONTROL.FPCA` 会被丢弃（该位由硬件驱动）；`FPDSCR` 不影响算术；不实现
-双精度与 FPSCR 陷阱。TrustZone 的安全/非安全浮点寄存器组未建模，因此
+可上报）；本模型中 `ASPEN = 0` 不会抑制 `CONTROL.FPCA`；`FPDSCR` 不影响算术；
+不实现双精度与 FPSCR 陷阱。TrustZone 的安全/非安全浮点寄存器组未建模，因此
 `CLRONRETS` 折叠到唯一的非安全状态，`TS` 恒为 1 而非遵循 Cortex-M33 的复位
 值 0。
 

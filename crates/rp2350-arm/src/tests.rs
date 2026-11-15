@@ -4,6 +4,7 @@
 mod decode_cache;
 mod fp_lazy;
 mod irq_gate;
+mod scr;
 mod sleep;
 
 use super::*;

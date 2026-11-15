@@ -389,6 +389,12 @@ pub fn enter_exception(
     // Save current SP
     // 保存当前 SP
     let thread_used_psp = regs.control & 0x2 != 0;
+    // IPSR 非零表示当前已在 Handler 模式；此时异常返回的目标是 Handler，
+    // EXC_RETURN bit3 必须为 0，否则嵌套中断会错误地返回到 Thread。
+    // A non-zero IPSR means the core is already in Handler mode; the return
+    // target is then Handler, so EXC_RETURN bit 3 must be 0 or a nested
+    // interrupt would incorrectly return to Thread mode.
+    let from_handler = regs.xpsr & 0x1FF != 0;
     let sp = if exception_number >= 16 {
         // External interrupt: always use MSP during handler
         // 外部中断：处理程序期间始终使用 MSP
@@ -484,21 +490,22 @@ pub fn enter_exception(
 
     // Set up return value in LR (EXC_RETURN)
     // 在 LR 中设置返回值（EXC_RETURN）
-    if exception_number >= 16 {
-        // Return to Thread mode, use MSP or PSP depending on the interrupted context
-        // 返回 Thread 模式，按被打断的上下文选择 MSP 或 PSP
-        if thread_used_psp {
-            // 0xFFFF_FFFD = standard frame; bit 4 is cleared below when the
-            // entry allocated an extended frame (0xFFFF_FFED).
-            // 0xFFFF_FFFD 为标准帧；若本次进入分配了扩展帧，下方会清除 bit 4
-            // （变为 0xFFFF_FFED）。
-            regs.lr = 0xFFFF_FFFD; // Return to Thread, PSP
-        } else {
-            regs.lr = 0xFFFF_FFF9; // Return to Thread, MSP
-        }
+    //
+    // Bit 3 selects Handler (0) vs Thread (1), bit 2 selects PSP, and bit 4 is
+    // the frame type patched below. A nested exception entered from Handler
+    // mode must return to Handler mode.
+    // bit3 选择 Handler（0）或 Thread（1），bit2 选择 PSP，bit4 为下方修补的帧类型。
+    // 从 Handler 模式进入的嵌套异常必须返回 Handler 模式。
+    if from_handler {
+        regs.lr = 0xFFFF_FFF1; // Return to Handler mode / 返回 Handler 模式
+    } else if thread_used_psp {
+        // 0xFFFF_FFFD = standard frame; bit 4 is cleared below when the
+        // entry allocated an extended frame (0xFFFF_FFED).
+        // 0xFFFF_FFFD 为标准帧；若本次进入分配了扩展帧，下方会清除 bit 4
+        // （变为 0xFFFF_FFED）。
+        regs.lr = 0xFFFF_FFFD; // Return to Thread, PSP
     } else {
-        // System exception / 系统异常
-        regs.lr = 0xFFFF_FFF1; // Return to Handler mode
+        regs.lr = 0xFFFF_FFF9; // Return to Thread, MSP
     }
 
     // EXC_RETURN bit 4 records the frame type: 1 = standard, 0 = extended.
@@ -528,9 +535,10 @@ pub fn enter_exception(
 /// Exit an exception handler — full sequence
 /// 退出异常处理程序 —— 完整序列
 ///
-/// Also applies `FPCCR.CLRONRET`/`CLRONRETS`: see the FP-clear block at the end
-/// of the function. / 同时应用 `FPCCR.CLRONRET`/`CLRONRETS`：见函数末尾的浮点
-/// 清除分支。
+/// Also restores `CONTROL.FPCA` from the frame type (`EXC_RETURN` bit 4) and
+/// applies `FPCCR.CLRONRET`/`CLRONRETS`: see the FP-clear block at the end of
+/// the function. / 同时按帧类型（`EXC_RETURN` bit4）恢复 `CONTROL.FPCA`，并应用
+/// `FPCCR.CLRONRET`/`CLRONRETS`：见函数末尾的浮点清除分支。
 ///
 /// Returns `Ok(new_sp)` — the SP after unstacking.
 /// 返回 `Ok(new_sp)` —— 出栈后的 SP。
@@ -610,6 +618,19 @@ pub fn exit_exception(
         } else {
             regs.control & !0x2
         };
+    }
+
+    // ARMv8-M B3.4.4: an exception return sets CONTROL.FPCA to the inverse of
+    // EXC_RETURN bit 4, so a basic frame restores a thread/handler with no live
+    // FP context and an extended frame restores one that has it. This is
+    // independent of `MSR CONTROL` writes made by the handler.
+    // ARMv8-M B3.4.4：异常返回把 CONTROL.FPCA 设为 EXC_RETURN bit 4 的反值，因此
+    // 基础帧恢复出的上下文没有活跃浮点状态，扩展帧恢复出的上下文有。该行为与处理程序
+    // 通过 `MSR CONTROL` 写入的值无关。
+    if exc_return_info.has_fp {
+        regs.control |= CONTROL_FPCA;
+    } else {
+        regs.control &= !CONTROL_FPCA;
     }
 
     // ---- FPCCR.CLRONRET / CLRONRETS ----

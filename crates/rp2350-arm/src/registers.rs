@@ -5,19 +5,19 @@ use crate::fpu::{FpuRegisters, cpacr, fpexc};
 
 /// CONTROL.FPCA — floating-point context active / CONTROL.FPCA —— 浮点上下文活跃
 ///
-/// The model keeps this bit in [`CortexM33Registers::control`] and raises it
-/// whenever a floating-point instruction executes with CPACR access granted
-/// (see `CortexM33Core::step_instruction`). Exception return clears it when
-/// `FPCCR.CLRONRET`/`CLRONRETS` request a clear and the returned frame carries
-/// no floating-point context. `MSR CONTROL` still stores only `bits[1:0]`, so a
-/// direct software write of `FPCA` is discarded; the bit is set and cleared by
-/// hardware only. See [`CortexM33Registers::fp_context_active`] for the
-/// frame-selection predicate.
-/// 本模型把该位保存在 [`CortexM33Registers::control`] 中，并在每条通过 CPACR
-/// 检查的浮点指令执行时置位（见 `CortexM33Core::step_instruction`）。当
-/// `FPCCR.CLRONRET`/`CLRONRETS` 请求清除且返回的栈帧不含浮点上下文时，异常
-/// 返回会清除它。`MSR CONTROL` 仍只保存 `bits[1:0]`，因此软件直接写 `FPCA`
-/// 会被丢弃；该位仅由硬件置位与清除。帧选择判据见
+/// The model keeps this bit in [`CortexM33Registers::control`]. Hardware raises
+/// it whenever a floating-point instruction executes with CPACR access granted
+/// (see `CortexM33Core::prepare_fpu_instruction`), software can read and write
+/// it through `MRS`/`MSR CONTROL`, and an exception return restores it from the
+/// returned frame type: `EXC_RETURN` bit 4 = 1 (basic frame) clears it, bit 4 =
+/// 0 (extended frame) sets it. `FPCCR.CLRONRET`/`CLRONRETS` additionally clear
+/// it when a basic frame is returned. See
+/// [`CortexM33Registers::fp_context_active`] for the frame-selection predicate.
+/// 本模型把该位保存在 [`CortexM33Registers::control`] 中。只要有浮点指令通过
+/// CPACR 检查，硬件就置位它（见 `CortexM33Core::prepare_fpu_instruction`）；
+/// 软件可通过 `MRS`/`MSR CONTROL` 读写；异常返回按返回帧类型恢复：`EXC_RETURN`
+/// bit4 = 1（基础帧）清除，bit4 = 0（扩展帧）置位。返回基础帧时
+/// `FPCCR.CLRONRET`/`CLRONRETS` 还会再次清除它。帧选择判据见
 /// [`CortexM33Registers::fp_context_active`]。
 pub const CONTROL_FPCA: u32 = 1 << 2;
 
@@ -211,17 +211,19 @@ impl CortexM33Registers {
     ///
     /// ARMv8-M selects the extended exception frame from `CONTROL.FPCA`. This
     /// model tracks `FPCA` (raised by every executed FPU instruction after the
-    /// CPACR check, cleared by `FPCCR.CLRONRET`) **and** keeps `FPEXC.EN` as a
-    /// fallback: the bit is set by the same instructions but is never cleared
-    /// by a software `MSR CONTROL`, so a context can never be silently lost.
-    /// The disjunction is therefore a superset of the architectural predicate
-    /// and leaves the pre-existing frame-selection behaviour untouched while
-    /// making `FPCA` observable through `MRS CONTROL`.
+    /// CPACR check, software-writable through `MSR CONTROL`, restored from the
+    /// frame type on exception return, cleared by `FPCCR.CLRONRET`) **and**
+    /// keeps `FPEXC.EN` as a fallback: the bit is set by the same instructions
+    /// but is never cleared by a software `MSR CONTROL`, so a context can never
+    /// be silently lost. The disjunction is therefore a superset of the
+    /// architectural predicate and leaves the pre-existing frame-selection
+    /// behaviour untouched while making `FPCA` observable through `MRS CONTROL`.
     /// ARMv8-M 用 `CONTROL.FPCA` 决定是否使用扩展异常帧。本模型跟踪 `FPCA`
-    /// （每条通过 CPACR 检查的浮点指令置位，`FPCCR.CLRONRET` 清除），同时保留
-    /// `FPEXC.EN` 作为回退：同一条指令会置该位，且软件 `MSR CONTROL` 不会清除
-    /// 它，因此上下文绝不会被静默丢弃。该逻辑或是架构判据的超集，既保持既有
-    /// 帧选择行为不变，又让 `FPCA` 可通过 `MRS CONTROL` 观察。
+    /// （每条通过 CPACR 检查的浮点指令置位，软件可经 `MSR CONTROL` 写入，异常返回
+    /// 按帧类型恢复，`FPCCR.CLRONRET` 清除），同时保留 `FPEXC.EN` 作为回退：
+    /// 同一条指令会置该位，且软件 `MSR CONTROL` 不会清除它，因此上下文绝不会被
+    /// 静默丢弃。该逻辑或是架构判据的超集，既保持既有帧选择行为不变，又让 `FPCA`
+    /// 可通过 `MRS CONTROL` 观察。
     #[must_use]
     pub fn fp_context_active(&self) -> bool {
         self.control & CONTROL_FPCA != 0 || self.fpu.fpexc & fpexc::EN != 0

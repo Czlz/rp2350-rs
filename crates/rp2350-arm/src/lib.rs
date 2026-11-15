@@ -38,6 +38,7 @@ mod fetch_cache;
 pub mod fpu;
 pub mod nvic;
 pub mod registers;
+pub mod scr;
 mod step_cached;
 mod system_access;
 pub mod systick;
@@ -93,10 +94,41 @@ const BOOT_SP_ADDR: u32 = 0x0000_0000;
 /// 原因决定什么能唤醒核心，并报告给前端，使睡眠中的机器无需猜测即可诊断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SleepReason {
-    /// `WFI` with no interrupt pending / 无挂起中断时的 `WFI`
+    /// `WFI` with `SLEEPDEEP = 0` and no interrupt pending
+    /// `SLEEPDEEP = 0` 且无挂起中断时的 `WFI`
     WaitForInterrupt,
-    /// `WFE` with the event register clear / 事件寄存器为空时的 `WFE`
+    /// `WFE` with `SLEEPDEEP = 0` and the event register clear
+    /// `SLEEPDEEP = 0` 且事件寄存器为空时的 `WFE`
     WaitForEvent,
+    /// `WFI`/`WFE` with `SCR.SLEEPDEEP = 1`
+    /// `SCR.SLEEPDEEP = 1` 时的 `WFI`/`WFE`
+    ///
+    /// There is no separately powered domain in this model, so the core still
+    /// enters [`CpuState::Sleeping`]. The payload keeps the instruction's wait
+    /// condition: `wait_for_event = true` is a deep-sleeping `WFE`, `false` a
+    /// deep-sleeping `WFI`. Hosts use the variant to report deep sleep without
+    /// confusing it with an ordinary wait.
+    /// 本模型没有独立掉电域，因此核心仍进入 [`CpuState::Sleeping`]。载荷保留指令的
+    /// 等待条件：`wait_for_event = true` 为深度睡眠的 `WFE`，`false` 为深度睡眠的
+    /// `WFI`。宿主可用该变体上报深度睡眠，而不会与普通等待混淆。
+    SleepDeep {
+        /// The instruction waits for an event (`WFE`) instead of an interrupt
+        /// 该指令等待事件（`WFE`）而非中断
+        wait_for_event: bool,
+    },
+    /// `SCR.SLEEPONEXIT` sleep entered by an exception return to Thread mode
+    /// 由异常返回到 Thread 模式触发的 `SCR.SLEEPONEXIT` 睡眠
+    ///
+    /// The wake condition is the `WFI` one: any enabled pending interrupt
+    /// resumes the core, while an event alone never does. `deep` mirrors
+    /// `SCR.SLEEPDEEP` at the moment of the return.
+    /// 唤醒条件与 `WFI` 相同：任何已使能的挂起中断都会恢复核心，单独的事件不会。
+    /// `deep` 反映异常返回瞬间的 `SCR.SLEEPDEEP`。
+    SleepOnExit {
+        /// Whether `SCR.SLEEPDEEP` also requested deep sleep
+        /// 是否同时由 `SCR.SLEEPDEEP` 请求深度睡眠
+        deep: bool,
+    },
     /// A load hit a retryable bus stall (blocking FIFO read)
     /// 载入遇到可重试的总线 stall（阻塞 FIFO 读）
     ///
@@ -106,6 +138,36 @@ pub enum SleepReason {
     /// 该指令**未**退役：`PC` 与所有寄存器保持指令执行前的值，因此设备能服务时重放的
     /// 是完全相同的载入。
     BlockedRead,
+}
+
+impl SleepReason {
+    /// Whether the reason describes `SCR.SLEEPDEEP` deep sleep
+    /// 该原因是否描述 `SCR.SLEEPDEEP` 深度睡眠
+    ///
+    /// A `SLEEPONEXIT` sleep counts as deep only when `SLEEPDEEP` was set at the
+    /// returning instruction. The electrical effect of deep sleep (power-down,
+    /// clock gating) is not modeled; only the reason is distinguished.
+    /// 只有异常返回瞬间 `SLEEPDEEP` 置位的 `SLEEPONEXIT` 睡眠才算深度睡眠。深度睡眠的
+    /// 电气效果（掉电、时钟门控）未建模，仅区分原因。
+    #[must_use]
+    pub fn is_deep_sleep(self) -> bool {
+        matches!(
+            self,
+            Self::SleepDeep { .. } | Self::SleepOnExit { deep: true }
+        )
+    }
+
+    /// Whether the reason waits for the event register (`WFE` semantics)
+    /// 该原因是否等待事件寄存器（`WFE` 语义）
+    fn waits_for_event(self) -> bool {
+        matches!(
+            self,
+            Self::WaitForEvent
+                | Self::SleepDeep {
+                    wait_for_event: true
+                }
+        )
+    }
 }
 
 /// Cortex-M33 processor core
@@ -157,6 +219,9 @@ pub struct CortexM33Core {
     /// Reason the core is sleeping, `None` while running
     /// 核心睡眠原因，运行时为 `None`
     sleep_reason: Option<SleepReason>,
+    /// System Control Register sleep bits (`SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND`)
+    /// 系统控制寄存器的睡眠位（`SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND`）
+    scr: u32,
     /// WFE event register / WFE 事件寄存器
     ///
     /// Set by `SEV` (this core and the peer), `SEVL`, exception entry and
@@ -196,6 +261,7 @@ impl CortexM33Core {
             decode_cache: decode_cache::DecodeCache::new(),
             decode_cache_enabled: false,
             sleep_reason: None,
+            scr: 0,
             event_register: false,
             events_sent: 0,
         }
@@ -311,6 +377,7 @@ impl CortexM33Core {
         self.total_cycles = 0;
         self.undefined_seen.clear();
         self.sleep_reason = None;
+        self.scr = 0;
         self.event_register = false;
         self.events_sent = 0;
     }
@@ -442,7 +509,7 @@ impl CortexM33Core {
         // SysTick tick (1 cycle per instruction fetch)
         // SysTick 计时（每条指令获取 1 个周期）
         if self.systick.tick(1) {
-            self.nvic.set_pending(EXC_SYSTICK);
+            self.set_pending_irq(EXC_SYSTICK);
         }
 
         // 被 stall 的载入必须完整回滚：PC 与 IT 状态回到指令前，寄存器由访问本身保证
@@ -516,17 +583,26 @@ impl CortexM33Core {
     /// guarantees it wakes on a pending interrupt even when `PRIMASK` masks it),
     /// `WFE` continues immediately when the event register is set and clears it,
     /// and both continue immediately when an exception is already pending
-    /// because exception entry itself is an event source.
+    /// because exception entry itself is an event source. `SCR.SLEEPDEEP` only
+    /// changes the recorded reason: this model has no power domain to shut down.
     /// 只要存在已使能的挂起中断，`WFI` 就不会挂起（ARM ARM 保证即使 `PRIMASK` 屏蔽它，
     /// 挂起中断也会唤醒 `WFI`）；`WFE` 在事件寄存器已置位时立即继续并清除它；两者在
-    /// 已有挂起异常时都立即继续，因为异常进入本身就是一个事件源。
+    /// 已有挂起异常时都立即继续，因为异常进入本身就是一个事件源。`SCR.SLEEPDEEP` 只
+    /// 改变记录的原因：本模型没有可关闭的掉电域。
     fn apply_sleep_request(&mut self, kind: SleepKind) {
+        let deep = self.scr & scr::SLEEPDEEP != 0;
         match kind {
             SleepKind::WaitForInterrupt => {
                 if self.nvic.has_runnable() {
                     return;
                 }
-                self.sleep_reason = Some(SleepReason::WaitForInterrupt);
+                self.sleep_reason = Some(if deep {
+                    SleepReason::SleepDeep {
+                        wait_for_event: false,
+                    }
+                } else {
+                    SleepReason::WaitForInterrupt
+                });
                 self.state = CpuState::Sleeping;
             }
             SleepKind::WaitForEvent => {
@@ -537,25 +613,97 @@ impl CortexM33Core {
                 if self.nvic.has_runnable() {
                     return;
                 }
-                self.sleep_reason = Some(SleepReason::WaitForEvent);
+                self.sleep_reason = Some(if deep {
+                    SleepReason::SleepDeep {
+                        wait_for_event: true,
+                    }
+                } else {
+                    SleepReason::WaitForEvent
+                });
                 self.state = CpuState::Sleeping;
             }
         }
     }
 
+    /// Enter the `SLEEPONEXIT` sleep after an exception return to Thread mode
+    /// 异常返回到 Thread 模式后进入 `SLEEPONEXIT` 睡眠
+    ///
+    /// The instruction at the restored `PC` has not run yet and must not run
+    /// until the sleep ends. A runnable interrupt keeps the core awake, exactly
+    /// like `WFI`, so the pending exception can be taken in the same step.
+    /// `SCR.SLEEPDEEP` again only changes the reported reason.
+    /// 恢复出的 `PC` 处指令尚未执行，睡眠结束前也不能执行。存在可运行中断时核心保持
+    /// 唤醒，与 `WFI` 完全一致，因此挂起异常可在同一步内被响应。`SCR.SLEEPDEEP`
+    /// 同样只改变上报原因。
+    fn apply_sleep_on_exit(&mut self) {
+        if self.nvic.has_runnable() {
+            return;
+        }
+        let deep = self.scr & scr::SLEEPDEEP != 0;
+        self.sleep_reason = Some(SleepReason::SleepOnExit { deep });
+        self.state = CpuState::Sleeping;
+    }
+
+    /// Set an interrupt pending and raise the `SEVONPEND` event on a transition
+    /// 置位中断挂起位，并在发生 0→1 跳变时按 `SEVONPEND` 置位事件
+    ///
+    /// Only a 0-to-1 transition of the pending bit sends the event, whether the
+    /// interrupt is enabled or masked (ARM ARM `SEVONPEND`). Repeated
+    /// assertions of a still-pending line must not keep the event permanently
+    /// set, otherwise `WFE` would stop waiting.
+    /// 只有挂起位发生 0→1 跳变才发送事件，无论中断是否使能或被屏蔽（ARM ARM
+    /// `SEVONPEND`）。对仍然挂起的中断线重复断言不得让事件永久置位，否则 `WFE`
+    /// 将不再等待。
+    fn set_pending_irq(&mut self, irq: IrqNumber) {
+        if usize::from(irq) >= 256 {
+            return;
+        }
+        if self.scr & scr::SEVONPEND != 0 && !self.nvic.is_pending(irq) {
+            self.event_register = true;
+        }
+        self.nvic.set_pending(irq);
+    }
+
+    /// Raise the `SEVONPEND` event when a register write sets new pending bits
+    /// 寄存器写入置位新的挂起位时按 `SEVONPEND` 置位事件
+    ///
+    /// `newly` is the write-1-to-set difference (`value & !ISPR`), so multiple
+    /// interrupts pended by one `ISPR` write produce one event, and writing an
+    /// already-pending bit produces none.
+    /// `newly` 是写 1 置位的差集（`value & !ISPR`），因此一次 `ISPR` 写入挂起多个
+    /// 中断只产生一个事件，而写已挂起的位不产生事件。
+    fn note_pending_bits(&mut self, newly: u32) {
+        if newly != 0 && self.scr & scr::SEVONPEND != 0 {
+            self.event_register = true;
+        }
+    }
+
     /// Whether a sleeping core has a reason to resume / 睡眠核心是否有理由恢复
     ///
-    /// `WFI` ignores the event register (a `SEV` never wakes it) but resumes as
-    /// soon as any enabled interrupt is pending, masked or not. `WFE` resumes on
-    /// an event or a pending interrupt. A blocked load is always retried: the
-    /// retry is side-effect free, so a missing event cannot deadlock it.
-    /// `WFI` 忽略事件寄存器（`SEV` 不会唤醒它），但只要有已使能的挂起中断就恢复，无论
-    /// 是否被屏蔽。`WFE` 在事件或挂起中断到来时恢复。阻塞载入总是重试：重试没有副作用，
+    /// `WFI` (and the `SLEEPONEXIT` sleep, whose wake rule is the `WFI` one)
+    /// ignores the event register but resumes as soon as any enabled interrupt
+    /// is pending, masked or not. `WFE` resumes on an event or a pending
+    /// interrupt, and `SLEEPDEEP` keeps the wait condition of the instruction
+    /// that requested it. A blocked load is always retried: the retry is
+    /// side-effect free, so a missing event cannot deadlock it.
+    /// `WFI`（以及唤醒规则与 `WFI` 相同的 `SLEEPONEXIT` 睡眠）忽略事件寄存器，但只要
+    /// 有已使能的挂起中断就恢复，无论是否被屏蔽。`WFE` 在事件或挂起中断到来时恢复，
+    /// `SLEEPDEEP` 保留请求它的指令的等待条件。阻塞载入总是重试：重试没有副作用，
     /// 因此缺少事件也不会死锁。
     fn wake_ready(&self) -> bool {
         match self.sleep_reason {
-            Some(SleepReason::WaitForInterrupt) => self.nvic.has_runnable(),
-            Some(SleepReason::WaitForEvent) => self.event_register || self.nvic.has_runnable(),
+            Some(SleepReason::WaitForInterrupt | SleepReason::SleepOnExit { .. }) => {
+                self.nvic.has_runnable()
+            }
+            Some(
+                SleepReason::WaitForEvent
+                | SleepReason::SleepDeep {
+                    wait_for_event: true,
+                },
+            ) => self.event_register || self.nvic.has_runnable(),
+            Some(SleepReason::SleepDeep {
+                wait_for_event: false,
+            }) => self.nvic.has_runnable(),
             Some(SleepReason::BlockedRead) | None => true,
         }
     }
@@ -594,17 +742,21 @@ impl CortexM33Core {
         let mut cycles = 0u64;
         self.total_cycles = self.total_cycles.saturating_add(1);
         if self.systick.tick(1) {
-            self.nvic.set_pending(EXC_SYSTICK);
+            self.set_pending_irq(EXC_SYSTICK);
         }
         if !self.wake_ready() {
             return Ok(false);
         }
         let reason = self.sleep_reason.take();
         self.state = CpuState::Running;
-        // WFE/阻塞载入消费掉唤醒它的事件；WFI 不消费（它根本不看事件寄存器）。
-        // WFE and a blocked load consume the event that woke them; WFI does not
-        // look at the event register at all.
-        if !matches!(reason, Some(SleepReason::WaitForInterrupt)) {
+        // WFE/阻塞载入消费掉唤醒它的事件；WFI（含 SLEEPONEXIT 与浅层/深层 WFI）
+        // 不消费，因为它根本不看事件寄存器。
+        // WFE and a blocked load consume the event that woke them; WFI (including
+        // SLEEPONEXIT and both shallow/deep WFI) does not look at the event
+        // register at all.
+        if reason.is_some_and(|reason| {
+            reason.waits_for_event() || matches!(reason, SleepReason::BlockedRead)
+        }) {
             self.event_register = false;
         }
         if self.nvic.has_runnable() {
@@ -869,16 +1021,20 @@ impl CortexM33Core {
 
     /// Perform an exception return for a `BX LR` carrying `EXC_RETURN`
     /// 对携带 `EXC_RETURN` 的 `BX LR` 执行异常返回
+    ///
+    /// Returns whether the return target is Thread mode, which is the only case
+    /// where `SCR.SLEEPONEXIT` may suspend the core.
+    /// 返回目标是否为 Thread 模式；只有该情况可能由 `SCR.SLEEPONEXIT` 挂起核心。
     fn return_from_exception(
         &mut self,
         bus: &mut dyn AddressBus,
         cycles: &mut u64,
-    ) -> Result<(), CoreError> {
+    ) -> Result<bool, CoreError> {
         let Some(info) = exceptions::decode_exc_return(self.registers.lr) else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(active) = self.active_exceptions.pop() else {
-            return Ok(());
+            return Ok(false);
         };
         exceptions::exit_exception(
             bus,
@@ -891,7 +1047,7 @@ impl CortexM33Core {
         )?;
         // 异常返回同样是 ARMv8-M 的事件源。 / Exception return is an event source.
         self.event_register = true;
-        Ok(())
+        Ok(!info.to_handler)
     }
 
     /// Execute one instruction, or advance a sleeping core by one cycle
@@ -929,7 +1085,14 @@ impl CortexM33Core {
         // instruction.
         if self.state == CpuState::Running {
             if result == StepResult::ExceptionReturn {
-                self.return_from_exception(bus, &mut cycle_count)?;
+                let to_thread = self.return_from_exception(bus, &mut cycle_count)?;
+                // SLEEPONEXIT 只在返回到 Thread 模式时生效；Handler→Handler 返回
+                // 继续执行被抢占的处理程序。
+                // SLEEPONEXIT only applies to a return to Thread mode; a
+                // Handler-to-Handler return resumes the preempted handler.
+                if to_thread && self.scr & scr::SLEEPONEXIT != 0 {
+                    self.apply_sleep_on_exit();
+                }
             }
             if self.state == CpuState::Running {
                 self.check_pending_exceptions(bus, &mut cycle_count)?;
@@ -987,7 +1150,7 @@ impl CpuCore for CortexM33Core {
     }
 
     fn signal_interrupt(&mut self, irq: IrqNumber) {
-        self.nvic.set_pending(irq);
+        self.set_pending_irq(irq);
     }
 
     fn system_write(&mut self, addr: u32, value: u32) {
