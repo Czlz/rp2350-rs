@@ -131,8 +131,9 @@ UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 
 | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ✅ 已完成（`BusErrorKind::Stall` + `MemoryRegion::read_would_stall`、`SIO_FIFO_ST` 粘滞位与写 1 清除、事件世代号、ARM/RISC-V 睡眠状态机、`[run] sleep` 统计；补充：`SCR` 的 `SEVONPEND`/`SLEEPONEXIT`/`SLEEPDEEP` 已生效，`MSR/MRS CONTROL` 读写 `nPRIV/SPSEL/FPCA`，异常返回按帧类型恢复 `FPCA`；`SLEEPDEEP` 仅区分原因，无掉电电气效果） |
 | GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ✅ 已完成（`MachineOptions::psram` + `PsramOptions::parse`；`--psram`/profile `psram` 覆盖 `run`/`repl`/`play`/`gdb`；未启用时 `0x1100_0000` 仍 `NoDevice`；超限/未对齐按 periph 规则钳制到 16 MiB 并只警告一次；挂载失败映射为启动错误） |
 | GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | ✅ 部分完成（`SNIFF_CTRL.CALC` 已按 `dma.h` 核对：仅 `0x0..=0x3`/`0xE`/`0xF` 有定义并有标准向量，`0x4..=0xD` 为保留值；嗅探改为观察通道 BSWAP 之后的单元；`BUSCTRL.PERFCTR0/1`+`PERFSEL0/1` 按端口累加 DMA `ACCESS`/`STALL_UPSTREAM`；`DmaBusCounters` 记账 DMA 占用周期与授予；**剩余**：`STALL_DOWNSTREAM`/`ACCESS_CONTESTED`、CPU 主设备事件与真正抢占需周期精确模型，`BootPeripherals` 内 `Dma`↔`BusCtrl` 接线需 `boot.rs` 一行） |
-| GAP-10 | MCP TLS 传输 | mcp | ⏳ |
+| GAP-10 | MCP TLS 传输 | mcp | ⏸ 按需（需引入 rustls，调试服务器收益有限，默认不实施） |
 | GAP-12 | 陈旧文档段落同步 | doc | ⏳ |
+| GAP-20 | SysTick 投递时延收紧（当前最坏 ≈10 064 步，150 MHz 下 ~67 µs） | periph + cli | ⏸ 可选 |
 
 ## 4. 风险 / Risks
 

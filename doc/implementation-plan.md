@@ -59,7 +59,7 @@
 > | GAP-07 | 阻塞 FIFO/IRQ + `WFI`/`WFE`/`SEV` + 睡眠调度 | periph → arm/riscv/cli | ✅ |
 > | GAP-08/08b | PSRAM 模型 + CLI `--psram` 挂载 | periph + cli | ✅ |
 > | GAP-09 | egui 调色板 + 画布持久化 | egui | ✅ |
-> | GAP-10 | MCP TLS 传输 | mcp | ⏳ 未开始（需引入 rustls 依赖，优先级最低） |
+> | GAP-10 | MCP TLS 传输 | mcp | ⏸ 按需（需引入 rustls 依赖，调试服务器收益有限，默认不实施） |
 > | GAP-11 | DMA `CALC` 6 模式 + `PERFCTR` + 总线记账 | periph | ✅ |
 > | GAP-12 | 文档陈旧段落同步 | doc | 🚧 主会话 |
 > | GAP-18 | 时钟精度（PLL/分频/超频） | periph + core + cli + usb-host | ✅（P4-1/P4-2） |
@@ -76,7 +76,7 @@
 > | P4-2f | `CCR` 陷阱（未对齐/除零）+ `SHPR1` | arm | 🚧 |
 > | P4-3 | 时钟频率回归矩阵（150/252/降频/源切换）+ 文档 | 主会话 | ⏳ |
 > | GAP-19 | MCP TLS（可选安全加固） | mcp | ⏳ |
-> | GAP-20 | SysTick 投递时延收紧（10 064 步 → 逐周期） | periph + cli | ⏳ 已知限制 |
+> | GAP-20 | SysTick 投递时延收紧（10 064 步 → 逐周期） | periph + cli | ⏸ 可选（已知限制，~67 µs @150 MHz） |
 >
 > **验收记录 / Acceptance（2026-11-16）**
 >
