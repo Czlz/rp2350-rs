@@ -86,7 +86,7 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
-| P3-1 | GAP-08b：CLI 挂载 PSRAM 窗口（`run`/`repl`/`play`） | `rp2350-cli` | 总线路由测试 + FV |
+| P3-1 ✅ | GAP-08b：CLI 挂载 PSRAM 窗口（`run`/`repl`/`play`/`gdb`） | `rp2350-cli` | `--psram SIZE`（字节/`K`/`M`/`MiB`）+ profile `psram` 键；未给出时不注册（`0x1100_0000` 仍 `NoDevice`），启动错误走 `anyhow`（超限只警告一次）；`cargo test -p rp2350-cli` 115 + 86 绿，FV-1/2/3 `stdout: 42`，emerald 300M 冒烟计数器不变 |
 | P3-2 | 存档/复位：`monitor reset` 在 GUI 可用；flash 存档路径可配置 | cli + egui | 手动冒烟 |
 | P3-3 | 稳定性：2 小时游玩 soak（headless，模拟时间 ≥30 分钟），内存/句柄不增长 | 主会话 | 日志 + 结论 |
 
@@ -100,21 +100,29 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 4. **Wave 4 ✅**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2（egui PlayView 已接线到真实 `PlaySession`）
 5. **Wave 5 ✅**：P0-3c（arm 译码缓存）‖ P2-3（GUI 音频）+ 示例配置整改（`profile.conf` / CLI `--profile` / GUI 无默认值）
 6. **Wave 6 🚧**：GAP-07 ✅（`WFI`/`WFE`/`SEV` + 阻塞 FIFO + 睡眠调度，**正确性**）‖ GAP-11（DMA `SNIFF`/`PERFCTR`）
-7. **Wave 7**：GAP-08b（CLI 挂载 PSRAM）+ P3-2（存档/复位）+ GAP-12（文档）；P3-3（soak）最后
+7. **Wave 7 🚧**：GAP-08b ✅（CLI 挂载 PSRAM）+ P3-2（存档/复位）+ GAP-12（文档）；P3-3（soak）最后
+
+## 3.6 精度任务（当前最高优先级）/ Precision tasks
+
+| ID | 任务 | 归属 | 状态 |
+|----|------|------|------|
+| P4-1 | `CLOCKS` 时钟树：XOSC/ROSC/PLL_SYS/PLL_USB（REFDIV/FBDIV/PDIV/VDIV/LOCK）、`CLK_*_CTRL`/`CLK_*_DIV`、源切换与实时频率 API + 已知向量测试（12 MHz→150 MHz、252 MHz 超频） | `rp2350-periph` | ⏳ 待派发 |
+| P4-2 | 动态频率接入全部计时消费者：`cycles→µs`、SysTick、TIMER、PIO `CLKDIV`、HSTX 像素时钟、UART 波特率、ADC/RTC、DMA 节拍；端到端固件验证（含 252 MHz 固件样例） | `rp2350-periph` + `rp2350-core` + `rp2350-cli` | ⏳ 待派发（依赖 P4-1） |
+| P4-3 | 时钟/频率回归与文档：超频/降频/源切换的 300M 计数器对照、`doc/architecture.md` 时钟章节 | 主会话 | ⏳ |
 
 ## 3.5 通用性任务（与帧率无关，必须推进）/ Generality tasks
 
 | ID | 任务 | 归属 | 状态 |
 |----|------|------|------|
 | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ✅ 已完成（`BusErrorKind::Stall` + `MemoryRegion::read_would_stall`、`SIO_FIFO_ST` 粘滞位与写 1 清除、事件世代号、ARM/RISC-V 睡眠状态机、`[run] sleep` 统计） |
-| GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ⏳ |
+| GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ✅ 已完成（`MachineOptions::psram` + `PsramOptions::parse`；`--psram`/profile `psram` 覆盖 `run`/`repl`/`play`/`gdb`；未启用时 `0x1100_0000` 仍 `NoDevice`；超限/未对齐按 periph 规则钳制到 16 MiB 并只警告一次；挂载失败映射为启动错误） |
 | GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | 🚧 Wave 6 |
 | GAP-10 | MCP TLS 传输 | mcp | ⏳ |
 | GAP-12 | 陈旧文档段落同步 | doc | ⏳ |
 
 ## 4. 风险 / Risks
 
-- **性能（更正）**：总步数吞吐 29.5–34 M/s 主要来自启动段（睡眠/自旋）；**真实游戏段只有 8.0–8.5 M steps/s ≈ 3.3 fps**（见 `doc/performance.md` §9）。60 fps 需约 18×、30 fps 需约 9×，解释器微优化最多再 1.5–2×，**必须 JIT**（或 JIT + 帧级并行）；度量口径改为 300–500 M 窗口；
+- **性能与定位（2026-11-15 决定）**：总步数吞吐 29.5–34 M/s 主要来自启动段（睡眠/自旋）；**真实游戏段 8.0–8.5 M steps/s ≈ 3.3 fps**（`doc/performance.md` §9）。**不做 JIT**：优先级是精确时钟/精确指令/功能与插件稳定；吞吐只优化宿主侧（缓存、去虚化、事件门控）。60 fps 不在当前目标内，3.3 fps 作为「运行真实固件」的当前水平记录；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
 - **GUI 架构**：`rp2350-cli` 提供 lib target（`rp2350_cli::run::Machine` +
