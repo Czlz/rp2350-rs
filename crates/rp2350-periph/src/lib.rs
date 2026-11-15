@@ -68,6 +68,8 @@ mod dma_tests;
 #[cfg(test)]
 mod hstx_tests;
 #[cfg(test)]
+mod io_bank0_tests;
+#[cfg(test)]
 mod sio_spinlock_tests;
 #[cfg(test)]
 mod timer_tests;

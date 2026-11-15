@@ -1191,6 +1191,105 @@ the latch with the pad levels.
 
 ---
 
+## IO_BANK0
+
+```rust
+pub enum PinFunction {
+    Hstx, Spi, Uart, I2c, Pwm, Sio, Pio0, Pio1, Pio2, Gpck, Usb, UartAux,
+    Null, Unknown(u32),
+}
+
+impl PinFunction {
+    pub const fn from_bits(bits: u32) -> Option<Self>;
+    pub const fn to_bits(self) -> u32;
+}
+
+pub struct IoBank0 { /* register file + shared GpioPads */ }
+impl IoBank0 {
+    pub fn new() -> Self;
+    pub fn with_pads(pads: GpioPads) -> Self;
+    pub fn funcsel(&self, pin: u32) -> Option<PinFunction>;
+    pub fn set_funcsel(&mut self, pin: u32, function: PinFunction);
+}
+```
+
+### FUNCSEL / 引脚功能选择
+
+`IO_BANK0` sits at `map::IO_BANK0_BASE` (`0x4002_8000`). Each of the 48 pins
+owns a `GPIOx_STATUS` word at `0x000 + 8*n` (read-only) and a `GPIOx_CTRL` word
+at `0x004 + 8*n`. `CTRL.FUNCSEL` (bits `[4:0]`) selects the peripheral that
+owns the pin and **resets to `0x1F` (`NULL`)** on every pin; the constructor
+writes that reset value explicitly instead of relying on zeroed storage, and
+`reset()` restores it while clearing `OUTOVER`/`INOVER`/`OEOVER`/`IRQOVER`.
+
+`IO_BANK0` 位于 `map::IO_BANK0_BASE`（`0x4002_8000`）。48 个引脚各自拥有
+`0x000 + 8*n` 的只读 `GPIOx_STATUS` 和 `0x004 + 8*n` 的 `GPIOx_CTRL`。
+`CTRL.FUNCSEL`（bits `[4:0]`）选择拥有该引脚的外设，**每个引脚的复位值都是
+`0x1F`（`NULL`）**；构造函数显式写入该复位值而不依赖零初始化，`reset()` 会恢复
+它并清掉 `OUTOVER`/`INOVER`/`OEOVER`/`IRQOVER`。
+
+| `FUNCSEL` | `PinFunction` | Peripheral / 外设 |
+|-----------|---------------|-------------------|
+| `0x00` | `Hstx` | HSTX |
+| `0x01` | `Spi` | SPI |
+| `0x02` | `Uart` | UART0 |
+| `0x03` | `I2c` | I2C |
+| `0x04` | `Pwm` | PWM |
+| `0x05` | `Sio` | SIO |
+| `0x06` | `Pio0` | PIO0 |
+| `0x07` | `Pio1` | PIO1 |
+| `0x08` | `Pio2` | PIO2 |
+| `0x09` | `Gpck` | GPCK / XIP CS1 / trace |
+| `0x0A` | `Usb` | USB |
+| `0x0B` | `UartAux` | UART1 (`UART_AUX`) |
+| `0x1F` | `Null` | none / 无 |
+| `0x0C..=0x1E` | `Unknown(bits)` | undocumented / 未文档化 |
+
+`PinFunction::from_bits` returns `None` only for values that do not fit the
+5-bit field (above `0x1F`); undocumented 5-bit values stay observable as
+`Unknown(bits)` so a host can distinguish "pin does not exist" from "firmware
+programmed an undocumented function". `IoBank0::funcsel` returns `None` for
+`pin >= 48`; `IoBank0::set_funcsel` ignores such pins and preserves every
+`CTRL` bit outside `FUNCSEL`.
+`PinFunction::from_bits` 仅在数值超出 5 位字段（大于 `0x1F`）时返回 `None`；
+未文档化的 5 位值以 `Unknown(bits)` 保留可观测性，使宿主能区分「引脚不存在」与
+「固件写入了未文档化功能」。`IoBank0::funcsel` 对 `pin >= 48` 返回 `None`；
+`IoBank0::set_funcsel` 忽略这类引脚，并保留 `CTRL` 中 `FUNCSEL` 之外的每一位。
+
+### STATUS / 状态寄存器
+
+`GPIOx_STATUS` is read-only in hardware: writes are acknowledged (`write32`
+returns `true`) but change nothing. `read32` overlays the live pad level onto
+`INFROMPAD` (bit 17), taken from the shared `gpio_pads::GpioPads` handle that
+`PADS_BANK0` programs and `SIO` samples. `OETOPAD` (bit 13) and `OUTTOPAD`
+(bit 9) stay `0` because no peripheral drives a pad yet.
+`GPIOx_STATUS` 在硬件上是只读的：写入会被确认（`write32` 返回 `true`）但不改变
+任何位。`read32` 会把实时 pad 电平叠加到 `INFROMPAD`（第 17 位），电平取自
+`PADS_BANK0` 配置、`SIO` 采样的共享 `gpio_pads::GpioPads` 句柄。由于尚无外设驱动
+pad，`OETOPAD`（第 13 位）与 `OUTTOPAD`（第 9 位）恒为 `0`。
+
+### Wiring and not-modelled routing / 接线与尚未建模的路由
+
+`BootPeripherals::mount` builds one `GpioPads` handle and passes it to
+`IoBank0::with_pads`, `PadsBank0::with_pads` and `Sio`, so a pull-up programmed
+through `PADS_BANK0` is visible in both `IO_BANK0.STATUS.INFROMPAD` and
+`SIO_GPIO_IN`. `BootPeripherals::pads()` remains the host injection point.
+
+`FUNCSEL` is decoded but **not routed**: selecting UART, PWM or a PIO block
+does not move the pad driver to that peripheral, does not connect PIO/PWM/UART
+inputs to the pad, and `IO_BANK0` interrupt routing (`PROC0_*`/`PROC1_*`) is
+plain storage. That crossbar is the remaining half of GAP-01.
+`BootPeripherals::mount` 只创建一个 `GpioPads` 句柄，并同时交给
+`IoBank0::with_pads`、`PadsBank0::with_pads` 与 `Sio`，因此通过 `PADS_BANK0`
+配置的上拉在 `IO_BANK0.STATUS.INFROMPAD` 与 `SIO_GPIO_IN` 中都可见；
+`BootPeripherals::pads()` 仍是宿主注入电平的入口。
+
+`FUNCSEL` 只被解码、**不做路由**：选择 UART、PWM 或 PIO 块既不会把 pad 驱动器
+交给该外设，也不会把 PIO/PWM/UART 输入接到 pad；`IO_BANK0` 的中断路由
+（`PROC0_*`/`PROC1_*`）也仅为普通存储。该交叉开关是 GAP-01 剩余的另一半。
+
+---
+
 ## BUSCTRL
 
 `busctrl::BusCtrl` models the `BUSCTRL` block at `map::BUSCTRL_BASE`
@@ -1294,13 +1393,13 @@ core1，反之亦然。
 
 ### Not modelled yet / 尚未建模
 
-`INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, GPIO pin routing between
-SIO/IO_BANK0/PADS_BANK0, and exclusive/`LDREX`/`STREX` monitors. The FIFO is
-8 entries deep per direction with sticky `WOF`/`ROE`; the spinlocks are 32 bits
-wide because the RP2350 block exposes exactly `SPINLOCK0..31`.
-`INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新、SIO/IO_BANK0/PADS_BANK0 之间的引脚
-路由，以及独占访问/`LDREX`/`STREX` 监视器均未建模。每方向 FIFO 深度 8，带粘滞
-`WOF`/`ROE`；自旋锁为 32 位，因为 RP2350 该块只提供 `SPINLOCK0..31`。
+`INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, pad routing driven by a
+decoded `IO_BANK0` `FUNCSEL`, and exclusive/`LDREX`/`STREX` monitors. The FIFO
+is 8 entries deep per direction with sticky `WOF`/`ROE`; the spinlocks are 32
+bits wide because the RP2350 block exposes exactly `SPINLOCK0..31`.
+`INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新、由 `IO_BANK0` `FUNCSEL` 解码结果驱动
+的 pad 路由，以及独占访问/`LDREX`/`STREX` 监视器均未建模。每方向 FIFO 深度 8，
+带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350 该块只提供 `SPINLOCK0..31`。
 
 ---
 

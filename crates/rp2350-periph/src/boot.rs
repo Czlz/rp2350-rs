@@ -223,7 +223,11 @@ impl BootPeripherals {
             Arc::clone(&core1_release),
             Arc::clone(&core1_reset),
         )))?;
-        apb.mount(Box::new(IoBank0::new()))?;
+        // IO_BANK0 与 PADS_BANK0、SIO 共享同一个 pad 句柄，`STATUS.INFROMPAD`
+        // 才能反映 PADS_BANK0 配置的上下拉与宿主注入的外部电平。
+        // IO_BANK0 shares one pad handle with PADS_BANK0 and SIO so
+        // `STATUS.INFROMPAD` reflects the programmed pulls and host levels.
+        apb.mount(Box::new(IoBank0::with_pads(pads.clone())))?;
         apb.mount(Box::new(IoQspi::new()))?;
         apb.mount(Box::new(PadsBank0::with_pads(pads.clone())))?;
         apb.mount(Box::new(PadsQspi::new()))?;
