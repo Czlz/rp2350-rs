@@ -40,6 +40,7 @@
     clippy::doc_markdown
 )]
 
+pub mod buffers;
 pub mod controller;
 pub mod device;
 pub mod endpoint;

@@ -4,14 +4,14 @@
 use crate::DPRAM_SIZE;
 use crate::regs::{
     self, Alias, BUFF_CPU_SHOULD_HANDLE, BUFF_STATUS, Direction, EP_ABORT, EP_ABORT_DONE,
-    EP_BUF_CTRL_BASE, EP_CTRL_BASE, EP_CTRL_DOUBLE_BUFFERED, EP_STALL_ARM, EP_STALL_ARM_EP0_MASK,
-    EP_STATUS_STALL_NAK, EP0_BUF_A, EP0_BUF_B, INTE, INTF, INTR, INTR_ABORT_DONE, INTR_BUFF_STATUS,
-    INTR_BUS_RESET, INTR_DEV_CONN_DIS, INTR_DEV_RESUME_FROM_HOST, INTR_DEV_SOF, INTR_DEV_SUSPEND,
+    EP_BUF_CTRL_BASE, EP_CTRL_BASE, EP_STALL_ARM, EP_STALL_ARM_EP0_MASK, EP_STATUS_STALL_NAK,
+    EP0_BUF_A, EP0_BUF_B, INTE, INTF, INTR, INTR_ABORT_DONE, INTR_BUFF_STATUS, INTR_BUS_RESET,
+    INTR_DEV_CONN_DIS, INTR_DEV_RESUME_FROM_HOST, INTR_DEV_SOF, INTR_DEV_SUSPEND,
     INTR_EP_STALL_NAK, INTR_IMPLEMENTED_MASK, INTR_SETUP_REQ, INTR_TRANS_COMPLETE,
     INTR_VBUS_DETECT, INTS, MAIN_CTRL, MAIN_CTRL_CONTROLLER_EN, REG_WORD_COUNT, SETUP_PACKET,
-    SIE_CTRL, SIE_CTRL_EP0_DOUBLE_BUF, SIE_CTRL_PULLUP_EN, SIE_STATUS, SIE_STATUS_BUS_RESET,
-    SIE_STATUS_CONNECTED, SIE_STATUS_RESUME, SIE_STATUS_SETUP_REC, SIE_STATUS_SUSPENDED,
-    SIE_STATUS_TRANS_COMPLETE, SIE_STATUS_VBUS_DETECTED, SIE_STATUS_W1C_MASK, SOF_RD, SOF_WR,
+    SIE_CTRL, SIE_CTRL_PULLUP_EN, SIE_STATUS, SIE_STATUS_BUS_RESET, SIE_STATUS_CONNECTED,
+    SIE_STATUS_RESUME, SIE_STATUS_SETUP_REC, SIE_STATUS_SUSPENDED, SIE_STATUS_TRANS_COMPLETE,
+    SIE_STATUS_VBUS_DETECTED, SIE_STATUS_W1C_MASK, SOF_RD, SOF_WR,
 };
 
 /// Pure device-side USB controller state.
@@ -302,11 +302,26 @@ impl UsbCore {
         self.dev_sof_pending = true;
     }
 
+    /// Frame number of the most recent SOF, read without side effects
+    /// 最近一次 SOF 的帧号，读取无副作用
+    ///
+    /// Unlike [`Self::read_reg`] on `SOF_RD`, this does not clear
+    /// `INTR.DEV_SOF`. Firmware caches it in TinyUSB's `e15_last_sof`; the host
+    /// bridge uses it to continue the frame counter across phases.
+    /// 与对 `SOF_RD` 调用 [`Self::read_reg`] 不同，它不会清除 `INTR.DEV_SOF`。
+    /// 固件把它缓存到 TinyUSB 的 `e15_last_sof`；主机桥用它跨阶段延续帧号。
+    #[must_use]
+    pub fn sof_frame(&self) -> u16 {
+        (self.reg_word(SOF_RD) & 0x7FF) as u16
+    }
+
     // -----------------------------------------------------------------
     // Internal helpers / 内部辅助
     // -----------------------------------------------------------------
 
-    fn reg_word(&self, offset: usize) -> u32 {
+    /// Read the raw register shadow word without read side effects
+    /// 读取寄存器影子字，不触发读副作用
+    pub(crate) fn reg_word(&self, offset: usize) -> u32 {
         self.regs.get(offset / 4).copied().unwrap_or(0)
     }
 
@@ -344,66 +359,6 @@ impl UsbCore {
         mask
     }
 
-    /// Abort the endpoints selected by an `EP_ABORT` write.
-    /// 中止由 `EP_ABORT` 写选中的端点。
-    ///
-    /// `EP_ABORT` is not a plain endpoint bitmap: datasheet Table 1317 encodes
-    /// one direction per bit as `2*ep + dir` (even = IN, odd = OUT), so bit 15
-    /// is `EP7_OUT`, not a direction flag. `EP_ABORT_DONE` (Table 1318) mirrors
-    /// the same layout, so the request mask is echoed back unchanged and
-    /// clearing only the IN half of EP0 leaves the OUT half untouched.
-    /// `EP_ABORT` 并非纯端点位图：数据手册表 1317 用 `2*ep + dir` 每位编码一个
-    /// 方向（偶数为 IN、奇数为 OUT），因此位 15 是 `EP7_OUT` 而不是方向标志。
-    /// `EP_ABORT_DONE`（表 1318）沿用同一布局，因此请求掩码原样回写；只中止
-    /// EP0 IN 时不会触碰 EP0 OUT。
-    fn abort_endpoints(&mut self, mask: u32) {
-        for ep in 0..16 {
-            for dir in [Direction::In, Direction::Out] {
-                if mask & regs::ep_abort_bit(ep, dir) == 0 {
-                    continue;
-                }
-                let offset = regs::ep_buf_ctrl_offset(ep, dir);
-                self.write_dpram_u32(offset, 0);
-                self.next_high[ep][dir.index()] = false;
-            }
-        }
-        self.regs[EP_ABORT_DONE / 4] |= mask;
-    }
-
-    /// Whether an endpoint is configured for double buffering
-    /// 端点是否配置为双缓冲
-    #[must_use]
-    pub(crate) fn double_buffered(&self, ep: usize, dir: Direction) -> bool {
-        if ep == 0 {
-            self.reg_word(SIE_CTRL) & SIE_CTRL_EP0_DOUBLE_BUF != 0
-        } else {
-            let offset = regs::ep_ctrl_offset(ep, dir);
-            self.read_dpram_u32(offset) & EP_CTRL_DOUBLE_BUFFERED != 0
-        }
-    }
-
-    /// DPSRAM offset of a buffer half, or `None` when unconfigured
-    /// 缓冲半的 DPSRAM 偏移；未配置时返回 `None`
-    #[must_use]
-    pub(crate) fn buffer_offset(&self, ep: usize, dir: Direction, half: u8) -> Option<usize> {
-        let base = if ep == 0 {
-            match half {
-                0 => EP0_BUF_A,
-                _ if self.double_buffered(0, dir) => EP0_BUF_B,
-                _ => return None,
-            }
-        } else {
-            let ctrl = self.read_dpram_u32(regs::ep_ctrl_offset(ep, dir));
-            let offset = (ctrl & regs::EP_CTRL_BUFFER_OFFSET_MASK) as usize;
-            if offset == 0 {
-                return None;
-            }
-            offset
-        };
-        let offset = base + usize::from(half) * regs::DOUBLE_BUF_STRIDE;
-        (offset + regs::MAX_PACKET_SIZE <= DPRAM_SIZE).then_some(offset)
-    }
-
     /// Record a completed buffer and raise `BUFF_STATUS`
     /// 记录完成的缓冲并置位 `BUFF_STATUS`
     pub(crate) fn complete_buffer(&mut self, ep: usize, dir: Direction, last: bool) {
@@ -411,6 +366,19 @@ impl UsbCore {
         self.regs[BUFF_STATUS / 4] |= bit;
         if last {
             self.regs[SIE_STATUS / 4] |= SIE_STATUS_TRANS_COMPLETE;
+        }
+    }
+
+    /// OR `bits` into the register word at `offset`
+    /// 把 `bits` 或入偏移 `offset` 的寄存器字
+    ///
+    /// Host-side diagnostic latches (for example `EP_ABORT_DONE`) live outside
+    /// the guest-visible write paths, so they need a plain shadow update.
+    /// 主机侧诊断锁存（例如 `EP_ABORT_DONE`）不经过客户机可见的写路径，因此
+    /// 需要直接更新影子寄存器。
+    pub(crate) fn set_reg_bits(&mut self, offset: usize, bits: u32) {
+        if let Some(word) = self.regs.get_mut(offset / 4) {
+            *word |= bits;
         }
     }
 
@@ -476,7 +444,7 @@ impl UsbCore {
 mod tests {
     use super::*;
     use crate::regs::{
-        BUF_CTRL_AVAIL, BUF_CTRL_FULL, INTR_BUS_RESET, MAIN_CTRL_CONTROLLER_EN, SIE_CTRL_PULLUP_EN,
+        BUF_CTRL_AVAIL, INTR_BUS_RESET, MAIN_CTRL_CONTROLLER_EN, SIE_CTRL_PULLUP_EN,
     };
 
     fn enabled_core() -> UsbCore {
@@ -572,94 +540,15 @@ mod tests {
 
     #[test]
     fn abort_requests_complete_immediately() {
+        // Abort coverage (including the double-buffered cases) lives with the
+        // implementation in `crate::buffers`.
+        // 中止相关覆盖（含双缓冲用例）与实现一起位于 `crate::buffers`。
         let mut core = enabled_core();
         core.write_dpram_u32(regs::ep_buf_ctrl_offset(1, Direction::Out), BUF_CTRL_AVAIL);
         let bit = regs::ep_abort_bit(1, Direction::Out);
         core.write_reg(EP_ABORT, Alias::Rw, bit);
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(1, Direction::Out)),
-            0
-        );
-        assert_ne!(core.read_reg(EP_ABORT_DONE) & bit, 0);
+        assert_eq!(core.read_reg(EP_ABORT_DONE) & bit, bit);
         assert_ne!(core.intr() & INTR_ABORT_DONE, 0);
-        core.write_reg(EP_ABORT_DONE, Alias::Rw, bit);
-        assert_eq!(core.read_reg(EP_ABORT_DONE), 0);
-    }
-
-    #[test]
-    fn ep0_in_abort_leaves_ep0_out_intact() {
-        // Bit 0 of EP_ABORT is EP0_IN only (datasheet Table 1317). Treating it
-        // as a plain endpoint number used to clear EP0 OUT as well, which lost
-        // the OUT status-stage buffer.
-        // EP_ABORT 的位 0 仅代表 EP0_IN（数据手册表 1317）。若按纯端点号解码
-        // 会连带清除 EP0 OUT，从而丢失 OUT 状态阶段的缓冲。
-        let mut core = enabled_core();
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::In), BUF_CTRL_AVAIL);
-        let out_ctrl = BUF_CTRL_AVAIL | BUF_CTRL_FULL | 3;
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out), out_ctrl);
-        core.write_reg(EP_ABORT, Alias::Rw, regs::ep_abort_bit(0, Direction::In));
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::In)),
-            0
-        );
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(0, Direction::Out)),
-            out_ctrl
-        );
-        assert_eq!(
-            core.read_reg(EP_ABORT_DONE),
-            regs::ep_abort_bit(0, Direction::In)
-        );
-    }
-
-    #[test]
-    fn directional_abort_hits_only_the_encoded_endpoint() {
-        let mut core = enabled_core();
-        let ep1_in = BUF_CTRL_AVAIL;
-        let ep2_in = BUF_CTRL_AVAIL | BUF_CTRL_FULL;
-        let ep2_out = BUF_CTRL_AVAIL | BUF_CTRL_FULL | 64;
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(1, Direction::In), ep1_in);
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(2, Direction::In), ep2_in);
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(2, Direction::Out), ep2_out);
-        // EP2 OUT is numeric bit 5, not bit 2.
-        let bit = regs::ep_abort_bit(2, Direction::Out);
-        assert_eq!(bit, 1 << 5);
-        core.write_reg(EP_ABORT, Alias::Rw, bit);
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(2, Direction::Out)),
-            0
-        );
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(2, Direction::In)),
-            ep2_in
-        );
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(1, Direction::In)),
-            ep1_in
-        );
-        assert_eq!(core.read_reg(EP_ABORT_DONE), bit);
-        assert!(!core.next_half(2, Direction::Out));
-    }
-
-    #[test]
-    fn abort_bit_fifteen_is_ep7_out_not_a_direction_flag() {
-        // Bit 15 is EP7_OUT in the datasheet layout; it must not be decoded as
-        // "EP0 with direction = IN" or as a 15-bit endpoint number.
-        // 数据手册布局中位 15 是 EP7_OUT，不能解码为“EP0 且方向为 IN”或
-        // 15 号端点。
-        let mut core = enabled_core();
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(7, Direction::In), BUF_CTRL_AVAIL);
-        core.write_dpram_u32(regs::ep_buf_ctrl_offset(7, Direction::Out), BUF_CTRL_AVAIL);
-        core.write_reg(EP_ABORT, Alias::Rw, 1 << 15);
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(7, Direction::Out)),
-            0
-        );
-        assert_eq!(
-            core.read_dpram_u32(regs::ep_buf_ctrl_offset(7, Direction::In)),
-            BUF_CTRL_AVAIL
-        );
-        assert_eq!(core.read_reg(EP_ABORT_DONE), 1 << 15);
     }
 
     #[test]

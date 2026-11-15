@@ -3,8 +3,8 @@
 
 use crate::device::UsbCore;
 use crate::regs::{
-    self, BUF_CTRL_AVAIL, BUF_CTRL_FULL, BUF_CTRL_LAST, BUF_CTRL_LEN_MASK, BUF_CTRL_STALL,
-    Direction, MAX_PACKET_SIZE, SETUP_PACKET, buf_ctrl_half, buf_ctrl_set_half,
+    self, BUF_CTRL_AVAIL, BUF_CTRL_FULL, BUF_CTRL_LAST, BUF_CTRL_LEN_MASK, Direction,
+    MAX_PACKET_SIZE, SETUP_PACKET, buf_ctrl_set_half,
 };
 use crate::setup::SetupPacket;
 
@@ -95,12 +95,13 @@ impl UsbCore {
             return InResponse::NoDevice;
         }
         let offset = regs::ep_buf_ctrl_offset(ep, Direction::In);
+        // 缓冲半的布防/轮转/STALL 判定集中在 `crate::buffers`。
+        // Half arming, rotation and STALL detection live in `crate::buffers`.
         let value = self.read_dpram_u32(offset);
-        let double = self.double_buffered(ep, Direction::In);
         if self.any_stalled(value, ep, Direction::In) {
             return InResponse::Stall;
         }
-        let Some((half, ctrl)) = self.armed_half(value, double, ep, Direction::In) else {
+        let Some((half, ctrl)) = self.armed_half(value, ep, Direction::In) else {
             return InResponse::Nak;
         };
         let Some(buffer) = self.buffer_offset(ep, Direction::In, half) else {
@@ -117,7 +118,7 @@ impl UsbCore {
         let cleared = ctrl & !(BUF_CTRL_AVAIL | BUF_CTRL_FULL);
         let updated = buf_ctrl_set_half(value, half, cleared);
         self.set_buf_ctrl(offset, updated);
-        self.schedule_next_half(ep, Direction::In, half, double);
+        self.schedule_next_half(ep, Direction::In, half);
         self.complete_buffer(ep, Direction::In, packet.last);
         InResponse::Data(packet)
     }
@@ -127,8 +128,13 @@ impl UsbCore {
     ///
     /// Copies at most 64 bytes into the armed buffer, marks it full and raises
     /// `BUFF_STATUS`. A short packet (or an armed `LAST`) ends the transfer.
+    /// Double-buffered OUT alternates `AVAILABLE_0`/`AVAILABLE_1`: the filled
+    /// half loses `AVAIL` and gains `FULL`, and only becomes arming-visible
+    /// again once the guest re-arms it with `AVAIL` and `FULL=0`.
     /// 将最多 64 字节复制到已布防缓冲，标记为满并置位 `BUFF_STATUS`。短包
-    /// （或已布防的 `LAST`）将结束本次传输。
+    /// （或已布防的 `LAST`）将结束本次传输。双缓冲 OUT 在
+    /// `AVAILABLE_0`/`AVAILABLE_1` 之间轮转：被填充的半清除 `AVAIL`、置位
+    /// `FULL`，只有在客户机以 `AVAIL`、`FULL=0` 重新布防后才会再次被选中。
     pub fn host_out(&mut self, ep: usize, data: &[u8]) -> OutResponse {
         if !self.transaction_ready() {
             return OutResponse::NoDevice;
@@ -138,11 +144,10 @@ impl UsbCore {
         }
         let offset = regs::ep_buf_ctrl_offset(ep, Direction::Out);
         let value = self.read_dpram_u32(offset);
-        let double = self.double_buffered(ep, Direction::Out);
         if self.any_stalled(value, ep, Direction::Out) {
             return OutResponse::Stall;
         }
-        let Some((half, ctrl)) = self.armed_half(value, double, ep, Direction::Out) else {
+        let Some((half, ctrl)) = self.armed_out_half(value, ep) else {
             return OutResponse::Nak;
         };
         let Some(buffer) = self.buffer_offset(ep, Direction::Out, half) else {
@@ -157,7 +162,7 @@ impl UsbCore {
         updated |= BUF_CTRL_FULL | (len as u32 & BUF_CTRL_LEN_MASK);
         let updated = buf_ctrl_set_half(value, half, updated);
         self.set_buf_ctrl(offset, updated);
-        self.schedule_next_half(ep, Direction::Out, half, double);
+        self.schedule_next_half(ep, Direction::Out, half);
         self.complete_buffer(ep, Direction::Out, last);
         OutResponse::Ack { last }
     }
@@ -200,50 +205,14 @@ impl UsbCore {
     pub fn acknowledge_setup(&mut self) {
         self.clear_sie_bits(regs::SIE_STATUS_SETUP_REC);
     }
-
-    /// Whether either half of the given endpoint reports STALL
-    /// 给定端点的任一半是否报告 STALL
-    fn any_stalled(&self, value: u32, ep: usize, dir: Direction) -> bool {
-        let halves: &[u8] = if self.double_buffered(ep, dir) {
-            &[0, 1]
-        } else {
-            &[0]
-        };
-        halves
-            .iter()
-            .any(|half| buf_ctrl_half(value, *half) & BUF_CTRL_STALL != 0)
-    }
-
-    /// Select the first armed half in the rotation order
-    /// 按轮转顺序选择第一个已布防的半
-    fn armed_half(&self, value: u32, double: bool, ep: usize, dir: Direction) -> Option<(u8, u32)> {
-        if !double {
-            let ctrl = buf_ctrl_half(value, 0);
-            return (ctrl & BUF_CTRL_AVAIL != 0).then_some((0, ctrl));
-        }
-        let first = u8::from(self.next_half(ep, dir));
-        for half in [first, 1 - first] {
-            let ctrl = buf_ctrl_half(value, half);
-            if ctrl & BUF_CTRL_AVAIL != 0 {
-                return Some((half, ctrl));
-            }
-        }
-        None
-    }
-
-    /// Advance the double-buffer rotation after consuming `half`
-    /// 消费 `half` 后推进双缓冲轮转
-    fn schedule_next_half(&mut self, ep: usize, dir: Direction, half: u8, double: bool) {
-        self.set_next_half(ep, dir, double && half == 0);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::regs::{
-        self, Alias, Direction, EP_CTRL_BUFFER_OFFSET_MASK, EP_CTRL_DOUBLE_BUFFERED,
-        EP_CTRL_ENABLE, SIE_CTRL_PULLUP_EN,
+        self, Alias, BUF_CTRL_STALL, Direction, EP_CTRL_BUFFER_OFFSET_MASK,
+        EP_CTRL_DOUBLE_BUFFERED, EP_CTRL_ENABLE, SIE_CTRL_PULLUP_EN,
     };
 
     /// Build a core with the controller and pull-up enabled and bus attached.

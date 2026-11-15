@@ -132,10 +132,43 @@ EPX_DATA          0x180
 
 1. 固件写 `buf_ctrl.out = AVAIL | LAST?`（`FULL=0` 表示已就绪接收）。
 2. 主机发 OUT token：
-   - `AVAIL=0` → NAK；
+   - `AVAIL=0` 或 `FULL=1`（已收数据尚未被取走）→ NAK；
    - 否则把 ≤64 字节写入缓冲，置 `FULL | LEN`，清 `AVAIL`，置 `BUFF_STATUS[2n+1]` 与
      `INTR.BUFF_STATUS`。
 3. 固件读完后写 `buf_ctrl.out = 0`（或重新 arm）并清 `BUFF_STATUS`。
+
+### 4.2.1 双缓冲 OUT（`AVAILABLE_0/1` 语义）
+
+`EP_CTRL.DOUBLE_BUFFERED=1`（EP0 用 `SIE_CTRL.EP0_DOUBLE_BUF`）时，32 位
+`buf_ctrl` 的两个 16 位半字是两路独立缓冲描述符：低半 = `AVAILABLE_0`，
+高半 = `AVAILABLE_1`。每半都有自己的 `AVAIL`（归控制器所有）、`FULL`（持有
+负载）与 `LEN`：
+
+| 事件 | `AVAIL` | `FULL` | `BUFF_STATUS[2n+1]` |
+|------|---------|--------|----------------------|
+| 客户机布防 | 1 | 0 | 保持 |
+| 主机写入一个包 | 0 | 1 | 置位 |
+| 客户机取走并重新布防 | 1 | 0 | 客户机 W1C |
+
+- 两路按轮转交替填充；只有 `AVAIL=1` **且** `FULL=0` 的半可被主机填充，因此
+  满缓冲永不被覆盖（残留的 `AVAIL` 位不会让主机丢弃已收数据）；两路都满时
+  端点返回 NAK，形成背压。
+- `FULL=1` 表示该半归 CPU 所有；客户机用 16 位写只重新布防一路，另一路与它的
+  数据、长度都不受影响。
+- `EP_ABORT` 对选中方向写 32 位 0，两路一起丢弃，并把轮转复位到
+  `AVAILABLE_0`；`EP_ABORT_DONE` 原样回显请求位，`INTR.ABORT_DONE` 同步置位。
+- 单缓冲端点完全忽略高半字，行为与旧模型一致。
+- EP0 控制传输与 `STALL` 语义不受影响：`STALL` 仍在数据交付前判定，SETUP 仍
+  清空 EP0 两个方向的两个半。
+
+- Double buffering turns the 32-bit `buf_ctrl` word into two independent buffer
+  descriptors (`AVAILABLE_0` low half, `AVAILABLE_1` high half), each with its
+  own `AVAIL`/`FULL`/`LEN`. The host fills them in rotation, only ever a half
+  with `AVAIL=1` and `FULL=0`, so a full buffer is never overwritten and a fully
+  occupied pair NAKs the host. `EP_ABORT` clears both halves and resets the
+  rotation to `AVAILABLE_0` while echoing the request into `EP_ABORT_DONE`.
+  Single-buffered endpoints ignore the high half entirely, and EP0 control /
+  STALL semantics are unchanged.
 
 ### 4.3 EP0 与 SETUP
 
@@ -151,7 +184,7 @@ EPX_DATA          0x180
 |----------|----------|
 | `host_attach()` | `VBUS_DETECTED|CONNECTED`；`INTR.DEV_CONN_DIS` 仅在断开时置位 |
 | `host_bus_reset()` | 地址清零、所有 EP ctrl/buf ctrl 清零、`SIE_STATUS.BUS_RESET` + `INTR.BUS_RESET` |
-| `host_sof(frame)` | 更新 `SOF_RD`，置 `INTR.DEV_SOF`（读 `SOF_RD` 清除） |
+| `host_sof(frame)` | 更新 `SOF_RD`，置 `INTR.DEV_SOF`（读 `SOF_RD` 清除）；主机桥按 1 ms 模拟时间自动调用 |
 | 固件清 `PULLUP_EN` | 主机视为设备拔出，回到 Detached |
 | 固件未置 `MAIN_CTRL.CONTROLLER_EN` | 主机事务返回 `NoDevice` |
 
@@ -211,10 +244,28 @@ HostState:
 - 固件 NAK 时 `poll` 返回 `Advised(100 μs)`；调用方用该值推进 guest 后再次 `poll`。
 - 不进行位级/包级抢占：仿真器串行执行 CPU，USB 事务只在 `poll` 时发生，因此不存在
   需要中断 CPU 的并发点。
-- **取舍**：该模型不模拟 SOF 周期抖动、CRC、位填充和总线错误；TinyUSB 的 errata
-  路径（E2/E15）按“立即完成 abort / 忽略”处理。对 REPL 与 perfbench 语义无影响。
-  与 rp2350js 的“AVAIL 写入即触发 + alarm 延迟”相比，本模型采用“主机轮询 + 周期调度”，
-  优点是 host 策略与控制器解耦、可在无 CPU 环境下单测；代价是需要调用方显式推进时间。
+- **1 ms SOF 调度**：`UsbHostBridge::poll(now)` 与 `CdcLink::advance()` 在推进模拟时间
+  时先调用 `SofScheduler::advance()`，每个 1 ms 帧下发一个 `host_sof()` 令牌，**再**
+  处理本帧的端点事务（顺序固定为「先 SOF，再传输」）。节拍由模拟周期
+  （`sysclk_hz/1000`，150 MHz 时 150,000 周期）导出，不依赖真实时钟。一次推进跨越
+  多个帧时按序补齐，单次最多 64 个令牌（`MAX_SOF_CATCH_UP`），被合并的帧只推进帧号；
+  帧号 11 位回绕。附着后帧号从 0 重新开始；枚举完成交给 CDC 通道时帧号延续设备上一次
+  `SOF_RD`，因此 TinyUSB 的 `e15_last_sof` 始终能看到新帧号。设备未附着
+  （`SIE_CTRL.PULLUP_EN=0`）时不下发 SOF。
+- **SOF scheduling** — `UsbHostBridge::poll(now)` and `CdcLink::advance()` first call
+  `SofScheduler::advance()`, which issues one `host_sof()` token per 1 ms frame
+  derived from simulated cycles (`sysclk_hz/1000`), and only then handles that
+  frame's endpoint transactions. Multi-frame jumps are caught up in order (at
+  most 64 tokens per call; coalesced frames still advance the 11-bit frame
+  number). The frame counter restarts at attach and continues from the device's
+  last `SOF_RD` when enumeration hands over to the CDC channel, so TinyUSB's
+  `e15_last_sof` always observes a fresh frame. No SOF is issued while the
+  device is detached.
+- **取舍**：该模型按固定 1 ms 周期调度 SOF，但不模拟周期抖动、CRC、位填充和总线
+  错误；TinyUSB 的 errata-15 变通因此能看到持续更新的 `SOF_RD`。对 REPL 与
+  perfbench 语义无影响。与 rp2350js 的“AVAIL 写入即触发 + alarm 延迟”相比，本模型
+  采用“主机轮询 + 周期调度”，优点是 host 策略与控制器解耦、可在无 CPU 环境下单测；
+  代价是需要调用方显式推进时间。
 
 ---
 
@@ -304,7 +355,8 @@ HostTransport (stdio / TCP)  ⇄  RawReplSession  ⇄  CdcChannel  ⇄  UsbHostB
 | 层 | 内容 |
 |----|------|
 | 寄存器单元测试 | DPRAM 布局常量、别名 SET/CLR/XOR、`BUFF_STATUS` W1C、`INTS = (INTR & INTE) \| INTF` |
-| 端点单元测试 | IN 装载→主机读取→AVAIL/FULL 清除与 BUFF_STATUS；OUT 装载→主机写入→FULL/LEN；NAK/STALL |
+| 端点单元测试 | IN 装载→主机读取→AVAIL/FULL 清除与 BUFF_STATUS；OUT 装载→主机写入→FULL/LEN；双缓冲 `AVAILABLE_0/1` 轮转、背压与 `EP_ABORT` 清理；NAK/STALL |
+| SOF 测试 | `SofScheduler` 的 1 ms 边界/系统时钟换算/长跳跃补齐/11 位回绕；`poll()` 内「先 SOF 后事务」顺序与 `e15_last_sof` 取新帧；`CdcLink` 数据阶段继续计帧 |
 | 枚举测试 | 用脚本化“假固件”在 `UsbCore` 上响应 SETUP；主机桥完成复位→取描述符→设地址→设配置 |
 | REPL 测试 | 假固件在 CDC Bulk 端点上回环 raw REPL 帧；`RawReplClient` 完成 Ctrl-A/执行/读取 |
 | 实机测试 | 加载真实 UF2 到 `SimpleBus` + `CortexM33`，驱动主机桥；如实记录 CPU 覆盖缺口 |
@@ -406,21 +458,21 @@ stdin open (for example from a pipe) long enough to reach the banner.
 
 ### 11.4 已知限制 / Limitations
 
-- 主机桥当前不调度 SOF：`host_sof()` 已实现，但 `poll()` 不按 1 ms 帧周期调用。
-  TinyUSB 的 errata-15 路径因此看到陈旧的 `e15_last_sof`，批量 IN 缓冲立即启动，
-  而不是等待 SOF 中断。
+- SOF 节拍固定为 1 ms（无周期抖动），且一次推进最多补齐 64 个令牌；更长停顿只
+  推进帧号，不逐帧下发。等时传输、CRC/位填充与总线错误仍未建模。
+- 双缓冲 OUT 已建模 `AVAILABLE_0/1` 的 `AVAIL`/`FULL`/`LEN` 与 `EP_ABORT` 清理，
+  但未建模 `BUF_CTRL.SEL` 的主机侧可见语义与 `DATA0/DATA1` 序列。
 - 可选的字符串描述符若被设备 STALL，会被主机桥跳过，不中止枚举；必需请求
   STALL 仍判定失败。
-- 未建模等时/大容量存储/音频类、双缓冲 OUT、位级总线时序与 CRC/位填充。
 
-- The host bridge does not schedule SOFs: `host_sof()` exists, but `poll()` never
-  issues one per 1 ms frame. TinyUSB's errata-15 path therefore sees a stale
-  `e15_last_sof` and starts bulk-IN buffers immediately instead of waiting for
-  the SOF interrupt.
+- The SOF cadence is a fixed 1 ms (no jitter) and a single advance catches up at
+  most 64 tokens; longer stalls only move the frame counter forward.
+  Isochronous transfers, CRC/bit-stuffing and bus errors remain unmodelled.
+- Double-buffered OUT models the `AVAILABLE_0/1` `AVAIL`/`FULL`/`LEN` fields and
+  `EP_ABORT` cleanup, but not the host-visible semantics of `BUF_CTRL.SEL` or the
+  `DATA0`/`DATA1` sequence.
 - An optional string descriptor that the device stalls is skipped instead of
   aborting enumeration; a stall on a required request still fails.
-- Isochronous/MSC/audio classes, double-buffered OUT, bit-level bus timing and
-  CRC/bit-stuffing are not modelled.
 
 ## 12. 参考 / References
 

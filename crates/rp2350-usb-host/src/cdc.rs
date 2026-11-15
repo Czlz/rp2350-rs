@@ -5,8 +5,9 @@ use std::collections::VecDeque;
 
 use rp2350_usb::controller::Controller;
 
-use crate::bridge::CdcEndpoints;
+use crate::bridge::{CdcEndpoints, UsbHostBridge};
 use crate::repl::ByteLink;
+use crate::sof::SofScheduler;
 
 /// Buffered CDC data channel between the host bridge and the guest firmware.
 /// 主机桥与客户机固件之间有缓冲的 CDC 数据通道。
@@ -21,19 +22,68 @@ pub struct CdcChannel {
     endpoints: CdcEndpoints,
     rx: VecDeque<u8>,
     tx: VecDeque<u8>,
+    /// 1 ms SOF schedule that keeps running after enumeration
+    /// 枚举结束后继续运行的 1 ms SOF 调度
+    sof: SofScheduler,
+    /// Simulated cycles elapsed since the channel was created
+    /// 通道创建以来经过的模拟周期
+    now_cycles: u64,
 }
 
 impl CdcChannel {
     /// Create a channel over the enumerated CDC endpoints
     /// 在枚举得到的 CDC 端点之上创建通道
+    ///
+    /// The SOF schedule continues from the frame number the device last saw, so
+    /// TinyUSB's errata-15 path keeps getting fresh frames during the data
+    /// phase instead of seeing `SOF_RD` jump back to zero.
+    /// SOF 调度从设备最后看到的帧号继续，因此 TinyUSB 的 errata-15 路径在数据
+    /// 阶段仍能拿到新帧号，而不会看到 `SOF_RD` 跳回零。
     #[must_use]
     pub fn new(controller: Controller, endpoints: CdcEndpoints) -> Self {
+        let frame = controller.with_core(|core| core.sof_frame());
+        let mut sof = SofScheduler::new(UsbHostBridge::DEFAULT_SYSCLK_HZ);
+        sof.reset_at(0, frame);
         Self {
             controller,
             endpoints,
             rx: VecDeque::new(),
             tx: VecDeque::new(),
+            sof,
+            now_cycles: 0,
         }
+    }
+
+    /// Override the system clock used for the SOF frame period
+    /// 覆盖用于 SOF 帧周期的系统时钟
+    pub fn set_sysclk_hz(&mut self, hz: u32) {
+        self.sof.set_sysclk_hz(hz);
+    }
+
+    /// Advance simulated time and issue every SOF frame that is due
+    /// 推进模拟时间并下发所有到期的 SOF 帧
+    ///
+    /// Callers must invoke this before pumping endpoints so the device observes
+    /// a fresh frame before the frame's transactions, matching [`crate::bridge`].
+    /// 调用方必须在搬运端点之前调用，使设备先看到新帧再看到本帧事务，与
+    /// [`crate::bridge`] 的顺序一致。
+    pub fn advance_time(&mut self, cycles: u64) -> u32 {
+        self.now_cycles = self.now_cycles.saturating_add(cycles);
+        self.sof.advance(&self.controller, self.now_cycles)
+    }
+
+    /// Simulated cycles elapsed since channel creation
+    /// 通道创建以来经过的模拟周期
+    #[must_use]
+    pub const fn now_cycles(&self) -> u64 {
+        self.now_cycles
+    }
+
+    /// Frame number of the last SOF handed to the device
+    /// 最近交给设备的 SOF 帧号
+    #[must_use]
+    pub const fn sof_frame(&self) -> u16 {
+        self.sof.frame()
     }
 
     /// Discovery result this channel was built from / 构建该通道时使用的枚举结果
@@ -159,6 +209,7 @@ impl<F: FnMut(u64)> CdcLink<F> {
     /// 覆盖将微秒换算为周期的系统时钟
     pub fn set_sysclk_hz(&mut self, hz: u32) {
         self.sysclk_hz = hz;
+        self.channel.set_sysclk_hz(hz);
     }
 
     /// Underlying CDC channel / 底层 CDC 通道
@@ -191,6 +242,9 @@ impl<F: FnMut(u64)> ByteLink for CdcLink<F> {
     fn advance(&mut self, micros: u64) {
         let cycles = (u64::from(self.sysclk_hz) * micros).div_ceil(1_000_000);
         (self.run_cycles)(cycles);
+        // SOF 先于本帧的端点事务，与主机桥 poll() 的顺序一致。
+        // SOF precedes this window's endpoint transactions, matching `poll()`.
+        self.channel.advance_time(cycles);
         self.channel.flush();
         self.channel.service();
         self.now_micros += micros;
@@ -244,6 +298,28 @@ mod tests {
             core.write_dpram_u32(regs::ep_ctrl_offset(ep, dir), ctrl);
             core.write_dpram_u32(regs::ep_buf_ctrl_offset(ep, dir), regs::BUF_CTRL_AVAIL);
         });
+    }
+
+    #[test]
+    fn cdc_link_keeps_the_one_millisecond_sof_cadence() {
+        // The data phase must keep SOFs flowing, otherwise errata-15 sees a
+        // frozen frame number once enumeration is over.
+        // 数据阶段必须继续产生 SOF，否则枚举结束后 errata-15 会看到冻结的帧号。
+        let controller = ready_controller();
+        let channel = CdcChannel::new(controller.clone(), endpoints());
+        let mut link = CdcLink::new(channel, |_cycles| {});
+        assert_eq!(link.channel().sof_frame(), 0);
+        link.advance(500);
+        assert_eq!(link.channel().sof_frame(), 0);
+        link.advance(500);
+        assert_eq!(link.channel().sof_frame(), 1);
+        let intr = controller.with_core(|core| core.intr());
+        assert_ne!(intr & rp2350_usb::regs::INTR_DEV_SOF, 0);
+        link.advance(500);
+        assert_eq!(link.channel().sof_frame(), 1);
+        link.advance(500);
+        assert_eq!(link.channel().sof_frame(), 2);
+        assert_eq!(link.channel().now_cycles(), 300_000);
     }
 
     #[test]

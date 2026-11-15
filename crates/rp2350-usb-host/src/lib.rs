@@ -18,6 +18,9 @@
 //!   [`perfbench`] 复现 `tests/run-perfbench.py` 的 `time norm result` 流程。
 //! - [`mask_rom`] provides the EP0 compatibility view of the boot ROM window.
 //!   [`mask_rom`] 提供 EP0 兼容所需的 boot ROM 窗口视图。
+//! - [`sof`] schedules one start-of-frame token per millisecond of simulated
+//!   time, for both enumeration and the CDC data phase.
+//!   [`sof`] 按模拟时间每毫秒调度一个帧起始令牌，枚举与 CDC 数据阶段共用。
 //!
 //! No CPU or clock is required: the guest firmware is simulated by callers
 //! through the controller's `host_*` methods.
@@ -40,6 +43,7 @@ pub mod descriptor;
 pub mod mask_rom;
 pub mod perfbench;
 pub mod repl;
+pub mod sof;
 
 pub use bridge::{CdcEndpoints, HostError, HostProgress, UsbHostBridge};
 pub use cdc::{CdcChannel, CdcLink};
@@ -47,3 +51,4 @@ pub use descriptor::{ConfigInfo, DescriptorError, DeviceInfo, EndpointInfo};
 pub use mask_rom::MaskRom;
 pub use perfbench::{BenchError, BenchOutcome, BenchResult, assemble_bench_script};
 pub use repl::{ByteLink, ExecOutput, RawReplSession, ReplError};
+pub use sof::SofScheduler;

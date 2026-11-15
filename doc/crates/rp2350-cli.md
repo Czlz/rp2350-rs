@@ -161,6 +161,16 @@ Ctrl-C/Ctrl-A/Ctrl-B/Ctrl-D，协议完全由对端（`pyboard.py`、
   传输中透过它写入；真实掩膜 ROM 会忽略该写入，拒绝写入的区域则会让客户机在
   首个 SETUP 处以 `Bus error at address 0x00000000` 停机。`run` 不枚举 USB，
   保留原区域。
+- **SOF cadence / SOF 节拍**：the host bridge issues one start-of-frame token per
+  1 ms of simulated time (`SofScheduler`, `sysclk_hz/1000` cycles), first during
+  enumeration and then through the CDC link's `advance()`. SOF always precedes
+  that frame's transactions, so TinyUSB's errata-15 workaround
+  (`e15_last_sof`) sees a fresh `SOF_RD` instead of a frozen value; no SOF is
+  sent while the device is detached.
+  主机桥按 **1 ms 模拟时间**下发一个帧起始令牌（`SofScheduler`，
+  `sysclk_hz/1000` 周期）：枚举期间由 `poll()` 下发，之后由 CDC 链路的
+  `advance()` 继续。SOF 总是先于本帧事务，因此 TinyUSB 的 errata-15 变通
+  （`e15_last_sof`）能看到新的 `SOF_RD` 而不是冻结值；设备未附着时不下发 SOF。
 - **Limitations / 限制**：no PTY, no real serial port, no hardware flow
   control (only the 64 KiB bounded queue and OS pipe backpressure), no TLS and
   no multi-client. `--stdio` expects a byte-oriented pipe/file; interactive

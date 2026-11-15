@@ -9,6 +9,7 @@ use rp2350_usb::regs::{self, Direction};
 use rp2350_usb::setup::{SetupPacket, request};
 
 use crate::descriptor::{ConfigInfo, DescriptorError, DeviceInfo, parse_config, parse_device};
+use crate::sof::SofScheduler;
 
 /// Full-speed control endpoint maximum packet size
 /// 全速控制端点最大包长
@@ -141,6 +142,9 @@ pub struct UsbHostBridge {
     failed_transfer: Option<String>,
     /// Newest control-transfer events, oldest first / 最新的控制传输事件，最旧在前
     trace: VecDeque<String>,
+    /// 1 ms SOF schedule driven by simulated cycles
+    /// 由模拟周期驱动的 1 ms SOF 调度
+    sof: SofScheduler,
 }
 
 impl UsbHostBridge {
@@ -165,6 +169,7 @@ impl UsbHostBridge {
             last_error: None,
             failed_transfer: None,
             trace: VecDeque::new(),
+            sof: SofScheduler::new(Self::DEFAULT_SYSCLK_HZ),
         }
     }
 
@@ -172,6 +177,27 @@ impl UsbHostBridge {
     /// 覆盖用于时序换算的系统时钟
     pub fn set_sysclk_hz(&mut self, hz: u32) {
         self.sysclk_hz = hz;
+        self.sof.set_sysclk_hz(hz);
+    }
+
+    /// Frame number of the last SOF sent to the device
+    /// 最近发送给设备的 SOF 帧号
+    #[must_use]
+    pub fn sof_frame(&self) -> u16 {
+        self.sof.frame()
+    }
+
+    /// Cycle at which the next SOF frame is due
+    /// 下一个 SOF 帧到期的周期
+    #[must_use]
+    pub fn sof_next_cycle(&self) -> u64 {
+        self.sof.next_cycle()
+    }
+
+    /// Total SOF tokens issued so far / 已下发的 SOF 令牌总数
+    #[must_use]
+    pub fn sof_emitted(&self) -> u64 {
+        self.sof.emitted()
     }
 
     /// Parsed device descriptor, once available / 已解析的设备描述符
@@ -229,9 +255,18 @@ impl UsbHostBridge {
         // the endpoint.
         let ep0 = self.ep0_snapshot();
         let trace = self.trace.iter().cloned().collect::<Vec<_>>().join(" | ");
+        // SOF 节拍也进入快照：帧号停在某个值上说明 1 ms 调度没有推进。
+        // The SOF cadence joins the snapshot: a frozen frame number means the
+        // 1 ms schedule stopped advancing.
+        let sof = format!(
+            "frame={} next={} emitted={}",
+            self.sof.frame(),
+            self.sof.next_cycle(),
+            self.sof.emitted()
+        );
         format!(
             "stage={stage}, address={}, queued={}, transfer=[{transfer}], \
-             device={}, config={}, ep0[{ep0}], trace=[{trace}]",
+             device={}, config={}, sof=[{sof}], ep0[{ep0}], trace=[{trace}]",
             self.address,
             self.queue.len(),
             self.device.is_some(),
@@ -296,6 +331,10 @@ impl UsbHostBridge {
     fn begin_enumeration(&mut self, now: u64) {
         self.stage = Stage::Enumerating;
         self.address = 0;
+        // 附着后从新的帧边界开始：总线复位期间不产生旧帧号。
+        // Restart the frame grid at attach: no stale frame numbers survive the
+        // bus reset.
+        self.sof.reset(now);
         self.retry_at = now + self.us_to_cycles(10_000);
         self.deadline = now + self.us_to_cycles(200_000);
         self.queue.clear();
@@ -332,7 +371,23 @@ impl UsbHostBridge {
 
     /// Advance enumeration by at most one USB transaction.
     /// 至多推进一次 USB 事务的枚举步骤。
+    ///
+    /// Ordering is fixed and mirrors the bus: every SOF frame due at `now` is
+    /// delivered **first**, then at most one endpoint transaction is attempted.
+    /// `now` is the simulated cycle count, so the cadence is derived from the
+    /// simulation clock rather than wall time.
+    /// 顺序固定且与总线一致：先下发所有在 `now` 到期的 SOF 帧，然后至多尝试一次
+    /// 端点事务。`now` 是模拟周期数，因此节拍来自模拟时钟而非真实时间。
     pub fn poll(&mut self, now: u64) -> HostProgress {
+        // SOF 必须先于本帧事务：TinyUSB 的 errata-15 路径用 SOF_RD 判断能否启动
+        // 批量 IN 缓冲，若先发传输会看到陈旧帧号。
+        // SOF must precede this frame's transactions: TinyUSB's errata-15 path
+        // reads SOF_RD to decide whether it may start a bulk-IN buffer, and a
+        // transfer issued first would observe a stale frame number.
+        if self.stage != Stage::Detached {
+            self.sof.advance(&self.controller, now);
+        }
+
         match self.stage {
             Stage::Detached => {
                 if !self.controller.device_visible() {
@@ -746,6 +801,8 @@ mod tests {
         stall_device: bool,
         respond: bool,
         configured: bool,
+        /// SOF frame observed when the first SETUP arrived / 首个 SETUP 到达时的 SOF 帧号
+        first_setup_frame: Option<u16>,
     }
 
     impl FakeFirmware {
@@ -763,6 +820,7 @@ mod tests {
                 stall_device: false,
                 respond: true,
                 configured: false,
+                first_setup_frame: None,
             }
         }
 
@@ -870,6 +928,16 @@ mod tests {
                 (setup, core.read_reg(regs::BUFF_STATUS))
             });
             if let Some(setup) = setup {
+                if self.first_setup_frame.is_none() {
+                    // 记录首个 SETUP 时的帧号：它证明同一轮 poll 里 SOF 先于事务。
+                    // Record the frame seen at the first SETUP: it proves the SOF
+                    // preceded the transaction inside the same poll call.
+                    self.first_setup_frame = Some(
+                        self.controller
+                            .with_core(|core| core.read_reg(regs::SOF_RD))
+                            as u16,
+                    );
+                }
                 self.controller.with_core(UsbCore::acknowledge_setup);
                 self.begin(setup);
                 return;
@@ -995,5 +1063,112 @@ mod tests {
         let _ = bridge.poll(now);
         firmware.detach();
         assert_eq!(bridge.poll(now + 1), HostProgress::Detached);
+    }
+
+    /// One 1 ms frame at the bridge's default 150 MHz system clock
+    /// 主机桥默认 150 MHz 系统时钟下 1 毫秒帧的周期数
+    const MS: u64 = 150_000;
+
+    fn sof_rd(firmware: &FakeFirmware) -> u16 {
+        firmware
+            .controller
+            .with_core(|core| core.read_reg(regs::SOF_RD) as u16)
+    }
+
+    fn dev_sof_pending(firmware: &FakeFirmware) -> bool {
+        firmware
+            .controller
+            .with_core(|core| core.intr() & regs::INTR_DEV_SOF != 0)
+    }
+
+    #[test]
+    fn poll_issues_one_sof_per_simulated_millisecond() {
+        // 1 ms of simulated time, not wall time: 0.5 ms never produces a frame.
+        // 以 1 毫秒模拟时间为节拍，而非真实时间：0.5 毫秒不产生新帧。
+        let mut firmware = FakeFirmware::new();
+        firmware.respond = false;
+        let mut bridge = UsbHostBridge::new(firmware.controller.clone());
+        let _ = bridge.poll(0);
+        assert_eq!(bridge.sof_frame(), 0);
+        assert_eq!(bridge.sof_next_cycle(), MS);
+        assert_eq!(sof_rd(&firmware), 0);
+
+        let _ = bridge.poll(MS / 2);
+        assert_eq!(bridge.sof_frame(), 0);
+        assert_eq!(sof_rd(&firmware), 0);
+
+        let _ = bridge.poll(MS);
+        assert_eq!(bridge.sof_frame(), 1);
+        assert_eq!(sof_rd(&firmware), 1);
+        assert_eq!(bridge.sof_emitted(), 1);
+
+        let _ = bridge.poll(MS + MS / 2);
+        assert_eq!(bridge.sof_frame(), 1);
+        assert_eq!(sof_rd(&firmware), 1);
+
+        let _ = bridge.poll(2 * MS);
+        assert_eq!(bridge.sof_frame(), 2);
+        assert_eq!(sof_rd(&firmware), 2);
+        assert_eq!(bridge.sof_next_cycle(), 3 * MS);
+    }
+
+    #[test]
+    fn sof_frame_is_fresh_for_the_errata_15_path() {
+        // TinyUSB caches SOF_RD in e15_last_sof; every millisecond must present
+        // a different frame number together with a DEV_SOF latch.
+        // TinyUSB 把 SOF_RD 缓存到 e15_last_sof；每毫秒都必须呈现不同帧号并
+        // 锁存 DEV_SOF。
+        let mut firmware = FakeFirmware::new();
+        firmware.respond = false;
+        let mut bridge = UsbHostBridge::new(firmware.controller.clone());
+        let _ = bridge.poll(0);
+        let first = sof_rd(&firmware);
+
+        let _ = bridge.poll(MS);
+        assert!(dev_sof_pending(&firmware), "a SOF must latch DEV_SOF");
+        let second = sof_rd(&firmware);
+        assert_ne!(second, first, "errata-15 must see a new frame");
+
+        let _ = bridge.poll(2 * MS);
+        assert!(dev_sof_pending(&firmware));
+        let third = sof_rd(&firmware);
+        assert_ne!(third, second);
+        assert_eq!(third, 2);
+    }
+
+    #[test]
+    fn sof_is_delivered_before_the_transaction_it_precedes() {
+        // The first transfer becomes possible 10 ms after attach; all 10 frame
+        // tokens must already be on the bus when the device sees the SETUP.
+        // 首次传输在附着后 10 毫秒才可能发生；设备看到 SETUP 时 10 个帧令牌
+        // 必须已经下发。
+        let mut firmware = FakeFirmware::new();
+        let (outcome, bridge) = enumerate(&mut firmware);
+        assert!(matches!(outcome, HostProgress::Configured(_)));
+        assert_eq!(
+            firmware.first_setup_frame,
+            Some(10),
+            "SOF for the frame must precede the SETUP token"
+        );
+        assert!(bridge.sof_frame() >= 10);
+    }
+
+    #[test]
+    fn sof_stops_while_the_device_is_detached() {
+        let mut firmware = FakeFirmware::new();
+        firmware.respond = false;
+        let mut bridge = UsbHostBridge::new(firmware.controller.clone());
+        let _ = bridge.poll(0);
+        let _ = bridge.poll(3 * MS);
+        assert_eq!(bridge.sof_frame(), 3);
+
+        firmware.detach();
+        assert_eq!(bridge.poll(4 * MS), HostProgress::Detached);
+        let frame_at_detach = bridge.sof_frame();
+        assert_eq!(frame_at_detach, 4);
+        // No frames exist on an unattached bus. / 未附着总线上没有帧。
+        let _ = bridge.poll(10 * MS);
+        assert_eq!(bridge.sof_frame(), frame_at_detach);
+        assert_eq!(sof_rd(&firmware), 4);
     }
 }
