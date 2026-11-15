@@ -43,13 +43,14 @@
 > | GAP-01a | `IO_BANK0` `FUNCSEL` 寄存器语义与访问器 | periph | — | ✅ |
 > | GAP-01b | PIO/SIO 引脚按 `FUNCSEL` 路由到 pad | periph | GAP-01a | ✅ |
 > | GAP-02 | GDB 多核线程表与 `vCont`/`thread:` | gdb + cli | — | ✅ |
-> | GAP-03 | ARM `SMLALxy` + `FPCCR` 惰性压栈剩余位 | arm | — | ⏳ wave 2 |
+> | GAP-03 | ARM `SMLALxy` + `FPCCR` 行为位（TS/CLRONRET） | arm | — | ✅ |
 > | GAP-04 | RISC-V 非法 CSR 陷阱 + ROM 表项 + `misa.B` | riscv + bootrom | — | ✅ |
 > | GAP-05 | USB 主机 1 ms SOF 调度 + 双缓冲 OUT | usb-host + usb | — | ✅ |
-> | GAP-06 | HSTX TMDS/像素捕获 API + 原始路径计时 | periph | — | ⏳ wave 3 |
-> | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ，重新落地 `WFI`/`WFE` | periph → arm/cli | GAP-07a | ⏳ wave 4 |
+> | GAP-06 | HSTX 原始路径计时 + 像素捕获 API | periph | — | 🚧 wave 4 |
+> | GAP-02b | `Machine` 按核步进，`vCont;s:1/s:2` 只推进选中核 | cli + gdb | GAP-02 | 🚧 wave 4 |
+| GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ，重新落地 `WFI`/`WFE` | periph → arm/cli | GAP-07a | ⏳ wave 4 |
 > | GAP-08 | PSRAM XIP 接入 QMI | virt-periph + periph | — | ⏳ wave 4 |
-> | GAP-09 | egui 设备调色板 + 画布持久化 | egui | — | ⏳ wave 5 |
+> | GAP-09 | egui 设备调色板 + 画布持久化 | egui | — | ✅ |
 > | GAP-10 | MCP TLS 传输 | mcp | — | ⏳ wave 5 |
 > | GAP-11 | DMA `SNIFF` 其余模式 / 周期精确仲裁 / PERFCTR | periph | — | ⏳ wave 6 |
 > | GAP-12 | 文档陈旧段落同步 | doc | — | 🚧 主会话直接改 |
