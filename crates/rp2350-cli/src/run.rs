@@ -891,6 +891,11 @@ impl Machine {
     /// Execute one instruction on each runnable core
     /// 在每个可运行核心上各执行一条指令
     ///
+    /// Thin wrapper over [`Self::step_cores`]`(true, true)`, so the dual-core
+    /// semantics of `run`, `repl` and `perfbench` are unchanged.
+    /// 这是 [`Self::step_cores`]`(true, true)` 的薄封装，因此 `run`、`repl` 与
+    /// `perfbench` 的双核语义保持不变。
+    ///
     /// # Errors
     /// Propagates bus errors raised while dispatching a core-0 boot ROM trap.
     /// Core-1 faults are captured in [`Self::core1_halt_reason`] and never abort
@@ -898,16 +903,43 @@ impl Machine {
     /// 传播 core0 boot ROM 陷阱分发期间的总线错误。core1 故障记录在
     /// [`Self::core1_halt_reason`] 中，绝不影响 core0。
     pub fn step(&mut self) -> Result<CpuState> {
-        self.execute_step(None)
+        self.step_cores(true, true)
+    }
+
+    /// Execute one instruction on the selected cores only
+    /// 仅在选中的核心上各执行一条指令
+    ///
+    /// `core0`/`core1` choose which cores retire one instruction. An unselected
+    /// core keeps its state and PC untouched, and a selected core that is not
+    /// [`CpuState::Running`] is not advanced either. The step still performs the
+    /// shared peripheral work of [`Self::step`] exactly once: the machine
+    /// timeline (step counter, budget, timebase) advances, the PIO and DMA
+    /// batches are pumped, PPB system writes are replayed, and SEV/peer
+    /// handshakes plus IRQ lines are forwarded. [`Self::run_cycles`] always
+    /// advances both cores; per-core stepping is meant for debugger
+    /// single-stepping.
+    /// `core0`/`core1` 选择哪些核心各退役一条指令。未选中的核心保持状态与 PC
+    /// 不变，被选中但不在 [`CpuState::Running`] 的核心同样不推进。该步仍恰好执行
+    /// 一次 [`Self::step`] 的共享外设工作：机器时间线（步数、预算、时基）推进，
+    /// PIO 与 DMA 批次泵送，PPB 系统写入回放，SEV/对端握手与中断线转发。
+    /// [`Self::run_cycles`] 始终推进双核；按核步进面向调试器单步。
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::step`]. / 错误条件与 [`Self::step`] 相同。
+    pub fn step_cores(&mut self, core0: bool, core1: bool) -> Result<CpuState> {
+        self.step_cores_with_trace(core0, core1, None)
     }
 
     /// Execute one instruction with a `run`-style trace line
     /// 执行一条指令并生成 `run` 风格的轨迹行
     ///
+    /// Traces always describe core 0, so this keeps advancing both cores.
+    /// 轨迹行始终描述 core0，因此仍然推进双核。
+    ///
     /// # Errors
     /// Same conditions as [`Self::step`]. / 错误条件与 [`Self::step`] 相同。
     pub fn trace_step(&mut self, index: usize) -> Result<CpuState> {
-        self.execute_step(Some(index))
+        self.step_cores_with_trace(true, true, Some(index))
     }
 
     /// Advance the guest by at most `cycles` instructions
@@ -915,9 +947,14 @@ impl Machine {
     ///
     /// This is the callback used by [`rp2350_usb_host::CdcLink`]: it runs the
     /// same boot-ROM dispatch, interrupt pump, timebase advance and UART
-    /// collection as the `run` path, and stops at the machine budget.
+    /// collection as the `run` path, and stops at the machine budget. Every
+    /// iteration retires one instruction on **both** cores (plain
+    /// [`Self::step`]); per-core progress is only available through
+    /// [`Self::step_cores`].
     /// 这是 [`rp2350_usb_host::CdcLink`] 使用的回调：执行与 `run` 路径相同的
-    /// boot ROM 分发、中断泵送、时基推进与 UART 收集，并在机器预算处停止。
+    /// boot ROM 分发、中断泵送、时基推进与 UART 收集，并在机器预算处停止。每次
+    /// 迭代在**两个**核心上各退役一条指令（普通 [`Self::step`]）；按核推进只能
+    /// 通过 [`Self::step_cores`] 获得。
     pub fn run_cycles(&mut self, cycles: u64) {
         let target = self.steps.saturating_add(cycles).min(self.budget);
         while self.steps < target && self.halt.is_none() {
@@ -945,9 +982,48 @@ impl Machine {
         self.uart.extend(self.peripherals.take_uart_output());
     }
 
-    fn execute_step(&mut self, trace: Option<usize>) -> Result<CpuState> {
-        let state = self.execute_core0_step(trace)?;
-        self.step_core1();
+    /// Step the selected cores and run the shared peripheral path once
+    /// 推进选中的核心并执行一次共享外设路径
+    ///
+    /// Core 0's instruction path already carries the common peripheral work
+    /// (DMA/PIO batches, PPB replay, SEV/IRQ forwarding, timebase), so a
+    /// core-1-only step runs the same pieces itself instead of duplicating a
+    /// second step loop.
+    /// core0 的指令路径本来就携带公共外设工作（DMA/PIO 批次、PPB 回放、
+    /// SEV/中断转发、时基），因此仅 core1 的步进直接复用这些片段，而不是另建一套
+    /// 步进循环。
+    fn step_cores_with_trace(
+        &mut self,
+        core0: bool,
+        core1: bool,
+        trace: Option<usize>,
+    ) -> Result<CpuState> {
+        if self.halt.is_some() || self.budget_exhausted() {
+            return Ok(CpuState::Halted);
+        }
+        let state = if core0 {
+            self.execute_core0_step(trace)?
+        } else {
+            CpuState::Running
+        };
+        // core1 只在被选中时推进；未选中时状态与 PC 保持原样。
+        // Core 1 advances only when selected; when unselected its state and PC
+        // stay untouched.
+        let core1_advanced = core1 && self.step_core1();
+        if !core0 && core1_advanced {
+            // core0 未选中时公共外设路径仍需每步一次：步数/预算、DMA 与 PIO
+            // 批量泵送、PPB 回放、SEV 转发与时基推进都与双核 `step` 一致。
+            // With core 0 unselected the shared peripheral path still runs once
+            // per step: timeline/budget, DMA and PIO batches, PPB replay, SEV
+            // forwarding and the timebase match the dual-core `step`.
+            self.steps += 1;
+            self.pump_dma_batch();
+            self.pump_pio_batch();
+            // 仅 core1 的步进不产生 core0 轨迹行，因此不传 trace。
+            // A core-1-only step produces no core-0 trace line, so `trace` is
+            // not forwarded.
+            self.after_running_step(None);
+        }
         Ok(state)
     }
 
@@ -959,13 +1035,16 @@ impl Machine {
     /// `FIFO_RD`, the doorbells and `CPUID` follow core 1's direction, and PPB
     /// system writes are replayed into core 1 so its `VTOR`, `CPACR` and NVIC
     /// stay independent from core 0's. A core-1 fault only stops core 1.
+    /// Returns whether an instruction was actually retired, so the caller knows
+    /// whether the machine timeline advanced.
     /// 在执行 core1 之前处理两种会改变其状态的握手（`PSM` 硬复位与已完成的 SIO
     /// FIFO 启动）。指令执行前后把 SIO 视图切到 core1，使 `FIFO_WR`、`FIFO_RD`、
     /// 门铃与 `CPUID` 遵循 core1 的方向；PPB 系统写入回放到 core1，使其
     /// `VTOR`、`CPACR` 与 NVIC 与 core0 相互独立。core1 故障只停止 core1。
-    fn step_core1(&mut self) {
+    /// 返回是否真的退役了一条指令，供调用方判断机器时间线是否推进。
+    fn step_core1(&mut self) -> bool {
         if self.halt.is_some() || self.budget_exhausted() {
-            return;
+            return false;
         }
         // PSM 置位 FRCE_OFF.PROC1：硬复位 core1 并重新启用 boot ROM 回显桩。
         // FRCE_OFF.PROC1 set: hard-reset core 1 and re-arm the boot-ROM echo stub.
@@ -984,10 +1063,10 @@ impl Machine {
             }
         }
         let Some(core1) = self.core1.as_mut() else {
-            return;
+            return false;
         };
         if core1.state() != CpuState::Running {
-            return;
+            return false;
         }
         self.peripherals.sio().select_core(CpuId::Core1);
         // core1 也走合成 boot ROM 的陷阱分发：`rom_table_lookup` 桩位于
@@ -1025,6 +1104,7 @@ impl Machine {
                 self.core1_halt = Some(reason);
             }
         }
+        true
     }
 
     /// Apply vectors from a completed FIFO launch / 应用已完成 FIFO 启动的向量
@@ -1123,7 +1203,8 @@ impl Machine {
                         &mut self.irqs,
                     );
                 } else {
-                    self.after_running_step();
+                    let pc = self.core.pc();
+                    self.after_running_step(Some(pc));
                 }
                 Ok(CpuState::Running)
             }
@@ -1140,7 +1221,18 @@ impl Machine {
         }
     }
 
-    fn after_running_step(&mut self) {
+    /// Post-step housekeeping for core 0 and the shared peripherals
+    /// core0 与共享外设的步后维护
+    ///
+    /// `core0_pc` is `Some` only when core 0 actually retired an instruction;
+    /// the spin detector then watches that PC window. A core-1-only step passes
+    /// `None` so core 0's frozen PC never looks like a polling spin. The PPB
+    /// replay, IRQ/SEV forwarding and timebase work always run, because they are
+    /// the shared path every step uses.
+    /// 仅当 core0 真的退役了一条指令时 `core0_pc` 才是 `Some`，自旋检测随后观察
+    /// 该 PC 窗口。仅 core1 的步进传 `None`，避免 core0 冻结的 PC 被误判为轮询
+    /// 自旋。PPB 回放、中断/SEV 转发与时基工作始终执行，因为它们是每步共享路径。
+    fn after_running_step(&mut self, core0_pc: Option<u32>) {
         // 紧凑自旋通常意味着固件在轮询一个永远不变的 MMIO 值（未建模设备静默
         // 读 0）或执行延时循环，会无声耗尽指令预算。PC 连续停在同一小窗口内
         // 达到阈值就告警一次，并给出窗口范围以便反汇编定位。
@@ -1148,47 +1240,48 @@ impl Machine {
         // changes (unmodelled devices read zero) or runs a delay loop, silently
         // burning the budget. Warn once when the PC stays inside one small window
         // and print the window so the spin point can be disassembled.
-        let pc = self.core.pc();
-        if pc.wrapping_sub(self.spin_base) < SPIN_WINDOW_BYTES {
-            self.spin_steps += 1;
-            if self.spin_steps == SPIN_REPORT_STEPS && self.spin_reports < SPIN_REPORT_LIMIT {
-                self.spin_reports += 1;
-                let registers = match self.core.arch() {
-                    rp2350_cpu::CpuArch::RiscVHazard3 => format!(
-                        "ra={:#010X} sp={:#010X} s0={:#010X} s1={:#010X} \
-                         a0={:#010X} a1={:#010X} a2={:#010X} a3={:#010X} \
-                         a4={:#010X} a5={:#010X}",
-                        self.core.read_register(1),
-                        self.core.read_register(2),
-                        self.core.read_register(8),
-                        self.core.read_register(9),
-                        self.core.read_register(10),
-                        self.core.read_register(11),
-                        self.core.read_register(12),
-                        self.core.read_register(13),
-                        self.core.read_register(14),
-                        self.core.read_register(15),
-                    ),
-                    rp2350_cpu::CpuArch::ArmCortexM33 => format!(
-                        "r0={:#010X} r1={:#010X} r2={:#010X} r3={:#010X} sp={:#010X}",
-                        self.core.read_register(0),
-                        self.core.read_register(1),
-                        self.core.read_register(2),
-                        self.core.read_register(3),
-                        self.core.read_register(13),
-                    ),
-                };
-                self.notices.push(format!(
-                    "[run] tight spin: PC stayed in {:#010X}..{:#010X} for {} steps, \
-                     likely polling a value that never changes / 疑似轮询等待; {registers}",
-                    self.spin_base,
-                    self.spin_base + SPIN_WINDOW_BYTES,
-                    self.spin_steps
-                ));
+        if let Some(pc) = core0_pc {
+            if pc.wrapping_sub(self.spin_base) < SPIN_WINDOW_BYTES {
+                self.spin_steps += 1;
+                if self.spin_steps == SPIN_REPORT_STEPS && self.spin_reports < SPIN_REPORT_LIMIT {
+                    self.spin_reports += 1;
+                    let registers = match self.core.arch() {
+                        rp2350_cpu::CpuArch::RiscVHazard3 => format!(
+                            "ra={:#010X} sp={:#010X} s0={:#010X} s1={:#010X} \
+                             a0={:#010X} a1={:#010X} a2={:#010X} a3={:#010X} \
+                             a4={:#010X} a5={:#010X}",
+                            self.core.read_register(1),
+                            self.core.read_register(2),
+                            self.core.read_register(8),
+                            self.core.read_register(9),
+                            self.core.read_register(10),
+                            self.core.read_register(11),
+                            self.core.read_register(12),
+                            self.core.read_register(13),
+                            self.core.read_register(14),
+                            self.core.read_register(15),
+                        ),
+                        rp2350_cpu::CpuArch::ArmCortexM33 => format!(
+                            "r0={:#010X} r1={:#010X} r2={:#010X} r3={:#010X} sp={:#010X}",
+                            self.core.read_register(0),
+                            self.core.read_register(1),
+                            self.core.read_register(2),
+                            self.core.read_register(3),
+                            self.core.read_register(13),
+                        ),
+                    };
+                    self.notices.push(format!(
+                        "[run] tight spin: PC stayed in {:#010X}..{:#010X} for {} steps, \
+                         likely polling a value that never changes / 疑似轮询等待; {registers}",
+                        self.spin_base,
+                        self.spin_base + SPIN_WINDOW_BYTES,
+                        self.spin_steps
+                    ));
+                }
+            } else {
+                self.spin_base = pc;
+                self.spin_steps = 0;
             }
-        } else {
-            self.spin_base = pc;
-            self.spin_steps = 0;
         }
         // 系统控制寄存器写入必须在下一条指令前生效：固件写 CPACR 后紧跟
         // `mrc p4`/VFP 指令，按 64 步批量回放会让核误判协处理器未使能并触发
@@ -2674,6 +2767,208 @@ mod tests {
         machine.step().expect("single step");
         machine.step().expect("single step");
         assert_eq!(read_word(&mut machine, SENTINEL), 1);
+    }
+
+    /// Build a machine whose two cores each run their own increment loop
+    /// 构建两个核心各自运行自增循环的机器
+    ///
+    /// Core 1 is released through the real SIO FIFO launch protocol, so both
+    /// cores are `Running` when this returns: core 0 counts into [`SENTINEL`]
+    /// and core 1 into `SENTINEL + 4`.
+    /// core1 通过真实的 SIO FIFO 启动协议释放，因此返回时双核都处于 `Running`：
+    /// core0 自增 [`SENTINEL`]，core1 自增 `SENTINEL + 4`。
+    fn dual_core_machine(max_cycles: u64) -> Machine {
+        let mut machine = machine_with_budget(max_cycles);
+        bind_counter_program(&mut machine, CORE1_CODE, SENTINEL);
+        bind_counter_program(&mut machine, SRAM_BASE + 0x8400, SENTINEL + 4);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        machine.write_register(15, SRAM_BASE + 0x8400);
+        machine.step().expect("launch step");
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        machine
+    }
+
+    #[test]
+    fn step_cores_core0_only_freezes_core1() {
+        // 只选 core0：core1 的 PC 与计数器保持不变，步数仍推进一次。
+        // Core 0 only: core 1's PC and counter stay frozen while steps advance.
+        let mut machine = dual_core_machine(1_000);
+        let core0_pc = machine.pc();
+        let core1_pc = machine.core1_pc().expect("core1 pc");
+        let core0_counter = read_word(&mut machine, SENTINEL + 4);
+        let core1_counter = read_word(&mut machine, SENTINEL);
+        let steps = machine.steps();
+
+        // 循环体 4 条指令，7 步后 PC 一定落在不同偏移。
+        // The loop body is four instructions, so seven steps land on a
+        // different PC offset.
+        for _ in 0..7 {
+            machine.step_cores(true, false).expect("core0 step");
+        }
+
+        assert_ne!(
+            machine.pc(),
+            core0_pc,
+            "core0 must advance / core0 必须推进"
+        );
+        assert!(read_word(&mut machine, SENTINEL + 4) > core0_counter);
+        assert_eq!(
+            machine.core1_pc(),
+            Some(core1_pc),
+            "core1 must stay frozen / core1 必须冻结"
+        );
+        assert_eq!(read_word(&mut machine, SENTINEL), core1_counter);
+        assert_eq!(machine.steps(), steps + 7);
+    }
+
+    #[test]
+    fn step_cores_core1_only_freezes_core0() {
+        // 只选 core1：core0 的 PC 与计数器保持不变。
+        // Core 1 only: core 0's PC and counter stay frozen.
+        let mut machine = dual_core_machine(1_000);
+        let core0_pc = machine.pc();
+        let core1_pc = machine.core1_pc().expect("core1 pc");
+        let core0_counter = read_word(&mut machine, SENTINEL + 4);
+        let steps = machine.steps();
+
+        for _ in 0..7 {
+            machine.step_cores(false, true).expect("core1 step");
+        }
+
+        assert_eq!(
+            machine.pc(),
+            core0_pc,
+            "core0 must stay frozen / core0 必须冻结"
+        );
+        assert_ne!(machine.core1_pc(), Some(core1_pc));
+        assert_eq!(read_word(&mut machine, SENTINEL + 4), core0_counter);
+        assert!(read_word(&mut machine, SENTINEL) > 0, "core1 must advance");
+        assert_eq!(machine.steps(), steps + 7);
+    }
+
+    #[test]
+    fn step_cores_with_both_flags_matches_step() {
+        // `step_cores(true, true)` 与 `step()` 在 PC、步数、计数器与时基上等价。
+        // `step_cores(true, true)` equals `step()` on PC, steps, counters and time.
+        let mut plain = dual_core_machine(1_000);
+        let mut selected = dual_core_machine(1_000);
+
+        for _ in 0..20 {
+            plain.step().expect("step");
+            selected.step_cores(true, true).expect("step cores");
+        }
+
+        assert_eq!(selected.steps(), plain.steps());
+        assert_eq!(selected.pc(), plain.pc());
+        assert_eq!(selected.core1_pc(), plain.core1_pc());
+        assert_eq!(selected.time_us(), plain.time_us());
+        assert_eq!(
+            read_word(&mut selected, SENTINEL),
+            read_word(&mut plain, SENTINEL)
+        );
+        assert_eq!(
+            read_word(&mut selected, SENTINEL + 4),
+            read_word(&mut plain, SENTINEL + 4)
+        );
+    }
+
+    #[test]
+    fn step_cores_skips_a_reset_core1_without_side_effects() {
+        // core1 未启动时只选 core1 不退役指令：状态、PC 与步数都不变。
+        // Arm 目前没有 `Sleeping` 状态（WFI 已回退），`Reset`/`Halted` 覆盖非运行态。
+        // Selecting a never-released core 1 retires nothing: state, PC and the
+        // step counter stay unchanged. The Arm core has no `Sleeping` state in
+        // this tree (WFI was reverted), so `Reset` and `Halted` cover non-running.
+        let mut machine = machine_with_budget(1_000);
+        bind_counter_program(&mut machine, CORE1_CODE, SENTINEL);
+        let steps = machine.steps();
+
+        for _ in 0..4 {
+            machine.step_cores(false, true).expect("core1 step");
+        }
+
+        assert_eq!(machine.core1_state(), Some(CpuState::Reset));
+        assert_eq!(machine.core1_pc(), Some(0));
+        assert_eq!(machine.core1_launch_count(), 0);
+        assert_eq!(machine.steps(), steps, "nothing retired / 未退役指令");
+        assert_eq!(read_word(&mut machine, SENTINEL), 0);
+    }
+
+    #[test]
+    fn step_cores_keeps_an_unselected_halted_core1_halted() {
+        // 未选中的 core1 已经停机：其停机原因、PC 与机器停机状态都不受影响。
+        // An unselected, already halted core 1 keeps its reason, PC and the
+        // machine halt state untouched.
+        let mut machine = machine_with_budget(20);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, 0x3000_0000 | 1);
+        machine.run_cycles(5);
+        assert_eq!(machine.core1_state(), Some(CpuState::Halted));
+        let reason = machine.core1_halt_reason().map(str::to_owned);
+        let core1_pc = machine.core1_pc();
+
+        for _ in 0..4 {
+            machine.step_cores(true, false).expect("core0 step");
+        }
+
+        assert_eq!(machine.core1_state(), Some(CpuState::Halted));
+        assert_eq!(machine.core1_halt_reason().map(str::to_owned), reason);
+        assert_eq!(machine.core1_pc(), core1_pc);
+        assert_eq!(machine.halt_reason(), None);
+        assert_eq!(machine.steps(), 9);
+    }
+
+    #[test]
+    fn core1_only_steps_still_pump_dma_and_the_timebase() {
+        // 仅 core1 步进仍走公共外设路径：步数/预算、DMA 泵送与时基都要推进。
+        // Core-1-only stepping still runs the shared peripheral path: the step
+        // counter/budget, the DMA pump and the timebase keep advancing.
+        let mut machine = machine_with_budget(20_000);
+        bind_counter_program(&mut machine, CORE1_CODE, SENTINEL);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+        program_channel(
+            &mut machine,
+            0,
+            SRAM_BASE + 0x1000,
+            SRAM_BASE + 0x4000,
+            1_000,
+            0,
+        );
+
+        for _ in 0..10_000 {
+            machine.step_cores(false, true).expect("core1 step");
+        }
+
+        assert_eq!(machine.core1_state(), Some(CpuState::Running));
+        assert_eq!(machine.steps(), 10_000);
+        assert!(
+            machine.dma_transfers() > 0,
+            "DMA must advance / DMA 必须推进"
+        );
+        assert!(
+            machine.time_us() > 0,
+            "timebase must advance / 时基必须推进"
+        );
+    }
+
+    #[test]
+    fn step_cores_respects_the_budget() {
+        // 预算耗尽后按核步进立即返回 `Halted`，不再推进任何核心。
+        // Once the budget is gone, a per-core step returns `Halted` without
+        // advancing any core.
+        let mut machine = machine_with_budget(3);
+        bind_counter_program(&mut machine, CORE1_CODE, SENTINEL);
+        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
+
+        for _ in 0..3 {
+            machine.step_cores(false, true).expect("core1 step");
+        }
+        let core1_pc = machine.core1_pc();
+        let state = machine.step_cores(false, true).expect("budget stop");
+
+        assert_eq!(state, CpuState::Halted);
+        assert!(machine.budget_exhausted());
+        assert_eq!(machine.core1_pc(), core1_pc);
+        assert_eq!(machine.steps(), 3);
     }
 
     /// `emerald.uf2` used by the ignore-gated smoke test / 冒烟测试使用的固件

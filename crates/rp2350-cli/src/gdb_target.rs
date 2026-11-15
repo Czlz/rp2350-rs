@@ -4,12 +4,13 @@
 //! `rp2350-gdb` exposes the transport and protocol layers only; the machine
 //! that owns the bus, boot ROM, peripherals and CPU lives in [`crate::run`].
 //! [`MachineTarget`] bridges the two: registers and memory go through the
-//! machine's public accessors, while `resume` uses [`Machine::step`] so boot
-//! ROM traps, interrupt pumping and the peripheral timebase stay active.
+//! machine's public accessors, while `resume` uses [`Machine::step`] (both
+//! cores) or [`Machine::step_cores`] (a single selected core) so boot ROM
+//! traps, interrupt pumping and the peripheral timebase stay active.
 //! `rp2350-gdb` 只提供传输与协议层；持有总线、boot ROM、外设与 CPU 的机器位于
 //! [`crate::run`]。[`MachineTarget`] 负责桥接：寄存器与内存走机器的公共访问器，
-//! `resume` 使用 [`Machine::step`]，使 boot ROM 陷阱、中断泵送与外设时基保持
-//! 有效。
+//! 恢复执行使用 [`Machine::step`]（双核）或 [`Machine::step_cores`]（单个选中
+//! 核心），使 boot ROM 陷阱、中断泵送与外设时基保持有效。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -286,11 +287,11 @@ impl MachineTarget {
         self.stop_reply(reason)
     }
 
-    /// Execute one instruction and map the result to a stop reason
-    /// 执行一条指令并将结果映射为停止原因
-    fn single_step(&mut self) -> StopReply {
+    /// Execute one instruction on the selected cores and map the result to a stop reason
+    /// 在选中的核心上执行一条指令并将结果映射为停止原因
+    fn single_step(&mut self, cores: (bool, bool)) -> StopReply {
         self.refresh_watchpoints();
-        match self.machine.step() {
+        match self.machine.step_cores(cores.0, cores.1) {
             Ok(CpuState::Running) => {
                 if let Some((address, kind)) = self.read_watch_hit() {
                     return self.watch_stop(address, kind);
@@ -315,7 +316,18 @@ impl MachineTarget {
 
     /// Run until a breakpoint, watchpoint, non-running state, or budget limit
     /// 运行直到断点、监视点、非运行状态或预算耗尽
-    fn continue_until_stop(&mut self) -> StopReply {
+    ///
+    /// Only `cores` advance, so a single-core resume retires instructions with
+    /// [`Machine::step_cores`] (one call per instruction) instead of
+    /// [`Machine::run_cycles`]: it is slower because the machine's per-step
+    /// peripheral path is entered from Rust for every instruction, but it keeps
+    /// the paused core frozen. A whole-target resume keeps the dual-core
+    /// `Machine::step` path and its throughput.
+    /// 只推进 `cores` 选中的核心，因此单核恢复用 [`Machine::step_cores`] 逐条执行
+    /// （每条指令一次调用），而不是 [`Machine::run_cycles`]：它更慢，因为每条指令
+    /// 都要从 Rust 进入机器的每步外设路径，但能让暂停的核心保持冻结。整目标恢复
+    /// 仍走双核 `Machine::step` 路径与其吞吐。
+    fn continue_until_stop(&mut self, cores: (bool, bool)) -> StopReply {
         let mut budget = self.instruction_budget;
         // 首次迭代跳过 PC 检查，使从断点恢复执行时跨过当前指令，而不是立即
         // 再次停下。
@@ -325,7 +337,7 @@ impl MachineTarget {
 
         loop {
             if !resume_from_breakpoint {
-                if let Some(thread) = self.breakpoint_thread() {
+                if let Some(thread) = self.breakpoint_thread_in(cores) {
                     self.last_thread = thread;
                     return self.stop_reply(StopReason::Breakpoint);
                 }
@@ -341,7 +353,7 @@ impl MachineTarget {
             // store anywhere inside the watched range is detected.
             // 先建立步前基线，步后比较，从而检测监视范围内的任意写入。
             self.refresh_watchpoints();
-            match self.machine.step() {
+            match self.machine.step_cores(cores.0, cores.1) {
                 Ok(CpuState::Running) => {
                     // 先查客户机读命中（读/访问监视点），再查写快照（写/访问）。
                     // Check guest read hits (read/access) before write snapshots
@@ -439,13 +451,16 @@ impl MachineTarget {
     /// Shared resume path for whole-target and per-thread requests
     /// 整目标与按线程恢复的共用路径
     ///
-    /// `Machine::step` always retires one core-0 and one core-1 instruction, so
-    /// a single-thread request still advances both cores; only the reported
-    /// thread (and PC) follows the request. See the crate docs for this
-    /// documented degradation.
-    /// `Machine::step` 总是各执行一条 core0 与 core1 指令，因此单线程请求仍会
-    /// 推进两个核心；只有上报的线程（与 PC）跟随请求。该退化语义见 crate 文档。
-    fn run(&mut self, mode: ResumeMode, thread: ThreadId) -> StopReply {
+    /// `cores` selects which cores retire instructions: a whole-target request
+    /// passes `(true, true)` so `c`/`s` keep the dual-core semantics of
+    /// [`Machine::step`], while a `vCont;<action>:<tid>` or `Hc<n>` selection
+    /// passes exactly the selected core. The reported thread always follows
+    /// `thread`, so a core-1 stop replies `thread:2;`.
+    /// `cores` 选择哪些核心退役指令：整目标请求传 `(true, true)`，使 `c`/`s`
+    /// 保持 [`Machine::step`] 的双核语义；而 `vCont;<action>:<tid>` 或 `Hc<n>`
+    /// 选择只传被选中的核心。上报线程始终跟随 `thread`，因此 core1 停止回复
+    /// `thread:2;`。
+    fn run(&mut self, mode: ResumeMode, thread: ThreadId, cores: (bool, bool)) -> StopReply {
         self.last_watch = None;
         // 丢弃停止期间宿主读取留下的读命中，只报告本次恢复内的访问。
         // Drop hits recorded by host reads while stopped; report only accesses
@@ -456,8 +471,8 @@ impl MachineTarget {
             self.stop_reply(StopReason::Halted)
         } else {
             match mode {
-                ResumeMode::Step => self.single_step(),
-                ResumeMode::Continue => self.continue_until_stop(),
+                ResumeMode::Step => self.single_step(cores),
+                ResumeMode::Continue => self.continue_until_stop(cores),
             }
         };
         self.last_stop = Some(reply.reason);
@@ -472,6 +487,20 @@ impl MachineTarget {
         }
     }
 
+    /// Cores to advance for a resume request / 恢复请求要推进的核心
+    ///
+    /// Thread 1 steps only core 0 and thread 2 only core 1; the "any thread"
+    /// id (`0`) and unknown ids fall back to advancing both cores.
+    /// 线程 1 只步进 core0，线程 2 只步进 core1；“任意线程”编号（`0`）与未知
+    /// 编号回退为双核推进。
+    fn core_selection(thread: ThreadId) -> (bool, bool) {
+        match thread {
+            ThreadId::CORE0 => (true, false),
+            ThreadId::CORE1 => (false, true),
+            _ => (true, true),
+        }
+    }
+
     /// Program counter of `thread`, falling back to core 0
     /// `thread` 的程序计数器；无 core1 时回退到 core0
     fn thread_pc(&self, thread: ThreadId) -> u32 {
@@ -483,9 +512,16 @@ impl MachineTarget {
 
     /// First core whose PC sits on an instruction breakpoint
     /// 首个 PC 位于指令断点上的核心
-    fn breakpoint_thread(&self) -> Option<ThreadId> {
-        if self.breakpoints.contains(&self.machine.pc()) {
+    ///
+    /// Only the cores selected for this resume are inspected, so a breakpoint
+    /// on the frozen core never ends a single-core resume.
+    /// 只检查本次恢复选中的核心，因此冻结核心上的断点不会结束单核恢复。
+    fn breakpoint_thread_in(&self, cores: (bool, bool)) -> Option<ThreadId> {
+        if cores.0 && self.breakpoints.contains(&self.machine.pc()) {
             return Some(ThreadId::CORE0);
+        }
+        if !cores.1 {
+            return None;
         }
         let core1_pc = self.machine.core1_pc()?;
         self.breakpoints
@@ -675,18 +711,19 @@ impl GdbTarget for MachineTarget {
     }
 
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError> {
-        // Plain `c`/`s` targets core 0; a core-1 breakpoint or stop overrides
-        // the reported thread inside the resume loop.
-        // 普通 `c`/`s` 以 core0 为目标；core1 断点或停机会在恢复循环内改写上报线程。
-        Ok(self.run(mode, ThreadId::CORE0))
+        // Plain `c`/`s` means "the whole target": both cores advance, and the
+        // reply reports core 0 unless a core-1 breakpoint overrides it.
+        // 普通 `c`/`s` 表示“整个目标”：双核都推进，回复上报 core0，除非 core1
+        // 断点改写上报线程。
+        Ok(self.run(mode, ThreadId::CORE0, (true, true)))
     }
 
     fn continue_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
-        Ok(self.run(ResumeMode::Continue, thread))
+        Ok(self.run(ResumeMode::Continue, thread, Self::core_selection(thread)))
     }
 
     fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
-        Ok(self.run(ResumeMode::Step, thread))
+        Ok(self.run(ResumeMode::Step, thread, Self::core_selection(thread)))
     }
 
     fn stopped_thread(&self) -> ThreadId {

@@ -296,7 +296,7 @@ arm-none-eabi-gdb firmware.elf
 (gdb) info threads         # 2 个线程：1 = core0，2 = core1
 (gdb) thread 2             # 切换到 core1
 (gdb) info registers pc    # core1 的 PC（core1 只读）
-(gdb) vCont;s:2            # 仅请求 core1 单步（双核同步退化）
+(gdb) vCont;s:2            # 仅推进 core1 一条指令（core0 冻结）
 (gdb) thread 1
 (gdb) break main
 (gdb) continue
@@ -316,13 +316,15 @@ arm-none-eabi-gdb firmware.elf
 
 **Behaviour / 行为**
 
-- `resume` 通过 `Machine::step` 执行，因此 boot ROM 陷阱、中断泵送、PPB 系统
-  写入回放与外设时基都保持有效；`StopReply` 的 `Breakpoint`/`SingleStep`/
+- `resume` 通过 `Machine::step`（双核）或 `Machine::step_cores`（单核）执行，因此
+  boot ROM 陷阱、中断泵送、PPB 系统写入回放与外设时基都保持有效；`StopReply` 的
+  `Breakpoint`/`SingleStep`/
   `Watchpoint`/`ReadWatch`/`AccessWatch`/`Fault`/`Sleeping`/`Halted`/`Reset`/
   `InstructionLimit` 映射为对应 GDB 信号（`T05thread:<n>;` /
   `T05watch:<addr>;thread:<n>;` / `T05rwatch:<addr>;thread:<n>;` /
   `T05awatch:<addr>;thread:<n>;` / `T0bthread:<n>;` / `T02thread:<n>;`）。
-  `resume` uses `Machine::step`, so boot ROM traps, interrupt pumping, PPB
+  `resume` uses `Machine::step` (both cores) or `Machine::step_cores` (one core),
+  so boot ROM traps, interrupt pumping, PPB
   replay and the peripheral timebase stay active; stop reasons map to GDB
   signals (`T05thread:<n>;` / `T05watch:<addr>;thread:<n>;` /
   `T05rwatch:<addr>;thread:<n>;` / `T05awatch:<addr>;thread:<n>;` /
@@ -363,19 +365,33 @@ arm-none-eabi-gdb firmware.elf
   are real, the other general-purpose registers read 0, and every write replies
   `E01` (`GdbError::Unsupported`). Core-1 breakpoints use PC comparison and their
   stop reply carries `thread:2;`.
-- 单步/继续由 `Machine::step` 驱动：它每次都先执行一条 core0 指令再执行一条
-  core1 指令。因此 `vCont;s:2`（或 `thread 2` 后的 `s`）**无法让 core0 停住**，
-  这是已文档化的退化语义；只有上报的线程号与 PC 跟随请求。
-  Single-steps and continues run through `Machine::step`, which retires one core-0
-  instruction and then one core-1 instruction. `vCont;s:2` (or `s` after
-  `thread 2`) therefore cannot freeze core 0 — a documented degradation; only the
-  reported thread and PC follow the request.
+- 单步与继续按核执行：`vCont;s:2`、`vCont;c:2` 或 `thread 2` 后的 `s`/`c` 只让
+  core1 逐条退役指令，core0 的 PC、寄存器与中断状态完全冻结（`vCont;s:1`/
+  `c:1` 反之）。只有裸 `c`/`s`、`vCont;c`/`s` 与 `c:1;c:2` 这类「整个目标」请求
+  才双核同步推进。单核继续用逐条 `Machine::step_cores` 循环实现（而非
+  `run_cycles`），语义正确但吞吐低于双核路径。
+  Single-steps and continues are per-core: `vCont;s:2`, `vCont;c:2` or `s`/`c`
+  after `thread 2` retire only core-1 instructions, leaving core 0's PC,
+  registers and interrupt state frozen (`vCont;s:1`/`c:1` is the mirror image).
+  Only whole-target requests — bare `c`/`s`, `vCont;c`/`s` and `c:1;c:2` —
+  advance both cores in lock-step. A single-core continue is implemented as a
+  loop of `Machine::step_cores` calls (not `run_cycles`): correct semantics, but
+  lower throughput than the dual-core path.
 - 停止回复统一带 `thread:<n>;`：普通停止 `T05thread:1;`、监视点停止
   `T05watch:<addr>;thread:2;`，`?` 复用最近停止线程。`monitor info` 仍打印
   core0/core1 摘要。
   Stop replies always carry `thread:<n>;`: a normal stop is `T05thread:1;`, a
   watchpoint stop is `T05watch:<addr>;thread:2;`, and `?` reuses the last stopped
   thread. `monitor info` still prints the core 0/1 summary.
+- 真实 GDB 单步注意：all-stop 模式下线程 2 的 `stepi` 默认发送混合动作列表
+  `vCont;s:2;c`，而 RSP 层无法满足混合列表、回复 `E01`（该限制位于
+  `rp2350-gdb`，不在本 crate）。先执行 `set scheduler-locking step`，或用
+  `maintenance packet vCont;s:2` 直接发单核动作，即可只推进选中核。
+  Real-GDB note: in all-stop mode `stepi` on thread 2 sends the mixed list
+  `vCont;s:2;c`, which the RSP layer cannot satisfy and answers with `E01` (that
+  limit lives in `rp2350-gdb`, not here). Run `set scheduler-locking step`, or
+  send `maintenance packet vCont;s:2` directly, to advance only the selected
+  core.
 - 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点、
   监视点）保留，仅无应答模式协商会被重置。
   After a client disconnects `serve` keeps accepting; target state (memory,
@@ -409,13 +425,15 @@ arm-none-eabi-gdb firmware.elf
   (core 0/1 state, step count, DMA/HSTX summaries) and `halt` (the next `c`/`s`
   stops immediately with SIGINT; `reset` clears it). Unknown commands are logged
   with `log::info!` and answered with `OK`, so the session never breaks.
-- 已支持双核线程模型（core0/core1）与 `vCont` 单核选择；受 `Machine::step`
-  双核同步步进限制，单核 resume 只改变上报线程。单客户端串行、无 TLS；细节见
+- 已支持双核线程模型（core0/core1）与真正的按核 `vCont`/`Hc` 选择：单核
+  `s`/`c` 只推进选中核，停止回复的线程号与该核一致。单核继续以逐条
+  `step_cores` 循环实现，吞吐低于整目标 `c`；单客户端串行、无 TLS；细节见
   `doc/crates/rp2350-gdb.md`。
-  The dual-core thread model (core 0/core 1) and single-thread `vCont` selection
-  are supported; because `Machine::step` advances both cores, a single-core
-  resume only changes the reported thread. One sequential client and no TLS; see
-  `doc/crates/rp2350-gdb.md`.
+  The dual-core thread model (core 0/core 1) and true per-core `vCont`/`Hc`
+  selection are supported: a single-core `s`/`c` advances only the selected
+  core, and the stop reply names that core. A single-core continue loops over
+  `step_cores`, so it is slower than a whole-target `c`. One sequential client
+  and no TLS; see `doc/crates/rp2350-gdb.md`.
 - 不做 Flash 编程：Flash 窗口对客户机写保护，`M`/`load` 写 Flash 会以 `E01`
   失败；SRAM 与已映射的可写 MMIO 可正常写入。
   No flash programming: the flash window rejects guest writes, so `M`/`load`
@@ -653,9 +671,10 @@ pub struct MachineOptions {
 pub struct Machine { /* bus, bootrom, core, core1, peripherals, usb … */ }
 impl Machine {
     pub fn new(bytes: &[u8], options: &MachineOptions) -> Result<Self>;
-    pub fn step(&mut self) -> Result<CpuState>;
+    pub fn step(&mut self) -> Result<CpuState>;   // both runnable cores
+    pub fn step_cores(&mut self, core0: bool, core1: bool) -> Result<CpuState>;
     pub fn trace_step(&mut self, index: usize) -> Result<CpuState>;  // prints [trace]
-    pub fn run_cycles(&mut self, cycles: u64);   // CdcLink cycle callback
+    pub fn run_cycles(&mut self, cycles: u64);   // CdcLink cycle callback, both cores
     pub fn finalize(&mut self);                  // flush timebase + UART
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
@@ -773,13 +792,21 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   `take_core1_launch` 取走向量，探测向量表后调用 `boot_at(sp, entry, vtor)`，
   即 `SP = sp`、`PC = entry & !1`、`VTOR = vtor`；结果由
   `[run] core1 state=… pc=… sp=… launches=…` 报告。
-- **Stepping order / 步进顺序**：`Machine::step`, `trace_step`, `run_cycles`
-  and GDB `resume` all retire one core-0 instruction and then one core-1
-  instruction (when core 1 is `Running`). `steps`/`now_cycles`/`budget` only
-  count core-0 steps; a halted core 1 contributes its state and nothing else.
-  `Machine::step`、`trace_step`、`run_cycles` 与 GDB `resume` 都先退役一条
-  core0 指令，再退役一条 core1 指令（core1 处于 `Running` 时）。
-  `steps`/`now_cycles`/`budget` 只统计 core0 步数；停机的 core1 只贡献状态。
+- **Stepping order / 步进顺序**：`Machine::step` and `Machine::trace_step` retire
+  one core-0 instruction and then one core-1 instruction (when core 1 is
+  `Running`); `step` is a thin wrapper over `step_cores(true, true)`.
+  `Machine::step_cores(core0, core1)` advances only the selected cores: an
+  unselected core keeps its state and PC, and a selected core that is not
+  `Running` is not advanced. The step still performs the shared peripheral work
+  once (budget/timebase, DMA/PIO batches, PPB replay, SEV/IRQ forwarding), and
+  `steps`/`now_cycles`/`budget` count one instruction slot per step whatever the
+  selection. `run_cycles` always advances both cores.
+  `Machine::step` 与 `Machine::trace_step` 先退役一条 core0 指令，再退役一条
+  core1 指令（core1 处于 `Running` 时）；`step` 是 `step_cores(true, true)` 的
+  薄封装。`Machine::step_cores(core0, core1)` 只推进选中的核心：未选中的核心保持
+  状态与 PC，被选中但非 `Running` 的核心也不推进。该步仍执行一次共享外设工作
+  （预算/时基、DMA/PIO 批次、PPB 回放、SEV/中断转发），且无论选择如何，
+  `steps`/`now_cycles`/`budget` 每步计一条指令槽。`run_cycles` 始终推进双核。
 - **Fault isolation / 故障隔离**：a core-1 bus error or undefined instruction
   halts **core 1 only** and is reported by `core1_halt_reason()` and
   `[run] core1 halt: …`; it never sets the machine's `halt_reason` and never
@@ -821,16 +848,16 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
 - **Not modelled / 未建模项**：DMA arbitration between cores, `WFI`/`WFE`/`SEV`
   as scheduling points (still no-ops in the current tree; the sleep work landed as
   `9a6b088` and was reverted pending blocking `SIO_FIFO_RD`/FIFO-IRQ semantics),
-  core-1 writable registers and true per-core stepping: GDB now exposes core 1 as
-  thread 2 with read-only PC/SP, and `Machine::step` still advances both cores in
-  lock-step. Core 1 has no
+  and core-1 writable registers: GDB exposes core 1 as thread 2 with read-only
+  PC/SP, while per-core stepping is available through `Machine::step_cores`.
+  Core 1 has no
   modelled mask ROM: a launch jumps straight to `entry`, reproducing the post-ROM
   state, and only the trap stubs (`rom_table_lookup` at `0x74`, the ROM function
   table) are dispatched.
   **未建模项**：双核之间的 DMA 仲裁、作为调度点的 `WFI`/`WFE`/`SEV`（当前仍为空
   操作；睡眠语义曾以 `9a6b088` 落地但因缺少阻塞式 `SIO_FIFO_RD`/FIFO IRQ 而回退）、
-  core1 可写寄存器与真正的按核步进：GDB 现已把 core1 暴露为线程 2（PC/SP 只读），
-  而 `Machine::step` 仍双核同步推进。core1 不建模掩膜 ROM：启动直接跳到
+  core1 可写寄存器：GDB 把 core1 暴露为线程 2（PC/SP 只读），而按核步进已可通过
+  `Machine::step_cores` 使用。core1 不建模掩膜 ROM：启动直接跳到
   `entry` 并复现 post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与
   ROM 函数表）。
 
@@ -843,13 +870,15 @@ transfers happen because the machine pumps them, not because the guest writes
 它们，而不是客户机写了 `CTRL_TRIG`。
 
 - **Pump point / 泵送点**：`Machine::pump_dma_batch` is called from
-  `execute_step` immediately after a step retires and **before** interrupt
-  delivery. Plain `step`, `trace_step`, boot-ROM trap steps and GDB `resume`
-  single steps all funnel through this one call, so a debugger cannot starve
-  the DMA engine.
-  `Machine::pump_dma_batch` 在一步退役后、**中断投递之前**由 `execute_step`
-  调用。普通 `step`、`trace_step`、boot ROM 陷阱步与 GDB `resume` 单步都汇入
-  这一处调用，调试器因此无法让 DMA 引擎停摆。
+  `step_cores_with_trace` (the shared body behind `step`, `step_cores` and
+  `trace_step`) immediately after a step retires and **before** interrupt
+  delivery. Plain `step`, `step_cores`, `trace_step`, boot-ROM trap steps and
+  GDB `resume` single steps all funnel through this one call, so a debugger
+  cannot starve the DMA engine.
+  `Machine::pump_dma_batch` 在一步退役后、**中断投递之前**由
+  `step_cores_with_trace`（`step`、`step_cores` 与 `trace_step` 的共享实现）
+  调用。普通 `step`、`step_cores`、`trace_step`、boot ROM 陷阱步与 GDB `resume`
+  单步都汇入这一处调用，调试器因此无法让 DMA 引擎停摆。
 - **PIO DREQ / PIO DREQ 门控**：the batch runs through
   `BootPeripherals::pump_dma`, which republishes every PIO FIFO level
   (`sync_pio_dreqs`) before touching the DMA controller. Channels whose
@@ -910,13 +939,14 @@ because the guest writes `CTRL.SM_ENABLE`.
 之所以运行，是因为机器在 tick 它们，而不是因为客户机写了 `CTRL.SM_ENABLE`。
 
 - **Pump point / 泵送点**：`Machine::pump_pio_batch` is called from
-  `execute_step` right next to `pump_dma_batch`, after the step retires and
-  **before** interrupt delivery. Plain `step`, `trace_step`, boot-ROM trap steps
-  and GDB `resume` all take this path, so a debugger cannot starve the PIO
-  state machines either.
+  `step_cores_with_trace` right next to `pump_dma_batch`, after the step retires
+  and **before** interrupt delivery. Plain `step`, `step_cores`, `trace_step`,
+  boot-ROM trap steps and GDB `resume` all take this path, so a debugger cannot
+  starve the PIO state machines either.
   `Machine::pump_pio_batch` 在一步退役后、**中断投递之前**、紧邻
-  `pump_dma_batch` 由 `execute_step` 调用。普通 `step`、`trace_step`、boot ROM
-  陷阱步与 GDB `resume` 都经过这里，因此调试器同样无法让 PIO 状态机停摆。
+  `pump_dma_batch` 由 `step_cores_with_trace` 调用。普通 `step`、`step_cores`、
+  `trace_step`、boot ROM 陷阱步与 GDB `resume` 都经过这里，因此调试器同样无法让
+  PIO 状态机停摆。
 - **Budget / 预算**：throttled to one call per `PUMP_INTERVAL` (64) retired
   steps. Each call ticks every block that has `CTRL.SM_ENABLE` set by the number
   of steps retired since the previous call, so one guest step is modelled as one

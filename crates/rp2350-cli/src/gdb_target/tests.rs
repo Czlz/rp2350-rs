@@ -462,10 +462,104 @@ fn core1_registers_are_read_only_and_limited_to_pc_and_sp() {
     );
 }
 
+/// SRAM code and counter addresses of the per-core stepping fixture
+/// 按核步进夹具使用的 SRAM 代码与计数器地址
+const CORE0_CODE: u32 = SRAM_BASE + 0x8400;
+const CORE1_CODE: u32 = SRAM_BASE + 0x8800;
+const CORE0_COUNTER: u32 = SRAM_BASE + 0x9000;
+const CORE1_COUNTER: u32 = SRAM_BASE + 0x9004;
+const CORE1_VTOR: u32 = SRAM_BASE + 0x1000;
+const CORE1_STACK: u32 = SRAM_BASE + 0xA000;
+/// `SIO.FIFO_WR` used by the core-1 launch protocol
+/// core1 启动协议使用的 `SIO.FIFO_WR`
+const SIO_FIFO_WR: u32 = 0xD000_0054;
+
+/// Thumb `LDR r1,[pc,#8]; LDR r0,[r1]; ADDS r0,#1; STR r0,[r1]; B` + literal
+/// Thumb `LDR r1,[pc,#8]; LDR r0,[r1]; ADDS r0,#1; STR r0,[r1]; B` 与常量
+///
+/// The branch targets the second halfword, so one loop iteration is four
+/// instructions and every counter increment is observable in SRAM.
+/// 分支目标是第二个半字，因此一次循环为四条指令，且每次自增都能在 SRAM 中看到。
+fn counter_image(counter: u32) -> Vec<u8> {
+    let mut image = vec![0u8; 0x10];
+    for (index, halfword) in [0x4902u16, 0x6808, 0x3001, 0x6008, 0xE7FB]
+        .into_iter()
+        .enumerate()
+    {
+        image[index * 2..index * 2 + 2].copy_from_slice(&halfword.to_le_bytes());
+    }
+    image[0x0C..0x10].copy_from_slice(&counter.to_le_bytes());
+    image
+}
+
+/// Write the increment loop and its literal through the machine bus
+/// 通过机器总线写入自增循环及其常量
+///
+/// Words go through [`AddressBus::write_u32`] instead of the byte-wise
+/// `write_memory`: `SIO.FIFO_WR` only pushes a frame on a 32-bit write, and
+/// SRAM code is naturally word-aligned here.
+/// 写入使用 [`AddressBus::write_u32`] 而非逐字节的 `write_memory`：
+/// `SIO.FIFO_WR` 只在 32 位写入时压入一帧，SRAM 代码本身也按字对齐。
+fn install_counter(machine: &mut crate::run::Machine, base: u32, counter: u32) {
+    let image = counter_image(counter);
+    let mut cycles = 0u64;
+    for offset in (0..image.len()).step_by(4) {
+        let word = u32::from_le_bytes([
+            image[offset],
+            image[offset + 1],
+            image[offset + 2],
+            image[offset + 3],
+        ]);
+        machine
+            .bus
+            .write_u32(
+                base + u32::try_from(offset).expect("offset"),
+                word,
+                &mut cycles,
+            )
+            .expect("code write");
+    }
+}
+
+/// Target whose core 0 and core 1 both run their own increment loop
+/// core0 与 core1 各自运行自增循环的目标
+///
+/// Core 1 is released through the real SIO FIFO launch stream, which the
+/// machine's 64-step peripheral pump consumes, so both cores are `Running`
+/// when this returns. The instruction budget is left at 14 — not a multiple of
+/// the four-instruction loop — so a `vCont;c` ends with both PCs on a different
+/// offset.
+/// core1 通过真实的 SIO FIFO 启动流释放，由机器的 64 步外设泵送消费，因此返回时
+/// 双核都处于 `Running`。指令预算留在 14（不是四条指令循环的整数倍），使
+/// `vCont;c` 结束时两个 PC 都落在不同偏移。
+fn dual_core_target() -> MachineTarget {
+    let mut target = target();
+    install_counter(&mut target.machine, CORE0_CODE, CORE0_COUNTER);
+    install_counter(&mut target.machine, CORE1_CODE, CORE1_COUNTER);
+    target
+        .write_register(regs::PC, CORE0_CODE)
+        .expect("core0 pc");
+    let mut cycles = 0u64;
+    for word in [0u32, 0, 1, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1] {
+        target
+            .machine
+            .bus
+            .write_u32(SIO_FIFO_WR, word, &mut cycles)
+            .expect("launch word");
+    }
+    target.instruction_budget = 96;
+    let reply = target.resume(ResumeMode::Continue).expect("boot core1");
+    assert_eq!(reply.reason, StopReason::InstructionLimit);
+    assert_eq!(target.machine.core1_state(), Some(CpuState::Running));
+    target.instruction_budget = 14;
+    target
+}
+
 #[test]
-fn stepping_core1_reports_thread_two_and_advances_both_cores() {
+fn stepping_a_reset_core1_reports_thread_two_without_advancing_core0() {
     let mut target = target();
     let steps = target.machine.steps();
+    let core0_pc = target.machine.pc();
     let reply = target.step_thread(ThreadId::CORE1).expect("step core1");
 
     // core1 仍为 Reset，因此上报其真实状态与 PC。
@@ -473,8 +567,72 @@ fn stepping_core1_reports_thread_two_and_advances_both_cores() {
     assert_eq!(reply.reason, StopReason::Reset);
     assert_eq!(reply.pc, target.machine.core1_pc().expect("core1 pc"));
     assert_eq!(target.stopped_thread(), ThreadId::CORE1);
-    // 已知退化：Machine::step 双核同步推进。 / Documented degradation.
+    // 未启动的 core1 不退役指令：core0 的 PC 与步数保持不变。
+    // A core 1 that was never released retires nothing: core 0's PC and the
+    // step counter stay unchanged.
+    assert_eq!(target.machine.pc(), core0_pc);
+    assert_eq!(target.machine.steps(), steps);
+}
+
+#[test]
+fn stepping_core1_advances_only_core1() {
+    let mut target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let steps = target.machine.steps();
+
+    let reply = target.step_thread(ThreadId::CORE1).expect("step core1");
+
+    assert_eq!(reply.reason, StopReason::SingleStep);
+    assert_eq!(reply.pc, target.machine.core1_pc().expect("core1 pc"));
+    assert_eq!(target.stopped_thread(), ThreadId::CORE1);
+    assert_ne!(target.machine.core1_pc(), Some(core1_pc));
+    assert_eq!(
+        target.machine.pc(),
+        core0_pc,
+        "core0 must stay frozen / core0 必须冻结"
+    );
     assert_eq!(target.machine.steps(), steps + 1);
+}
+
+#[test]
+fn stepping_core0_advances_only_core0() {
+    let mut target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+
+    let reply = target.step_thread(ThreadId::CORE0).expect("step core0");
+
+    assert_eq!(reply.reason, StopReason::SingleStep);
+    assert_eq!(reply.pc, target.machine.pc());
+    assert_eq!(target.stopped_thread(), ThreadId::CORE0);
+    assert_ne!(target.machine.pc(), core0_pc);
+    assert_eq!(
+        target.machine.core1_pc(),
+        Some(core1_pc),
+        "core1 must stay frozen / core1 必须冻结"
+    );
+}
+
+#[test]
+fn continuing_only_core1_leaves_core0_frozen() {
+    let mut target = dual_core_target();
+    target.instruction_budget = 10;
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+
+    let reply = target
+        .continue_thread(ThreadId::CORE1)
+        .expect("continue core1");
+
+    assert_eq!(reply.reason, StopReason::InstructionLimit);
+    assert_eq!(reply.pc, target.machine.core1_pc().expect("core1 pc"));
+    assert_ne!(target.machine.core1_pc(), Some(core1_pc));
+    assert_eq!(
+        target.machine.pc(),
+        core0_pc,
+        "core0 must stay frozen / core0 必须冻结"
+    );
 }
 
 #[test]
@@ -491,18 +649,22 @@ fn continuing_core0_reports_thread_one() {
 #[test]
 fn breakpoint_thread_identifies_each_core() {
     let mut target = target();
+    let all = (true, true);
     let core1_pc = target.machine.core1_pc().expect("core1 pc");
     target.set_breakpoint(core1_pc).expect("core1 breakpoint");
-    assert_eq!(target.breakpoint_thread(), Some(ThreadId::CORE1));
+    assert_eq!(target.breakpoint_thread_in(all), Some(ThreadId::CORE1));
 
     let core0_pc = target.machine.pc();
     target.set_breakpoint(core0_pc).expect("core0 breakpoint");
     // core0 优先检查。 / core0 is checked first.
-    assert_eq!(target.breakpoint_thread(), Some(ThreadId::CORE0));
+    assert_eq!(target.breakpoint_thread_in(all), Some(ThreadId::CORE0));
 
     target.clear_breakpoint(core0_pc).expect("clear core0");
     target.clear_breakpoint(core1_pc).expect("clear core1");
-    assert_eq!(target.breakpoint_thread(), None);
+    assert_eq!(target.breakpoint_thread_in(all), None);
+    // 未选中的核心不参与断点检查。 / Unselected cores are not inspected.
+    target.set_breakpoint(core0_pc).expect("core0 breakpoint");
+    assert_eq!(target.breakpoint_thread_in((false, true)), None);
 }
 
 #[test]
@@ -529,9 +691,10 @@ fn rsp_thread_enumeration_and_selection_drive_core1_registers() {
 }
 
 #[test]
-fn rsp_vcont_step_core1_reports_thread_two() {
-    let target = target();
-    let pc = target.machine.core1_pc().expect("core1 pc");
+fn rsp_vcont_step_core1_advances_only_core1() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
     let mut session = RspSession::new(target);
 
     assert_eq!(
@@ -539,10 +702,59 @@ fn rsp_vcont_step_core1_reports_thread_two() {
         Some("T05thread:2;")
     );
     assert_eq!(session.target().stopped_thread(), ThreadId::CORE1);
-    let expected = encode_hex(&pc.to_le_bytes());
+    assert_ne!(session.target().machine.core1_pc(), Some(core1_pc));
+    assert_eq!(session.target().machine.pc(), core0_pc);
+    // `Hg` 未选择时 `pf` 跟随最近停止线程，即 core1 的 PC。
+    // Without an `Hg` selection, `pf` follows the last stopped thread (core 1).
+    let expected = encode_hex(
+        &session
+            .target()
+            .machine
+            .core1_pc()
+            .expect("core1 pc")
+            .to_le_bytes(),
+    );
     assert_eq!(
         session.handle_packet("pf").as_deref(),
         Some(expected.as_str())
+    );
+}
+
+#[test]
+fn rsp_vcont_step_core0_advances_only_core0() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;s:1").as_deref(),
+        Some("T05thread:1;")
+    );
+    assert_eq!(session.target().stopped_thread(), ThreadId::CORE0);
+    assert_ne!(session.target().machine.pc(), core0_pc);
+    assert_eq!(session.target().machine.core1_pc(), Some(core1_pc));
+}
+
+#[test]
+fn rsp_vcont_continue_advances_both_cores() {
+    let target = dual_core_target();
+    let core0_pc = target.machine.pc();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    let steps = target.machine.steps();
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;c").as_deref(),
+        Some("T05thread:1;")
+    );
+    assert_eq!(session.target().stopped_thread(), ThreadId::CORE0);
+    assert!(session.target().machine.steps() > steps);
+    assert_ne!(session.target().machine.pc(), core0_pc);
+    assert_ne!(
+        session.target().machine.core1_pc(),
+        Some(core1_pc),
+        "core1 must advance too / core1 也必须推进"
     );
 }
 

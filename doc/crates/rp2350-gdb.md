@@ -253,13 +253,27 @@ replies `OK` or `E01`.
 `s`/`S<sig>`（单步）或 `t`（停止）。省略 `:<tid>`、`tid = -1`/`0` 均表示全部
 线程；`c:1;c:2` 与裸 `c` 等价。继续与单步混用的列表无法由本目标满足，回复
 `E01`；未知动作回复空包；越界线程号回复 `E01`。`vCont;t` 以
-`T02thread:<n>;`（SIGINT）应答。
+`T02thread:<n>;`（SIGINT）应答。注意 all-stop 模式下 GDB 的单步会发送
+`vCont;s:2;c` 这类混合列表，因此客户端需 `set scheduler-locking step` 或直接发
+`vCont;s:2`，才能真正只推进选中核。
 `vCont` syntax is `vCont;<action>[:<tid>][;...]` with `c`/`C<sig>` (continue),
 `s`/`S<sig>` (step) or `t` (stop). A missing `:<tid>`, `tid = -1` and `tid = 0`
 all mean every thread, and `c:1;c:2` is equivalent to a bare `c`. Mixed
 continue/step lists cannot be satisfied by this target and reply `E01`; unknown
 actions reply an empty packet and out-of-range ids reply `E01`. `vCont;t` answers
-`T02thread:<n>;` (SIGINT).
+`T02thread:<n>;` (SIGINT). Note that in all-stop mode GDB steps with a mixed list
+such as `vCont;s:2;c`, so a client needs `set scheduler-locking step` (or a
+direct `vCont;s:2`) to really advance only the selected core.
+
+具体推进哪个核心由目标实现决定：`MachineTarget` 通过 `Machine::step_cores`
+真正只推进被选中的核（线程 1 → core0、线程 2 → core1），整目标请求（无 `:<tid>`、
+`0`/`-1` 或 `c:1;c:2`）才推进双核。单核 continue 以逐条 `step_cores` 循环实现，
+语义正确但吞吐低于 `run_cycles` 的双核路径。
+Which cores actually advance is the target's decision: `MachineTarget` steps
+only the selected core through `Machine::step_cores` (thread 1 → core 0,
+thread 2 → core 1), and only whole-target requests (no `:<tid>`, `0`/`-1` or
+`c:1;c:2`) advance both cores. A single-core continue loops over `step_cores`:
+correct semantics, lower throughput than the dual-core `run_cycles` path.
 
 停止回复统一带线程字段：普通停止为 `T05thread:1;`，监视点停止为
 `T05watch:<addr>;thread:2;`（字段顺序不敏感）。线程号来自
@@ -269,15 +283,18 @@ watchpoint stop is `T05watch:<addr>;thread:2;` (field order is not significant).
 The number comes from `GdbTarget::stopped_thread`; `MachineTarget` reports 2
 when a core-1 breakpoint or core-1 stop is what ended the resume.
 
-> 单线程选择只影响**上报线程与 PC**：没有按核步进 API 的目标（如
-> `MachineTarget`，其 `Machine::step` 各推进 core0/core1 一条指令）会退化为
-> 双核同步步进。`step_thread(2)` 时 core0 也会前进一条指令，这一点由
-> `crates/rp2350-cli/src/gdb_target/tests.rs` 锁定。
-> A single-thread selection only affects the **reported thread and PC**: targets
-> without a per-core step API (such as `MachineTarget`, whose `Machine::step`
-> retires one core-0 *and* one core-1 instruction) degrade to lock-step dual-core
-> stepping. `step_thread(2)` also advances core 0 by one instruction; the CLI
-> adapter tests lock this behaviour down.
+> 线程选择决定**实际推进哪个核心**：`MachineTarget` 用 `Machine::step_cores`
+> 只推进被选中的核，因此 `step_thread(2)`/`vCont;s:2` 时 core0 的 PC 与寄存器
+> 完全冻结；`step_thread(1)` 反之。裸 `c`/`s` 与 `c:1;c:2` 属于整目标请求，仍是
+> 双核同步推进。单核 continue 以逐条 `step_cores` 循环实现，吞吐低于整目标 `c`。
+> 该语义由 `crates/rp2350-cli/src/gdb_target/tests.rs` 锁定。
+> The thread selection decides **which core really advances**: `MachineTarget`
+> steps only the selected core through `Machine::step_cores`, so core 0's PC and
+> registers stay frozen for `step_thread(2)`/`vCont;s:2`, and the mirror image
+> holds for `step_thread(1)`. Bare `c`/`s` and `c:1;c:2` are whole-target
+> requests and still advance both cores. A single-core continue loops over
+> `step_cores`, which is slower than a whole-target `c`. The CLI adapter tests
+> lock this behaviour down.
 
 `QStartNoAckMode` 注意：传输层必须在发送 `OK` 之后才进入无应答模式；分发器只
 记录协商状态。
@@ -459,8 +476,9 @@ survives because one `Session` is shared for the whole `serve` call.
   多一次 thread-local 判断。门控只置位不复位（区间按线程存放），因此不会出现另一
   线程撤除监视导致本线程漏报；写监视点仍按指令采样。
 - 线程模型上限为两核（core0/core1）；`CortexM33Target` 仍是单线程目标（默认
-  `thread_count() == 1`）。`MachineTarget` 暴露两线程，但 core1 寄存器只读且仅
-  PC/SP 为真实值（其余读 0），单线程 `vCont`/`Hc` 选择退化为双核同步步进。
+  `thread_count() == 1`）。`MachineTarget` 暴露两线程，core1 寄存器只读且仅
+  PC/SP 为真实值（其余读 0），单线程 `vCont`/`Hc` 选择通过 `Machine::step_cores`
+  真正只推进该核。
 - 继续与单步混用的 `vCont` 动作列表返回 `E01`；不支持 `vCont;r`（range step）。
 - `qRcmd` monitor 命令由目标定义；库层默认全部返回 `OK`（无输出）。
 - `stop()` 只清标志，不能中断阻塞中的 `accept`（需要连接一次才退出）。
@@ -492,9 +510,9 @@ survives because one `Session` is shared for the whole `serve` call.
   sampling once per instruction.
 - The thread model tops out at two cores (core 0/core 1); `CortexM33Target` stays
   a single-thread target (default `thread_count() == 1`). `MachineTarget`
-  exposes two threads, but core-1 registers are read-only and only PC/SP carry
-  real values (everything else reads 0); a single-thread `vCont`/`Hc` selection
-  degrades to lock-step dual-core stepping.
+  exposes two threads; core-1 registers are read-only and only PC/SP carry real
+  values (everything else reads 0), and a single-thread `vCont`/`Hc` selection
+  really advances only that core through `Machine::step_cores`.
 - Mixed continue/step `vCont` action lists reply `E01`; `vCont;r` (range step) is
   not supported.
 - `qRcmd` monitor commands are defined by the target; the library default
