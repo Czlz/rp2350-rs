@@ -245,7 +245,12 @@ fn expander_disabled_passes_raw_words_to_the_host() {
     let mut hstx = new_hstx();
     enable(&hstx, false);
     assert!(hstx.push_data(0xDEAD_BEEF));
-    hstx.advance(1);
+    // Raw words are paced by the shift register: N_SHIFTS = 0 → 1, CLKDIV = 0 →
+    // 1, so one word lasts 1 * 2 * 1 = 2 clk_sys and reaches the host when its
+    // shift period completes.
+    // 原始字按移位寄存器计时：N_SHIFTS = 0 → 1、CLKDIV = 0 → 1，因此每字占
+    // 1 * 2 * 1 = 2 个 clk_sys，移位周期结束后才交给宿主。
+    hstx.advance(2);
     assert_eq!(hstx.drain_output(), [0xDEAD_BEEF]);
 }
 
@@ -426,8 +431,233 @@ fn boot_peripherals_mounts_both_hstx_windows() {
     assert_eq!(peripherals.hstx().fifo_level(), 1);
 
     peripherals.advance(1);
-    // HSTX is host-pumped at the DMA batch cadence; advance it explicitly.
-    // HSTX 由宿主按 DMA 批次节拍推进；测试中显式推进。
-    peripherals.hstx_mut().advance(1);
+    // HSTX is host-pumped at the DMA batch cadence; advance it explicitly. The
+    // raw path needs N_SHIFTS(0 → 1) * 2 * CLKDIV(0 → 1) = 2 clk_sys per word.
+    // HSTX 由宿主按 DMA 批次节拍推进；测试中显式推进。原始路径每字需要
+    // N_SHIFTS(0 → 1) * 2 * CLKDIV(0 → 1) = 2 个 clk_sys。
+    peripherals.hstx_mut().advance(2);
     assert_eq!(peripherals.hstx_mut().drain_output(), [0x1234_5678]);
+}
+
+/// The GBA firmware's HSTX/DVI setup / GBA 固件的 HSTX/DVI 配置
+///
+/// `csr = EXPAND_EN | CLKDIV=5 | N_SHIFTS=5 | SHIFT=2 | EN`,
+/// `expand_shift = ENC_N_SHIFTS=2 | ENC_SHIFT=16`,
+/// `expand_tmds = L2 red 5b @ rot 8 | L1 green 6b @ rot 3 | L0 blue 5b @ rot 29`
+/// (field positions from the RP2350 `hstx_ctrl.h` header).
+fn load_gba_display_config(hstx: &Hstx) {
+    write_ctrl(
+        hstx,
+        0x00,
+        CSR_EN | CSR_EXPAND_EN | (5 << 28) | (5 << 16) | (2 << 8),
+    );
+    write_ctrl(hstx, 0x24, (2 << 24) | (16 << 16));
+    write_ctrl(
+        hstx,
+        0x28,
+        (4 << 21) | (8 << 16) | (5 << 13) | (3 << 8) | (4 << 5) | 0x001d,
+    );
+}
+
+#[test]
+fn raw_passthrough_words_take_n_shifts_times_two_clkdiv_cycles() {
+    let mut hstx = new_hstx();
+    // N_SHIFTS = 5, CLKDIV = 5 → 5 * 2 * 5 = 50 clk_sys per raw word.
+    // N_SHIFTS = 5、CLKDIV = 5 → 每个原始字 5 * 2 * 5 = 50 个 clk_sys。
+    write_ctrl(&hstx, 0x00, CSR_EN | (5 << 28) | (5 << 16));
+    assert!(hstx.push_data(0xAAAA_0001));
+    assert!(hstx.push_data(0xAAAA_0002));
+
+    hstx.advance(49);
+    assert_eq!(hstx.fifo_level(), 2, "49 of 50 cycles shift nothing out");
+    assert_eq!(hstx.output_level(), 0);
+
+    hstx.advance(1);
+    assert_eq!(hstx.fifo_level(), 1, "the first word completes at t = 50");
+    assert_eq!(hstx.output_level(), 1);
+
+    hstx.advance(50);
+    assert_eq!(hstx.fifo_level(), 0);
+    assert_eq!(hstx.drain_output(), [0xAAAA_0001, 0xAAAA_0002]);
+    assert_eq!(hstx.output_words(), 2, "two words were shifted out");
+}
+
+#[test]
+fn raw_passthrough_treats_zero_n_shifts_as_one_shift() {
+    // CLKDIV = 1 → 2 clk_sys per shift; N_SHIFTS = 0 is modelled as 1 shift, so
+    // a word lasts 2 clk_sys — identical to an explicit N_SHIFTS = 1.
+    // CLKDIV = 1 → 每次移位 2 个 clk_sys；N_SHIFTS = 0 按 1 次移位处理，因此
+    // 每字 2 个 clk_sys，与显式 N_SHIFTS = 1 完全一致。
+    let mut implicit = new_hstx();
+    write_ctrl(&implicit, 0x00, CSR_EN | (1 << 28));
+    assert!(implicit.push_data(0x0000_0042));
+    implicit.advance(1);
+    assert_eq!(implicit.output_level(), 0);
+    implicit.advance(1);
+    assert_eq!(implicit.drain_output(), [0x42]);
+
+    let mut explicit = new_hstx();
+    write_ctrl(&explicit, 0x00, CSR_EN | (1 << 28) | (1 << 16));
+    assert!(explicit.push_data(0x0000_0042));
+    explicit.advance(1);
+    assert_eq!(explicit.output_level(), 0);
+    explicit.advance(1);
+    assert_eq!(explicit.drain_output(), [0x42]);
+}
+
+#[test]
+fn raw_passthrough_produces_no_tmds_pixels() {
+    let mut hstx = new_hstx();
+    write_ctrl(&hstx, 0x00, CSR_EN | (5 << 28) | (5 << 16));
+    assert!(hstx.push_data(0xF800_07E0));
+    hstx.advance(50);
+
+    assert_eq!(hstx.output_level(), 1, "the raw word is still delivered");
+    assert!(
+        hstx.take_pixels().is_empty(),
+        "without the expander no word is TMDS data"
+    );
+    assert_eq!(hstx.pixels_emitted(), 0);
+    assert_eq!(
+        hstx.drain_output(),
+        [0xF800_07E0],
+        "the word stays available as raw data"
+    );
+}
+
+#[test]
+fn tmds_word_decodes_into_two_rgb565_pixels() {
+    // 0xF800_07E0 holds two RGB565 pixels: the low half 0x07E0 is pure green
+    // (G = 0b111111 = 63) and the high half 0xF800 is pure red (R = 31).
+    // ENC_SHIFT = 16 → 2 pixels per word, pixel 0 = bits [15:0].
+    // Lane decode rule: symbol = bits [7:8-width] of word.rotate_right(rot +
+    // 16 * pixel), with L0 blue 5b @ rot 29, L1 green 6b @ rot 3, L2 red 5b @
+    // rot 8. Per pixel:
+    //   p0 blue  = bits [7:3] of rotate_right(29)    = word[4:0]   = 0
+    //   p0 green = bits [7:2] of rotate_right(3)     = word[10:5]  = 63
+    //   p0 red   = bits [7:3] of rotate_right(8)     = word[15:11] = 0
+    //   p1 blue  = bits [7:3] of rotate_right(29+16) = word[20:16] = 0
+    //   p1 green = bits [7:2] of rotate_right(3+16)  = word[26:21] = 0
+    //   p1 red   = bits [7:3] of rotate_right(8+16)  = word[31:27] = 31
+    let mut hstx = new_hstx();
+    load_gba_display_config(&hstx);
+    assert!(hstx.push_command(CMD_TMDS | 2), "2 pixels, ENC_SHIFT = 16");
+    assert!(hstx.push_data(0xF800_07E0));
+    // One data word covering 2 pixels × 10 clk_sys per pixel = 20 clk_sys.
+    hstx.advance(20);
+
+    let pixels = hstx.take_pixels();
+    assert_eq!(pixels.len(), 2, "ENC_SHIFT = 16 → two pixels per word");
+    assert_eq!(pixels[0].lanes, [0, 63, 0], "0x07E0 is pure green");
+    assert_eq!(pixels[1].lanes, [0, 0, 31], "0xF800 is pure red");
+    assert_eq!(hstx.pixels_emitted(), 2);
+    assert_eq!(hstx.output_level(), 0, "the TMDS word was consumed");
+}
+
+#[test]
+fn take_pixels_leaves_raw_words_for_drain_output() {
+    // 0x0000_001F decodes to blue = 31 in pixel 0 and black in pixel 1.
+    // 0x0000_001F 解码为像素 0 的蓝 = 31、像素 1 全黑。
+    let mut hstx = new_hstx();
+    load_gba_display_config(&hstx);
+    assert!(hstx.push_command(CMD_RAW | 1));
+    assert!(hstx.push_data(0x354));
+    assert!(hstx.push_command(CMD_TMDS | 2));
+    assert!(hstx.push_data(0x0000_001F));
+    // RAW word 1 pixel period, TMDS word 2 pixel periods → 30 clk_sys.
+    // RAW 字 1 个像素周期、TMDS 字 2 个像素周期 → 30 个 clk_sys。
+    hstx.advance(30);
+
+    let pixels = hstx.take_pixels();
+    assert_eq!(pixels.len(), 2);
+    assert_eq!(pixels[0].lanes, [31, 0, 0]);
+    assert_eq!(pixels[1].lanes, [0, 0, 0]);
+    assert_eq!(
+        hstx.drain_output(),
+        [0x354],
+        "the RAW sync word is not a pixel"
+    );
+}
+
+#[test]
+fn take_pixels_returns_nothing_once_the_queue_is_drained() {
+    let mut hstx = new_hstx();
+    load_gba_display_config(&hstx);
+    assert!(hstx.push_command(CMD_TMDS | 4));
+    assert!(hstx.push_data(0xF800_0000));
+    assert!(hstx.push_data(0x0000_07E0));
+    hstx.advance(40);
+
+    assert_eq!(hstx.take_pixels().len(), 4, "two words × two pixels");
+    assert_eq!(hstx.pixels_emitted(), 4);
+    assert!(hstx.take_pixels().is_empty(), "the queue is drained");
+    assert_eq!(hstx.pixels_emitted(), 4, "the counter never decreases");
+
+    assert!(hstx.push_command(CMD_TMDS | 2));
+    assert!(hstx.push_data(0));
+    hstx.advance(20);
+    assert_eq!(hstx.take_pixels().len(), 2);
+    assert_eq!(hstx.pixels_emitted(), 6, "the counter keeps growing");
+}
+
+#[test]
+fn tmds_decode_falls_back_to_the_low_byte_without_lane_config() {
+    let mut hstx = new_hstx();
+    // Expander on, ENC_SHIFT = 16, but EXPAND_TMDS keeps its all-zero reset
+    // value, so no lane can be decoded reliably.
+    // 扩展器开启、ENC_SHIFT = 16，但 EXPAND_TMDS 保持全 0 复位值，无法可靠解码。
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, (2 << 24) | (16 << 16));
+    assert_eq!(read_ctrl(&hstx, 0x28), 0);
+    assert!(hstx.push_command(CMD_TMDS | 2));
+    assert!(hstx.push_data(0xF800_07E0));
+    hstx.advance(20);
+
+    let pixels = hstx.take_pixels();
+    assert_eq!(pixels.len(), 2);
+    assert_eq!(pixels[0].lanes, [0xE0, 0, 0], "slice 0x07E0 → low byte");
+    assert_eq!(pixels[1].lanes, [0x00, 0, 0], "slice 0xF800 → low byte");
+}
+
+#[test]
+fn zero_enc_shift_decodes_one_fallback_pixel_per_word() {
+    let mut hstx = new_hstx();
+    // ENC_SHIFT = 0 cannot split a word: one pixel per word, one pixel period.
+    // ENC_SHIFT = 0 无法切分字：每字一个像素、一个像素周期。
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, 0);
+    assert!(hstx.push_command(CMD_TMDS | 1));
+    assert!(hstx.push_data(0x1234_5678));
+    hstx.advance(10);
+
+    let pixels = hstx.take_pixels();
+    assert_eq!(pixels.len(), 1);
+    assert_eq!(pixels[0].lanes, [0x78, 0, 0], "low byte of the whole word");
+}
+
+#[test]
+fn eight_bit_lanes_decode_rgb888_from_the_sdk_layout() {
+    let mut hstx = new_hstx();
+    // NBITS = 7 → 8-bit lanes; ROT 0/8/16 places blue/green/red in bytes 0/1/2
+    // and ENC_SHIFT = 24 keeps one pixel per word.
+    // NBITS = 7 → 8 位通道；ROT 0/8/16 把蓝/绿/红放在字节 0/1/2，
+    // ENC_SHIFT = 24 使每字仍只有 1 个像素。
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, (2 << 24) | (24 << 16));
+    write_ctrl(
+        &hstx,
+        0x28,
+        (7 << 21) | (16 << 16) | (7 << 13) | (8 << 8) | (7 << 5),
+    );
+    assert!(hstx.push_command(CMD_TMDS | 1));
+    assert!(hstx.push_data(0x0012_3456));
+    hstx.advance(10);
+
+    let pixels = hstx.take_pixels();
+    assert_eq!(pixels.len(), 1, "32 / 24 rounds down to one pixel");
+    assert_eq!(
+        pixels[0].lanes,
+        [0x56, 0x34, 0x12],
+        "blue, green, red bytes"
+    );
 }

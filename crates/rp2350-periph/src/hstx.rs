@@ -17,12 +17,14 @@
 //! # Modelled subset / 已建模子集
 //!
 //! - `CSR` reset `0x1005_0600`; `EN` (bit 0) gates FIFO popping and
-//!   `EXPAND_EN` (bit 1) selects command expansion. The remaining fields
-//!   (`CLKDIV`, `CLKPHASE`, `N_SHIFTS`, `SHIFT`, coupled-mode bits) are stored
-//!   and read back through the datasheet write mask.
+//!   `EXPAND_EN` (bit 1) selects command expansion. `CLKDIV` (bits 31:28) sets
+//!   the pixel/shift clock and `N_SHIFTS` (bits 20:16) paces the raw path; the
+//!   other fields (`CLKPHASE`, `SHIFT`, coupled-mode bits) are stored and read
+//!   back through the datasheet write mask.
 //! - `BIT0..BIT7` and `EXPAND_SHIFT`/`EXPAND_TMDS` are stored with their
 //!   datasheet write masks; `EXPAND_SHIFT.ENC_SHIFT` (bits 20:16) drives the
-//!   modelled TMDS word count.
+//!   modelled TMDS word count and `EXPAND_TMDS` `Lx_NBITS`/`Lx_ROT` drive
+//!   [`Hstx::take_pixels`].
 //! - `HSTX_FIFO_STAT` exposes `LEVEL[7:0]`, `FULL`, `EMPTY` and the
 //!   write-one-to-clear `WOF` overflow flag.
 //! - `HSTX_FIFO_FIFO` is write-only (reads return zero). With `EXPAND_EN = 0`
@@ -30,10 +32,12 @@
 //!   command words followed by their data payload.
 //!
 //! - `CSR` 复位值 `0x1005_0600`；`EN`（位 0）控制 FIFO 弹出，`EXPAND_EN`
-//!   （位 1）选择命令扩展。其余字段（`CLKDIV`、`CLKPHASE`、`N_SHIFTS`、
-//!   `SHIFT`、耦合模式位）按数据手册写掩码存储并可回读。
+//!   （位 1）选择命令扩展。`CLKDIV`（位 31:28）决定像素/移位时钟，
+//!   `N_SHIFTS`（位 20:16）为原始路径计时；其余字段（`CLKPHASE`、`SHIFT`、
+//!   耦合模式位）按数据手册写掩码存储并可回读。
 //! - `BIT0..BIT7` 与 `EXPAND_SHIFT`/`EXPAND_TMDS` 按数据手册写掩码存储；
-//!   `EXPAND_SHIFT.ENC_SHIFT`（位 20:16）驱动建模的 TMDS 字数换算。
+//!   `EXPAND_SHIFT.ENC_SHIFT`（位 20:16）驱动建模的 TMDS 字数换算，
+//!   `EXPAND_TMDS` 的 `Lx_NBITS`/`Lx_ROT` 驱动 [`Hstx::take_pixels`]。
 //! - `HSTX_FIFO_STAT` 暴露 `LEVEL[7:0]`、`FULL`、`EMPTY` 与写 1 清零的
 //!   `WOF` 溢出标志。
 //! - `HSTX_FIFO_FIFO` 只写（读回 0）。`EXPAND_EN = 0` 时每个写入字都是原始
@@ -70,15 +74,35 @@
 //!
 //! # Timing model / 时序模型
 //!
-//! [`Hstx::advance`] pops at most one FIFO word per HSTX clock cycle when
-//! `EN` is set, expands it and pushes the resulting output words onto the
-//! host-side queue drained by [`Hstx::drain_output`] /
-//! [`Hstx::take_scanline`]. It never synthesises pixels, so an idle HSTX only
-//! updates status. While a `CMD_WAIT` is pending no FIFO word is consumed.
-//! [`Hstx::advance`] 在 `EN` 置位时每个 HSTX 时钟周期至多弹出一个 FIFO 字，
-//! 展开后把输出字压入宿主队列，由 [`Hstx::drain_output`] /
-//! [`Hstx::take_scanline`] 取走。它从不合成像素，因此空闲 HSTX 只更新状态。
-//! `CMD_WAIT` 等待期间不消费 FIFO 字。
+//! [`Hstx::advance`] paces the block from the pixel clock
+//! (`clk_hstx / CSR.CLKDIV`, with `clk_hstx = clk_sys / 2`):
+//!
+//! - `EXPAND_EN = 1`: the expander pops one FIFO word per command word period
+//!   and pushes the expanded words onto the host queue drained by
+//!   [`Hstx::drain_output`] / [`Hstx::take_scanline`]. While a `CMD_WAIT` is
+//!   pending no FIFO word is consumed.
+//! - `EXPAND_EN = 0`: raw FIFO words feed the output shift register directly, so
+//!   one word occupies `CSR.N_SHIFTS * 2 * CSR.CLKDIV` `clk_sys` cycles — the
+//!   shift clock is `clk_hstx / CLKDIV`, i.e. `2 * CLKDIV` `clk_sys` per shift,
+//!   and the register shifts `N_SHIFTS` times per word (`0` is treated as `1`).
+//!   A word only reaches the host queue once its shift period completes.
+//!
+//! [`Hstx::advance`] never synthesises pixels, so an idle HSTX only refreshes
+//! status. [`Hstx::take_pixels`] decodes the TMDS data words of the host queue
+//! into [`HstxPixel`]s (three lane symbols per pixel, before TMDS encoding).
+//! [`Hstx::advance`] 由像素时钟（`clk_hstx / CSR.CLKDIV`，`clk_hstx` 取
+//! `clk_sys / 2`）推进：
+//!
+//! - `EXPAND_EN = 1`：扩展器按命令的字周期弹出 FIFO 字，并把展开后的字压入
+//!   宿主队列（由 [`Hstx::drain_output`] / [`Hstx::take_scanline`] 取走）。
+//!   `CMD_WAIT` 等待期间不消费 FIFO 字。
+//! - `EXPAND_EN = 0`：原始 FIFO 字直接进入输出移位寄存器，因此每个字占用
+//!   `CSR.N_SHIFTS * 2 * CSR.CLKDIV` 个 `clk_sys` 周期——移位时钟为
+//!   `clk_hstx / CLKDIV`（即每次移位 `2 * CLKDIV` 个 `clk_sys`），每个字移位
+//!   `N_SHIFTS` 次（值为 `0` 时按 `1` 处理）。移位周期结束后该字才进入宿主队列。
+//!
+//! 空闲 HSTX 只刷新状态，不会凭空产生像素。[`Hstx::take_pixels`] 把宿主队列中
+//! 的 TMDS 数据字解码为 [`HstxPixel`]（每像素三路通道符号，TMDS 编码前）。
 //!
 //! # Interrupts / 中断
 //!
@@ -96,13 +120,16 @@
 //! # Not modelled / 未建模项
 //!
 //! DVI/HDMI bit timing, the TMDS encoder and 10-bit symbol packing, the output
-//! shift register and clock generator, `BITx` pin crossbar routing, GPIO
-//! mapping, HSTX DMA handshakes (DREQ) and PIO coupled mode. TMDS command data
-//! words are passed through unchanged; only the number of words is derived from
-//! `EXPAND_SHIFT`.
-//! DVI/HDMI 位时序、TMDS 编码器与 10 位符号打包、输出移位寄存器与时钟发生器、
+//! shift register bit ordering, `BITx` pin crossbar routing, GPIO mapping, HSTX
+//! DMA handshakes (DREQ) and PIO coupled mode. TMDS command data words are kept
+//! unchanged in the word queue; [`Hstx::take_pixels`] only splits them into
+//! pre-encoding lane symbols, so a host can rebuild RGB565/RGB888 but cannot
+//! recover the serialised TMDS stream.
+//! DVI/HDMI 位时序、TMDS 编码器与 10 位符号打包、输出移位寄存器的位序、
 //! `BITx` 引脚交叉开关、GPIO 映射、HSTX DMA 握手（DREQ）以及 PIO 耦合模式均
-//! 未建模。TMDS 命令的数据字原样透传，只有字数由 `EXPAND_SHIFT` 推导。
+//! 未建模。TMDS 命令的数据字在字队列中保持原样；[`Hstx::take_pixels`] 只把它们
+//! 切成编码前通道符号，因此宿主可以重建 RGB565/RGB888，但无法还原串行化的
+//! TMDS 码流。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -112,6 +139,9 @@ use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
 use super::irq::IrqAssert;
 use super::map;
+
+pub use super::hstx_pixels::HstxPixel;
+use super::hstx_pixels::{self, OutputWord};
 
 /// Depth of the HSTX command/data FIFO in 32-bit words
 /// HSTX 命令/数据 FIFO 深度（32 位字）
@@ -190,6 +220,13 @@ const CSR_CLKDIV_SHIFT: u32 = 28;
 /// `CSR.CLKDIV` mask / `CSR.CLKDIV` 掩码
 const CSR_CLKDIV_MASK: u32 = 0xf;
 
+/// `CSR.N_SHIFTS` shift: shifts per FIFO word on the raw path
+/// `CSR.N_SHIFTS` 移位：原始路径每个 FIFO 字的移位次数
+const CSR_N_SHIFTS_SHIFT: u32 = 16;
+
+/// `CSR.N_SHIFTS` mask / `CSR.N_SHIFTS` 掩码
+const CSR_N_SHIFTS_MASK: u32 = 0x1f;
+
 /// `EXPAND_SHIFT.ENC_SHIFT` shift: bits per lane symbol on the encoded path
 /// `EXPAND_SHIFT.ENC_SHIFT` 移位：编码路径每通道每符号的位数
 const ENC_SHIFT_SHIFT: u32 = 16;
@@ -255,25 +292,35 @@ struct Pending {
     /// `clk_sys` cycles the next consumed word occupies
     /// 下一个被消费的字占用的 `clk_sys` 周期
     word_cycles: u64,
+    /// Whether the command is an encoded (TMDS) data command
+    /// 该命令是否为编码（TMDS）数据命令
+    tmds: bool,
 }
 
 /// Shared HSTX register, FIFO and command-expander state
 /// 共享的 HSTX 寄存器、FIFO 与命令扩展器状态
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HstxState {
     csr: u32,
     bit: [u32; 8],
     expand_shift: u32,
     expand_tmds: u32,
     fifo: VecDeque<u32>,
-    output: VecDeque<u32>,
+    output: VecDeque<OutputWord>,
     pending: Option<Pending>,
+    /// `clk_sys` cycles left before the next word is loaded (raw path) or before
+    /// the next FIFO pop (expander `CMD_WAIT`)
+    /// 下一个字装入前（原始路径）或下一次 FIFO 弹出前（扩展器 `CMD_WAIT`）
+    /// 剩余的 `clk_sys` 周期
     wait_cycles: u64,
     starving: bool,
     wof: bool,
     underruns: u64,
     /// FIFO words consumed by the expander / 扩展器已消费的 FIFO 字数
     produced: u64,
+    /// Pixels returned by [`Hstx::take_pixels`] so far
+    /// [`Hstx::take_pixels`] 累计返回的像素数
+    pixels: u64,
     irq_status: u32,
     irq_enable: u32,
     unknown_commands: u64,
@@ -281,26 +328,14 @@ struct HstxState {
     unknown_opcodes: u16,
 }
 
-impl Default for HstxState {
-    fn default() -> Self {
+impl HstxState {
+    /// Power-on state: zeroed fields plus the `CSR`/`EXPAND_SHIFT` reset values
+    /// 上电状态：字段清零，并加上 `CSR`/`EXPAND_SHIFT` 的复位值
+    fn power_on() -> Self {
         Self {
             csr: CSR_RESET,
-            bit: [0; 8],
             expand_shift: EXPAND_SHIFT_RESET,
-            expand_tmds: 0,
-            fifo: VecDeque::with_capacity(FIFO_DEPTH),
-            output: VecDeque::new(),
-            pending: None,
-            wait_cycles: 0,
-            starving: false,
-            wof: false,
-            underruns: 0,
-            produced: 0,
-            irq_status: 0,
-            irq_enable: 0,
-            unknown_commands: 0,
-            last_unknown: None,
-            unknown_opcodes: 0,
+            ..Self::default()
         }
     }
 }
@@ -412,6 +447,11 @@ impl HstxState {
         true
     }
 
+    /// `CSR.CLKDIV`, with zero modelled as one / `CSR.CLKDIV`，0 按 1 处理
+    fn clkdiv(&self) -> u64 {
+        u64::from((self.csr >> CSR_CLKDIV_SHIFT) & CSR_CLKDIV_MASK).max(1)
+    }
+
     /// `clk_sys` cycles per pixel / 每个像素占用的 `clk_sys` 周期
     ///
     /// The pixel clock is `clk_hstx / CSR.CLKDIV`, and `clk_hstx` is assumed to
@@ -422,8 +462,26 @@ impl HstxState {
     /// （已验证的 640x480p60 DVI 配置）。这正是扩展器的节拍来源：一个 256 字的
     /// 扫描行块覆盖 800 像素，因此无论 FIFO 补字多快，都占用 800 个像素周期。
     fn cycles_per_pixel(&self) -> u64 {
-        let clkdiv = u64::from((self.csr >> CSR_CLKDIV_SHIFT) & CSR_CLKDIV_MASK);
-        CLK_HSTX_DIV * clkdiv.max(1)
+        CLK_HSTX_DIV * self.clkdiv()
+    }
+
+    /// `clk_sys` cycles one raw (pass-through) FIFO word occupies
+    /// 原始（透传）路径每个 FIFO 字占用的 `clk_sys` 周期
+    ///
+    /// With `EXPAND_EN = 0` the FIFO word is loaded straight into the output
+    /// shift register, which is clocked at `clk_hstx / CSR.CLKDIV` and shifts
+    /// `CSR.N_SHIFTS` times before the next fetch. One word therefore lasts
+    /// `N_SHIFTS * 2 * CLKDIV` `clk_sys` cycles (the validated DVI setup gives
+    /// `5 * 2 * 5 = 50`). `N_SHIFTS = 0` is modelled as 1 shift, consistent with
+    /// the `CLKDIV = 0` handling above.
+    /// `EXPAND_EN = 0` 时 FIFO 字直接装入输出移位寄存器；移位寄存器由
+    /// `clk_hstx / CSR.CLKDIV` 驱动，并在下一次取字前移位 `CSR.N_SHIFTS` 次。
+    /// 因此每个字占用 `N_SHIFTS * 2 * CLKDIV` 个 `clk_sys` 周期（已验证的 DVI
+    /// 配置为 `5 * 2 * 5 = 50`）。`N_SHIFTS = 0` 按 1 次移位处理，与上面的
+    /// `CLKDIV = 0` 处理保持一致。
+    fn raw_word_cycles(&self) -> u64 {
+        let n_shifts = u64::from((self.csr >> CSR_N_SHIFTS_SHIFT) & CSR_N_SHIFTS_MASK).max(1);
+        self.clkdiv() * CLK_HSTX_DIV * n_shifts
     }
 
     /// Bits per lane symbol on the encoded path / 编码路径每通道每符号的位数
@@ -450,7 +508,7 @@ impl HstxState {
     }
 
     /// Start a non-repeating data command / 启动非重复数据命令
-    fn start_data(&mut self, words: u32, word_cycles: u64) -> bool {
+    fn start_data(&mut self, words: u32, word_cycles: u64, tmds: bool) -> bool {
         if words == 0 {
             return true;
         }
@@ -458,12 +516,13 @@ impl HstxState {
             words,
             repeat: None,
             word_cycles,
+            tmds,
         });
         false
     }
 
     /// Start a repeating data command / 启动重复数据命令
-    fn start_repeat(&mut self, copies: u32, word_cycles: u64) -> bool {
+    fn start_repeat(&mut self, copies: u32, word_cycles: u64, tmds: bool) -> bool {
         if copies == 0 {
             return true;
         }
@@ -471,6 +530,7 @@ impl HstxState {
             words: 1,
             repeat: Some(copies),
             word_cycles,
+            tmds,
         });
         false
     }
@@ -484,19 +544,19 @@ impl HstxState {
         match opcode {
             // RAW: `count` words, one pixel period each.
             // RAW：`count` 个字，每字一个像素周期。
-            0x0 => self.start_data(count, cpp),
+            0x0 => self.start_data(count, cpp, false),
             // RAW_REPEAT: one word repeated for `count` pixel periods.
             // RAW_REPEAT：一个字重复输出 `count` 个像素周期。
-            0x1 => self.start_repeat(count, u64::from(count) * cpp),
+            0x1 => self.start_repeat(count, u64::from(count) * cpp, false),
             0x2 => {
                 let words = self.tmds_words(count);
                 let per_word = u64::from(self.tmds_pixels_per_word()) * cpp;
-                self.start_data(words, per_word)
+                self.start_data(words, per_word, true)
             }
             0x3 => {
                 // One word repeated for `count` pixel periods.
                 // 一个字重复输出 `count` 个像素周期。
-                self.start_repeat(count, u64::from(count) * cpp)
+                self.start_repeat(count, u64::from(count) * cpp, true)
             }
             0xe => {
                 self.wait_cycles = u64::from(count);
@@ -538,32 +598,34 @@ impl HstxState {
     /// Pop one FIFO word, expand it and schedule the next pop
     /// 弹出一个 FIFO 字、展开它并安排下一次弹出
     ///
-    /// Each popped word occupies the pixel time of the command that owns it, so
-    /// the expander drains the FIFO at the real scanout rate (a 256-word line
-    /// block takes 800 pixel periods) instead of one word per clock.
-    /// 每个被弹出的字占用其所属命令的像素时长，因此扩展器按真实扫描速率排空
-    /// FIFO（一个 256 字行块占 800 个像素周期），而不是每时钟一字。
+    /// Only the command expander calls this (`EXPAND_EN = 1`); the raw path is
+    /// handled by [`HstxState::advance_raw`]. Each popped word occupies the pixel
+    /// time of the command that owns it, so the expander drains the FIFO at the
+    /// real scanout rate (a 256-word line block takes 800 pixel periods) instead
+    /// of one word per clock.
+    /// 只有命令扩展器（`EXPAND_EN = 1`）调用它；原始路径由
+    /// [`HstxState::advance_raw`] 处理。每个被弹出的字占用其所属命令的像素时长，
+    /// 因此扩展器按真实扫描速率排空 FIFO（一个 256 字行块占 800 个像素周期），
+    /// 而不是每时钟一字。
     fn pump(&mut self) {
         let Some(word) = self.fifo.pop_front() else {
             return;
         };
         self.starving = false;
-        if self.csr & CSR_EXPAND_EN == 0 {
-            // 扩展器关闭时每个 FIFO 字都是原始输出数据。
-            // With the expander off every FIFO word is raw output data.
-            self.output.push_back(word);
-            return;
-        }
         let retired = match self.pending.take() {
             Some(pending) => {
                 let mut words = pending.words;
+                let out = OutputWord {
+                    word,
+                    tmds: pending.tmds,
+                };
                 if let Some(copies) = pending.repeat {
                     for _ in 0..copies {
-                        self.output.push_back(word);
+                        self.output.push_back(out);
                     }
                     words = 0;
                 } else {
-                    self.output.push_back(word);
+                    self.output.push_back(out);
                     words = words.saturating_sub(1);
                 }
                 self.wait_cycles = pending.word_cycles;
@@ -572,6 +634,7 @@ impl HstxState {
                         words,
                         repeat: None,
                         word_cycles: pending.word_cycles,
+                        tmds: pending.tmds,
                     });
                     false
                 } else {
@@ -585,9 +648,43 @@ impl HstxState {
         }
     }
 
+    /// Advance the raw (pass-through) path / 推进原始（透传）路径
+    ///
+    /// `EXPAND_EN = 0` bypasses the expander: each FIFO word is loaded into the
+    /// output shift register for [`HstxState::raw_word_cycles`] `clk_sys` cycles
+    /// and reaches the host queue only when that shift period completes, so the
+    /// host observes one word per period instead of one per clock.
+    /// `EXPAND_EN = 0` 时绕过扩展器：每个 FIFO 字装入输出移位寄存器，占用
+    /// [`HstxState::raw_word_cycles`] 个 `clk_sys` 周期，只有移位周期结束后才
+    /// 进入宿主队列，因此宿主观察到的是每周期一个字，而不是每时钟一个字。
+    fn advance_raw(&mut self, cycles: u64) {
+        let mut remaining = cycles;
+        while remaining > 0 && !self.fifo.is_empty() {
+            if self.wait_cycles == 0 {
+                // 开始移出下一个字。Start shifting out the next word.
+                self.wait_cycles = self.raw_word_cycles();
+            }
+            let burned = self.wait_cycles.min(remaining);
+            self.wait_cycles -= burned;
+            remaining -= burned;
+            if self.wait_cycles > 0 {
+                break;
+            }
+            if let Some(word) = self.fifo.pop_front() {
+                self.starving = false;
+                self.produced = self.produced.saturating_add(1);
+                self.output.push_back(OutputWord { word, tmds: false });
+            }
+        }
+    }
+
     /// Advance the modelled HSTX clock / 推进建模的 HSTX 时钟
     fn advance(&mut self, cycles: u64) {
         if cycles == 0 || self.csr & CSR_EN == 0 {
+            return;
+        }
+        if self.csr & CSR_EXPAND_EN == 0 {
+            self.advance_raw(cycles);
             return;
         }
         let mut remaining = cycles;
@@ -638,7 +735,7 @@ impl Hstx {
     #[must_use]
     pub fn new(irq: IrqAssert) -> Self {
         Self {
-            state: Arc::new(Mutex::new(HstxState::default())),
+            state: Arc::new(Mutex::new(HstxState::power_on())),
             irq,
         }
     }
@@ -689,13 +786,16 @@ impl Hstx {
     ///
     /// The expander is paced by the pixel clock: every popped word occupies the
     /// pixel time of the command that owns it, so a 256-word scanline block
-    /// lasts 800 pixel periods (matching the real 25.2 MHz scanout). The call
-    /// does nothing when `EN` is clear or the FIFO is idle, so it never invents
-    /// pixels, and it refreshes the shared interrupt line.
+    /// lasts 800 pixel periods (matching the real 25.2 MHz scanout). With
+    /// `EXPAND_EN = 0` the raw path is paced the same way, one word per
+    /// `CSR.N_SHIFTS * 2 * CSR.CLKDIV` `clk_sys` cycles. The call does nothing
+    /// when `EN` is clear or the FIFO is idle, so it never invents pixels, and it
+    /// refreshes the shared interrupt line.
     /// 扩展器按像素时钟节拍推进：每个被弹出的字占用其所属命令的像素时长，因此
     /// 一个 256 字扫描行块持续 800 个像素周期（与真实 25.2 MHz 扫描一致）。
-    /// `EN` 清零或 FIFO 空闲时不做任何事，因此不会凭空产生像素；调用后刷新共享
-    /// 中断线。
+    /// `EXPAND_EN = 0` 时原始路径同样计时：每个字占用
+    /// `CSR.N_SHIFTS * 2 * CSR.CLKDIV` 个 `clk_sys` 周期。`EN` 清零或 FIFO 空闲时
+    /// 不做任何事，因此不会凭空产生像素；调用后刷新共享中断线。
     pub fn advance(&self, cycles: u64) {
         let asserted = {
             let mut state = self.state.lock();
@@ -708,7 +808,12 @@ impl Hstx {
     /// Drain all output words produced so far / 取走目前产生的全部输出字
     #[must_use]
     pub fn drain_output(&mut self) -> Vec<u32> {
-        self.state.lock().output.drain(..).collect()
+        self.state
+            .lock()
+            .output
+            .drain(..)
+            .map(|out| out.word)
+            .collect()
     }
 
     /// Drain the host-side output queue as one scanline chunk
@@ -721,6 +826,58 @@ impl Hstx {
     #[must_use]
     pub fn take_scanline(&mut self) -> Vec<u32> {
         self.drain_output()
+    }
+
+    /// Take the TMDS data words out of the host queue and decode them into pixels
+    /// 取走宿主队列中的 TMDS 数据字并解码为像素
+    ///
+    /// Each `CMD_TMDS`/`CMD_TMDS_REPEAT` word carries `32 / ENC_SHIFT` pixels
+    /// (one when `ENC_SHIFT = 0`); every pixel is split into three lane symbols
+    /// by `EXPAND_TMDS`: the word is right-rotated by `Lx_ROT` and the symbol is
+    /// the `Lx_NBITS + 1` bits anchored at bit 7 of the rotated word, so the
+    /// validated GBA configuration (`L2` red 5 bits, `L1` green 6 bits, `L0` blue
+    /// 5 bits) decodes RGB565 words directly. Non-TMDS words — raw-mode words and
+    /// `CMD_RAW`/`CMD_RAW_REPEAT` sync payloads — stay in the queue for
+    /// [`Hstx::drain_output`], and with `EXPAND_EN = 0` this returns nothing
+    /// because no TMDS pixel is produced.
+    ///
+    /// The symbols are **pre-encoding** values: TMDS 10-bit coding, DC balancing
+    /// and DVI/HDMI bit timing are still not modelled, so a host can assemble
+    /// RGB565/RGB888 but cannot recover the serialised TMDS stream. When the lane
+    /// configuration cannot be decoded (`EXPAND_TMDS` all zero, or
+    /// `ENC_SHIFT = 0`) every pixel instead carries the low 8 bits of its raw
+    /// slice in `lanes[0]` with `lanes[1]`/`lanes[2]` zero.
+    /// 每个 `CMD_TMDS`/`CMD_TMDS_REPEAT` 字承载 `32 / ENC_SHIFT` 个像素
+    /// （`ENC_SHIFT = 0` 时 1 个）；`EXPAND_TMDS` 把每个像素切成三路通道符号：
+    /// 字先右旋 `Lx_ROT` 位，符号取旋转后字中锚定在位 7 的 `Lx_NBITS + 1` 位，
+    /// 因此已验证的 GBA 配置（`L2` 红 5 位、`L1` 绿 6 位、`L0` 蓝 5 位）可直接
+    /// 解码 RGB565 字。非 TMDS 字（原始模式字与 `CMD_RAW`/`CMD_RAW_REPEAT` 同步
+    /// 载荷）留在队列中供 [`Hstx::drain_output`] 取用；`EXPAND_EN = 0` 时不产生
+    /// TMDS 像素，因此返回空。
+    ///
+    /// 符号是**编码前**取值：TMDS 10 位编码、直流平衡与 DVI/HDMI 位时序仍未建模，
+    /// 因此宿主可以组装 RGB565/RGB888，但无法还原串行化的 TMDS 码流。当通道配置
+    /// 无法可靠解码（`EXPAND_TMDS` 全 0，或 `ENC_SHIFT = 0`）时，每个像素改为在
+    /// `lanes[0]` 携带其原始切片的低 8 位，`lanes[1]`/`lanes[2]` 为 0。
+    pub fn take_pixels(&mut self) -> Vec<HstxPixel> {
+        let mut state = self.state.lock();
+        let expand_tmds = state.expand_tmds;
+        let enc_shift = state.enc_shift();
+        let pixels = hstx_pixels::drain_pixels(&mut state.output, expand_tmds, enc_shift);
+        state.pixels = state.pixels.saturating_add(pixels.len() as u64);
+        pixels
+    }
+
+    /// Total pixels returned by [`Hstx::take_pixels`] so far
+    /// [`Hstx::take_pixels`] 累计返回的像素数
+    ///
+    /// The counter only grows and survives [`Hstx::drain_output`], which makes it
+    /// usable as a diagnostic during scanout; [`Hstx::reset`] clears it.
+    /// 该计数只增不减，且不受 [`Hstx::drain_output`] 影响，可在扫描输出期间作为
+    /// 诊断量；[`Hstx::reset`] 会清零。
+    #[must_use]
+    pub fn pixels_emitted(&self) -> u64 {
+        self.state.lock().pixels
     }
 
     /// Number of recorded output underruns / 已记录的输出下溢次数
@@ -806,7 +963,7 @@ impl Hstx {
 impl HstxState {
     /// Restore power-on defaults / 恢复上电默认值
     fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::power_on();
     }
 }
 

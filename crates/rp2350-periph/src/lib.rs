@@ -29,6 +29,7 @@ pub mod dma;
 pub mod dreq;
 pub mod gpio_pads;
 pub mod hstx;
+pub mod hstx_pixels;
 pub mod io_bank0;
 pub mod io_qspi;
 pub mod irq;

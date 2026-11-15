@@ -495,12 +495,15 @@ pumps `Hstx::advance`.
 ### Register subset / 寄存器子集
 
 - `CSR` (`+0x00`, reset `0x1005_0600`, write mask `0xFF1F_1F73`) — `EN` (bit 0)
-  gates FIFO popping; `EXPAND_EN` (bit 1) enables command expansion. `CLKDIV`,
-  `CLKPHASE`, `N_SHIFTS`, `SHIFT` and the coupled-mode bits are stored and read
+  gates FIFO popping; `EXPAND_EN` (bit 1) enables command expansion. `CLKDIV`
+  (bits 31:28) sets the pixel/shift clock and `N_SHIFTS` (bits 20:16) paces the
+  raw path; `CLKPHASE`, `SHIFT` and the coupled-mode bits are stored and read
   back but have no timing effect.
-- `BIT0..BIT7` (`+0x04..+0x20`, mask `0x0003_1F1F`) and `EXPAND_SHIFT` (`+0x24`,
-  reset `0x0100_0100`), `EXPAND_TMDS` (`+0x28`) are storage only;
-  `EXPAND_SHIFT.ENC_SHIFT` (bits 20:16) drives the modelled TMDS word count.
+- `BIT0..BIT7` (`+0x04..+0x20`, mask `0x0003_1F1F`) are storage only.
+  `EXPAND_SHIFT` (`+0x24`, reset `0x0100_0100`) and `EXPAND_TMDS` (`+0x28`) drive
+  the pixel capture path: `ENC_SHIFT` (bits 20:16) sets the pixels per word,
+  `Lx_NBITS` (bits 7:5 / 15:13 / 23:21) and `Lx_ROT` (bits 4:0 / 12:8 / 20:16)
+  split each pixel into lane symbols.
 - `HSTX_FIFO_STAT` (`+0x00`) — `LEVEL[7:0]`, `FULL` (8), `EMPTY` (9) derived
   from the queue; `WOF` (10) sticky write-while-full flag, write-one-to-clear.
 - `HSTX_FIFO_FIFO` (`+0x04`) — write-only; reads return zero. Writes while full
@@ -511,11 +514,14 @@ pumps `Hstx::advance`.
   policy (read 0, write ignored).
 
 - `CSR`（`+0x00`，复位 `0x1005_0600`，写掩码 `0xFF1F_1F73`）——`EN`（位 0）
-  控制 FIFO 弹出，`EXPAND_EN`（位 1）启用命令扩展。`CLKDIV`、`CLKPHASE`、
-  `N_SHIFTS`、`SHIFT` 与耦合模式位仅存储/回读，无时序效果。
-- `BIT0..BIT7`（`+0x04..+0x20`，掩码 `0x0003_1F1F`）与 `EXPAND_SHIFT`
-  （`+0x24`，复位 `0x0100_0100`）、`EXPAND_TMDS`（`+0x28`）仅存储；
-  `EXPAND_SHIFT.ENC_SHIFT`（位 20:16）驱动建模的 TMDS 字数换算。
+  控制 FIFO 弹出，`EXPAND_EN`（位 1）启用命令扩展。`CLKDIV`（位 31:28）决定
+  像素/移位时钟，`N_SHIFTS`（位 20:16）为原始路径计时；`CLKPHASE`、`SHIFT` 与
+  耦合模式位仅存储/回读，无时序效果。
+- `BIT0..BIT7`（`+0x04..+0x20`，掩码 `0x0003_1F1F`）仅存储。
+  `EXPAND_SHIFT`（`+0x24`，复位 `0x0100_0100`）与 `EXPAND_TMDS`（`+0x28`）驱动
+  像素捕获：`ENC_SHIFT`（位 20:16）决定每字像素数，`Lx_NBITS`（位
+  7:5 / 15:13 / 23:21）与 `Lx_ROT`（位 4:0 / 12:8 / 20:16）把每个像素切成
+  三路符号。
 - `HSTX_FIFO_STAT`（`+0x00`）——`LEVEL[7:0]`、`FULL`（8）、`EMPTY`（9）由
   队列推导；`WOF`（10）为满写粘滞标志，写 1 清零。
 - `HSTX_FIFO_FIFO`（`+0x04`）——只写，读回 0；满时写入丢弃该字并置位 `WOF`。
@@ -550,10 +556,35 @@ never panic or raise the completion IRQ.
 不会 panic，也不会触发完成中断。
 
 With `EXPAND_EN = 0`, every FIFO word is raw output data and no command decoding
-happens — matching the datasheet's "raw FIFO data passed directly" mode. The
-model does not pace this path: words pass through as fast as they arrive.
+happens — matching the datasheet's "raw FIFO data passed directly" mode. This
+path **is** paced now: the word goes straight into the output shift register,
+which is clocked at `clk_hstx / CSR.CLKDIV` and shifts `CSR.N_SHIFTS` times per
+word, so one word occupies
+
+```text
+CSR.N_SHIFTS * 2 * CSR.CLKDIV   clk_sys cycles
+```
+
+(`2 * CLKDIV` `clk_sys` per shift because `clk_hstx = clk_sys / 2`). The
+validated DVI setup (`N_SHIFTS = 5`, `CLKDIV = 5`) therefore takes 50 `clk_sys`
+per raw word, and a word only reaches the host queue when its shift period
+completes — `advance(49)` does not consume it, `advance(1)` does. `N_SHIFTS = 0`
+is modelled as one shift (and `CLKDIV = 0` as one, matching the pixel-clock
+derivation); the datasheet's "0 means shift 32 times" / "CLKDIV 0 means a period
+of 16" encodings are not modelled.
 `EXPAND_EN = 0` 时每个 FIFO 字都是原始输出数据，不做命令解码，对应数据手册的
-“原始 FIFO 数据直通”模式。模型不为此路径计时：字以到达速度直接透传。
+“原始 FIFO 数据直通”模式。该路径**已计时**：字直接进入输出移位寄存器，移位
+寄存器由 `clk_hstx / CSR.CLKDIV` 驱动、每字移位 `CSR.N_SHIFTS` 次，因此每字占用
+
+```text
+CSR.N_SHIFTS * 2 * CSR.CLKDIV   个 clk_sys 周期
+```
+
+（因 `clk_hstx = clk_sys / 2`，每次移位为 `2 * CLKDIV` 个 `clk_sys`）。已验证的
+DVI 配置（`N_SHIFTS = 5`、`CLKDIV = 5`）因此每字占 50 个 `clk_sys`；字的移位周期
+结束后才进入宿主队列——`advance(49)` 不消费它，`advance(1)` 才消费。`N_SHIFTS = 0`
+按 1 次移位处理（`CLKDIV = 0` 按 1 处理，与像素时钟推导一致）；数据手册中
+“0 表示移位 32 次”“CLKDIV 0 表示周期 16”的编码未建模。
 
 ### Host-side output / 宿主侧输出
 
@@ -614,6 +645,60 @@ peripherals.advance(6);
 assert_eq!(peripherals.hstx_mut().drain_output(), [0x0011_2233, 0x0044_5566, 0x0077_8899]);
 ```
 
+### Pixel capture / 像素捕获
+
+`take_pixels()` drains the TMDS data words out of the host queue and returns
+`HstxPixel { lanes: [u8; 3] }` values; `pixels_emitted()` counts every pixel
+handed out so far (monotonic, cleared by `reset()`). A
+`CMD_TMDS`/`CMD_TMDS_REPEAT` word carries `32 / ENC_SHIFT` pixels (`1` when
+`ENC_SHIFT = 0`), pixel 0 being the lowest `ENC_SHIFT` bits with each following
+pixel rotating the word one slot further. `EXPAND_TMDS` splits a pixel into
+three lane symbols — lane 0 blue, lane 1 green, lane 2 red:
+`take_pixels()` 把宿主队列中的 TMDS 数据字取走并返回
+`HstxPixel { lanes: [u8; 3] }`；`pixels_emitted()` 累计已交付的像素数（只增，
+`reset()` 清零）。一个 `CMD_TMDS`/`CMD_TMDS_REPEAT` 字承载 `32 / ENC_SHIFT` 个
+像素（`ENC_SHIFT = 0` 时为 1），像素 0 取最低 `ENC_SHIFT` 位，后续像素依次再旋转
+一个槽位。`EXPAND_TMDS` 把像素切成三路通道符号——通道 0 蓝、通道 1 绿、通道 2 红：
+
+```text
+symbol = bits [7 : 8 - width] of word.rotate_right(Lx_ROT + pixel * ENC_SHIFT)
+width  = Lx_NBITS + 1      (1..=8, "starting from bit 7 of the rotated data")
+```
+
+With the validated GBA firmware setup (`csr = EXPAND_EN | CLKDIV 5 | N_SHIFTS 5 |
+SHIFT 2 | EN`, `expand_shift = ENC_N_SHIFTS 2 | ENC_SHIFT 16`,
+`expand_tmds = L2 red 5b @ rot 8 | L1 green 6b @ rot 3 | L0 blue 5b @ rot 29`) the
+word `0xF800_07E0` decodes to two pixels, `[0, 63, 0]` (green `0x07E0`) and
+`[0, 0, 31]` (red `0xF800`) — RGB565. These symbols are **pre-encoding** values:
+TMDS 10-bit coding, DC balancing, DVI/HDMI bit timing, `BITx` routing and pin
+timing are still unmodelled. When the lane config cannot be decoded
+(`EXPAND_TMDS` all zero, or `ENC_SHIFT = 0`) each pixel instead carries the low 8
+bits of its raw slice in `lanes[0]` with `lanes[1]`/`lanes[2]` zero, so the
+payload stays observable. Non-TMDS words (raw-mode words and
+`CMD_RAW`/`CMD_RAW_REPEAT` sync payloads) stay in the queue for `drain_output()`,
+and with `EXPAND_EN = 0` `take_pixels()` returns nothing because no word is TMDS
+data.
+在已验证的 GBA 固件配置下（`csr = EXPAND_EN | CLKDIV 5 | N_SHIFTS 5 | SHIFT 2 | EN`，
+`expand_shift = ENC_N_SHIFTS 2 | ENC_SHIFT 16`，
+`expand_tmds = L2 红 5 位 @ rot 8 | L1 绿 6 位 @ rot 3 | L0 蓝 5 位 @ rot 29`），
+字 `0xF800_07E0` 解码为两个像素：`[0, 63, 0]`（绿 `0x07E0`）与 `[0, 0, 31]`
+（红 `0xF800`），即 RGB565。这些符号是**编码前**取值：TMDS 10 位编码、直流平衡、
+DVI/HDMI 位时序、`BITx` 路由与引脚时序仍未建模。当通道配置无法可靠解码
+（`EXPAND_TMDS` 全 0，或 `ENC_SHIFT = 0`）时，每个像素改为在 `lanes[0]` 携带其
+原始切片的低 8 位、`lanes[1]`/`lanes[2]` 为 0，使载荷仍可观察。非 TMDS 字
+（原始模式字与 `CMD_RAW`/`CMD_RAW_REPEAT` 同步载荷）留在队列中供
+`drain_output()` 取用；`EXPAND_EN = 0` 时没有 TMDS 数据，`take_pixels()` 返回空。
+
+```rust
+// Rebuild RGB565 from the captured lane symbols / 用捕获的通道符号重建 RGB565
+for pixel in peripherals.hstx_mut().take_pixels() {
+    let rgb565 = (u16::from(pixel.lanes[2]) << 11)
+        | (u16::from(pixel.lanes[1]) << 5)
+        | u16::from(pixel.lanes[0]);
+    let _ = rgb565;
+}
+```
+
 ### Interrupts / 中断
 
 Silicon has no dedicated HSTX interrupt line. The model borrows `SPARE_IRQ_0`
@@ -631,19 +716,21 @@ write-one-to-clear.
 ### Not modelled / 未建模项
 
 DVI/HDMI bit timing, the TMDS encoder and 10-bit symbol packing, the output
-shift register/clock generator (`CLKDIV`, `CLKPHASE`, `N_SHIFTS`, `SHIFT` are
-stored but only `CLKDIV` and `ENC_SHIFT` feed the pacing), `BITx` pin crossbar
-routing, GPIO pin mapping, `EXPAND_TMDS` lane configuration and PIO coupled
-mode. TMDS data words are passed through unchanged; only the consumed word count
-and each word's pixel time are derived from `EXPAND_SHIFT`. No scanline/frame
-boundary, pixel format or `HstxDecoder` is provided. `DREQ_HSTX` (52) is
-modelled and asserted while the FIFO has room.
-DVI/HDMI 位时序、TMDS 编码器与 10 位符号打包、输出移位寄存器/时钟发生器
-（`CLKDIV`、`CLKPHASE`、`N_SHIFTS`、`SHIFT` 仅保存，只有 `CLKDIV` 与
-`ENC_SHIFT` 参与节拍）、`BITx` 引脚交叉开关、GPIO 引脚映射、`EXPAND_TMDS`
-通道配置与 PIO 耦合模式均未建模。TMDS 数据字原样透传，只有消费字数与每字的
-像素时长由 `EXPAND_SHIFT` 推导。不提供扫描线/帧边界、像素格式或
-`HstxDecoder`。`DREQ_HSTX`（52）已建模，FIFO 有空间时断言。
+shift register bit ordering and `BITx` pin crossbar routing, GPIO pin mapping and
+PIO coupled mode. TMDS command data words are kept unchanged in the word queue;
+`take_pixels()` only splits them into pre-encoding lane symbols (see
+`HstxPixel`), so a host can rebuild RGB565/RGB888 but cannot recover the
+serialised TMDS stream. No scanline/frame boundary or DVI pixel timing is
+provided, and `CMD_TMDS_REPEAT` emits one word copy per pixel period, so a
+repeat run surfaces `count` decoded word copies. `DREQ_HSTX` (52) is modelled
+and asserted while the FIFO has room.
+DVI/HDMI 位时序、TMDS 编码器与 10 位符号打包、输出移位寄存器的位序与 `BITx`
+引脚交叉开关、GPIO 引脚映射以及 PIO 耦合模式均未建模。TMDS 命令的数据字在字队列
+中保持原样；`take_pixels()` 只把它们切成编码前的通道符号（见 `HstxPixel`），
+因此宿主可以重建 RGB565/RGB888，但无法还原串行化的 TMDS 码流。模型不提供
+扫描线/帧边界或 DVI 像素时序，且 `CMD_TMDS_REPEAT` 按每个像素周期输出一个字的
+副本，因此一次重复运行会表现为 `count` 个已解码字副本。`DREQ_HSTX`（52）已建模，
+FIFO 有空间时断言。
 
 ---
 
