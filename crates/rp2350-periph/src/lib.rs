@@ -41,6 +41,7 @@ pub mod pll;
 pub mod powman;
 pub mod ppb;
 pub mod psm;
+pub mod psram;
 pub mod pwm;
 pub mod resets;
 pub mod rosc;
@@ -72,6 +73,8 @@ mod hstx_tests;
 mod io_bank0_tests;
 #[cfg(test)]
 mod pin_matrix_tests;
+#[cfg(test)]
+mod psram_tests;
 #[cfg(test)]
 mod sio_spinlock_tests;
 #[cfg(test)]

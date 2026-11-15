@@ -1206,6 +1206,63 @@ impl XipController {
 See [rp2350-virt-periph.md](rp2350-virt-periph.md) for PSRAM and QSPI Flash device details.
 PSRAM 和 QSPI Flash 设备详情参见 [rp2350-virt-periph.md](rp2350-virt-periph.md)。
 
+### PSRAM window (XIP CS1) / PSRAM 窗口（XIP CS1）
+
+`psram::Psram` is the built-in model of the external PSRAM that RP2350 reaches
+through QMI chip select 1. It is a bus-mounted `MemoryRegion`, not a QMI
+register block, and is installed independently of `BootPeripherals::mount`:
+
+```rust
+use rp2350_core::memory::SimpleBus;
+use rp2350_periph::psram::mount_psram;
+
+let mut bus = SimpleBus::new();
+let psram = mount_psram(&mut bus, 8 * 1024 * 1024).expect("psram window");
+// `psram` shares the bytes that the bus serves at PSRAM_BASE.
+```
+
+`psram::Psram` 是内置的外部 PSRAM 模型，对应 RP2350 经 QMI 片选 1 访问的器件。
+它是挂到总线上的 `MemoryRegion`（不是 QMI 寄存器块），挂载与
+`BootPeripherals::mount` 相互独立：
+
+- **Base and size / 基址与大小**: `PSRAM_BASE = 0x1100_0000`
+  (`XIP_MAIN1`, not a mirror of the CS0 flash window at `0x1000_0000`) with
+  `PSRAM_MAX_SIZE = 16 MB`. `Psram::zeroed()` builds the 8 MB window fitted by
+  common PSRAM boards; `Psram::new(size)` takes any 4 KiB aligned size in
+  `1..=PSRAM_MAX_SIZE`. Invalid sizes (zero, unaligned, oversized) clamp to the
+  16 MB ceiling with a one-shot `log::warn!`, never to a silently truncated size.
+- **基址与大小**: `PSRAM_BASE = 0x1100_0000`（`XIP_MAIN1`，不是
+  `0x1000_0000` 处 CS0 Flash 窗口的镜像），`PSRAM_MAX_SIZE = 16 MB`。
+  `Psram::zeroed()` 生成常见 PSRAM 板的 8 MB 窗口；`Psram::new(size)` 接受
+  `1..=PSRAM_MAX_SIZE` 内任意 4 KiB 对齐大小。非法大小（0、未对齐、超上限）会
+  钳制到 16 MB 上限并只 `log::warn!` 一次，绝不会静默截断。
+- **QMI CS1 / QMI 片选 1**: `M1_TIMING`, `M1_RFMT`, `M1_RCMD` (and the other
+  `M1_*` words) remain plain storage in `xip_qmi`; the PSRAM window does not
+  interpret CS1 timing, latency or command encodings.
+- **QMI 片选 1**: `M1_TIMING`、`M1_RFMT`、`M1_RCMD` 等 `M1_*` 字在 `xip_qmi`
+  中仍是普通存储；PSRAM 窗口不解释 CS1 时序、延迟或命令编码。
+- **Read/write semantics / 读写语义**: guest reads and writes are byte
+  addressable and cost one bus cycle per byte (halfword two, word four, matching
+  `RamRegion`). Out-of-window accesses return `BusErrorKind::DeviceError`.
+  `Psram::read_only(size)` builds a window whose writes return
+  `BusErrorKind::AccessDenied`. Clones share one backing store, so the handle
+  returned by `mount_psram` observes bus traffic in both directions.
+- **读写语义**: 客户机读写按字节可寻址，每字节一个总线周期（半字两个、字四个，
+  与 `RamRegion` 一致）。窗口外访问返回 `BusErrorKind::DeviceError`。
+  `Psram::read_only(size)` 构造的窗口写返回 `BusErrorKind::AccessDenied`。
+  克隆共享同一份底层存储，因此 `mount_psram` 返回的句柄可双向观察总线流量。
+- **Unmounted / 未挂载**: `0x1100_0000` stays unmapped unless `mount_psram` (or
+  another region) is registered, so access reports `BusErrorKind::NoDevice`.
+- **未挂载**: 除非调用 `mount_psram`（或注册其它区域），`0x1100_0000` 保持未映射，
+  访问返回 `BusErrorKind::NoDevice`。
+- **Not modelled / 未建模**: PSRAM timing (`M1_TIMING` latency/RXDELAY),
+  command formats, CS1 address remapping (`M1_ADDR`), the non-cached PSRAM alias
+  at `0x1500_0000`, the `0x1800_0000` maintenance window, and QMI arbitration
+  with CS0 flash.
+- **未建模**: PSRAM 时序（`M1_TIMING` 的延迟/RXDELAY）、命令格式、CS1 地址重映射
+  （`M1_ADDR`）、`0x1500_0000` 处的非缓存 PSRAM 别名、`0x1800_0000` 维护窗口，
+  以及与 CS0 Flash 之间的 QMI 仲裁。
+
 ---
 
 ## UART

@@ -211,7 +211,7 @@ RpPlugin (rp2350-plugin)
 | BOOTROM | 0x0000_0000 | 0x0000_7FFF | 32KB | Synthetic boot ROM (read-only, host trap) |
 | XIP Flash | 0x1000_0000 | 0x10FF_FFFF | 16MB | QSPI Flash XIP (cached) |
 | XIP Flash (no-cache alias) | 0x1400_0000 | 0x14FF_FFFF | 16MB | Same flash bytes, non-cached window |
-| XIP PSRAM | 0x1100_0000 | 0x11FF_FFFF | 16MB | PSRAM XIP alias |
+| XIP PSRAM | 0x1100_0000 | 0x11FF_FFFF | 16MB | PSRAM window on QMI CS1 (`rp2350-periph::psram::Psram`) |
 | SRAM0-9 | 0x2000_0000 | 0x2008_1FFF | 520KB | Internal SRAM |
 | APB | 0x4000_0000 | 0x4FFF_FFFF | 256MB | Peripherals |
 | USB DPRAM | 0x5010_0000 | 0x5010_0FFF | 4KB | USB Controller RAM |
@@ -225,8 +225,11 @@ XIP 别名依据 pico-sdk `addressmap.h`（RP2350）：`XIP_BASE = 0x1000_0000`�
 `XIP_NOCACHE_NOALLOC_END = 0x1800_0000`、`XIP_MAINTENANCE_BASE = 0x1800_0000`。
 缓存区 `0x1000_0000..0x1400_0000` 是四个 16 MB 的 XIP_MAIN 窗口，
 `0x1100_0000` 属于 XIP_MAIN1（PSRAM/CS1 窗口），**不是** Flash CS0 的镜像，
-因此不映射到 Flash；本实现只补 Flash CS0 的非缓存窗口
-`0x1400_0000..0x1500_0000`。`0x1800_0000` 是维护窗口，暂不建模。
+因此不映射到 Flash。它由 `rp2350-periph::psram::Psram` 单独建模（`mount_psram`
+挂载，默认 8 MB、上限 16 MB，客户机可读写），不随 `BootPeripherals::mount`
+自动安装；未挂载时访问返回 `BusErrorKind::NoDevice`。本实现只补 Flash CS0 的
+非缓存窗口 `0x1400_0000..0x1500_0000`，PSRAM 的非缓存别名
+`0x1500_0000` 与 `0x1800_0000` 维护窗口暂不建模。
 
 boot ROM 与 Flash 是两个独立地址区：厂商镜像不能随仓库分发，因此
 `0x0000_0000..0x0000_7FFF` 由 `rp2350-bootrom` 提供合成只读镜像（magic 位于
@@ -413,7 +416,7 @@ CPU ld/st → RP2350Chip::read_u32(addr)
     ├── 0x0000_0000-0x0000_7FFF → BOOTROM (synthetic, read-only, host trap)
     ├── 0x1000_0000-0x10FF_FFFF → XIP → QMI → QspiFlash.read()
     ├── 0x1400_0000-0x14FF_FFFF → XIP no-cache alias → same Flash bytes
-    ├── 0x1100_0000-0x11FF_FFFF → XIP → QMI → Psram.read()
+    ├── 0x1100_0000-0x11FF_FFFF → PSRAM window (CS1) → psram::Psram
     ├── 0x2000_0000-0x2008_1FFF → SRAM
     ├── 0x4000_0000-0x4FFF_FFFF → APB peripherals
     ├── 0x5010_0000-0x5010_0FFF → USB DPRAM (4 KB)

@@ -102,6 +102,26 @@ pub const HSTX_CTRL_BASE: Address = 0x400C_0000;
 /// XIP_QMI base / XIP_QMI 基地址
 pub const XIP_QMI_BASE: Address = 0x400D_0000;
 
+/// Base of the external PSRAM window behind XIP chip select 1 (CS1)
+/// XIP 片选 1（CS1）背后的外部 PSRAM 窗口基地址
+///
+/// `0x1100_0000` is `XIP_MAIN1` in pico-sdk `addressmap.h`, not a mirror of the
+/// CS0 flash window at `0x1000_0000`. The model lives in
+/// [`crate::psram`], which re-exports this constant.
+/// `0x1100_0000` 是 pico-sdk `addressmap.h` 中的 `XIP_MAIN1`，并非
+/// `0x1000_0000` 处 CS0 Flash 窗口的镜像。模型位于 [`crate::psram`]，并从那里
+/// 重导出本常量。
+pub const PSRAM_BASE: Address = 0x1100_0000;
+
+/// Largest PSRAM window modelled behind CS1 (16 MB)
+/// CS1 后建模的最大 PSRAM 窗口（16 MB）
+///
+/// Boards fit 8 MB by default (see [`crate::psram::DEFAULT_PSRAM_SIZE`]); the
+/// rest of the alias window is the architectural ceiling.
+/// 板载默认 8 MB（见 [`crate::psram::DEFAULT_PSRAM_SIZE`]）；别名窗口的剩余部分
+/// 是架构上限。
+pub const PSRAM_MAX_SIZE: usize = 16 * 1024 * 1024;
+
 /// WATCHDOG base / WATCHDOG 基地址
 pub const WATCHDOG_BASE: Address = 0x400D_8000;
 
