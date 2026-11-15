@@ -67,6 +67,8 @@ pub use uart::UartSink;
 mod dma_tests;
 #[cfg(test)]
 mod hstx_tests;
+#[cfg(test)]
+mod sio_spinlock_tests;
 
 use rp2350_core::mmio::MmioRegion;
 

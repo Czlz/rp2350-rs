@@ -117,7 +117,7 @@
 
 ### Verified / 验证（2026-11-15）
 
-- **GBA 示例 ✅**：`emerald.uf2`（SHA-256 `5BEE593F…A9B4C4`）双核运行 2 G 步（13.3 s 模拟时间），`hstx words=128386654 underruns=0 wof=false unknown=0`、`core1 state=Running`、无总线错误；`g_fb` 为 32 色真实画面（Game Freak 标志）。详见 [example/gba/doc/gba-bringup-report.md](../../example/gba/doc/gba-bringup-report.md)。
+- **GBA 示例 ✅**：`emerald.uf2`（SHA-256 `5BEE593F…A9B4C4`）双核运行 2 G 步（13.3 s 模拟时间），`hstx words=128386654 underruns=0 wof=false unknown=0`、`core1 state=Running`、无总线错误；`g_fb` 为 32 色真实画面（Game Freak 标志）。详见 [example/gba/doc/gba-bringup-report.md](../example/gba/doc/gba-bringup-report.md)。
 - **FV-1/2/3 ✅**：三个固件 `repl --exec "print(6 * 7)"` 均输出 `42`。
 - **perfbench ✅**：官方 `run-perfbench.py` Arm 与 RISC-V 各 24/24 通过 CPython 真值（[报告](perfbench-report.md)）。
 

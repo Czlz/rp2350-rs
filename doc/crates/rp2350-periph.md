@@ -1043,16 +1043,47 @@ impl Sio {
     pub fn pop_from_core(&self) -> Option<u32>;      // one core-0 → core-1 frame
     pub fn peer_bells(&self) -> u8;
     pub fn core1_irq_mask(&self) -> u64;
+    pub fn spinlock_state(&self) -> u32;             // held-lock bitmap / 已占用锁位图
     pub fn refresh_irq(&self);
 }
 ```
 
 Modelled registers: `CPUID`, `GPIO_IN/OUT/OUT_SET/OUT_CLR/OUT_XOR`, the `GPIO_HI_*`
 equivalents, `GPIO_OE` and its aliases, `FIFO_ST`, `FIFO_WR`, `FIFO_RD`,
-`SPINLOCK_ST` (all free) and `DOORBELL_OUT/IN_SET/CLR` at `0x180`.
+`SPINLOCK_ST`, the 32 `SPINLOCK0..31` registers at `0x100 + 4*n`, and
+`DOORBELL_OUT/IN_SET/CLR` at `0x180`.
 已建模寄存器：`CPUID`、`GPIO_IN/OUT/OUT_SET/OUT_CLR/OUT_XOR`、对应的
 `GPIO_HI_*`、`GPIO_OE` 及其别名、`FIFO_ST`、`FIFO_WR`、`FIFO_RD`、
-`SPINLOCK_ST`（全部空闲）以及 `0x180` 的 `DOORBELL_OUT/IN_SET/CLR`。
+`SPINLOCK_ST`、位于 `0x100 + 4*n` 的 32 个 `SPINLOCK0..31`，以及 `0x180`
+的 `DOORBELL_OUT/IN_SET/CLR`。
+
+### Hardware spinlocks / 硬件自旋锁
+
+RP2350 moves the spinlocks to `0x100 + 4*n` (RP2040 had them at `0x000`), so
+`SPINLOCK0` is `0x100` and `SPINLOCK31` is `0x17C`. Reading a lock address tries
+to claim it: if it was free the read returns `1 << n` and the lock becomes held,
+otherwise the read returns `0`. A write of **any** value releases the lock.
+`SPINLOCK_ST` (`0x05C`, read-only) returns the claim bitmap with one bit per
+lock, `1 = held`, reset value `0`.
+RP2350 把自旋锁移到 `0x100 + 4*n`（RP2040 在 `0x000`），因此 `SPINLOCK0`
+是 `0x100`、`SPINLOCK31` 是 `0x17C`。读取锁地址即尝试取锁：空闲时返回
+`1 << n` 并置为占用，否则返回 `0`。写入**任意**值即释放。`SPINLOCK_ST`
+（`0x05C`，只读）返回占用位图，每位对应一个锁，`1 = 已锁`，复位值 `0`。
+
+Lock state lives outside the per-core view: `select_core` only redirects the FIFO,
+doorbells and `CPUID`, so either core's view reads and releases the same locks.
+The whole `SioState` sits behind one mutex, so the claim is a single
+check-and-set step — the sequential-execution stand-in for the hardware's atomic
+claim. "Core 0 wins a simultaneous claim" therefore means only that a driver
+stepping core 0 first lets it reach a free lock first; the model deliberately
+adds no concurrency semantics. [`Sio::spinlock_state`] exposes the same bitmap
+without a bus access for tests and the CLI.
+锁状态位于按核视图之外：`select_core` 只改变 FIFO、门铃与 `CPUID` 的方向，
+两个核心视图读写的是同一组锁。全部 `SioState` 位于同一个互斥锁之后，因此取锁
+是一步完成的检查并置位——这是顺序执行模型对硬件原子取锁的替代。所谓「core0 在
+同时争抢时获胜」，在这里仅意味着先推进 core0 的驱动器先到达空闲锁；模型有意
+不引入并发语义。[`Sio::spinlock_state`] 绕过总线暴露同一份位图，供测试与 CLI
+使用。
 
 ### Per-core view / 按核视图
 
@@ -1085,14 +1116,13 @@ core1，反之亦然。
 
 ### Not modelled yet / 尚未建模
 
-Hardware spinlocks (`SPINLOCK_ST` always reads all-free and the `SPINLOCKn`
-registers are unmapped), `INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, GPIO
-pin routing between SIO/IO_BANK0/PADS_BANK0, and exclusive/`LDREX`/`STREX`
-monitors. The FIFO is 8 entries deep per direction with sticky `WOF`/`ROE`.
-硬件自旋锁（`SPINLOCK_ST` 恒读全空闲，`SPINLOCKn` 寄存器未映射）、
+`INTERP0/1`, the TMDS encoder, `SIO_FIFO` flush, GPIO pin routing between
+SIO/IO_BANK0/PADS_BANK0, and exclusive/`LDREX`/`STREX` monitors. The FIFO is
+8 entries deep per direction with sticky `WOF`/`ROE`; the spinlocks are 32 bits
+wide because the RP2350 block exposes exactly `SPINLOCK0..31`.
 `INTERP0/1`、TMDS 编码器、`SIO_FIFO` 刷新、SIO/IO_BANK0/PADS_BANK0 之间的引脚
 路由，以及独占访问/`LDREX`/`STREX` 监视器均未建模。每方向 FIFO 深度 8，带粘滞
-`WOF`/`ROE`。
+`WOF`/`ROE`；自旋锁为 32 位，因为 RP2350 该块只提供 `SPINLOCK0..31`。
 
 ---
 

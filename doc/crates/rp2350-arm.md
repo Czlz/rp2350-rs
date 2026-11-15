@@ -480,6 +480,67 @@ GE 绝不参与 `GE`/`LT` 条件码（后者仍比较 `N == V`）。累加后再
 `set_apsr_nzcv` 与异常压栈都会保留它，并可通过 `MRS APSR` /
 `MSR APSR_g` / `MSR APSR_nzcvqg` 读写。
 
+### Exclusive Monitor / 独占监视器
+
+`LDREX`/`LDREXB`/`LDREXH`/`LDREXD`, their `LDAEX*` acquire forms and the
+`STREX*`/`STLEX*` stores share one monitor **per core**, held in
+`CortexM33Registers` as `exclusive: Option<(u32, u8)>` — watched address plus
+transfer width in bytes. `arm_exclusive` / `consume_exclusive` /
+`clear_exclusive` are the only entry points, and `CortexM33Registers::new()`
+starts disarmed (`None`). Firmware sees the architectural contract:
+
+- `LDREX*` overwrites the monitor with its own address and width; a second
+  load never keeps the first.
+- `STREX*` succeeds (`Rd = 0`) **only** when address *and* width both match,
+  and clears the monitor either way. Failure writes `Rd = 1` and performs no
+  store; `Rd == 15` discards the status. `STREXB` therefore fails against a
+  word `LDREX` on the same address.
+- `CLREX` (`0xF3BF_8F2F`, selector `2` in bits[7:4] with option `1111`) clears
+  the executing core's monitor and returns `Ok`. `DSB`/`DMB`/`ISB` remain
+  ordering-only no-ops.
+
+Because the monitor lives in the register file rather than in a
+`thread_local!`, the two RP2350 cores — advanced in sequence on one host
+thread — cannot observe each other's exclusive accesses: `LDREX` on core0
+followed by `STREX` on core1 fails, as the hardware requires, and `CLREX` on
+one core leaves the other armed. Sharing one monitor through thread-local
+state was a real correctness bug, and `CLREX` used to fall through the barrier
+group as an undefined instruction (startup firmware logged it). `CpuCore::reset`
+and `boot_at` rebuild the register file, so the monitor starts disarmed exactly
+like a hardware reset.
+
+Not modelled: **bus snooping** — a write by another core to the watched
+address does not clear the monitor, so a `STREX` that hardware would reject
+can still succeed; acquire/release ordering (these instructions execute as
+plain loads/stores); and monitor clearing on exception entry/return. If a
+firmware ever depends on snooping, a shared generation counter bumped by every
+store could approximate it.
+
+`LDREX`/`LDREXB`/`LDREXH`/`LDREXD` 及其 `LDAEX*` 获取形式与 `STREX*`/`STLEX*`
+存储共享**每核一个**监视器，保存在 `CortexM33Registers` 的
+`exclusive: Option<(u32, u8)>` 中——被监视地址加按字节计的传输宽度。
+`arm_exclusive` / `consume_exclusive` / `clear_exclusive` 是唯一入口，
+`CortexM33Registers::new()` 初始为未武装（`None`）。固件可见的架构契约：
+
+- `LDREX*` 用自身的地址与宽度覆盖监视器；第二次加载不会保留第一次的。
+- `STREX*` **仅当**地址与宽度同时匹配才成功（`Rd = 0`），且无论成败都清除
+  监视器。失败写入 `Rd = 1` 且不产生存储；`Rd == 15` 丢弃状态。因此同地址上
+  的 `STREXB` 对字 `LDREX` 必然失败。
+- `CLREX`（`0xF3BF_8F2F`，bits[7:4] 选择子为 `2`、选项字段 `1111`）清除正在
+  执行核心的监视器并返回 `Ok`。`DSB`/`DMB`/`ISB` 仍是仅影响顺序的无操作。
+
+由于监视器位于寄存器文件而非 `thread_local!`，在同一宿主线程中顺序推进的两个
+RP2350 核心无法看到彼此的独占访问：core0 的 `LDREX` 之后 core1 的 `STREX`
+必然失败，与硬件一致；一个核心执行 `CLREX` 也不会解除另一个核心的武装。用
+线程局部状态共享单个监视器曾是真实的正确性缺陷，且 `CLREX` 此前落入屏障分组
+被判为未定义指令（启动固件会打印告警）。`CpuCore::reset` 与 `boot_at` 会重建
+寄存器文件，因此监视器与硬件复位一样从解除武装开始。
+
+未建模：**总线监听** —— 另一核心对被监视地址的写入不会清除监视器，因此硬件本
+应拒绝的 `STREX` 仍可能成功；获取/释放的顺序保证（这些指令按普通加载/存储
+执行）；以及异常进入/返回时的监视器清除。若某固件依赖总线监听，可用由每次
+存储递增的共享世代计数近似模拟。
+
 ---
 
 ## FPU (FPv5-SP, D16) / 浮点单元

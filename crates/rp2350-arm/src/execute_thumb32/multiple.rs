@@ -7,15 +7,16 @@
 //! 覆盖 `op1 == 0b01` 编码组内的 LDM/STM（含 push/pop 使用的 `.W` 写回形式）、
 //! 独占访问与获取/释放指令，以及 TBB/TBH。
 //!
-//! The exclusive monitor is a per-thread single-core simplification that
-//! records the last exclusive-load address and size. Multi-core visibility and
-//! the ordering guarantees of acquire/release are not modelled; the instructions
-//! are executed as plain loads/stores with the architecturally visible result.
-//! 独占监视器是单核简化实现，按线程记录最近一次独占加载的地址与尺寸。未建模
-//! 多核可见性以及获取/释放的顺序保证；这些指令按普通加载/存储执行，只保留
-//! 架构上可见的数据结果。
-
-use core::cell::Cell;
+//! The exclusive monitor is kept per core, inside each
+//! `CortexM33Registers`, so an exclusive load on one core can never be
+//! consumed by an exclusive store on the other core. Bus snooping (a write by
+//! another core invalidating the monitor) and the ordering guarantees of
+//! acquire/release are still not modelled; those instructions execute as plain
+//! loads/stores with the architecturally visible data result.
+//! 独占监视器按核心保存在各自的 `CortexM33Registers` 中，因此一个核心的独占
+//! 加载绝不可能被另一核心的独占存储消费。仍未建模跨核总线监听（其它核对监视
+//! 地址的写入不会自动清除监视器）以及获取/释放的顺序保证；这些指令按普通
+//! 加载/存储执行，只保留架构上可见的数据结果。
 
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
@@ -37,26 +38,23 @@ enum TransferSize {
     Double,
 }
 
-thread_local! {
-    /// Address and size currently watched by the exclusive monitor
-    /// 当前被独占监视器监视的地址与尺寸
-    static EXCLUSIVE_MONITOR: Cell<Option<(u32, TransferSize)>> = const { Cell::new(None) };
-}
-
-/// Arm the monitor for an exclusive load
-/// 为独占加载启用监视器
-fn monitor_set(addr: u32, size: TransferSize) {
-    EXCLUSIVE_MONITOR.with(|monitor| monitor.set(Some((addr, size))));
-}
-
-/// Consume the monitor, reporting whether the address and size matched
-/// 消费监视器，返回地址与尺寸是否匹配
-fn monitor_consume(addr: u32, size: TransferSize) -> bool {
-    EXCLUSIVE_MONITOR.with(|monitor| {
-        let hit = monitor.get() == Some((addr, size));
-        monitor.set(None);
-        hit
-    })
+impl TransferSize {
+    /// Transfer width in bytes, used as the exclusive-monitor size code
+    /// 以字节计的传输宽度，用作独占监视器的尺寸编码
+    ///
+    /// Address and width must both match for a `STREX*` to succeed, so the code
+    /// is what distinguishes e.g. a word `LDREX` from a `STREXB` on the same
+    /// address.
+    /// `STREX*` 必须地址与宽度同时匹配才成功，因此该编码用于区分同一地址上的
+    /// 字 `LDREX` 与 `STREXB`。
+    const fn bytes(self) -> u8 {
+        match self {
+            Self::Byte => 1,
+            Self::Half => 2,
+            Self::Word => 4,
+            Self::Double => 8,
+        }
+    }
 }
 
 /// Execute LDM/STM, `op1 == 0b01`, `op2 == 0b00`, bit 22 clear
@@ -147,11 +145,11 @@ pub(super) fn execute_register_list(
 /// Execute LDREX/STREX, `op1 == 0b01`, `op2 == 0b00`, bit 22 set, bit 23 clear
 /// 执行 LDREX/STREX，`op1 == 0b01`，`op2 == 0b00`，位 22 置位、位 23 清零
 ///
-/// `imm8` is scaled by four. LDREX loads into `Rt` (bits 15:12) and arms the
-/// monitor; STREX stores `Rt`, reports success in `Rd` (bits 11:8) and clears
-/// the monitor, with `Rd == 15` discarding the status.
-/// `imm8` 按四倍缩放。LDREX 加载到 `Rt`（位段 15:12）并启用监视器；STREX
-/// 存储 `Rt`，把成功状态写入 `Rd`（位段 11:8）并清除监视器，`Rd == 15`
+/// `imm8` is scaled by four. LDREX loads into `Rt` (bits 15:12) and arms this
+/// core's monitor; STREX stores `Rt`, reports success in `Rd` (bits 11:8) and
+/// clears the monitor, with `Rd == 15` discarding the status.
+/// `imm8` 按四倍缩放。LDREX 加载到 `Rt`（位段 15:12）并武装本核的监视器；
+/// STREX 存储 `Rt`，把成功状态写入 `Rd`（位段 11:8）并清除监视器，`Rd == 15`
 /// 表示丢弃状态。
 pub(super) fn execute_exclusive(
     instr: u32,
@@ -164,14 +162,15 @@ pub(super) fn execute_exclusive(
     let rt = ((instr >> 12) & 0xF) as u8;
     let offset = (instr & 0xFF) << 2;
     let addr = regs.read(rn).wrapping_add(offset);
+    let size = TransferSize::Word.bytes();
 
     if load {
         let value = bus.read_u32(addr, cycles)?;
         regs.write(rt, value);
-        monitor_set(addr, TransferSize::Word);
+        regs.arm_exclusive(addr, size);
     } else {
         let rd = ((instr >> 8) & 0xF) as u8;
-        let success = monitor_consume(addr, TransferSize::Word);
+        let success = regs.consume_exclusive(addr, size);
         if success {
             bus.write_u32(addr, regs.read(rt), cycles)?;
         }
@@ -243,14 +242,14 @@ pub(super) fn execute_acquire_release(
             regs.write(rt, value);
         }
         if exclusive {
-            monitor_set(addr, size);
+            regs.arm_exclusive(addr, size.bytes());
         }
         *cycles += 1;
         return Ok(StepResult::Ok);
     }
 
     let success = if exclusive {
-        monitor_consume(addr, size)
+        regs.consume_exclusive(addr, size.bytes())
     } else {
         true
     };

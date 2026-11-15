@@ -6,6 +6,7 @@ mod coproc;
 mod data_processing;
 mod dsp;
 mod dsp_extra;
+mod exclusive;
 mod fpu;
 mod load_store;
 mod multiply;

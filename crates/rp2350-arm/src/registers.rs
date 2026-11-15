@@ -73,6 +73,17 @@ pub struct CortexM33Registers {
     pub fpu: FpuRegisters,
     /// Coprocessor Access Control Register (CPACR) / 协处理器访问控制寄存器
     pub cpacr: u32,
+    /// Exclusive monitor armed by this core's last exclusive load, as
+    /// `(address, size in bytes)`
+    /// 本核最近一次独占加载武装的独占监视器，形式为 `(地址, 字节尺寸)`
+    ///
+    /// The monitor belongs to the core, not to the host thread: both RP2350
+    /// cores are stepped on one thread, so shared state would let core0's
+    /// `LDREX` satisfy core1's `STREX`. See [`Self::arm_exclusive`].
+    /// 监视器属于核心而非宿主线程：RP2350 的两个核心在同一线程中推进，若共享
+    /// 状态，core0 的 `LDREX` 就会让 core1 的 `STREX` 误判成功。参见
+    /// [`Self::arm_exclusive`]。
+    pub(crate) exclusive: Option<(u32, u8)>,
     /// A synchronous UsageFault is pending from the instruction just executed
     /// 刚执行的指令已引发待处理的同步用法故障
     pub(crate) pending_usage_fault: bool,
@@ -99,6 +110,7 @@ impl CortexM33Registers {
             psplim: 0,
             fpu: FpuRegisters::new(),
             cpacr: 0,
+            exclusive: None,
             pending_usage_fault: false,
         }
     }
@@ -235,6 +247,44 @@ impl CortexM33Registers {
     /// 取出并清除待处理的同步用法故障标志
     pub(crate) fn take_usage_fault(&mut self) -> bool {
         core::mem::take(&mut self.pending_usage_fault)
+    }
+
+    /// Arm this core's exclusive monitor for `addr` with byte size `size`
+    /// 以字节尺寸 `size` 为本核武装地址 `addr` 的独占监视器
+    ///
+    /// Every core owns its monitor, so an `LDREX` executed by core0 can never
+    /// be consumed by a `STREX` on core1: a cross-core pair must fail, as the
+    /// architecture requires. Arming overwrites any monitor still pending,
+    /// matching the single-monitor-per-core model (`LDREX` is not additive).
+    /// 每个核心拥有自己的监视器，因此 core0 的 `LDREX` 绝不可能被 core1 的
+    /// `STREX` 消费：跨核配对必须失败，与架构要求一致。武装会覆盖仍然待处理的
+    /// 监视器，符合「每核单一监视器」模型（`LDREX` 不会累加）。
+    pub(crate) fn arm_exclusive(&mut self, addr: u32, size: u8) {
+        self.exclusive = Some((addr, size));
+    }
+
+    /// Consume the exclusive monitor, reporting whether address and size matched
+    /// 消费独占监视器，返回地址与尺寸是否匹配
+    ///
+    /// The monitor is retired whether or not it matched, so a failed `STREX`
+    /// also discards the pending `LDREX`; the caller must still store only on
+    /// `true`.
+    /// 无论是否匹配都会废弃监视器，因此失败的 `STREX` 同样丢弃未完成的
+    /// `LDREX`；调用方只能在返回 `true` 时真正写入内存。
+    #[must_use]
+    pub(crate) fn consume_exclusive(&mut self, addr: u32, size: u8) -> bool {
+        let hit = self.exclusive == Some((addr, size));
+        self.exclusive = None;
+        hit
+    }
+
+    /// Clear this core's exclusive monitor (`CLREX` semantics)
+    /// 清除本核的独占监视器（`CLREX` 语义）
+    ///
+    /// Clearing an unarmed monitor is a no-op, so `CLREX` succeeds either way.
+    /// 清除未武装的监视器是无操作，因此 `CLREX` 在两种情况下都成功。
+    pub(crate) fn clear_exclusive(&mut self) {
+        self.exclusive = None;
     }
 }
 

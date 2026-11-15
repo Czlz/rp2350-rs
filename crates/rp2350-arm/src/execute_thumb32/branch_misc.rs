@@ -2,10 +2,10 @@
 //! Thumb-32 分支、立即数、位域与杂项指令
 //!
 //! Covers conditional and unconditional branches, BL/BLX, MRS/MSR, barriers,
-//! hints, plain-binary immediates (ADDW/SUBW/MOVW/MOVT), and the bitfield
-//! instructions (SBFX/UBFX/BFI/BFC).
-//! 覆盖条件/无条件分支、BL/BLX、MRS/MSR、屏障、提示指令、纯二进制立即数
-//!（ADDW/SUBW/MOVW/MOVT）以及位域指令（SBFX/UBFX/BFI/BFC）。
+//! `CLREX`, hints, plain-binary immediates (ADDW/SUBW/MOVW/MOVT), and the
+//! bitfield instructions (SBFX/UBFX/BFI/BFC).
+//! 覆盖条件/无条件分支、BL/BLX、MRS/MSR、屏障、`CLREX`、提示指令、纯二进制
+//! 立即数（ADDW/SUBW/MOVW/MOVT）以及位域指令（SBFX/UBFX/BFI/BFC）。
 
 use crate::conditions::Condition;
 use crate::execute_thumb16::StepResult;
@@ -129,8 +129,9 @@ fn execute_mrs(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
     StepResult::Ok
 }
 
-/// Execute `MSR`, barrier, and hint instructions (instruction bits [25:22] = 1110)
-/// 执行 `MSR`、屏障与提示指令（指令位 [25:22] = 1110）
+/// Execute `MSR`, barrier, `CLREX`, and hint instructions
+/// (instruction bits [25:22] = 1110)
+/// 执行 `MSR`、屏障、`CLREX` 与提示指令（指令位 [25:22] = 1110）
 fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
     let op4 = ((instr >> 20) & 0xF) as u8;
     let rn = ((instr >> 16) & 0xF) as u8;
@@ -186,11 +187,20 @@ fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult 
             StepResult::Ok
         }
         // DSB (4), DMB (5), ISB (6): ordering only, no architectural state.
+        // CLREX (2) clears this core's exclusive monitor and has no other
+        // effect; the architecture requires its option field, bits[3:0], to be
+        // 1111, so every other low nibble stays undefined.
         // The selector is bits[7:4]; bits[3:0] carry the option field.
         // DSB（4）、DMB（5）、ISB（6）：仅影响顺序，无体系结构状态。
+        // CLREX（2）清除本核的独占监视器，没有其它作用；架构要求其选项字段
+        // bits[3:0] 为 1111，因此其它低位半字节仍视为未定义。
         // 选择子位于 bits[7:4]；bits[3:0] 携带选项字段。
         0xB => match (instr >> 4) & 0xF {
             0x4..=0x6 => StepResult::Ok,
+            0x2 if instr & 0xF == 0xF => {
+                regs.clear_exclusive();
+                StepResult::Ok
+            }
             _ => StepResult::Undefined,
         },
         // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4).

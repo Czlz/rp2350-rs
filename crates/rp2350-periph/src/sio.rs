@@ -107,6 +107,25 @@ const FIFO_RD: u32 = 0x058;
 /// `SPINLOCK_ST` offset / `SPINLOCK_ST` 偏移
 const SPINLOCK_ST: u32 = 0x05C;
 
+/// `SPINLOCK0` offset (RP2350 moves these to `0x100`) / `SPINLOCK0` 偏移（RP2350 移到 `0x100`）
+const SPINLOCK0: u32 = 0x100;
+
+/// Number of hardware spinlocks / 硬件自旋锁数量
+const SPINLOCK_COUNT: u32 = 32;
+
+/// Index of the `SPINLOCKn` register at `offset` / `offset` 处 `SPINLOCKn` 的下标
+///
+/// Returns `None` for unaligned or out-of-window offsets so callers fall through
+/// to their normal unmapped-register path.
+/// 未对齐或超出窗口时返回 `None`，调用方据此走正常的未映射寄存器路径。
+fn spinlock_index(offset: u32) -> Option<usize> {
+    let delta = offset.checked_sub(SPINLOCK0)?;
+    if delta % 4 != 0 || delta >= 4 * SPINLOCK_COUNT {
+        return None;
+    }
+    Some((delta / 4) as usize)
+}
+
 /// `DOORBELL_OUT_SET` offset / `DOORBELL_OUT_SET` 偏移
 const DOORBELL_OUT_SET: u32 = 0x180;
 
@@ -164,6 +183,13 @@ struct SioState {
     bell_core0: u8,
     /// Doorbells posted to core 1 / 投递给 core1 的门铃
     bell_core1: u8,
+    /// Bitmap of claimed spinlocks, bit `n` = `SPINLOCKn` held
+    /// 已占用自旋锁位图，位 `n` 对应 `SPINLOCKn`
+    spinlocks: u32,
+    /// Claiming core index + 1 per lock (0 = free); diagnostics only, not
+    /// architecturally visible / 各锁占用核下标 + 1（0 = 空闲）；仅诊断用，
+    /// 不对体系结构可见
+    spinlock_owner: [u8; SPINLOCK_COUNT as usize],
 }
 
 impl SioState {
@@ -241,6 +267,31 @@ impl SioState {
             CpuId::Core0 => &mut self.bell_core0,
             CpuId::Core1 => &mut self.bell_core1,
         }
+    }
+
+    /// Try to claim spinlock `index` for `core` / 尝试为 `core` 取得自旋锁 `index`
+    ///
+    /// The check-and-set happens in one step because the whole state sits behind
+    /// a single mutex, which is the sequential-execution stand-in for the
+    /// hardware's atomic claim. The first core to reach a free lock wins; core 0
+    /// wins only because a sequential driver steps it first.
+    /// 由于全部状态位于同一互斥锁之后，检查与置位是一步完成的，这正是顺序执行模型
+    /// 对硬件原子取锁的替代。先到达空闲锁的核心获胜；core0 获胜只是顺序驱动器先
+    /// 推进它的结果。
+    fn claim_spinlock(&mut self, index: usize, core: CpuId) -> bool {
+        let bit = 1u32 << index;
+        if self.spinlocks & bit != 0 {
+            return false;
+        }
+        self.spinlocks |= bit;
+        self.spinlock_owner[index] = core_index(core) as u8 + 1;
+        true
+    }
+
+    /// Release spinlock `index` regardless of writer / 释放自旋锁 `index`，与写入方无关
+    fn release_spinlock(&mut self, index: usize) {
+        self.spinlocks &= !(1u32 << index);
+        self.spinlock_owner[index] = 0;
     }
 
     /// The other core / 另一个核心
@@ -384,6 +435,18 @@ impl Sio {
         self.state.lock().bell_core1
     }
 
+    /// Bitmap of held hardware spinlocks / 已占用硬件自旋锁位图
+    ///
+    /// Bit `n` is set when `SPINLOCKn` is claimed, exactly what `SPINLOCK_ST`
+    /// reports. This accessor skips the bus so tests and the CLI can observe the
+    /// locks directly; it is a diagnostic, not a writable register.
+    /// 位 `n` 置位表示 `SPINLOCKn` 已被占用，与 `SPINLOCK_ST` 一致。该访问器绕过
+    /// 总线，便于测试与 CLI 直接观察锁状态；它是诊断接口，不是可写寄存器。
+    #[must_use]
+    pub fn spinlock_state(&self) -> u32 {
+        self.state.lock().spinlocks
+    }
+
     /// Interrupt mask of core 1's SIO lines / core1 SIO 中断线的掩码
     ///
     /// Excludes core 0's endpoint because `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` are
@@ -457,13 +520,23 @@ impl MmioDevice for Sio {
                 });
                 Some(value)
             }
-            // All 32 spinlocks report free. 全部 32 个自旋锁报告空闲。
-            SPINLOCK_ST => Some(0xFFFF_FFFF),
+            // `SPINLOCK_ST` is a read-only snapshot of the claim bitmap: 1 = held.
+            // `SPINLOCK_ST` 是占用位图的只读快照：1 = 已锁。
+            SPINLOCK_ST => Some(state.spinlocks),
             DOORBELL_OUT_SET | DOORBELL_OUT_CLR => {
                 Some(u32::from(state.bells_for(SioState::peer(view))))
             }
             DOORBELL_IN_SET | DOORBELL_IN_CLR => Some(u32::from(state.bells_for(view))),
-            _ => None,
+            _ => spinlock_index(offset).map(|index| {
+                // Reading claims the lock atomically and yields 1 << n on success,
+                // 0 when another core already holds it. Locks ignore the core view.
+                // 读即原子取锁：成功返回 1 << n，被占则返回 0；锁与核心视图无关。
+                if state.claim_spinlock(index, view) {
+                    1u32 << index
+                } else {
+                    0
+                }
+            }),
         };
         drop(state);
         self.refresh_irq();
@@ -507,8 +580,13 @@ impl MmioDevice for Sio {
             DOORBELL_IN_SET => *state.bells_mut(view) |= (value & 0xFF) as u8,
             DOORBELL_IN_CLR => *state.bells_mut(view) &= !(value & 0xFF) as u8,
             _ => {
-                drop(state);
-                return false;
+                // Writing any value to `SPINLOCKn` releases it; the data is ignored.
+                // 向 `SPINLOCKn` 写任意值即释放该锁，写入数据被忽略。
+                let Some(index) = spinlock_index(offset) else {
+                    drop(state);
+                    return false;
+                };
+                state.release_spinlock(index);
             }
         }
         drop(state);
