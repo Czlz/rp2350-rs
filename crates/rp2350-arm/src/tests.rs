@@ -1,6 +1,7 @@
 //! Unit tests for the Cortex-M33 core integration and boot sequence
 //! Cortex-M33 核心集成与启动序列的单元测试
 
+mod decode_cache;
 mod fp_lazy;
 mod irq_gate;
 

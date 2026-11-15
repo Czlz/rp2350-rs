@@ -23,6 +23,7 @@
 )]
 
 pub mod conditions;
+pub mod decode_cache;
 pub mod dual_core;
 pub mod exceptions;
 pub mod execute_thumb16;
@@ -31,6 +32,7 @@ mod fetch_cache;
 pub mod fpu;
 pub mod nvic;
 pub mod registers;
+mod step_cached;
 mod system_access;
 pub mod systick;
 
@@ -120,6 +122,10 @@ pub struct CortexM33Core {
     fetch_cache: fetch_cache::FetchCache,
     /// Whether the flash fetch cache may serve fetches / 是否允许 Flash 取指缓存服务取指
     fetch_cache_enabled: bool,
+    /// Decoded-instruction cache / 译码结果缓存
+    decode_cache: decode_cache::DecodeCache,
+    /// Whether the decoded-instruction cache may serve steps / 是否允许译码缓存服务单步
+    decode_cache_enabled: bool,
 }
 
 impl CortexM33Core {
@@ -145,6 +151,8 @@ impl CortexM33Core {
             undefined_seen: BTreeSet::new(),
             fetch_cache: fetch_cache::FetchCache::new(),
             fetch_cache_enabled: false,
+            decode_cache: decode_cache::DecodeCache::new(),
+            decode_cache_enabled: false,
         }
     }
 
@@ -335,6 +343,40 @@ impl CortexM33Core {
     /// *可写*内存，则必须保持关闭，使该处的自修改代码立即可见。
     pub fn set_flash_fetch_cache(&mut self, enabled: bool) {
         self.fetch_cache_enabled = enabled;
+        // 译码缓存依赖与取指缓存完全相同的不变量（XIP 窗口只读 + 世代号失效），
+        // 因此同一个开关同时启用两者；需要单独对照实验时可随后调用
+        // [`Self::set_decode_cache`]。
+        // The decoded-instruction cache relies on exactly the same invariants as
+        // the fetch cache (read-only XIP windows plus generation invalidation),
+        // so one switch enables both. A caller that needs them independently can
+        // follow up with [`Self::set_decode_cache`].
+        self.decode_cache_enabled = enabled;
+    }
+
+    /// Enable or disable the decoded-instruction cache
+    /// 启用或关闭译码结果缓存
+    ///
+    /// The cache stores, per flash `PC`, the instruction length, the raw word
+    /// and the dispatch tag, so the hot path skips the second fetch, the width
+    /// decision and the opcode-class chain. It requires the same preconditions
+    /// as [`Self::set_flash_fetch_cache`]: flash XIP windows backed by a
+    /// read-only region whose host-side mutations bump
+    /// [`rp2350_core::flash::content_generation`]. `SRAM` is never cached, so
+    /// self-modifying `SRAM` code keeps working with the cache on.
+    /// 该缓存按 Flash `PC` 保存指令长度、原始指令字与分派标签，使热路径跳过第二次
+    /// 取指、宽度判定与操作码类别链。前置条件与 [`Self::set_flash_fetch_cache`] 相同：
+    /// XIP 窗口由只读区域支撑，且宿主侧变更会递增
+    /// [`rp2350_core::flash::content_generation`]。`SRAM` 永不缓存，因此缓存开启时
+    /// 自修改 `SRAM` 代码仍然正确。
+    pub fn set_decode_cache(&mut self, enabled: bool) {
+        self.decode_cache_enabled = enabled;
+    }
+
+    /// Number of decode-cache generation flushes (diagnostics)
+    /// 译码缓存的世代清空次数（诊断用）
+    #[must_use]
+    pub fn decode_cache_flushes(&self) -> u32 {
+        self.decode_cache.generation_flushes()
     }
 
     /// Execute one instruction (step)
@@ -355,6 +397,35 @@ impl CortexM33Core {
             self.nvic.set_pending(EXC_SYSTICK);
         }
 
+        // 译码缓存命中：一次查表取代两次取指、宽度判定与分发链。仅在 IT 块之外
+        // 使用，块内指令仍走完整译码器以保留槽位消费与标志抑制语义。
+        // A decode-cache hit replaces the two fetches, the width decision and the
+        // dispatch chain with one table lookup. Only used outside an IT block:
+        // instructions inside one still run the full decoder so the slot
+        // consumption and flag suppression stay exactly as they were.
+        if self.decode_cache_enabled && !self.it_state.in_it_block() {
+            let pc = self.registers.pc;
+            if let Some(entry) = self.decode_cache.lookup(pc) {
+                return self.step_cached(bus, cycles, entry);
+            }
+        }
+
+        self.step_decoded(bus, cycles)
+    }
+
+    /// Full fetch/decode/execute path, used on a decode-cache miss
+    /// 完整取指/译码/执行路径，用于译码缓存未命中
+    ///
+    /// This is the pre-cache interpreter body. It also fills the decode cache
+    /// after a flash fetch so the next visit to this `PC` takes the fast path.
+    /// 这是加入缓存之前的解释器主体。它还会在 Flash 取指之后填充译码缓存，使该 `PC`
+    /// 的下一次执行走快路径。
+    #[inline]
+    fn step_decoded(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        cycles: &mut u64,
+    ) -> Result<StepResult, CoreError> {
         // Fetch halfword
         // 获取半字
         let hw = self.fetch_halfword(bus, cycles)?;
@@ -379,30 +450,8 @@ impl CortexM33Core {
             raw_opcode = instr32;
             width = 4;
             self.registers.pc = old_pc.wrapping_add(4);
-            // 惰性浮点压栈：处理程序第一次执行任何 VFP 指令（算术、搬移、
-            // 加载/存储、系统寄存器访问）之前，把被中断上下文的 S0-S15 与
-            // FPSCR 写入异常进入时由 FPCAR 预留的区域并清除 LSPACT，保证每个
-            // 栈帧只提交一次。FPU 未活跃时该分支不生效。
-            // 同一条路径还负责置位 CONTROL.FPCA（ARMv8-M 的「浮点上下文活跃」
-            // 位）：只要 CPACR 允许访问，执行浮点指令就会置位，之后由异常返回
-            // 的 CLRONRET 路径清除。
-            // Lazy FP stacking: before the first VFP instruction in a handler
-            // (arithmetic, transfers, loads/stores, system registers), commit
-            // the interrupted context's S0-S15 and FPSCR to the area reserved
-            // by FPCAR at exception entry and clear LSPACT, so each frame is
-            // saved exactly once. Inactive when no lazy frame is pending.
-            // The same hook raises CONTROL.FPCA (the ARMv8-M "FP context
-            // active" bit) whenever CPACR grants access; the CLRONRET path of
-            // exception return clears it again.
-            if fpu::is_fpu_encoding(instr32) {
-                if self.registers.fp_access_enabled() {
-                    self.registers.control |= registers::CONTROL_FPCA;
-                }
-                if self.registers.fpu.lspact() {
-                    exceptions::commit_lazy_fp_context(bus, &mut self.registers, cycles)?;
-                }
-            }
-            execute_thumb32(
+            self.prepare_fpu_instruction(bus, cycles, instr32)?;
+            let result = execute_thumb32(
                 instr32,
                 &mut self.registers,
                 bus,
@@ -410,10 +459,15 @@ impl CortexM33Core {
                 &mut self.systick,
                 &mut self.it_state,
                 cycles,
-            )?
+            )?;
+            if self.decode_cache_enabled && decode_cache::in_flash_window(old_pc) {
+                self.decode_cache
+                    .store(decode_cache::decode32(old_pc, instr32));
+            }
+            result
         } else {
             self.registers.pc = self.registers.pc.wrapping_add(2);
-            execute_thumb16(
+            let result = execute_thumb16(
                 hw,
                 &mut self.registers,
                 bus,
@@ -421,9 +475,61 @@ impl CortexM33Core {
                 &mut self.systick,
                 &mut self.it_state,
                 cycles,
-            )?
+            )?;
+            if self.decode_cache_enabled && decode_cache::in_flash_window(old_pc) {
+                self.decode_cache.store(decode_cache::decode16(old_pc, hw));
+            }
+            result
         };
 
+        self.finish_instruction(bus, cycles, old_pc, raw_opcode, width, result)
+    }
+
+    /// Lazy FP stacking and `CONTROL.FPCA` before the first VFP instruction
+    /// 首条 VFP 指令之前的惰性浮点压栈与 `CONTROL.FPCA`
+    ///
+    /// A handler's first VFP instruction (arithmetic, transfers, loads/stores,
+    /// system registers) commits the interrupted context's S0-S15 and FPSCR to
+    /// the area reserved by FPCAR at exception entry and clears LSPACT, so each
+    /// frame is saved exactly once. Inactive when no lazy frame is pending. The
+    /// same hook raises CONTROL.FPCA (the ARMv8-M "FP context active" bit)
+    /// whenever CPACR grants access; the CLRONRET path of exception return
+    /// clears it again.
+    /// 处理程序的第一条 VFP 指令（算术、搬移、加载/存储、系统寄存器访问）会把被中断
+    /// 上下文的 S0-S15 与 FPSCR 写入异常进入时由 FPCAR 预留的区域并清除 LSPACT，
+    /// 保证每个栈帧只提交一次。FPU 未活跃时该分支不生效。同一路径还负责置位
+    /// CONTROL.FPCA（ARMv8-M 的「浮点上下文活跃」位）：只要 CPACR 允许访问，执行
+    /// 浮点指令就会置位，之后由异常返回的 CLRONRET 路径清除。
+    #[inline]
+    fn prepare_fpu_instruction(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        cycles: &mut u64,
+        instr32: u32,
+    ) -> Result<(), CoreError> {
+        if fpu::is_fpu_encoding(instr32) {
+            if self.registers.fp_access_enabled() {
+                self.registers.control |= registers::CONTROL_FPCA;
+            }
+            if self.registers.fpu.lspact() {
+                exceptions::commit_lazy_fp_context(bus, &mut self.registers, cycles)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared tail: synchronous UsageFault entry and undefined-instruction report
+    /// 共享尾部：同步用法故障进入与未定义指令报告
+    #[inline]
+    fn finish_instruction(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        cycles: &mut u64,
+        old_pc: u32,
+        raw_opcode: u32,
+        width: u8,
+        result: StepResult,
+    ) -> Result<StepResult, CoreError> {
         // 同步用法故障（当前仅 NOCP）：设置 CFSR 并立即进入 UsageFault。
         // Synchronous UsageFault (currently only NOCP): set CFSR and enter
         // the UsageFault handler immediately with a standard stack frame.

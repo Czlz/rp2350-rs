@@ -32,10 +32,12 @@
     clippy::similar_names
 )]
 
+pub(crate) mod fast;
+
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
-use super::conditions::{Condition, ITBlockState};
+use super::conditions::ITBlockState;
 use super::nvic::Nvic;
 use super::registers::CortexM33Registers;
 use super::systick::SysTick;
@@ -435,127 +437,9 @@ pub fn execute_thumb16(
             // Data processing register (two-operand): ANDS, EORS, LSLS, LSRS,
             // ASRS, ADCS, SBCS, RORS, TST, RSBS, CMP, CMN, ORRS, MULS, BICS, MVNS
             // 数据处理寄存器（双操作数）
-            let op = (opcode >> 6) & 0xF;
-            let rm = ((opcode >> 3) & 0x7) as usize;
-            let rdn = (opcode & 0x7) as usize;
-            let rn_val = regs.r[rdn];
-            let rm_val = regs.r[rm];
-            match op {
-                0x0 => {
-                    // ANDS / 按位与
-                    let result = rn_val & rm_val;
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0x1 => {
-                    // EORS / 异或
-                    let result = rn_val ^ rm_val;
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0x2 => {
-                    // LSLS / 逻辑左移
-                    let shift = rm_val & 0xFF;
-                    let result = lsl_c(rn_val, shift, regs);
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0x3 => {
-                    // LSRS / 逻辑右移
-                    let shift = rm_val & 0xFF;
-                    let result = lsr_c(rn_val, shift, regs);
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0x4 => {
-                    // ASRS / 算术右移
-                    let shift = rm_val & 0xFF;
-                    let result = asr_c(rn_val, shift, regs);
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0x5 => {
-                    // ADCS / 带进位加法
-                    let carry = if regs.apsr_c() { 1u64 } else { 0u64 };
-                    let result64 = rn_val as u64 + rm_val as u64 + carry;
-                    let result32 = adc(result64, regs, true);
-                    regs.r[rdn] = result32;
-                }
-                0x6 => {
-                    // SBCS / 带借位减法
-                    let carry = if regs.apsr_c() { 0u64 } else { 1u64 };
-                    let result64 = (rn_val as u64)
-                        .wrapping_sub(rm_val as u64)
-                        .wrapping_sub(carry);
-                    let result32 = sbc(result64, regs, true);
-                    regs.r[rdn] = result32;
-                }
-                0x7 => {
-                    // RORS / 循环右移
-                    let shift = rm_val & 0xFF;
-                    let result = ror_c(rn_val, shift, regs);
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0x8 => {
-                    // TST / 测试（AND 不存结果）
-                    let result = rn_val & rm_val;
-                    regs.set_nz_flags(result);
-                    // C flag unchanged for TST
-                }
-                0x9 => {
-                    // RSBS / 反减（0 - Rm）：Rdn 只是结果寄存器，取反的是源操作数。
-                    // RSBS negates the source register Rm; Rdn only receives the
-                    // result. Negating Rdn is wrong (e.g. NEGS r5, r3 at 0x425D).
-                    let (result, overflow) = 0u32.overflowing_sub(rm_val);
-                    let carry = rm_val == 0; // C = NOT borrow / C 表示无借位
-                    regs.r[rdn] = result;
-                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, carry, overflow);
-                }
-                0xA => {
-                    // CMP / 比较
-                    let (result, _overflow) = rn_val.overflowing_sub(rm_val);
-                    let c = rn_val >= rm_val;
-                    let v = ((rn_val ^ rm_val) & (rn_val ^ result) & 0x8000_0000) != 0;
-                    regs.set_apsr_nzcv((result & 0x8000_0000) != 0, result == 0, c, v);
-                }
-                0xB => {
-                    // CMN / 比较负数
-                    let (result, overflow) = rn_val.overflowing_add(rm_val);
-                    regs.set_apsr_nzcv(
-                        (result & 0x8000_0000) != 0,
-                        result == 0,
-                        overflow,
-                        ((rn_val ^ rm_val) & !(rn_val ^ result) & 0x8000_0000) == 0
-                            && ((rn_val ^ rm_val) & 0x8000_0000) != 0,
-                    );
-                }
-                0xC => {
-                    // ORRS / 按位或
-                    let result = rn_val | rm_val;
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0xD => {
-                    // MULS / 乘法
-                    let result = rn_val.wrapping_mul(rm_val);
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0xE => {
-                    // BICS / 位清零
-                    let result = rn_val & !rm_val;
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                0xF => {
-                    // MVNS / 按位取反
-                    let result = !rm_val;
-                    regs.r[rdn] = result;
-                    regs.set_nz_flags(result);
-                }
-                _ => unreachable!(),
-            }
+            // 与译码缓存快路径共用同一实现（见 `fast`）。
+            // Shared with the decode-cache fast path (see `fast`).
+            fast::dp_register(opcode, regs);
         }
         0b01010 => {
             // Load/store register offset: STR, STRH, STRB, LDRSB
@@ -659,28 +543,13 @@ pub fn execute_thumb16(
         0b01001 => {
             // LDR Rd, [PC, #imm8*4] — literal load
             // LDR Rd, [PC, #imm8*4] — 文字池加载
-            let rd = ((opcode >> 8) & 0x7) as usize;
-            let imm8 = (opcode & 0xFF) as u32;
-            let addr = (regs.pc.wrapping_add(2) & !0x3u32).wrapping_add(imm8 << 2);
-            regs.r[rd] = bus.read_u32(addr, cycles)?;
-            *cycles += 1;
+            return fast::load_literal(opcode, regs, bus, cycles);
         }
         0b01100..=0b01101 => {
             // Load/store immediate offset: STR, LDR
             // 加载/存储立即数偏移：STR、LDR
-            let op = (opcode >> 11) & 0x1;
-            let imm5 = ((opcode >> 6) & 0x1F) as u32;
-            let rb = ((opcode >> 3) & 0x7) as usize;
-            let rd = (opcode & 0x7) as usize;
-            let addr = regs.r[rb].wrapping_add(imm5 << 2);
-            if op == 0 {
-                // STR Rd, [Rb, #imm5*4]
-                bus.write_u32(addr, regs.r[rd], cycles)?;
-            } else {
-                // LDR Rd, [Rb, #imm5*4]
-                regs.r[rd] = bus.read_u32(addr, cycles)?;
-            }
-            *cycles += 1;
+            let store = (opcode >> 11) & 0x1 == 0;
+            return fast::load_store_word_imm5(opcode, store, regs, bus, cycles);
         }
         0b01110..=0b01111 => {
             // Load/store immediate offset: STRB, LDRB
@@ -795,18 +664,7 @@ pub fn execute_thumb16(
                 0xB6 => match opcode {
                     0xB650 => {}
                     o if (o & 0xFFF0) == 0xB660 || (o & 0xFFF0) == 0xB670 => {
-                        let enable = (opcode >> 4) & 0x1 == 0;
-                        if (opcode & 0x1) != 0 {
-                            if enable {
-                                regs.faultmask &= !1;
-                            } else {
-                                regs.faultmask |= 1;
-                            }
-                        } else if enable {
-                            regs.primask &= !1;
-                        } else {
-                            regs.primask |= 1;
-                        }
+                        fast::cps(opcode, regs);
                     }
                     _ => return Ok(StepResult::Undefined),
                 },
@@ -889,32 +747,12 @@ pub fn execute_thumb16(
                 // HINT / IT
                 // HINT / IT 指令
                 0xBF => {
-                    // 编码按 ARMv8-M 手册：bits[3:0] 为 0 时进入 hint 空间，
-                    // bits[7:4] 为提示编号；只有 bits[3:0] 非 0 才是 IT 块。
-                    // 依据：`IT EQ` 汇编为 0xBF08、`IT NE` 为 0xBF18，
-                    // 而 NOP/YIELD/WFE/WFI/SEV/SEVL 分别是 0xBF00/10/20/30/40/50。
-                    // Per ARMv8-M, bits[3:0] == 0 selects the hint space with
-                    // the hint number in bits[7:4]; only a non-zero mask is IT.
-                    let firstcond = ((opcode >> 4) & 0xF) as u8;
-                    let mask = (opcode & 0xF) as u8;
-                    if mask == 0 {
-                        return Ok(match firstcond {
-                            // WFE / WFI：显式进入等待状态，不能顺带跳过下一条。
-                            // WFE / WFI: a real wait state, never a silent skip.
-                            0x2 | 0x3 => StepResult::Sleep,
-                            // NOP / YIELD / SEV / SEVL 以及手册保留的 hint 编码
-                            // （0x6..=0xF）均按 NOP 执行。
-                            // NOP / YIELD / SEV / SEVL, plus the reserved hint
-                            // encodings (0x6..=0xF), all execute as NOP.
-                            _ => StepResult::Ok,
-                        });
+                    // 提示空间与 IT 块的判定集中在 `fast::hint_space`，快路径共用。
+                    // The hint space and IT-block decisions live in
+                    // `fast::hint_space`, shared with the fast path.
+                    if let Some(result) = fast::hint_space(opcode, it) {
+                        return Ok(result);
                     }
-                    // mask 非 0 才是 IT；AL（0xE）与 NV（0xF）条件非法。
-                    // A non-zero mask selects IT; AL (0xE) and NV (0xF) are illegal.
-                    if firstcond == 0xF || firstcond == 0xE {
-                        return Ok(StepResult::Undefined);
-                    }
-                    it.execute_it(firstcond, mask);
                 }
                 _ => return Ok(StepResult::Undefined),
             }
@@ -957,22 +795,11 @@ pub fn execute_thumb16(
         0b11010..=0b11011 => {
             // B<cond> (conditional branch) or SVC (cond == 0xF)
             // 条件分支 B<cond>，或 cond == 0xF 时的 SVC
-            let cond_bits = ((opcode >> 8) & 0xF) as u8;
-            if cond_bits == 0xF {
-                return Ok(StepResult::SvCall((opcode & 0xFF) as u8));
-            }
-            let cond = Condition::from_bits(cond_bits);
-            if cond != Condition::Al && cond.evaluate(regs) {
-                let offset = sign_extend(((opcode & 0xFF) as u32) << 1, 9);
-                regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
-                return Ok(StepResult::BranchTaken);
-            }
+            return Ok(fast::branch_conditional(opcode, regs));
         }
         0b11100 => {
             // B (unconditional branch) / 无条件分支
-            let offset = sign_extend(((opcode & 0x7FF) as u32) << 1, 12);
-            regs.pc = regs.pc.wrapping_add(2).wrapping_add(offset);
-            return Ok(StepResult::BranchTaken);
+            return Ok(fast::branch_unconditional(opcode, regs));
         }
         0b11101..=0b11111 => {
             // BL (unconditional branch with link) or miscellaneous
@@ -1000,6 +827,7 @@ pub fn execute_thumb16(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conditions::Condition;
 
     #[test]
     fn ldmia_base_in_list_keeps_the_loaded_value() {

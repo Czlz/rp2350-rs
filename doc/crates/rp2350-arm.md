@@ -25,6 +25,8 @@
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
 | `system_access` | System control space routing (`SCB_VTOR`/`SCB_CPACR`/`SCB_CFSR`, FPU system registers, NVIC/IPR aliases, SysTick) |
 | `fetch_cache` | Direct-mapped flash XIP instruction fetch cache (private, enabled per core) |
+| `decode_cache` | Direct-mapped decoded-instruction cache: length, raw word, dispatch tag per flash `PC` |
+| `execute_thumb16::fast` | Hot Thumb-16 executors shared by the decoder and the decode-cache fast path |
 | `exceptions` | Exception entry/exit, EXC_RETURN decoding, standard and extended (lazy FP) stack frames |
 
 ---
@@ -389,6 +391,76 @@ pub enum StepResult {
 - **Branch**: `B`, `B<cc>`, `BL`, `BX`, `BLX`
 - **Load/Store**: `LDR`, `STR`, `LDRH`, `STRH`, `LDRB`, `STRB`, `LDMIA`, `STMIA`, `PUSH`, `POP`
 - **Miscellaneous**: `NOP`, `BKPT`, `SVC`, `CPS`, `IT`, `CBZ`, `CBNZ`, `REV`
+
+### Shared executors / 共享执行器
+
+`execute_thumb16::fast` holds the hot arms (`LDR (literal)`, `LDR`/`STR`
+immediate word forms, data-processing (register), `B`, `B<cc>`, the hint space,
+`CPS`). Both `execute_thumb16` and the decode-cache fast path call them, so the
+cached and uncached paths can never diverge: the cache stores *how* to dispatch,
+never *what* the instruction does.
+`execute_thumb16::fast` 存放热点分支（`LDR（文字池）`、`LDR`/`STR` 立即数字形式、
+数据处理（寄存器）、`B`、`B<cc>`、提示空间、`CPS`）。`execute_thumb16` 与译码缓存
+快路径都调用它们，因此缓存路径与非缓存路径绝不可能分叉：缓存只保存**如何分派**，
+从不保存指令**做什么**。
+
+---
+
+## Decoded-instruction cache / 译码结果缓存
+
+```rust
+pub struct DecodeCache { /* 1024 direct-mapped entries, 16 bytes each */ }
+pub enum Kind { Empty, Slow16, Slow32, B16, BCond16, LdrLiteral16,
+                LdrWordImm5, StrWordImm5, DpRegister16, Hint16, Cps16, Group32 }
+pub fn decode16(pc: u32, word: u16) -> Entry;
+pub fn decode32(pc: u32, word: u32) -> Entry;
+```
+
+- `CortexM33Core::set_decode_cache(bool)` toggles it; **off by default**.
+  `CortexM33Core::set_flash_fetch_cache(true)` enables both caches because they
+  rely on the same invariants.
+  `CortexM33Core::set_decode_cache(bool)` 开关该缓存，**默认关闭**；
+  `CortexM33Core::set_flash_fetch_cache(true)` 会同时启用两者，因为它们依赖相同的
+  不变量。
+- An entry holds the instruction address (tag), the raw word, the length, a
+  dispatch tag and one pre-computed value (branch target or literal address).
+  A hit replaces two fetch lookups, the Thumb-16/32 width decision and the
+  opcode-class chain with one tag compare. The index is `(pc >> 1) & 1023`, so
+  1024 entries cover 2 KiB of code without conflicts.
+  条目保存指令地址（标签）、原始指令字、长度、分派标签与一个预计算值（分支目标或
+  文字池地址）。一次命中以一次标签比较取代两次取指查找、Thumb-16/32 宽度判定与
+  操作码类别链。索引为 `(pc >> 1) & 1023`，因此 1024 条覆盖 2 KiB 代码无冲突。
+- A cache hit books exactly the cycles the fetch path books (3 for a 16-bit
+  instruction, 6 for a 32-bit one), and the fast executors keep the original
+  per-arm cycle additions — including the fact that a **taken** branch books no
+  extra cycle, because the generic arm returns before the shared tail.
+  一次命中记入与取指路径完全相同的周期（16 位指令 3 个、32 位指令 6 个），快路径
+  也保留原始的逐分支周期记账——包括「**已执行**的分支不额外记周期」这一点，因为
+  通用分支在共享尾部之前就返回了。
+- Inside an IT block every instruction still runs the full decoder, so slot
+  consumption and the `setflags = !InITBlock()` flag suppression are untouched.
+  `--strict-decode`, `watch`, `trace` and GDB single-step/breakpoints keep their
+  behaviour: they all use this same `step`, which the cache only accelerates.
+  IT 块内的指令仍走完整译码器，因此槽位消费与 `setflags = !InITBlock()` 的标志抑制
+  完全不变。`--strict-decode`、`watch`、`trace` 与 GDB 单步/断点行为不变：它们都
+  使用同一条 `step`，缓存只是加速了它。
+
+### Invalidation / 失效
+
+| Source / 来源 | Mechanism / 机制 |
+|---|---|
+| Host flash write/erase (`FlashHandle`, `load_bytes`, UF2/ELF load) | `flash::content_generation` bump → the whole table is dropped on the next lookup |
+| Guest write to flash | rejected by `FlashRegion`, so flash can never be self-modified |
+| `SRAM` write (self-modifying code) | **not cached at all** — `SRAM` code always takes the normal fetch path |
+| `reset` / `boot_at` | register file only; entries stay valid because they only describe flash bytes |
+
+`SRAM` 写入（自修改代码）**完全不缓存**：`SRAM` 代码始终走常规取指路径，因此不需要
+失效钩子，也不会读到过期条目。要做到精确失效，必须在热路径上查询按 16 字节行的世代
+表，其成本高于它节省的取指；实测负载也都不在 `SRAM` 中执行。
+
+`CortexM33Core::decode_cache_flushes()` exposes the generation-flush counter for
+diagnostics and tests.
+`CortexM33Core::decode_cache_flushes()` 暴露世代清空计数，供诊断与测试使用。
 
 ## Thumb-32 Decoder / Thumb-32 解码器
 

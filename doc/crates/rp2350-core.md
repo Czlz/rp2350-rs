@@ -216,13 +216,34 @@ pub fn content_generation() -> u32;
 `FlashHandle::write` and `FlashHandle::erase` each bump it (relaxed atomic
 `fetch_add`). Readers can therefore cache flash bytes and revalidate with one
 relaxed load instead of taking the shared-store lock per access;
-`rp2350-arm`'s flash instruction fetch cache is the only consumer today. The
-counter is monotonic and process-wide, so a mismatch simply discards the cache.
+`rp2350-arm`'s flash instruction fetch cache and its decoded-instruction cache
+are the consumers today. The counter is monotonic and process-wide, so a
+mismatch simply discards the cache. Because the counter is global, two machines
+in one process (unit tests, two cores) can only cause *extra* invalidations,
+never a stale hit.
 每次宿主侧变更都会发布世代号：`FlashRegion::new`、`FlashRegion::load_bytes`、
 `MemoryRegion::load_u8` 路径、`FlashHandle::write` 与 `FlashHandle::erase` 各递增
 一次（relaxed 原子 `fetch_add`）。因此读取方可缓存 Flash 字节，并用一次 relaxed
-读取重新验证，而不必每次访问都获取共享存储锁；目前唯一使用者是 `rp2350-arm`
-的 Flash 取指缓存。计数器是进程级单调量，失配即丢弃整个缓存。
+读取重新验证，而不必每次访问都获取共享存储锁；当前使用者是 `rp2350-arm` 的 Flash
+取指缓存与译码结果缓存。计数器是进程级单调量，失配即丢弃整个缓存。由于计数全局
+共享，同进程内的两台机器（单元测试、双核）只会导致**多余**的失效，绝不会产生过期
+命中。
+
+### Why `SRAM` has no generation / `SRAM` 为什么没有世代号
+
+`RamRegion` deliberately publishes **no** content generation. Guest writes are
+the normal case (0.1–0.3 per step in real firmware), so a per-write global bump
+would invalidate any decoded-instruction cache many times per frame and make it
+useless. An exact `SRAM` scheme needs a table of 16-byte-line generations
+consulted on the hot path, which costs more per instruction than the fetch it
+saves, so `rp2350-arm` caches the flash XIP windows only and leaves `SRAM` code
+on the normal fetch path — self-modifying `SRAM` code therefore stays correct by
+construction (see `doc/crates/rp2350-arm.md`).
+`RamRegion` **刻意不发布**内容世代号。客户机写入是常态（真实固件中每步 0.1–0.3
+次），若每次写入都递增全局世代号，任何译码缓存都会每帧被清空多次而失去意义。精确
+的 `SRAM` 方案需要在热路径上查询按 16 字节行的世代表，其成本高于它节省的取指，
+因此 `rp2350-arm` 只缓存 Flash XIP 窗口，`SRAM` 代码始终走常规取指路径——自修改
+`SRAM` 代码由构造保证正确（见 `doc/crates/rp2350-arm.md`）。
 
 ### XIP maintenance window / XIP 维护窗口
 

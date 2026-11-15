@@ -1,13 +1,15 @@
 # 解释器热路径性能 / Interpreter hot-path performance
 
-本文件记录 **P0-1 第一轮**、**P0-2 第二轮**、**P0-3a 第三轮** 与 **P0-3b 第四轮**
-（`rp2350-cli` 批量步进）的性能工作：测量方法、基线、每项优化的收益、最终数字、
-剩余瓶颈与下一轮建议。目标与实际结果并列，未达标处如实记录。
-This document records the first (P0-1), second (P0-2), third (P0-3a) and fourth
-(P0-3b, batched stepping in `rp2350-cli`) rounds of interpreter performance work:
-measurement method, baseline, per-optimization gains, final numbers, remaining
-bottlenecks and next-round suggestions. Targets
-and actual results are both listed, and any shortfall is reported as measured.
+本文件记录 **P0-1 第一轮**、**P0-2 第二轮**、**P0-3a 第三轮**、**P0-3b 第四轮**
+（`rp2350-cli` 批量步进）与 **P0-3c 第五轮**（`rp2350-arm` 译码结果缓存）的性能工作：
+测量方法、基线、每项优化的收益、最终数字、剩余瓶颈与下一轮建议。目标与实际结果并列，
+未达标处如实记录。
+This document records the first (P0-1), second (P0-2), third (P0-3a), fourth
+(P0-3b, batched stepping in `rp2350-cli`) and fifth (P0-3c decoded-instruction
+cache in `rp2350-arm`) rounds of interpreter performance work: measurement
+method, baseline, per-optimization gains, final numbers, remaining bottlenecks
+and next-round suggestions. Targets and actual results are both listed, and any
+shortfall is reported as measured.
 
 关联文档 / Related: [`playability-plan.md`](playability-plan.md)（为什么需要 ≥50 M steps/s）、
 [`crates/rp2350-core.md`](crates/rp2350-core.md)、[`crates/rp2350-cli.md`](crates/rp2350-cli.md)。
@@ -643,4 +645,242 @@ across the five short sections.
 
 要进入 ≥50 M steps/s（20 fps 游玩）仍需 JIT 或帧级并行，详见
 [`playability-plan.md`](playability-plan.md)。
+
+---
+
+## 9. 第五轮 / Round 5（P0-3c：`rp2350-arm` 译码结果缓存）
+
+第四轮把 50 M 步做到 1.66~1.70 s（~30 M steps/s），并把 **65~75 %** 的时间归给
+`core.step`（取指 + 译码 + 执行）。本轮**只改 `rp2350-arm`**：先用 PC 直方图确认
+「同一小段指令被反复取指/译码」，再把每条指令的**长度、原始指令字、分派标签与
+操作数字段**放进一张按 `PC` 索引的直接映射表，命中时一次查表取代两次取指、宽度判定
+与操作码类别链。
+Round 4 brought emerald's 50 M steps to 1.66–1.70 s (~30 M steps/s) and attributed
+**65–75 %** of the time to `core.step`. Round 5 touches only `rp2350-arm`: a PC
+histogram first confirms that a tiny instruction window is re-fetched and
+re-decoded millions of times, then a direct-mapped table keyed by `PC` stores the
+instruction length, the raw word, a dispatch tag and the operand fields, so a hit
+replaces two fetches, the width decision and the opcode-class chain with one tag
+compare.
+
+### 9.1 热点测量 / Hot-spot measurement
+
+临时探针（交付前已删除）：在 `step_instruction` 里按 `(pc >> 1) & 0xFFFF` 累加
+计数并记录代表 `PC`，5 M 步后输出 top-N、覆盖区间与类别直方图。
+Temporary probe (removed before delivery): counts per `(pc >> 1) & 0xFFFF` bucket
+plus a representative `PC`, dumped after 5 M steps.
+
+emerald 前 5 M 步（**只有 1530 个不同 PC**）：
+
+| 排名 | PC | 步数占比 | 指令 |
+|---|---|---|---|
+| 1–24 | `0x1000B222..0x1000B262`（每 2 字节一个） | 各 **4.079 %**，合计 **97.9 %** | `sleep_ms` 的 WFE 自旋循环，24 条指令 |
+
+覆盖区间 / Coverage：
+
+| top-N 桶 | 覆盖步数 |
+|---|---|
+| 4 | 16.3 % |
+| 8 | 32.6 % |
+| **16** | **65.3 %** |
+| **32** | **99.91 %** |
+| 64 | 99.95 % |
+| 1024 | 99.99 % |
+
+即：整个窗口是**一段 0x42 字节（24 条指令）的循环**（`ldr`/`cmp`/`bhi`/`bcs`/`bne`
+采样 SIO 与 TIMERAWL，然后 `cpsid`/`mrs`/`ldaexb`/`strexb`/`dmb`/`stlb`/`msr`/`wfe`），
+被反复执行 5 M / 24 ≈ 208 000 次。**1024 条表项（2 KiB 代码无冲突）远大于所需**，
+但保留余量给真实负载中更分散的代码。
+
+类别直方图（5 M 步）/ Class histogram：16 位 `01101`（LDR 立即数）16.3 %、
+`11010|11011`（B&lt;cond&gt;）21.0 %、`01000`（数据处理寄存器）12.9 %、
+`11100`（B）4.1 %、`10110`（CPS）4.1 %、`10111`（hint/WFE）4.1 %；
+32 位 `0xE8xx`（`ldaexb`/`strexb`/`stlb`）12.2 %、`0xF3xx`（`mrs`/`dmb`/`msr`）
+12.2 %、`0xF1xx`/`0xF0xx`（`cmp.w`/`movs.w`）12.2 %。
+
+### 9.2 缓存设计 / Cache design
+
+`crates/rp2350-arm/src/decode_cache.rs`：
+
+```rust
+pub struct Entry {            // 16 bytes
+    pub tag: u32,             // PC the entry was filled from (0 = empty)
+    pub word: u32,            // raw instruction word (hw1 in bits 31:16)
+    pub aux: u32,             // branch target or literal address
+    pub kind: Kind,           // dispatch tag (u8)
+    pub group: u8,            // Thumb-32 group id, or the condition code
+    pub len: u8,              // 2 or 4
+}
+```
+
+- **索引**：`(pc >> 1) & 1023`，1024 条 × 16 B = 16 KiB（与 4 KiB 的取指缓存
+  组成 L1/L2 两级：命中走译码缓存，未命中落回取指缓存再到总线）。
+- **命中**：`tag == pc` 即命中（条目只能由 `store` 建立，而 `store` 拒绝窗口外地址，
+  因此标签相等已隐含「来自 Flash」，不需要窗口判定与有效位）。
+- **分派标签**：`B16`/`BCond16`/`LdrLiteral16`/`LdrWordImm5`/`StrWordImm5`/
+  `DpRegister16`/`Hint16`/`Cps16`/`Group32`/`Slow16`/`Slow32`。`Group32` 存的是
+  `execute_thumb32` 本来会在 FPU/协处理器探测与 `op1`/`op2` 判定之后选择的**同一个
+  整数组**，热路径直接调用该组函数（`execute_group_tag`）。
+- **字段预提取**：分支目标 `pc + 4 + offset` 与 `LDR (literal)` 地址在**填充时**
+  算好（条目按 `PC` 索引，因此恒定），命中时不再做符号扩展。
+- **执行体唯一**：`execute_thumb16::fast` 里的热点分支（`LDR`/`STR` 立即数、
+  数据处理寄存器、`B`、`B<cc>`、hint、`CPS`、文字池）由**译码器与快路径共用**，
+  因此两条路径不可能分叉；`Group32` 直接调用既有的组函数。缓存只保存**如何分派**，
+  不保存指令**做什么**。
+- **周期精确**：命中按取指路径记同样的周期（16 位 3 个、32 位 6 个），并保留原有的
+  逐分支记账——**已执行的分支不额外记周期**（通用分支在共享尾部之前就返回）。
+  这一点在差分测试里被发现并修正（第一版多记了 1 个周期，`total_cycles` 立刻偏离）。
+- **语义边界**：`IT` 块内的指令一律走完整译码器（槽位消费与
+  `setflags = !InITBlock()` 抑制不动）；FPU/协处理器编码（`0xEC..0xEE`、`0xFE`
+  前缀）保留在慢路径，惰性浮点压栈（`FPCAR`/`LSPACT`/`CONTROL.FPCA`）与 NOCP
+  用法故障逻辑完全不变。
+
+**失效**：Flash 侧沿用 `flash::content_generation`（失配即整表清空）；
+**SRAM 完全不缓存**（见 9.6 的理由与代价分析），因此自修改 `SRAM` 代码由构造保证
+正确。
+
+### 9.3 逐项 A/B / Per-item A/B
+
+本轮所有数字都是**同一 release 二进制、同一时段交错运行**，脚本用环境变量切换译码
+缓存开关（探针与开关交付前已删除）。50 M 步最小/中位数：
+
+| # | 优化 / Optimization | 文件 | 前 / Before | 后 / After | 收益 |
+|---|---|---|---|---|---|
+| 1 | 融合取指：一条指令一次查表（取代 1.4 次半字取指查找） | `decode_cache.rs`、`lib.rs` | 1.85 s¹ | 1.66 s¹ | −10 % |
+| 2 | 分派标签 + 整数组函数指针（跳过 FPU/协处理器探测与 `op1`/`op2` 链） | `decode_cache.rs`、`execute_thumb32.rs` | 1.66 s¹ | 1.59 s¹ | −4 % |
+| 3 | 热点 16 位分支与字段预提取（`B`/`B<cc>`/`LDR`/`STR`/DP-reg/hint/CPS） | `execute_thumb16/fast.rs` | 1.59 s¹ | 1.56 s¹ | −2 % |
+| 4 | 命中路径去掉重复的窗口判定与有效位（标签相等已隐含有效性） | `decode_cache.rs` | 1.60 s | 1.56 s | −2.5 % |
+| — | **合计** | | **1.85 s** | **1.56 s** | **−16 %** |
+
+¹ 第 1~3 项是同一批改动里的三个可分别关闭的部分，前后值来自逐步回退的快速测量
+（±3 % 抖动），只用于判断「哪一项值得保留」；第 4 项是独立的开关对照。**合计**一行
+才是同二进制、同口径下的可信数字（关闭全部译码缓存 vs 全开）。
+
+微基准（同机、直接驱动 `CortexM33Core::step`，emerald 自旋循环 10 M 步，取 3 次
+最小值；单位 TSC 周期，3.29 GHz；在本轮中段测得，之后把命中路径拆成独立模块只带来
+噪声级变化）：
+
+| 配置 / Configuration | 周期/步 | 说明 |
+|---|---|---|
+| 无任何缓存 | 115~118 | 每次取指两次半字总线读 |
+| 仅 Flash 取指缓存 | 83~86 | 32 位指令取两次 |
+| 取指 + 译码缓存 | **52.0~52.2** | 一条指令一次查表 |
+
+即 `core.step` 本体 **−37 %**；端到端只有 −16 %，因为 `rp2350-cli` 骨架（~30 周期/步）
+与本轮无关。
+
+### 9.4 最终数字 / Final numbers
+
+| 场景 / Case | 步数 | 样本 (s) | 最小值 | 吞吐（最小值） |
+|---|---|---|---|---|
+| emerald | 50 M | 1.735 / 1.470 / 1.502 / 1.508 / 1.531 / 1.552 / 1.559 / 1.573 / 1.608 / 1.634 / 1.684 | **1.470 s** | **34.0 M steps/s** |
+| emerald | 300 M | 16.30 | **16.30 s** | **18.4 M steps/s** |
+| `play --frames 20` | 50 M | 13.1~13.6 fps（32.8~33.9 M steps/s） | — | **13.6 fps** |
+
+- emerald 50 M：**1.66~1.75 s → 1.47~1.61 s（−7~11 % vs 第四轮记录的最好值）**，同二进制
+  开关对照（同一时段交错的另一组样本）为 **1.85 → 1.56 s（−16 %）**，吞吐
+  **27.0 → 32.0~34.0 M steps/s**。两组数字的差异来自并行会话的负载抖动
+  （该机器实测 ±10 %），A/B 只应看同一组内的前后差。
+- emerald 300 M：同二进制开关对照 **19.0 → 16.3 s（−14 %）**；中断打开、代码足迹
+  更大后命中率下降，收益比 50 M 小。
+- `play`：**12.4 → 13.6 fps（+10 %）**。
+- **目标 ≤1.2 s（≥42 M steps/s）未达成**：实测 1.47 s / 34.0 M steps/s，差 **1.24×**。
+  原因见 9.6。
+
+### 9.5 不变量核对 / Invariant checks
+
+| 检查 / Check | 结果 |
+|---|---|
+| emerald 6 M 步全部 stdout（与改动前同一命令逐字节比较） | **无差异**（`Compare-Object` 空） |
+| emerald 300 M `final PC=0x1000B3A6`、`dma=2195390 busy=0x0009`、`hstx words=5401204 underruns=0 fifo=8 enabled=true wof=false unknown=0`、`core1 state=Running pc=0x10009D92 sp=0x2003D680 launches=1` | 全部 ✅（逐字段相同） |
+| 8 条 `[irq]`、无总线错误 | ✅ |
+| `RP2350_WATCH` / `RP2350_WATCHV` | 写钩子调用点未动；`SimpleBus::write_u32` 仍只调一次 `check_write`，逐字节回退路径不变 |
+| `--strict-decode` / `undefined` 行为 | 差分测试覆盖（strict 与宽容两种模式，未定义指令结果与 `undefined_seen` 去重相同） |
+| IT 块、`watch`、`trace`、GDB 单步/断点 | 块内指令仍走完整译码器；四者都用同一条 `step`，只是被加速 |
+| FV-1 / FV-2 / FV-3 | 均 `[repl] banner` + `stdout: 42` ✅ |
+| `cargo test --all-features` | 全绿（rp2350-arm 438、core 90、periph 347…；40 个测试目标） |
+| `cargo fmt --check` / `clippy -D warnings -W clippy::pedantic` / `cargo doc --no-deps` | 全绿 |
+
+新增测试 **17 项**：
+
+- `decode_cache.rs` 7 项：窗口内可缓存 / `SRAM` 不可缓存、字段往返、条件分支预计算
+  （`cond == 0xF` 不进快路径）、Thumb-32 组号与解码树一致（含 FPU/协处理器前缀与
+  未定义编码保持慢路径）、宿主 Flash 写触发清空、同索引冲突替换、标签字节往返。
+- `tests/decode_cache.rs` 10 项（**差分**：同程序跑两台核心，逐步比较
+  `pc`/寄存器/`xpsr`/`primask`/`faultmask`/`control`/`total_cycles`/独占监视器/
+  `FPSCR` 与总线内容）：
+  ① 全部特化的 Thumb-16 编码（16 种 DP-reg 运算、`LDR`/`STR`/`LDRB`/`STRB`/
+  `LDRH`/`STRH`、`MRS`/`MSR`、`CPS`/`WFE`/`YIELD`/`NOP`、`PUSH`/`POP`）；
+  ② 分支与 IT 块（已执行/未执行、IT 内标志抑制）；③ Thumb-32 各组
+  （`movw`、`movs.w`、`cmp.w`、`ldr.w`/`str.w`、`ldm.w`、`ldaexb`/`strexb`、`mrs`/
+  `msr`、`dmb`、`lsl.w`、`and.w`、`mul.w`）；④ 未定义指令（strict 与宽容）；
+  ⑤ 宿主 Flash 改写立即生效；⑥ `SRAM` 代码永不缓存、自修改立即生效；
+  ⑦ 非对齐 PC 取指；⑧ 32 位指令跨 Flash 窗口末尾；⑨ 伪随机 120 条指令流（600 步）
+  逐步等价；⑩ 热循环填充后持续命中。
+
+### 9.6 剩余瓶颈 / Remaining bottlenecks
+
+50 M 步现在 **1.47~1.61 s ≈ 97~106 周期/步**（TSC 3.29 GHz）：
+
+| 组成 | 每步 | 占比 | 归属 |
+|---|---|---|---|
+| ARM 解释器（`core.step`：一次查表 + 执行 + 数据访问） | **~70 周期** | ~68 % | `rp2350-arm` |
+| cli 骨架（`pc()`、`record_step`、PPB 世代、自旋/泵送节流、循环摊薄） | ~30 周期 | ~29 % | `rp2350-cli`（第四轮已定稿） |
+| 外设/MMIO | 少数 | ~3 % | `rp2350-periph` |
+
+译码缓存已经把「取指 + 译码 + 字段提取」从 ~30 周期压到 ~10；剩下的 ~40 周期/步是
+**每条指令都必须做的固定工作**：`watch::set_pc`、`systick.tick`、一次世代号原子读、
+`Kind` 匹配、条件求值、`take_usage_fault`、`check_pending_exceptions` 的短路、
+`total_cycles` 累加，以及三次函数调用层。实测这些项**逐个都不显著**（关掉 `watch`/
+`systick`/`check_pending_exceptions` 在整机上都是噪声内），但合起来就是解释器的地板。
+
+热循环里另外 0.29 次/步的数据访问（含 2 次 `TIMERAWL` MMIO 读与独占访问）经
+`dyn AddressBus` → 桶表 → 设备虚调用，每次 ~25~40 周期，合计 ~10 周期/步，属于
+`rp2350-core`/`rp2350-periph`。
+
+本轮**未做**：
+
+- **SRAM 译码缓存**：实测负载都不在 `SRAM` 执行（emerald 全程 Flash XIP）。要做到
+  精确失效需在热路径上查询按 16 字节行的世代表（`0x2000_0000..0x2008_2000` 需
+  ~33 k 项），每步多 4~6 周期，而它只在 SRAM 代码上才有收益；`RamRegion` 若改成
+  「每次写都递增全局世代」则会被自旋锁的 `stlb` 每帧清空几十次。故只缓存 Flash
+  窗口，`SRAM` 由构造保持精确（见 `doc/crates/rp2350-core.md`）。
+- **MMIO 读路径**（定时器轮询每次数百周期）：在 `rp2350-periph`，本轮白名单外。
+- **cli 骨架再摊薄**：`rp2350-cli`，第四轮已到最小必需集合。
+
+### 9.7 JIT 可行性与路线 / JIT feasibility
+
+当前 **32~34 M steps/s（1.47~1.56 s / 50 M）**，`play` 13.1~13.6 fps（每帧 2.5 M 步）。
+
+| 目标 | 需要吞吐 | 相对当前 | 每步预算 |
+|---|---|---|---|
+| 30 fps（每帧 2.5 M 步） | 75 M steps/s | **2.2~2.3×** | 44 周期/步 |
+| 60 fps（每帧 2.5 M 步） | 150 M steps/s | **4.4~4.7×** | 22 周期/步 |
+| 20 fps（旧目标，≥50 M/s） | 50 M steps/s | **1.5~1.6×** | 66 周期/步 |
+
+判断：
+
+1. **1.5~1.6×（20 fps）仍然只靠解释器就可能达到**：把上面列的固定成本（`watch`
+   门控、`Kind` 匹配、条件求值、`take_usage_fault`、`check_pending_exceptions`
+   短路）合并成一次「快照比较」，并给 `movs`/`adds`/`subs`/`push`/`pop`/`ldrb` 等
+   常见 16 位编码补上快路径（emerald 热循环已全覆盖，但 MicroPython 字节码解释器
+   未覆盖），估计还能拿到 15~25 %（1.47 → 1.15~1.25 s）。这正好是**本轮目标**
+   （≤1.2 s）的量级，仍有 1.2~1.3× 的不确定性。
+2. **2.2~2.3×（30 fps）需要「块级」执行**：把 N 条指令的取指/译码一次性完成，并在
+   块内把 `pc`/`steps` 的更新折叠成一次（**必须保持逐步可观测**：`watch`、GDB、
+   `--trace-steps`、`[tail]` 需要按步回放，只能在这些调试开关关闭时才允许折叠）。
+   预计 1.8~2.2×，风险在于中断/时基粒度必须保持逐条不变。
+3. **4.4~4.7×（60 fps）需要 JIT**：把 Thumb 译成宿主机器码的**基本块**，guest 寄存器
+   常驻宿主寄存器，块尾用「同一份 `check_pending_exceptions` + `cycles` 记账」收尾。
+   可行性的关键前提在本模拟器里已经具备：
+   - **Flash 只读且带世代号**：`content_generation` 足以使译好的块失效，因此可以
+     做「按地址缓存 + 世代校验」的持久代码缓存，不需要处理自修改代码（自修改只可能
+     发生在 `SRAM`，那条路径可以继续解释执行）。
+   - **指令语义已用差分测试固定**：快路径与完整译码器逐步等价，JIT 可以复用同一批
+     测试作为「解释 vs JIT」的对照。
+   - 主要工作量在**异常入口/出口**（stacks frame、EXC_RETURN、惰性浮点）与
+     **MMIO/独占访问**的边界：这些必须强制回解释器。
+   预计 4~8×（块级 JIT 的常见区间），是唯一能达到 60 fps 的路线；帧级并行（双核
+   分线程）只能拿到 1.3~1.5×。
+
 

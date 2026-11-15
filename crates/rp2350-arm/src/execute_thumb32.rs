@@ -62,6 +62,7 @@ use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
 use super::conditions::ITBlockState;
+use super::decode_cache;
 use super::execute_thumb16::StepResult;
 use super::nvic::Nvic;
 use super::registers::CortexM33Registers;
@@ -177,6 +178,46 @@ pub fn execute_thumb32(
 
     *cycles += 1;
     Ok(result)
+}
+
+/// Execute one cached Thumb-32 integer group / 执行一个缓存的 Thumb-32 整数组
+///
+/// The tag is the group the decode cache recorded for this instruction word, so
+/// the call target is the same function [`execute_thumb32`] would have selected
+/// after its FPU/coprocessor probes and its `op1`/`op2` walk. The caller has
+/// already advanced `PC`, consumed the IT slot and booked the base cycle.
+/// 标签即译码缓存为该指令字记录的组号，因此调用目标与 [`execute_thumb32`] 在跑完
+/// FPU/协处理器探测与 `op1`/`op2` 判定之后所选的是同一个函数。调用方已推进 `PC`、
+/// 消费 IT 槽位并记入基础周期。
+pub(crate) fn execute_group_tag(
+    tag: u8,
+    instr: u32,
+    regs: &mut CortexM33Registers,
+    bus: &mut dyn AddressBus,
+    cycles: &mut u64,
+) -> Result<StepResult, CoreError> {
+    match tag {
+        decode_cache::group32::LOAD_STORE_GROUP => {
+            load_store::execute_group(instr, regs, bus, cycles)
+        }
+        decode_cache::group32::SHIFTED_REGISTER => {
+            Ok(data_processing::execute_shifted_register(instr, regs))
+        }
+        decode_cache::group32::BRANCH_MISC => Ok(branch_misc::execute_branch_or_misc(instr, regs)),
+        decode_cache::group32::MODIFIED_IMMEDIATE => {
+            Ok(data_processing::execute_modified_immediate(instr, regs))
+        }
+        decode_cache::group32::PLAIN_IMMEDIATE => {
+            Ok(branch_misc::execute_plain_immediate(instr, regs))
+        }
+        decode_cache::group32::SATURATE => Ok(dsp::execute_saturate(instr, regs)),
+        decode_cache::group32::BITFIELD => Ok(branch_misc::execute_bitfield(instr, regs)),
+        decode_cache::group32::SINGLE => load_store::execute_single(instr, regs, bus, cycles),
+        decode_cache::group32::REGISTER => Ok(data_processing::execute_register_shifted_or_misc(
+            instr, regs,
+        )),
+        _ => Ok(multiply::execute(instr, regs)),
+    }
 }
 
 /// Shift types used by the Thumb-32 data-processing encodings
