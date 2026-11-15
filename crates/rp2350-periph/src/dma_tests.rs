@@ -14,9 +14,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::dma::{
-    CTRL_BUSY, CTRL_CHAIN_TO_SHIFT, CTRL_DATA_SIZE_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_INCR_WRITE,
-    CTRL_IRQ_QUIET, CTRL_RING_SEL, CTRL_RING_SIZE_SHIFT, CTRL_TREQ_SEL_SHIFT, Dma, DmaChannelState,
-    TREQ_PERMANENT,
+    CTRL_BSWAP, CTRL_BUSY, CTRL_CHAIN_TO_SHIFT, CTRL_DATA_SIZE_SHIFT, CTRL_EN, CTRL_INCR_READ,
+    CTRL_INCR_WRITE, CTRL_IRQ_QUIET, CTRL_RING_SEL, CTRL_RING_SIZE_SHIFT, CTRL_SNIFF_EN,
+    CTRL_TREQ_SEL_SHIFT, Dma, DmaChannelState, SNIFF_BSWAP, SNIFF_CALC_CRC16R, SNIFF_CALC_CRC32R,
+    SNIFF_CALC_SHIFT, SNIFF_CALC_SUM, SNIFF_CALC_XOR, SNIFF_DMACH_SHIFT, SNIFF_EN, TREQ_PERMANENT,
 };
 use crate::dreq;
 use crate::irq::IrqAssert;
@@ -956,6 +957,194 @@ fn zero_length_trigger_completes_chains_and_honours_irq_quiet() {
     f.reg_write(2 * STRIDE + CH_AL3_READ_ADDR_TRIG_OFFSET, 0);
     assert!(!f.channel(2).busy);
     assert_eq!(f.reg_read(INTR) & (1 << 2), 1 << 2);
+}
+
+// ---------------------------------------------------------------------------
+// Sniffer CALC vectors / 嗅探 `CALC` 已知向量
+// ---------------------------------------------------------------------------
+
+/// `SNIFF_CTRL` offset / `SNIFF_CTRL` 偏移
+const SNIFF_CTRL_OFFSET: u32 = 0x454;
+
+/// `SNIFF_DATA` offset / `SNIFF_DATA` 偏移
+const SNIFF_DATA_OFFSET: u32 = 0x458;
+
+/// Build a `SNIFF_CTRL` value for one channel and `CALC` mode
+/// 为某个通道与 `CALC` 模式构造 `SNIFF_CTRL` 值
+fn sniff_ctrl_for(calc: u32, channel: u32) -> u32 {
+    SNIFF_EN | (channel << SNIFF_DMACH_SHIFT) | (calc << SNIFF_CALC_SHIFT)
+}
+
+/// Channel control word that feeds the sniffer / 会把数据送入嗅探器的通控制字
+fn sniffing_ctrl(channel: usize, data_size: u32) -> u32 {
+    ctrl_word(channel, data_size, TREQ_PERMANENT) | CTRL_SNIFF_EN
+}
+
+#[test]
+fn sniff_crc32r_matches_the_bit_reversed_bzip2_vector() {
+    // CALC=0x1（输入字节位反转）等价于 CRC-32/BZIP2 的内部寄存器位反转形式：
+    // 多项式 0x04C1_1DB7、init 0xFFFF_FFFF、refin/refout=false、xorout 0xFFFF_FFFF
+    // 对 "123456789" 的内部寄存器为 0x0376_E6E7，bitreverse32 后即 0xE767_6EC0。
+    // CALC=0x1 (bit-reversed input bytes) is the bit-reversed-register form of
+    // CRC-32/BZIP2 (poly 0x04C1_1DB7, init 0xFFFF_FFFF, no refin/refout): its
+    // internal register for "123456789" is 0x0376_E6E7, so reverse_bits() gives
+    // 0xE767_6EC0 for seed 0xFFFF_FFFF.
+    let mut f = fixture();
+    write_bytes(&mut f, SRC, b"123456789");
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_CRC32R, 0));
+    f.reg_write(SNIFF_DATA_OFFSET, 0xFFFF_FFFF);
+    configure(&mut f, 0, SRC, DST, 9, sniffing_ctrl(0, 0));
+    assert_eq!(f.run(9), 9);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0xE767_6EC0);
+}
+
+#[test]
+fn sniff_crc16r_matches_the_reflected_ccitt_vector() {
+    // CALC=0x3 是 CRC-16/CCITT-FALSE（0x1021, init 0xFFFF）的反射寄存器形式：
+    // 标准校验值 0x29B1 的 bitreverse16 即 0x8D94。
+    // CALC=0x3 is the reflected-register form of CRC-16/CCITT-FALSE (0x1021,
+    // init 0xFFFF): bitreverse16 of the standard check value 0x29B1 is 0x8D94.
+    let mut f = fixture();
+    write_bytes(&mut f, SRC, b"123456789");
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_CRC16R, 0));
+    f.reg_write(SNIFF_DATA_OFFSET, 0x0000_FFFF);
+    configure(&mut f, 0, SRC, DST, 9, sniffing_ctrl(0, 0));
+    assert_eq!(f.run(9), 9);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x8D94);
+    // 结果与正向 CRC16 的 0x29B1 互为位反转，可交叉验证。
+    // The result is the bit reverse of the forward CRC16 value 0x29B1.
+    assert_eq!(0x8D94u16.reverse_bits(), 0x29B1);
+}
+
+#[test]
+fn sniff_sum_wraps_and_masks_to_the_unit_width() {
+    let mut f = fixture();
+    // 半字单元按 16 位掩码累加：0xBEEF + 0x1234 = 0xD123。
+    // Halfword units accumulate under a 16-bit mask: 0xBEEF + 0x1234 = 0xD123.
+    f.write_half(SRC, 0xBEEF);
+    f.write_half(SRC + 2, 0x1234);
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_SUM, 0));
+    configure(&mut f, 0, SRC, DST, 2, sniffing_ctrl(0, 1));
+    assert_eq!(f.run(2), 2);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0xD123);
+    // 32 位加法校验和在 u32 上环绕：0xFFFF_FFFF + 2 = 1。
+    // The 32-bit addition checksum wraps: 0xFFFF_FFFF + 2 = 1.
+    let mut wrap = fixture();
+    wrap.write_word(SRC, 0xFFFF_FFFF);
+    wrap.write_word(SRC + 4, 0x0000_0002);
+    wrap.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_SUM, 0));
+    configure(&mut wrap, 0, SRC, DST, 2, sniffing_ctrl(0, DATA_SIZE_WORD));
+    assert_eq!(wrap.run(2), 2);
+    assert_eq!(wrap.reg_read(SNIFF_DATA_OFFSET), 1);
+}
+
+#[test]
+fn sniff_xor_folds_every_unit_across_a_transfer() {
+    let mut f = fixture();
+    // 奇偶按单元折叠：0x00FF（8 个 1，偶）+ 0x0003（偶）+ 0x0001（奇）= 1。
+    // Parity folds per unit: 0x00FF (8 ones, even) + 0x0003 (even) + 0x0001 = 1.
+    f.write_half(SRC, 0x00FF);
+    f.write_half(SRC + 2, 0x0003);
+    f.write_half(SRC + 4, 0x0001);
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_XOR, 0));
+    configure(&mut f, 0, SRC, DST, 3, sniffing_ctrl(0, 1));
+    assert_eq!(f.run(3), 3);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 1);
+    // 再观察一个奇校验单元后折叠回 0。One odd unit folds it back to 0.
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_XOR, 0));
+    configure(&mut f, 0, SRC + 4, DST, 1, sniffing_ctrl(0, 1));
+    assert_eq!(f.run(1), 1);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0);
+}
+
+#[test]
+fn sniff_reserved_calc_values_leave_the_accumulator_unchanged() {
+    // hardware/regs/dma.h 只定义 CALC 0x0..=0x3、0xE、0xF；0x4..=0xD 为保留值，
+    // 累加器必须保持不变（不伪造算法）。
+    // hardware/regs/dma.h defines only CALC 0x0..=0x3, 0xE and 0xF; 0x4..=0xD are
+    // reserved, so the accumulator must stay untouched (no invented algorithms).
+    let mut f = fixture();
+    write_bytes(&mut f, SRC, b"123456789");
+    for calc in 0x4u32..=0xD {
+        f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(calc, 0));
+        f.reg_write(SNIFF_DATA_OFFSET, 0x1234_5678);
+        configure(&mut f, 0, SRC, DST, 9, sniffing_ctrl(0, 0));
+        assert_eq!(f.run(9), 9, "calc {calc:#X} still moves data");
+        assert_eq!(
+            f.reg_read(SNIFF_DATA_OFFSET),
+            0x1234_5678,
+            "reserved calc {calc:#X} must not touch the accumulator"
+        );
+        assert_eq!(read_bytes(&mut f, DST, 9), b"123456789".to_vec());
+    }
+}
+
+#[test]
+fn sniff_data_read_returns_the_accumulator_without_clearing_it() {
+    // 数据手册：SNIFF_DATA 是种子兼累加器，写入设置，读出不清零。
+    // Datasheet: SNIFF_DATA is seed + accumulator; writes set it, reads do not
+    // clear it.
+    let mut f = fixture();
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_SUM, 0));
+    f.reg_write(SNIFF_DATA_OFFSET, 0x0000_1000);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x0000_1000);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x0000_1000);
+    f.write_word(SRC, 0x0000_0023);
+    configure(&mut f, 0, SRC, DST, 1, sniffing_ctrl(0, DATA_SIZE_WORD));
+    assert_eq!(f.run(1), 1);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x0000_1023);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x0000_1023);
+}
+
+#[test]
+fn sniff_observes_the_post_bswap_unit() {
+    // 嗅探位于通道字节交换之后，因此 CTRL.BSWAP 会改变被观察数据；
+    // 两个 BSWAP 位同时置位时相互抵消（数据手册明确说明）。
+    // The sniffer sits downstream of the channel byte swap, so CTRL.BSWAP
+    // changes what it sees; with both BSWAP bits set the effects cancel.
+    let mut f = fixture();
+    f.write_word(SRC, 0x1122_3344);
+    let swapped = ctrl_word(0, DATA_SIZE_WORD, TREQ_PERMANENT) | CTRL_SNIFF_EN | CTRL_BSWAP;
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_SUM, 0));
+    configure(&mut f, 0, SRC, DST, 1, swapped);
+    assert_eq!(f.run(1), 1);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x4433_2211);
+    assert_eq!(f.read_word(DST), 0x4433_2211);
+    // 两个 BSWAP 抵消：嗅探器又看到原始字节序。
+    // Both swaps cancel: the sniffer sees the original byte order again.
+    f.reg_write(
+        SNIFF_CTRL_OFFSET,
+        sniff_ctrl_for(SNIFF_CALC_SUM, 0) | SNIFF_BSWAP,
+    );
+    f.reg_write(SNIFF_DATA_OFFSET, 0);
+    configure(&mut f, 0, SRC, DST, 1, swapped);
+    assert_eq!(f.run(1), 1);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 0x1122_3344);
+}
+
+#[test]
+fn sniff_accumulator_continues_across_channel_switches() {
+    let mut f = fixture();
+    f.write_word(SRC, 0x0000_0001);
+    f.write_word(SRC + 4, 0x0000_0002);
+    f.write_word(SRC + 0x100, 0x0000_0004);
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_SUM, 0));
+    configure(&mut f, 0, SRC, DST, 2, sniffing_ctrl(0, DATA_SIZE_WORD));
+    assert_eq!(f.run(2), 2);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 3);
+    // DMACH 改到通道 1：累加器继续累加而不是重新开始。
+    // Retarget DMACH to channel 1: the accumulator keeps accumulating.
+    f.reg_write(SNIFF_CTRL_OFFSET, sniff_ctrl_for(SNIFF_CALC_SUM, 1));
+    configure(
+        &mut f,
+        1,
+        SRC + 0x100,
+        DST + 0x100,
+        1,
+        sniffing_ctrl(1, DATA_SIZE_WORD),
+    );
+    assert_eq!(f.run(1), 1);
+    assert_eq!(f.reg_read(SNIFF_DATA_OFFSET), 7);
 }
 
 #[path = "dma_feature_tests.rs"]

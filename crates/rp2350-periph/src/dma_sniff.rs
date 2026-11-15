@@ -17,11 +17,14 @@
 //! CRC with bit-reversed input bytes, `0x2` CRC-16-CCITT (`0x1021`), `0x3` its
 //! bit-reversed input variant (`0x8408`), `0xE` the XOR reduction (parity of
 //! all data bits, result 0 or 1) and `0xF` a 32-bit addition checksum.
-//! `CALC` `0x4..=0xD` are not modelled and leave the accumulator unchanged.
+//! `hardware/regs/dma.h` defines no other encodings: `0x4..=0xD` are reserved
+//! and leave the accumulator unchanged (they are *not* undocumented extra
+//! algorithms).
 //! `SNIFF_DATA` is the accumulator **and** the seed: a write stores the value
 //! verbatim (for example `0xFFFF_FFFF` before a CRC-32 run), each observed read
 //! unit updates it, and a read applies only `OUT_REV`/`OUT_INV` to the
-//! presented value, never to the stored state.
+//! presented value, never to the stored state. A read does **not** clear the
+//! accumulator — only a write does.
 //! 通道每次读出的数据单元都会送入本引擎，运行状态保存在 `SNIFF_DATA`
 //! （`0x458`）。`SNIFF_CTRL`（`0x454`）遵循 RP2350 寄存器头文件布局：
 //! `EN[0]` 总开关、`DMACH[4:1]` 被观察通道、`CALC[8:5]` 校验模式、
@@ -29,10 +32,11 @@
 //! `OUT_INV[11]` 读出结果取反。`CALC` 取值：`0x0` CRC-32/IEEE（反射
 //! `0xEDB8_8320`）、`0x1` 同上但输入字节位反转、`0x2` CRC-16-CCITT
 //! （`0x1021`）、`0x3` 其输入位反转变体（`0x8408`）、`0xE` 全部数据位的异或
-//! 折叠（奇偶，结果为 0/1）、`0xF` 32 位加法校验和。`CALC` `0x4..=0xD` 未建模，
-//! 累加器保持不变。`SNIFF_DATA` 既是累加器也是种子：写入即原样保存（例如
+//! 折叠（奇偶，结果为 0/1）、`0xF` 32 位加法校验和。`hardware/regs/dma.h`
+//! 未定义其它编码：`0x4..=0xD` 为保留值，累加器保持不变（它们*不是*未文档化的
+//! 额外算法）。`SNIFF_DATA` 既是累加器也是种子：写入即原样保存（例如
 //! CRC-32 前写 `0xFFFF_FFFF`），每次观察到的读单元都会更新它；读出只对展示值
-//! 应用 `OUT_REV`/`OUT_INV`，不改变存储状态。
+//! 应用 `OUT_REV`/`OUT_INV`，不改变存储状态。读出**不会**清零累加器，只有写入会。
 
 use super::{
     SNIFF_BSWAP, SNIFF_CALC_CRC16, SNIFF_CALC_CRC16R, SNIFF_CALC_CRC32, SNIFF_CALC_CRC32R,
@@ -130,8 +134,9 @@ pub(super) fn accumulate(ctrl: u32, accumulator: &mut u32, value: u32, data_size
         SNIFF_CALC_SUM => {
             *accumulator = (*accumulator).wrapping_add(value & mask);
         }
-        // CALC 0x4..=0xD 未建模：累加器保持不变。
-        // CALC 0x4..=0xD are not modelled: the accumulator is left unchanged.
+        // 0x4..=0xD 在 dma.h 中未定义（保留）：累加器保持不变，不伪造算法。
+        // 0x4..=0xD are undefined (reserved) in dma.h: leave the accumulator
+        // unchanged instead of inventing algorithms.
         _ => {}
     }
 }

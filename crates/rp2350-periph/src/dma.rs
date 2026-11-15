@@ -73,11 +73,15 @@
 //! channel into the checksum engine documented in `dma_sniff`: sniffing also
 //! requires `SNIFF_CTRL.EN` and a matching `SNIFF_CTRL.DMACH`, and the
 //! `SNIFF_DATA` register is both the seed written by software (for example
-//! `0xFFFF_FFFF` before CRC-32) and the running accumulator. `SNIFF_CTRL.CALC`
-//! selects CRC-32/IEEE (reflected input), CRC-32 with bit-reversed input bytes,
-//! CRC-16-CCITT in both bit orders, the XOR reduction (parity) or the 32-bit
-//! addition checksum; `BSWAP`, `OUT_REV` (bit reverse) and `OUT_INV`
-//! (complement) apply as described in `dma_sniff`. `CTRL_TRIG.HIGH_PRIORITY`
+//! `0xFFFF_FFFF` before CRC-32) and the running accumulator. The sniffer sits
+//! downstream of the channel byte swap, so it observes the *already swapped*
+//! unit; `SNIFF_CTRL.BSWAP` then applies on top, which is why the two swap bits
+//! cancel when both are set. `SNIFF_CTRL.CALC` selects CRC-32/IEEE (reflected
+//! input), CRC-32 with bit-reversed input bytes, CRC-16-CCITT in both bit
+//! orders, the XOR reduction (parity) or the 32-bit addition checksum (`0x4`
+//! through `0xD` are reserved by the register header and leave the accumulator
+//! unchanged); `OUT_REV` (bit reverse) and `OUT_INV` (complement) apply only to
+//! the presented value, as described in `dma_sniff`. `CTRL_TRIG.HIGH_PRIORITY`
 //! channels are served before any normal channel in each scheduling round;
 //! channels of the same priority keep round-robin order.
 //! `TRANS_COUNT[31:28]` 选择传输模式，并与重载计数一起锁存。`0x0` NORMAL 递减
@@ -88,23 +92,50 @@
 //! `CTRL_TRIG.SNIFF_EN` 把被观察通道每次读出的数据送入 `dma_sniff` 记录的校验
 //! 引擎：嗅探还要求 `SNIFF_CTRL.EN` 置位且 `SNIFF_CTRL.DMACH` 匹配；`SNIFF_DATA`
 //! 既是软件写入的种子（例如 CRC-32 前写 `0xFFFF_FFFF`），也是运行累加器。
-//! `SNIFF_CTRL.CALC` 选择 CRC-32/IEEE（反射输入）、输入字节位反转的 CRC-32、
-//! 两种位序的 CRC-16-CCITT、异或折叠（奇偶）或 32 位加法校验和；`BSWAP`、
-//! `OUT_REV`（位反转）与 `OUT_INV`（取反）的语义见 `dma_sniff`。
-//! `CTRL_TRIG.HIGH_PRIORITY` 通道在每个调度轮次中先于任何普通通道被服务；
-//! 同优先级的通道保持轮转顺序。
+//! 嗅探器位于通道字节交换之后，因此它观察的是*已交换*的单元；`SNIFF_CTRL.BSWAP`
+//! 再叠加其上，这就是两个交换位同时置位时相互抵消的原因。`SNIFF_CTRL.CALC`
+//! 选择 CRC-32/IEEE（反射输入）、输入字节位反转的 CRC-32、两种位序的
+//! CRC-16-CCITT、异或折叠（奇偶）或 32 位加法校验和（`0x4..=0xD` 在寄存器头文件中
+//! 为保留值，累加器保持不变）；`OUT_REV`（位反转）与 `OUT_INV`（取反）只作用于
+//! 展示值，语义见 `dma_sniff`。`CTRL_TRIG.HIGH_PRIORITY` 通道在每个调度轮次中
+//! 先于任何普通通道被服务；同优先级的通道保持轮转顺序。
+//!
+//! # Bus accounting / 总线记账
+//!
+//! Every unit performs one bus read and one bus write; [`Dma::bus_counters`]
+//! reports the completed units and the bus cycles those accesses consumed, plus
+//! the number of arbitration grants [`Dma::run`] handed out. When the
+//! controller is built with [`Dma::with_perf`] it also reports every completed
+//! access, attributed by address to a crossbar downstream port, into a
+//! [`crate::busctrl::BusPerf`] bank behind `BUSCTRL.PERFCTR0/1`. This turns "who
+//! held the bus" into queryable data; it is not a cycle-exact arbiter (see the
+//! not-modelled section).
+//! 每个单元执行一次总线读与一次总线写；[`Dma::bus_counters`] 报告完成单元数与
+//! 这些访问消耗的总线周期，以及 [`Dma::run`] 发出的仲裁授予次数。用
+//! [`Dma::with_perf`] 构造时，控制器还会把每次完成的访问按地址归属到交叉开关
+//! 下游端口，并上报到 `BUSCTRL.PERFCTR0/1` 背后的 [`crate::busctrl::BusPerf`]
+//! 计数器组。这把「谁占用了总线」变成可查询数据；它不是周期精确仲裁器（见未建模
+//! 一节）。
 //!
 //! # Not modelled / 未建模项
 //!
 //! The per-channel debug registers at `0x800..=0xBFF`, AHB error recovery
-//! beyond clearing `BUSY`, and the `SNIFF_CTRL.CALC` values `0x4..=0xD` (the
-//! accumulator is left unchanged there) are not modelled. Bus timing is not
-//! cycle-exact and the DMA window does not intercept CPU buses, so transfers
-//! are only performed when the host calls [`Dma::run`].
-//! `0x800..=0xBFF` 的通道调试寄存器、除清除 `BUSY` 之外的 AHB 错误恢复，以及
-//! `SNIFF_CTRL.CALC` 的 `0x4..=0xD`（累加器保持不变）未建模。总线时序不是
-//! 周期精确的，DMA 窗口也不拦截 CPU 总线，因此只有宿主调用 [`Dma::run`] 时才
-//! 执行传输。
+//! beyond clearing `BUSY`, and cycle-exact bus/arbitration timing are not
+//! modelled: contention, downstream stalls and preemption need a shared
+//! multi-master bus model, so `BUSCTRL.PERFSEL` events
+//! `STALL_DOWNSTREAM`/`ACCESS_CONTESTED` stay 0 and DMA accesses are never
+//! stalled by CPU traffic. `SNIFF_CTRL.CALC` values `0x4..=0xD` are reserved in
+//! `hardware/regs/dma.h` (only `0x0..=0x3`, `0xE` and `0xF` are defined), so
+//! they leave the accumulator unchanged. Bus timing is not cycle-exact and the
+//! DMA window does not intercept CPU buses, so transfers are only performed
+//! when the host calls [`Dma::run`].
+//! `0x800..=0xBFF` 的通道调试寄存器、除清除 `BUSY` 之外的 AHB 错误恢复，以及周期
+//! 精确的总线/仲裁时序未建模：争用、下游 stall 与抢占需要共享的多主设备总线模型，
+//! 因此 `BUSCTRL.PERFSEL` 的 `STALL_DOWNSTREAM`/`ACCESS_CONTESTED` 事件保持 0，
+//! DMA 访问也不会被 CPU 流量 stall。`SNIFF_CTRL.CALC` 的 `0x4..=0xD` 在
+//! `hardware/regs/dma.h` 中为保留值（只定义了 `0x0..=0x3`、`0xE`、`0xF`），
+//! 因此累加器保持不变。总线时序不是周期精确的，DMA 窗口也不拦截 CPU 总线，
+//! 因此只有宿主调用 [`Dma::run`] 时才执行传输。
 
 #[path = "dma_mmio.rs"]
 mod mmio;
@@ -118,6 +149,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rp2350_core::bus::{AddressBus, BusResult};
 
+use super::busctrl::BusPerf;
 use super::irq::IrqAssert;
 use super::map;
 
@@ -407,6 +439,33 @@ struct Channel {
     busy: bool,
 }
 
+/// Arbitration and bus-occupancy totals of the DMA master
+/// DMA 主设备的仲裁与总线占用总计
+///
+/// Every executed unit performs one bus read and (unless the read faulted) one
+/// bus write; `read_cycles`/`write_cycles` are the bus cycles those accesses
+/// consumed. `grants` counts the arbitration decisions [`Dma::run`] made, so a
+/// host can compare granted units against moved data. This is *accounting*, not
+/// cycle-exact preemption: the model never stalls a CPU access against a DMA
+/// access.
+/// 每个执行单元执行一次总线读与（读未出错时）一次总线写；`read_cycles` /
+/// `write_cycles` 是这些访问消耗的总线周期。`grants` 统计 [`Dma::run`] 做出的
+/// 仲裁决定数，宿主可据此把授予单元数与搬运数据对照。这是*记账*而非周期精确
+/// 抢占：模型不会让 CPU 访问与 DMA 访问互相 stall。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DmaBusCounters {
+    /// Completed read units / 完成的读单元数
+    pub read_units: u64,
+    /// Completed write units / 完成的写单元数
+    pub write_units: u64,
+    /// Bus cycles consumed by reads / 读消耗的总线周期
+    pub read_cycles: u64,
+    /// Bus cycles consumed by writes / 写消耗的总线周期
+    pub write_cycles: u64,
+    /// Arbitration grants (one per attempted unit) / 仲裁授予次数（每个尝试单元一次）
+    pub grants: u64,
+}
+
 /// Shared register file and channel state / 共享寄存器文件与通道状态
 #[derive(Debug)]
 struct DmaState {
@@ -425,6 +484,8 @@ struct DmaState {
     sniff_ctrl: u32,
     sniff_data: u32,
     cursor: usize,
+    /// Bus-occupancy totals of this master / 本主设备的总线占用总计
+    bus: DmaBusCounters,
 }
 
 impl Default for DmaState {
@@ -449,6 +510,7 @@ impl Default for DmaState {
             sniff_ctrl: 0,
             sniff_data: 0,
             cursor: 0,
+            bus: DmaBusCounters::default(),
         }
     }
 }
@@ -492,20 +554,65 @@ enum BusFault {
 #[derive(Clone)]
 pub struct Dma {
     state: Arc<Mutex<DmaState>>,
+    /// Optional bus-fabric counter bank (`BUSCTRL.PERFCTR0/1`)
+    /// 可选的总线矩阵计数器组（`BUSCTRL.PERFCTR0/1`）
+    perf: Option<BusPerf>,
     irq: IrqAssert,
 }
 
 impl Dma {
     /// Create a DMA controller asserting lines into `irq`
     /// 创建向 `irq` 断言中断线的 DMA 控制器
+    ///
+    /// The controller is not wired to a bus-fabric counter bank; use
+    /// [`Self::with_perf`] to report into [`crate::busctrl::BusCtrl`].
+    /// 控制器未接线到总线矩阵计数器组；用 [`Self::with_perf`] 向
+    /// [`crate::busctrl::BusCtrl`] 上报。
     #[must_use]
     pub fn new(irq: IrqAssert) -> Self {
         let mut state = DmaState::default();
         state.reset();
         Self {
             state: Arc::new(Mutex::new(state)),
+            perf: None,
             irq,
         }
+    }
+
+    /// Create a DMA controller reporting into a shared counter bank
+    /// 创建向共享计数器组上报的 DMA 控制器
+    ///
+    /// Pass `BusCtrl::perf()` so firmware reads the accumulated `PERFCTR0/1`
+    /// values; every completed read and write is attributed to its crossbar
+    /// downstream port (see [`crate::busctrl::port_of_address`]).
+    /// 传入 `BusCtrl::perf()` 后固件即可读到累积的 `PERFCTR0/1`；每次完成的读/写
+    /// 都会归属到对应的交叉开关下游端口（见 [`crate::busctrl::port_of_address`]）。
+    #[must_use]
+    pub fn with_perf(irq: IrqAssert, perf: BusPerf) -> Self {
+        let mut state = DmaState::default();
+        state.reset();
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            perf: Some(perf),
+            irq,
+        }
+    }
+
+    /// Shared counter bank, when one was wired / 已接线时的共享计数器组
+    #[must_use]
+    pub fn perf(&self) -> Option<&BusPerf> {
+        self.perf.as_ref()
+    }
+
+    /// Bus-occupancy totals of this master / 本主设备的总线占用总计
+    ///
+    /// Unlike `PERFCTR0/1` these totals are always available, whether or not a
+    /// [`BusPerf`] bank is wired, because they live in the register file.
+    /// 与 `PERFCTR0/1` 不同，这些总计始终可用（无论是否接线 [`BusPerf`] 计数器组），
+    /// 因为它们保存在寄存器文件内。
+    #[must_use]
+    pub fn bus_counters(&self) -> DmaBusCounters {
+        self.state.lock().bus
     }
 
     /// Advance the four pacing timers by `cycles` DMA cycles
@@ -536,10 +643,13 @@ impl Dma {
     /// one bus read plus one bus write per unit; completion clears `BUSY`,
     /// raises `INTR` unless `IRQ_QUIET` is set, and starts `CHAIN_TO`. Returns
     /// the number of units attempted, so a caller can stop at its cycle budget.
+    /// Every unit also updates [`Self::bus_counters`] and, when a counter bank
+    /// is wired, the `BUSCTRL` performance counters.
     /// 通道按轮转顺序访问。通道在 `EN` 与 `BUSY` 置位且其 `TREQ_SEL` 请求断言时
     /// 可执行。每次调用对每个数据单元执行一次总线读与一次总线写；完成时清除
     /// `BUSY`、在未置 `IRQ_QUIET` 时置位 `INTR`，并启动 `CHAIN_TO`。返回尝试
-    /// 执行的单元数，调用方可据此按周期预算停止。
+    /// 执行的单元数，调用方可据此按周期预算停止。每个单元还会更新
+    /// [`Self::bus_counters`]，已接线计数器组时也更新 `BUSCTRL` 性能计数器。
     #[must_use]
     pub fn run(&mut self, bus: &mut dyn AddressBus, max_transfers: u64) -> u64 {
         let mut performed = 0u64;
@@ -548,19 +658,38 @@ impl Dma {
             let Some(job) = self.claim_job() else {
                 break;
             };
+            let read_start = cycles;
+            let mut read = None;
+            let mut write = None;
             let outcome = match read_unit(bus, job.read_addr, job.data_size, &mut cycles) {
                 Ok(value) => {
-                    // 嗅探观察读侧原始数据（字节交换之前），写侧再应用 BSWAP。
-                    // The sniffer observes the raw read data (before BSWAP);
-                    // the write side applies the byte swap afterwards.
-                    self.sniff_unit(job.channel, job.ctrl, value, job.data_size);
+                    let read_cycles = cycles - read_start;
+                    read = Some(read_cycles);
+                    // 嗅探位于通道字节交换之后：先做 BSWAP，再送入校验引擎，
+                    // 于是 CTRL.BSWAP 与 SNIFF_CTRL.BSWAP 同时置位时相互抵消。
+                    // The sniffer sits downstream of the channel byte swap, so
+                    // BSWAP runs first: CTRL.BSWAP and SNIFF_CTRL.BSWAP cancel.
                     let value = apply_bswap(job.ctrl, value, job.data_size);
-                    write_unit(bus, job.write_addr, job.data_size, value, &mut cycles)
-                        .map_err(|_| BusFault::Write)
+                    if let Some(perf) = &self.perf {
+                        perf.record_read(job.read_addr, read_cycles);
+                    }
+                    self.sniff_unit(job.channel, job.ctrl, value, job.data_size);
+                    let write_start = cycles;
+                    let outcome =
+                        write_unit(bus, job.write_addr, job.data_size, value, &mut cycles)
+                            .map_err(|_| BusFault::Write);
+                    let write_cycles = cycles - write_start;
+                    if outcome.is_ok() {
+                        write = Some(write_cycles);
+                        if let Some(perf) = &self.perf {
+                            perf.record_write(job.write_addr, write_cycles);
+                        }
+                    }
+                    outcome
                 }
                 Err(_) => Err(BusFault::Read),
             };
-            self.finish_job(job.channel, outcome.err());
+            self.finish_job(job.channel, outcome.err(), read, write);
             performed += 1;
         }
         performed
@@ -774,8 +903,31 @@ impl Dma {
 
     /// Commit one unit: advance addresses, decrement the count, chain and IRQ
     /// 提交一个数据单元：推进地址、递减计数、链式启动与中断
-    fn finish_job(&self, index: usize, fault: Option<BusFault>) {
+    ///
+    /// `read`/`write` carry the bus cycles each side consumed; `None` means the
+    /// access failed, so it is not counted as a completed unit.
+    /// `read`/`write` 携带两侧各消耗的总线周期；`None` 表示访问失败，因此不计入
+    /// 完成单元。
+    fn finish_job(
+        &self,
+        index: usize,
+        fault: Option<BusFault>,
+        read: Option<u64>,
+        write: Option<u64>,
+    ) {
         let mut state = self.state.lock();
+        state.bus.grants = state.bus.grants.saturating_add(1);
+        if let Some(perf) = &self.perf {
+            perf.record_grant();
+        }
+        if let Some(cycles) = read {
+            state.bus.read_units = state.bus.read_units.saturating_add(1);
+            state.bus.read_cycles = state.bus.read_cycles.saturating_add(cycles);
+        }
+        if let Some(cycles) = write {
+            state.bus.write_units = state.bus.write_units.saturating_add(1);
+            state.bus.write_cycles = state.bus.write_cycles.saturating_add(cycles);
+        }
         let mut completed = false;
         let mut quiet = true;
         let mut chain = index;

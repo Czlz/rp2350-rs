@@ -99,7 +99,7 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 3. **Wave 3 ✅**：P0-3a（arm+core）‖ P1-1（cli lib + `play` worker + headless `--frames`）
 4. **Wave 4 ✅**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2（egui PlayView 已接线到真实 `PlaySession`）
 5. **Wave 5 ✅**：P0-3c（arm 译码缓存）‖ P2-3（GUI 音频）+ 示例配置整改（`profile.conf` / CLI `--profile` / GUI 无默认值）
-6. **Wave 6 🚧**：GAP-07 ✅（`WFI`/`WFE`/`SEV` + 阻塞 FIFO + 睡眠调度，**正确性**）‖ GAP-11（DMA `SNIFF`/`PERFCTR`）
+6. **Wave 6 🚧**：GAP-07 ✅（`WFI`/`WFE`/`SEV` + 阻塞 FIFO + 睡眠调度，**正确性**）‖ GAP-11 ✅ 部分（DMA `SNIFF` 向量核对 + `PERFCTR`/`PERFSEL` 事件计数 + 总线记账；周期精确仲裁仍待）
 7. **Wave 7 🚧**：GAP-08b ✅（CLI 挂载 PSRAM）+ P3-2（存档/复位）+ GAP-12（文档）；P3-3（soak）最后
 
 ## 3.6 精度任务（当前最高优先级）/ Precision tasks
@@ -116,7 +116,7 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 |----|------|------|------|
 | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ + 总线 stall，重新落地 `WFI`/`WFE`/`SEV` 睡眠语义 | periph → arm/riscv/cli | ✅ 已完成（`BusErrorKind::Stall` + `MemoryRegion::read_would_stall`、`SIO_FIFO_ST` 粘滞位与写 1 清除、事件世代号、ARM/RISC-V 睡眠状态机、`[run] sleep` 统计） |
 | GAP-08b | CLI 挂载 PSRAM 窗口（模型已完成，地址可配置） | cli | ✅ 已完成（`MachineOptions::psram` + `PsramOptions::parse`；`--psram`/profile `psram` 覆盖 `run`/`repl`/`play`/`gdb`；未启用时 `0x1100_0000` 仍 `NoDevice`；超限/未对齐按 periph 规则钳制到 16 MiB 并只警告一次；挂载失败映射为启动错误） |
-| GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | 🚧 Wave 6 |
+| GAP-11 | DMA `SNIFF` 其余模式 / `PERFCTR` / 周期精确仲裁 | periph | ✅ 部分完成（`SNIFF_CTRL.CALC` 已按 `dma.h` 核对：仅 `0x0..=0x3`/`0xE`/`0xF` 有定义并有标准向量，`0x4..=0xD` 为保留值；嗅探改为观察通道 BSWAP 之后的单元；`BUSCTRL.PERFCTR0/1`+`PERFSEL0/1` 按端口累加 DMA `ACCESS`/`STALL_UPSTREAM`；`DmaBusCounters` 记账 DMA 占用周期与授予；**剩余**：`STALL_DOWNSTREAM`/`ACCESS_CONTESTED`、CPU 主设备事件与真正抢占需周期精确模型，`BootPeripherals` 内 `Dma`↔`BusCtrl` 接线需 `boot.rs` 一行） |
 | GAP-10 | MCP TLS 传输 | mcp | ⏳ |
 | GAP-12 | 陈旧文档段落同步 | doc | ⏳ |
 

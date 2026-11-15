@@ -70,6 +70,8 @@ pub use uart::UartSink;
 #[cfg(test)]
 mod audio_tests;
 #[cfg(test)]
+mod busctrl_tests;
+#[cfg(test)]
 mod dma_tests;
 #[cfg(test)]
 mod hstx_tests;

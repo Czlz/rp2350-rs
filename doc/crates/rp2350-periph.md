@@ -827,10 +827,13 @@ by `BootPeripherals::dma()` / `dma_mut()` observe the same state.
 句柄看到相同状态。
 
 ```rust
-pub struct Dma { /* shared register file + IrqAssert */ }
+pub struct Dma { /* shared register file + IrqAssert + optional BusPerf */ }
 
 impl Dma {
     pub fn new(irq: IrqAssert) -> Self;
+    pub fn with_perf(irq: IrqAssert, perf: BusPerf) -> Self;
+    pub fn perf(&self) -> Option<&BusPerf>;
+    pub fn bus_counters(&self) -> DmaBusCounters;
     pub fn run(&mut self, bus: &mut dyn AddressBus, max_transfers: u64) -> u64;
     pub fn advance(&mut self, cycles: u64);
     pub fn set_dreq(&self, dreq: u8, asserted: bool);
@@ -840,6 +843,14 @@ impl Dma {
     pub fn abort(&mut self, mask: u16);
     pub fn busy_mask(&self) -> u16;
     pub fn channel_state(&self, index: usize) -> Option<DmaChannelState>;
+}
+
+pub struct DmaBusCounters {
+    pub read_units: u64,    // completed reads / 完成的读单元
+    pub write_units: u64,   // completed writes / 完成的写单元
+    pub read_cycles: u64,   // bus cycles consumed by reads / 读占用的总线周期
+    pub write_cycles: u64,  // bus cycles consumed by writes / 写占用的总线周期
+    pub grants: u64,        // arbitration grants / 仲裁授予次数
 }
 
 pub struct DmaChannelState {
@@ -971,31 +982,43 @@ clears both `EN` and `BUSY`.
 - `CTRL_TRIG.SNIFF_EN` feeds the observed channel's read units into the checksum
   engine. All three conditions are required: `SNIFF_CTRL.EN[0]` is set, the
   channel carries `CTRL_TRIG.SNIFF_EN`, and the channel index equals
-  `SNIFF_CTRL.DMACH[4:1]`. `SNIFF_DATA` (`0x458`) is both the seed written by
-  software (for example `0xFFFF_FFFF` before CRC-32) and the running
-  accumulator: each observed unit updates it, and a read applies only
+  `SNIFF_CTRL.DMACH[4:1]`. The sniffer sits **downstream of the channel byte
+  swap**, so it observes the already `CTRL_TRIG.BSWAP`-transformed unit and
+  `SNIFF_CTRL.BSWAP[9]` then reverses it again — with both bits set the two
+  swaps cancel, matching the datasheet note. `SNIFF_DATA` (`0x458`) is both the
+  seed written by software (for example `0xFFFF_FFFF` before CRC-32) and the
+  running accumulator: each observed unit updates it, a read applies only
   `OUT_REV[10]` (bit reverse) and `OUT_INV[11]` (complement) to the presented
-  value, never to the stored state. `SNIFF_CTRL.CALC[8:5]` selects `0x0`
-  CRC-32/IEEE (reflected polynomial `0xEDB8_8320`), `0x1` the same CRC with
-  bit-reversed input bytes, `0x2` CRC-16-CCITT (`0x1021`), `0x3` CRC-16-CCITT
-  with bit-reversed input, `0xE` the XOR reduction (parity of all data bits,
-  result 0 or 1) and `0xF` a 32-bit addition checksum. `BSWAP[9]` byte-reverses
-  the sniffed unit before the checksum. With seed `0xFFFF_FFFF`, the bytes of
-  `"123456789"`, `CALC = 0` and `OUT_INV = 1`, `SNIFF_DATA` reads
-  `0xCBF4_3926`; CRC-16 with seed `0xFFFF` reads `0x29B1`. `CALC` values
-  `0x4..=0xD` leave the accumulator unchanged.
+  value, and a read never clears it (only a write sets the accumulator).
+  `SNIFF_CTRL.CALC[8:5]` follows `hardware/regs/dma.h`: `0x0` CRC-32/IEEE
+  (reflected polynomial `0xEDB8_8320`, i.e. the 802.3/zlib bit order), `0x1` the
+  same CRC with bit-reversed input bytes, `0x2` CRC-16-CCITT (`0x1021`), `0x3`
+  CRC-16-CCITT with bit-reversed input (`0x8408`), `0xE` the XOR reduction
+  (parity of all data bits, result 0 or 1) and `0xF` a 32-bit addition checksum
+  (`wrapping_add`, masked to the unit width). `0x4..=0xD` are reserved by the
+  header — no other algorithms exist — and leave the accumulator unchanged.
+  Known vectors (all over the bytes of `"123456789"`): seed `0xFFFF_FFFF`,
+  `CALC = 0x0`, `OUT_INV = 1` → `0xCBF4_3926`; seed `0xFFFF_FFFF`,
+  `CALC = 0x1` → `0xE767_6EC0` (bit reverse of the CRC-32/BZIP2 register
+  `0x0376_E6E7`); seed `0xFFFF`, `CALC = 0x2` → `0x29B1` and `CALC = 0x3` →
+  `0x8D94` (bit reverse of `0x29B1`).
   `CTRL_TRIG.SNIFF_EN` 把被观察通道读出的数据送入校验引擎。需要同时满足三个
   条件：`SNIFF_CTRL.EN[0]` 置位、通道置 `CTRL_TRIG.SNIFF_EN`、且通道号等于
-  `SNIFF_CTRL.DMACH[4:1]`。`SNIFF_DATA`（`0x458`）既是软件写入的种子（例如
-  CRC-32 前写 `0xFFFF_FFFF`），也是运行累加器：每次观察到的单元都会更新它；
-  读出只对展示值应用 `OUT_REV[10]`（位反转）与 `OUT_INV[11]`（取反），不改变
-  存储状态。`SNIFF_CTRL.CALC[8:5]` 取值：`0x0` CRC-32/IEEE（反射多项式
-  `0xEDB8_8320`）、`0x1` 同上但输入字节位反转、`0x2` CRC-16-CCITT（`0x1021`）、
-  `0x3` 输入位反转的 CRC-16-CCITT、`0xE` 全部数据位异或折叠（奇偶，结果 0/1）、
-  `0xF` 32 位加法校验和。`BSWAP[9]` 在送入校验器前把嗅探单元按字节反转。种子
-  `0xFFFF_FFFF`、数据 `"123456789"`、`CALC = 0`、`OUT_INV = 1` 时，
-  `SNIFF_DATA` 读回 `0xCBF4_3926`；CRC-16 种子 `0xFFFF` 时读回 `0x29B1`。
-  `CALC` 的 `0x4..=0xD` 使累加器保持不变。
+  `SNIFF_CTRL.DMACH[4:1]`。嗅探器位于**通道字节交换之后**，因此它观察的是已按
+  `CTRL_TRIG.BSWAP` 变换过的单元，`SNIFF_CTRL.BSWAP[9]` 再反转一次——两个位同时
+  置位时相互抵消，与数据手册说明一致。`SNIFF_DATA`（`0x458`）既是软件写入的种子
+  （例如 CRC-32 前写 `0xFFFF_FFFF`），也是运行累加器：每次观察到的单元都会更新
+  它；读出只对展示值应用 `OUT_REV[10]`（位反转）与 `OUT_INV[11]`（取反），且读出
+  从不清零（只有写入才会设置累加器）。`SNIFF_CTRL.CALC[8:5]` 遵循
+  `hardware/regs/dma.h`：`0x0` CRC-32/IEEE（反射多项式 `0xEDB8_8320`，即
+  802.3/zlib 位序）、`0x1` 同上但输入字节位反转、`0x2` CRC-16-CCITT（`0x1021`）、
+  `0x3` 输入位反转的 CRC-16-CCITT（`0x8408`）、`0xE` 全部数据位异或折叠（奇偶，
+  结果 0/1）、`0xF` 32 位加法校验和（`wrapping_add`，按单元宽度掩码）。
+  `0x4..=0xD` 在头文件中为保留值——不存在其它算法——累加器保持不变。
+  已知向量（数据均为 `"123456789"` 的字节）：种子 `0xFFFF_FFFF`、`CALC = 0x0`、
+  `OUT_INV = 1` → `0xCBF4_3926`；种子 `0xFFFF_FFFF`、`CALC = 0x1` → `0xE767_6EC0`
+  （CRC-32/BZIP2 寄存器 `0x0376_E6E7` 的位反转）；种子 `0xFFFF`、`CALC = 0x2` →
+  `0x29B1`、`CALC = 0x3` → `0x8D94`（`0x29B1` 的位反转）。
 - `CTRL_TRIG.HIGH_PRIORITY` changes arbitration: in every scheduling round all
   eligible high-priority channels are served before any normal channel, while
   channels of the same priority keep round-robin order. A busy high-priority
@@ -1015,6 +1038,44 @@ clears both `EN` and `BUSY`.
   `BUSY` and raises no completion interrupt.
   总线读/写错误会锁存 `READ_ERROR` / `WRITE_ERROR`、清除 `BUSY`，且不产生
   完成中断。
+
+### Bus accounting / 总线记账
+
+Every executed unit performs one bus read and one bus write, and both report the
+bus cycles they consumed through the `cycles` out-parameter of
+`AddressBus`. `Dma::bus_counters` publishes those totals per master together
+with the number of arbitration grants `Dma::run` handed out, so a host can see
+how much of the bus the DMA claimed without a cycle-exact arbiter:
+每个执行单元执行一次总线读与一次总线写，二者都通过 `AddressBus` 的 `cycles`
+出参回报消耗的总线周期。`Dma::bus_counters` 按主设备发布这些总计以及
+`Dma::run` 发出的仲裁授予次数，因此宿主无需周期精确仲裁器也能看到 DMA 占用了
+多少总线：
+
+```rust
+pub struct DmaBusCounters {
+    pub read_units: u64,
+    pub write_units: u64,
+    pub read_cycles: u64,
+    pub write_cycles: u64,
+    pub grants: u64,
+}
+```
+
+`Dma::with_perf(irq, busctrl.perf())` additionally reports every completed
+access into the `BUSCTRL` performance counters: the access address is attributed
+to a crossbar downstream port (`busctrl::port_of_address`: ROM, XIP main 0/1,
+the ten SRAM banks, APB, fast peripheral) and `PERFSELn = ACCESS` counts one,
+`PERFSELn = STALL_UPSTREAM` adds the consumed cycles. `Dma::new` leaves the
+controller unwired, which is what `BootPeripherals::mount` uses: the counters
+then store `PERFSEL`/`PERFCTR_EN` correctly but nothing increments them. Wiring
+`Dma` to `BusCtrl` inside `BootPeripherals` needs a change in `boot.rs`.
+`Dma::with_perf(irq, busctrl.perf())` 还会把每次完成的访问上报到 `BUSCTRL`
+性能计数器：访问地址被归属到交叉开关下游端口（`busctrl::port_of_address`：
+ROM、XIP main 0/1、十个 SRAM 存储体、APB、快速外设），`PERFSELn = ACCESS`
+计 1，`PERFSELn = STALL_UPSTREAM` 累加消耗的周期。`Dma::new` 不接线，这正是
+`BootPeripherals::mount` 目前的用法：计数器仍能正确保存 `PERFSEL`/`PERFCTR_EN`，
+但不会有任何递增。要让 `BootPeripherals` 内的 `Dma` 与 `BusCtrl` 接线需要在
+`boot.rs` 中改动一行。
 
 ### DREQ / DREQ 请求
 
@@ -1113,15 +1174,19 @@ HSTX 扫描输出使用 SDK 经典的三通道环，模型端到端复现
 ### Not modelled / 未建模项
 
 The per-channel debug registers at `0x800..=0xBFF`, AHB error recovery beyond
-clearing `BUSY`, cycle-exact bus and arbitration timing, and the
-`SNIFF_CTRL.CALC` values `0x4..=0xD` (the accumulator is left unchanged there)
-are not modelled. `PERFCTR` and the other extended registers read as zero;
-writes are ignored. The DMA device never intercepts CPU bus traffic: transfers
-happen only inside `Dma::run`.
-`0x800..=0xBFF` 的通道调试寄存器、除清除 `BUSY` 之外的 AHB 错误恢复、周期精确的
-总线与仲裁时序，以及 `SNIFF_CTRL.CALC` 的 `0x4..=0xD`（累加器保持不变）未建模。
-`PERFCTR` 等扩展寄存器读出 0、写入被忽略。DMA 设备不拦截 CPU 总线流量：传输只在
-`Dma::run` 内部发生。
+clearing `BUSY`, and cycle-exact bus/arbitration timing are not modelled.
+Contention, downstream stalls and preemption need a shared multi-master bus
+model, so `BUSCTRL.PERFSEL` events `STALL_DOWNSTREAM`/`ACCESS_CONTESTED` stay 0
+and a DMA access is never stalled by CPU traffic. `SNIFF_CTRL.CALC` values
+`0x4..=0xD` are reserved in `hardware/regs/dma.h` (only `0x0..=0x3`, `0xE` and
+`0xF` exist) and leave the accumulator unchanged. The DMA device never
+intercepts CPU bus traffic: transfers happen only inside `Dma::run`.
+`0x800..=0xBFF` 的通道调试寄存器、除清除 `BUSY` 之外的 AHB 错误恢复，以及周期
+精确的总线/仲裁时序未建模。争用、下游 stall 与抢占需要共享的多主设备总线模型，
+因此 `BUSCTRL.PERFSEL` 的 `STALL_DOWNSTREAM`/`ACCESS_CONTESTED` 事件保持 0，
+DMA 访问也不会被 CPU 流量 stall。`SNIFF_CTRL.CALC` 的 `0x4..=0xD` 在
+`hardware/regs/dma.h` 中为保留值（只存在 `0x0..=0x3`、`0xE`、`0xF`），累加器
+保持不变。DMA 设备不拦截 CPU 总线流量：传输只在 `Dma::run` 内部发生。
 
 ### Host driving / 宿主驱动方式
 
@@ -1599,15 +1664,119 @@ interrupt routing (`PROC0_*`/`PROC1_*`) is plain storage.
 ## BUSCTRL
 
 `busctrl::BusCtrl` models the `BUSCTRL` block at `map::BUSCTRL_BASE`
-(`0x4006_8000`): `BUS_PRIORITY` stores the DMA/core priority hints
-(`BUS_PRIORITY_ACK` always reads 1 because the model applies them immediately),
-`PERFCTR_EN` and the counter/selector registers are plain storage, and the
-standard SET/CLR/XOR aliases fold onto the 4 KB block. Firmware writes it during
-display bring-up (`bus_ctrl_hw->priority`).
+(`0x4006_8000`): the `BUS_PRIORITY` master priority hints, the `BUS_PRIORITY_ACK`
+handshake, `PERFCTR_EN`, and the two bus-fabric performance counters
+`PERFCTR0/1` with their `PERFSEL0/1` selectors. The standard SET/CLR/XOR aliases
+fold onto the 4 KB block. Firmware writes it during display bring-up
+(`bus_ctrl_hw->priority`).
 `busctrl::BusCtrl` 建模 `map::BUSCTRL_BASE`（`0x4006_8000`）处的 `BUSCTRL` 块：
-`BUS_PRIORITY` 保存 DMA/核心优先级提示（`BUS_PRIORITY_ACK` 恒读 1，因为模型
-立即生效），`PERFCTR_EN` 与计数器/选择寄存器为普通存储，标准 SET/CLR/XOR 别名
-折叠到 4 KB 块上。固件在显示初始化时写入它（`bus_ctrl_hw->priority`）。
+`BUS_PRIORITY` 主设备优先级提示、`BUS_PRIORITY_ACK` 握手、`PERFCTR_EN`，以及
+两个总线矩阵性能计数器 `PERFCTR0/1` 与其 `PERFSEL0/1` 选择器。标准
+SET/CLR/XOR 别名折叠到 4 KB 块上。固件在显示初始化时写入它
+（`bus_ctrl_hw->priority`）。
+
+```rust
+pub struct BusCtrl { /* register file + BusPerf bank */ }
+pub struct BusPerf { /* cloneable Arc<Mutex<counters>> */ }
+
+pub enum BusPort { SiobProc1, SiobProc0, Apb, FastPeri, Sram(u8), XipMain1, XipMain0, Rom }
+
+impl BusCtrl {
+    pub fn new() -> Self;                     // private counter bank / 私有计数器组
+    pub fn with_perf(perf: BusPerf) -> Self;  // shared with Dma / 与 Dma 共享
+    pub fn perf(&self) -> BusPerf;
+    pub fn priority(&self) -> u32;
+    pub fn dma_bus_cycles(&self) -> u64;
+    pub fn dma_grants(&self) -> u64;
+    pub fn dma_occupancy(&self, total_cycles: u64) -> u32; // per mille / 千分比
+    pub fn perf_snapshot(&self) -> BusPerfSnapshot;
+}
+
+impl BusPerf {
+    pub fn record_read(&self, address: u32, cycles: u64);
+    pub fn record_write(&self, address: u32, cycles: u64);
+    pub fn record_grant(&self);
+    pub fn snapshot(&self) -> BusPerfSnapshot;
+    pub fn occupancy(&self, total_cycles: u64) -> u32;
+}
+```
+
+### Register map / 寄存器映射
+
+| Offset | Register | Model / 模型 |
+|--------|----------|--------------|
+| `0x00` | `BUS_PRIORITY` | `PROC0[0]`, `PROC1[4]`, `DMA_R[8]`, `DMA_W[12]`, mask `0x1111` / 四个优先级提示位，掩码 `0x1111` |
+| `0x04` | `BUS_PRIORITY_ACK` | reads 1 (the model latches immediately) / 读 1（模型立即锁存） |
+| `0x08` | `PERFCTR_EN` | bit 0 gates both counters / bit0 门控两个计数器 |
+| `0x0C` | `PERFCTR0` | 24-bit saturating counter, write any value to clear / 24 位饱和计数器，写任意值清零 |
+| `0x10` | `PERFSEL0` | 7-bit event select, reset `0x1F` (`sram6_access`) / 7 位事件选择，复位 `0x1F` |
+| `0x14` | `PERFCTR1` | second counter / 第二个计数器 |
+| `0x18` | `PERFSEL1` | second selector / 第二个选择器 |
+
+### Performance events / 性能事件
+
+`PERFSELn` selects one of `0x00..=0x43` event codes: code `n` means port `n / 4`
+and kind `n % 4`, with kinds `STALL_UPSTREAM`, `STALL_DOWNSTREAM`,
+`ACCESS_CONTESTED` and `ACCESS`. The port order is the datasheet order
+(`siob_proc1`, `siob_proc0`, `apb`, `fastperi`, `sram9..=sram0`, `xip_main1`,
+`xip_main0`, `rom`); `busctrl::BusPort::event_code` builds the code and
+`busctrl::port_of_address` attributes an address.
+`PERFSELn` 从 `0x00..=0x43` 的事件码中选择一个：码 `n` 表示端口 `n / 4`、种类
+`n % 4`，种类依次为 `STALL_UPSTREAM`、`STALL_DOWNSTREAM`、`ACCESS_CONTESTED`、
+`ACCESS`。端口顺序即数据手册顺序（`siob_proc1`、`siob_proc0`、`apb`、
+`fastperi`、`sram9..=sram0`、`xip_main1`、`xip_main0`、`rom`）；
+`busctrl::BusPort::event_code` 生成事件码，`busctrl::port_of_address` 做地址归属。
+
+Implemented events (fed by the DMA master through `Dma::with_perf`):
+已实现事件（由 `Dma::with_perf` 接线的 DMA 主设备提供）：
+
+- `ACCESS` — one completed DMA read or write attributed to the port by address
+  (SRAM banks are decoded from the 520 KiB layout, XIP `0x1000_0000`/`0x1100_0000`
+  to main 0/1, `0x4000_0000` to APB, `0x5000_0000` to the fast peripherals).
+  `ACCESS` — 每次完成的 DMA 读/写按地址归属到端口（SRAM 存储体按 520 KiB 布局
+  解码，XIP 的 `0x1000_0000`/`0x1100_0000` 归属 main 0/1，`0x4000_0000` 归属
+  APB，`0x5000_0000` 归属快速外设）。
+- `STALL_UPSTREAM` — the bus cycles that access consumed (the `cycles`
+  out-parameter), a proxy for how long the master held the fabric.
+  `STALL_UPSTREAM` — 该访问消耗的总线周期（`cycles` 出参），作为主设备占用总线
+  矩阵时长的代理指标。
+
+Not implemented: `STALL_DOWNSTREAM` and `ACCESS_CONTESTED` stay 0 because both
+need a cycle-exact multi-master arbiter, and `siob_proc0/1` events stay 0 because
+CPU accesses do not pass through the peripheral models. Counters saturate at
+`0x00FF_FFFF`; only a write to `PERFCTR` clears them (changing `PERFSEL` keeps
+the accumulated value, exactly as the datasheet specifies — it documents no
+other clear).
+未实现：`STALL_DOWNSTREAM` 与 `ACCESS_CONTESTED` 保持 0，因为二者需要周期精确的
+多主设备仲裁器；`siob_proc0/1` 事件也保持 0，因为 CPU 访问不经过外设模型。
+计数器在 `0x00FF_FFFF` 饱和；只有写 `PERFCTR` 才清零（改变 `PERFSEL` 会保留
+已累积值，与数据手册一致——手册没有规定其它清零方式）。
+
+### Accounting and occupancy / 记账与占用率
+
+`BusPerf` also keeps monotonic host-side totals that are not registers:
+`dma_read_units`, `dma_write_units`, `dma_cycles`, `grants` and per-port
+`port_accesses`/`port_cycles`. They survive `BusCtrl::reset`. `Dma::bus_counters`
+reports the same master totals even when no counter bank is wired, and
+`BusCtrl::dma_occupancy(total_cycles)` returns the DMA share of a caller-supplied
+cycle window in parts per thousand (saturating at 1000), which is how
+DMA-versus-CPU contention becomes observable.
+`BusPerf` 还保存不映射寄存器的单调宿主侧总计：`dma_read_units`、
+`dma_write_units`、`dma_cycles`、`grants` 以及每端口 `port_accesses`/
+`port_cycles`。它们会在 `BusCtrl::reset` 后保留。`Dma::bus_counters` 即使未接线
+计数器组也会报告同样的主设备总计；`BusCtrl::dma_occupancy(total_cycles)` 返回
+DMA 在调用方给出的周期窗口中的千分比占用（在 1000 饱和），从而让 DMA 与 CPU 的
+争用可观测。
+
+### Not modelled / 未建模项
+
+Only DMA-master events are countable; CPU masters, downstream stalls and
+contested accesses require a cycle-exact shared bus model. `BUS_PRIORITY` is
+stored (and reported acknowledged immediately) but it does not change arbitration
+because the model has a single DMA master and no preemption.
+只有 DMA 主设备事件可统计；CPU 主设备、下游 stall 与争用访问需要周期精确的共享
+总线模型。`BUS_PRIORITY` 会被保存（并立即报告已确认），但不改变仲裁，因为模型只有
+一个 DMA 主设备且没有抢占。
 
 ---
 
