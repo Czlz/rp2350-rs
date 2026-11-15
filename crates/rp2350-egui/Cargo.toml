@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# 转发到 `rp2350-audio/playback`，启用 cpal 真实声卡输出。
+# 用法：`cargo build -p rp2350-egui --features audio-playback`；不加该 feature 时
+# 音频走 null 后端（消费样本并静默），因此无声卡 / CI 环境无需任何额外依赖。
+# Forwards to `rp2350-audio/playback` and enables real cpal output. Without the
+# feature audio uses the null backend (samples consumed, silence), so CI and
+# device-less hosts need no extra dependency.
+audio-playback = ["rp2350-audio/playback"]
+
 [dependencies]
 eframe = { workspace = true }
 egui = { workspace = true }
@@ -19,6 +29,7 @@ tracing-subscriber = { workspace = true }
 rp2350-core = { workspace = true }
 rp2350-cpu = { workspace = true }
 rp2350-arm = { workspace = true }
+rp2350-audio = { workspace = true }
 rp2350-cli = { workspace = true }
 rp2350-virt-periph = { workspace = true, features = ["gui"] }
 

@@ -41,6 +41,6 @@ pub use canvas::CanvasState;
 pub use canvas_io::CanvasParseError;
 pub use palette::DevicePalette;
 pub use play_view::{
-    CliPlaySource, CliPlayStarter, PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats,
-    PlayView,
+    AudioRequest, CliPlaySource, CliPlayStarter, PlayFields, PlayFrame, PlayRequest, PlaySource,
+    PlayStarter, PlayStats, PlayView,
 };

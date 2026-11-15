@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Key, Modifiers, Pos2, RawInput, Rect, Vec2};
+use rp2350_audio::SampleSource;
 use rp2350_cli::play::{FrameSpec, PlayConfig, PlaySession};
 use rp2350_cli::run::MachineOptions;
 
@@ -18,7 +19,7 @@ use super::*;
 
 /// Fake source state shared with the test / 与测试共享的假来源状态
 #[derive(Default)]
-struct FakeShared {
+pub(super) struct FakeShared {
     /// Frame handed to the view / 交给视图的帧
     frame: Mutex<Option<Arc<PlayFrame>>>,
     /// Mask written by the view / 视图写入的掩码
@@ -29,6 +30,8 @@ struct FakeShared {
     running: AtomicBool,
     /// Button pins reported by the source / 来源报告的按键引脚
     pins: AtomicU16,
+    /// Audio tap handed to the view once / 交给视图一次的音频 tap
+    pub(super) audio: Mutex<Option<Box<dyn SampleSource>>>,
     /// Number of shutdowns / shutdown 次数
     shutdowns: AtomicU16,
 }
@@ -59,6 +62,10 @@ impl PlaySource for FakeSource {
         self.shared.pins.load(Ordering::Relaxed)
     }
 
+    fn audio_source(&self) -> Option<Box<dyn SampleSource>> {
+        self.shared.audio.lock().unwrap().take()
+    }
+
     fn shutdown(self: Box<Self>) -> PlayStats {
         self.shared.running.store(false, Ordering::Relaxed);
         self.shared.shutdowns.fetch_add(1, Ordering::Relaxed);
@@ -68,7 +75,10 @@ impl PlaySource for FakeSource {
 
 /// Build a view whose starter always returns a [`FakeSource`]
 /// 构造启动器总是返回 [`FakeSource`] 的视图
-fn view_with_fake(shared: &Arc<FakeShared>, requests: &Arc<Mutex<Vec<PlayRequest>>>) -> PlayView {
+pub(super) fn view_with_fake(
+    shared: &Arc<FakeShared>,
+    requests: &Arc<Mutex<Vec<PlayRequest>>>,
+) -> PlayView {
     let source = Arc::clone(shared);
     let recorded = Arc::clone(requests);
     PlayView::default().with_starter(Box::new(move |request: PlayRequest| {
@@ -133,7 +143,7 @@ fn key_press(key: Key) -> egui::Event {
 }
 
 /// Write a temporary firmware file and return its path / 写一个临时固件文件并返回路径
-fn temp_firmware(tag: &str) -> std::path::PathBuf {
+pub(super) fn temp_firmware(tag: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("rp2350-egui-{tag}-{}.uf2", std::process::id()));
     std::fs::write(&path, b"not a real uf2").expect("temp firmware write");
     path
@@ -350,7 +360,9 @@ fn keyboard_mask_reaches_the_source_only_when_focused() {
 #[test]
 fn start_reports_read_error_without_panicking() {
     let mut view = PlayView::default();
-    view.file = String::from("definitely-missing-firmware.uf2");
+    view.fields.firmware = String::from("definitely-missing-firmware.uf2");
+    view.fields.frame = String::from(FAKE_FRAME);
+    view.fields.steps_per_frame = String::from("200");
     view.start();
     assert!(
         view.status()
@@ -363,7 +375,9 @@ fn start_reports_read_error_without_panicking() {
 fn start_reports_missing_starter() {
     let path = temp_firmware("nostarter");
     let mut view = PlayView::default();
-    view.file = path.display().to_string();
+    view.fields.firmware = path.display().to_string();
+    view.fields.frame = String::from(FAKE_FRAME);
+    view.fields.steps_per_frame = String::from("200");
     view.start();
     assert!(view.status().contains("no play source attached"));
     assert!(!view.is_running());
@@ -373,10 +387,15 @@ fn start_reports_missing_starter() {
 #[test]
 fn start_reports_bad_steps_per_frame() {
     let mut view = PlayView::default();
-    view.steps_per_frame = String::from("0");
+    // 固件与帧文本有效，因此校验会走到每帧步数；文件在步数校验之后才读取。
+    // Firmware and frame text are valid so validation reaches the step count; the
+    // file is only read after that.
+    view.fields.firmware = String::from("unused.uf2");
+    view.fields.frame = String::from(FAKE_FRAME);
+    view.fields.steps_per_frame = String::from("0");
     view.start();
     assert!(view.status().contains("steps per frame"));
-    view.steps_per_frame = String::from("abc");
+    view.fields.steps_per_frame = String::from("abc");
     view.start();
     assert!(view.status().contains("steps per frame"));
 }
@@ -387,10 +406,10 @@ fn start_boots_source_and_stop_shuts_it_down() {
     let shared = Arc::new(FakeShared::default());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut view = view_with_fake(&shared, &requests);
-    view.file = path.display().to_string();
-    view.fb = String::from("0x20063DF4:240x160");
-    view.steps_per_frame = String::from("2500000");
-    view.audio = true;
+    view.fields.firmware = path.display().to_string();
+    view.fields.frame = String::from(FAKE_FRAME);
+    view.fields.steps_per_frame = String::from("200");
+    view.fields.buttons = String::from("0x3FF");
     view.start();
 
     assert!(view.is_running());
@@ -398,9 +417,12 @@ fn start_boots_source_and_stop_shuts_it_down() {
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].image, b"not a real uf2");
-    assert_eq!(recorded[0].frame, "0x20063DF4:240x160");
-    assert_eq!(recorded[0].steps_per_frame, 2_500_000);
-    assert!(recorded[0].audio);
+    assert_eq!(recorded[0].frame, FAKE_FRAME);
+    assert_eq!(recorded[0].steps_per_frame, 200);
+    // 音频默认关闭，因此请求里没有接线；引脚掩码来自输入框。
+    // Audio is off by default, so the request carries no wiring; the pin mask
+    // comes from its field.
+    assert!(recorded[0].audio.is_none(), "audio off => no wiring");
     assert_eq!(recorded[0].button_pins, GBA_BUTTONS);
     drop(recorded);
 
@@ -419,7 +441,9 @@ fn starter_error_is_shown_in_the_toolbar() {
             Err("machine boot failed / 机器启动失败".to_owned())
         },
     ));
-    view.file = path.display().to_string();
+    view.fields.firmware = path.display().to_string();
+    view.fields.frame = String::from(FAKE_FRAME);
+    view.fields.steps_per_frame = String::from("200");
     view.start();
     assert!(view.status().contains("start failed / 启动失败"));
     assert!(view.status().contains("machine boot failed"));
@@ -439,7 +463,7 @@ const FLASH_BASE: u32 = 0x1000_0000;
 const FAMILY_ARM: u32 = 0xE48B_FF59;
 
 /// Frame buffer text handed to the starter / 交给启动器的帧缓冲文本
-const FAKE_FRAME: &str = "0x20001000:4x4";
+pub(super) const FAKE_FRAME: &str = "0x20001000:4x4";
 
 /// Build one 512-byte UF2 block / 构造一个 512 字节 UF2 块
 fn uf2_block(block_number: u32, total_blocks: u32, address: u32, payload: &[u8]) -> Vec<u8> {
@@ -459,7 +483,7 @@ fn uf2_block(block_number: u32, total_blocks: u32, address: u32, payload: &[u8])
 }
 
 /// Synthetic Arm UF2 whose reset handler is `b .` / 复位处理程序为 `b .` 的合成 Arm UF2
-fn spin_uf2() -> Vec<u8> {
+pub(super) fn spin_uf2() -> Vec<u8> {
     let vectors = [
         0x2008_2000u32.to_le_bytes(),
         (FLASH_BASE + 0x09).to_le_bytes(),
@@ -491,7 +515,7 @@ fn request(frame: &str) -> PlayRequest {
         image: spin_uf2(),
         frame: frame.to_owned(),
         steps_per_frame: 200,
-        audio: false,
+        audio: None,
         button_pins: GBA_BUTTONS,
     }
 }
@@ -514,7 +538,9 @@ fn wait_for(source: &CliPlaySource, predicate: impl Fn(&PlayStats) -> bool) -> P
 fn cli_source_publishes_frames_and_shuts_down() {
     let source = cli_source(200);
     let stats = wait_for(&source, |stats| stats.frames >= 1);
-    assert_eq!(source.button_pins(), GBA_BUTTONS);
+    // `PlayConfig::new` 不驱动任何引脚：按键映射必须由前端显式给出。
+    // `PlayConfig::new` drives no pin: the frontend must supply the button map.
+    assert_eq!(source.button_pins(), 0);
 
     source.set_buttons(BUTTON_A | BUTTON_START);
     assert_eq!(source.session().buttons(), BUTTON_A | BUTTON_START);
@@ -580,9 +606,9 @@ fn play_view_with_cli_starter_boots_and_uploads_a_frame() {
     std::fs::write(&path, &image).expect("temp firmware write");
 
     let mut view = PlayView::default().with_starter(Box::new(CliPlayStarter));
-    view.file = path.display().to_string();
-    view.fb = FAKE_FRAME.to_owned();
-    view.steps_per_frame = String::from("200");
+    view.fields.firmware = path.display().to_string();
+    view.fields.frame = FAKE_FRAME.to_owned();
+    view.fields.steps_per_frame = String::from("200");
     view.start();
     assert!(view.is_running(), "status={}", view.status());
 

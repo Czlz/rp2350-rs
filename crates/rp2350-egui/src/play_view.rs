@@ -4,11 +4,21 @@
 //! [`PlayView`] is the GUI end of the play pipeline: it owns a [`PlaySource`]
 //! (a background worker that publishes guest frames and accepts a button mask),
 //! uploads each new frame as an egui texture, paints it centred with an integer
-//! zoom that keeps the guest aspect ratio, and maps the keyboard onto the
-//! `GP0..GP9` button bitmap the GBA example firmware reads.
+//! zoom that keeps the guest aspect ratio, and maps the keyboard onto a button
+//! bitmap.
 //! [`PlayView`] 是游玩流水线的 GUI 端：持有一个 [`PlaySource`]（在后台发布客户机
 //! 帧、接收按键掩码的 worker），把每个新帧上传为 egui 纹理，按整数倍缩放、保持
-//! 客户机宽高比居中绘制，并把键盘映射到 GBA 示例固件读取的 `GP0..GP9` 按键位图。
+//! 客户机宽高比居中绘制，并把键盘映射为按键位图。
+//!
+//! The toolbar is **profile driven**: the firmware path, frame buffer, steps per
+//! frame, button mask and the I2S wiring are typed by the user or loaded from a
+//! `key = value` profile (`profile` field + `Load profile`), so no example
+//! constant lives in this crate. See [`fields`] for the text/typed split and
+//! [`types`] for the shared types.
+//! 工具栏由 **profile 驱动**：固件路径、帧缓冲、每帧步数、按键掩码与 I2S 接线都由
+//! 用户输入或从 `key = value` profile 载入（`profile` 输入框 + `Load profile`），
+//! 因此 crate 内没有示例常量。文本与数值的拆分见 [`fields`]，共享类型见
+//! [`types`]。
 //!
 //! The view itself only talks to the [`PlaySource`] / [`PlayStarter`] traits, so
 //! tests and alternate hosts can inject a fake worker. The concrete worker is
@@ -17,6 +27,16 @@
 //! 视图本身只与 [`PlaySource`] / [`PlayStarter`] trait 交互，因此测试与其它宿主
 //! 可以注入假 worker。具体 worker 为 `rp2350_cli::play::PlaySession`，由
 //! [`cli_source`] 桥接并由原生入口挂载；依赖方向为 `rp2350-egui → rp2350-cli`。
+//!
+//! Host audio is optional and decoupled: when `Audio / 音频` is ticked before a
+//! start, the view pulls the worker's I2S tap through
+//! [`PlaySource::audio_source`] and hands it to `rp2350_audio::AudioOutput`
+//! (see [`audio`]). The output thread is joined **before** the session drops, so
+//! it never reads a released tap.
+//! 宿主音频可选且解耦：启动前勾选「Audio / 音频」，视图就通过
+//! [`PlaySource::audio_source`] 取走 worker 的 I2S tap 并交给
+//! `rp2350_audio::AudioOutput`（见 [`audio`]）。音频线程严格在会话丢弃**之前**
+//! join，因此绝不会读取已释放的 tap。
 //!
 //! Pixel math, key mapping and fitting are free functions so they can be tested
 //! without a window; [`PlayView::ui`] only wires them together.
@@ -28,31 +48,32 @@
 // channel is 8 bits wide.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+pub mod audio;
+#[cfg(test)]
+mod audio_tests;
 pub mod cli_source;
+pub mod fields;
+#[cfg(test)]
+mod params_tests;
 #[cfg(test)]
 mod tests;
+pub mod types;
 
+pub use audio::{AUDIO_CAPACITY, AUDIO_NULL, SILENT_NOTICE, format_audio};
 pub use cli_source::{CliPlaySource, CliPlayStarter};
-
-use std::sync::Arc;
+pub use fields::{PlayFields, PlayInputs, format_frame};
+pub use types::{
+    AudioRequest, PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats, format_stats,
+};
 
 use egui::{
     Align2, Color32, ColorImage, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Vec2, pos2, vec2,
 };
+use rp2350_audio::AudioOutput;
 
-/// Default firmware pre-filled in the path field / 路径框预填的固件
-pub const DEFAULT_FIRMWARE: &str =
-    r"E:\Source\mcu\pico\rp2350\gba\pokeemerald-rp2350\rp2350\hw\build_emerald\emerald.uf2";
-
-/// Default frame buffer pre-filled in the frame field / 帧缓冲框预填值
-pub const DEFAULT_FRAME_BUFFER: &str = "0x20063DF4:240x160";
-
-/// Default steps per published frame / 每发布一帧的默认步数
-pub const DEFAULT_STEPS_PER_FRAME: &str = "2500000";
-
-/// Height reserved for the two-line status bar / 两行状态栏保留的高度
-const STATUS_HEIGHT: f32 = 44.0;
+/// Height reserved for the three-line status bar / 三行状态栏保留的高度
+const STATUS_HEIGHT: f32 = 64.0;
 
 /// Screen background behind the guest picture / 客户机画面背后的底色
 const BACKDROP: Color32 = Color32::from_rgb(0x12, 0x14, 0x18);
@@ -283,124 +304,6 @@ pub fn fit_size(available: Vec2, width: usize, height: usize) -> Vec2 {
     vec2(width * scale, height * scale)
 }
 
-/// One guest frame handed to the Play tab / 交给「游戏」标签页的一帧客户机画面
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayFrame {
-    /// 1-based frame counter / 从 1 开始的帧序号
-    pub index: u64,
-    /// Guest steps executed when the frame was captured / 抓取该帧时的客户机步数
-    pub steps: u64,
-    /// Pixels per row / 每行像素数
-    pub width: u16,
-    /// Number of rows / 行数
-    pub height: u16,
-    /// Row-major RGB565 pixels / 行优先 RGB565 像素
-    pub rgb565: Vec<u16>,
-    /// Whether the whole guest frame buffer was readable / 客户机帧缓冲是否完整可读
-    pub readable: bool,
-}
-
-/// Progress snapshot displayed in the status bar / 状态栏显示的进度快照
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PlayStats {
-    /// Frames published so far / 已发布帧数
-    pub frames: u64,
-    /// Guest steps executed so far / 已执行客户机步数
-    pub steps: u64,
-    /// Rolling wall-clock frames per second / 滚动窗口的每秒帧数
-    pub fps: f64,
-    /// Rolling wall-clock steps per second / 滚动窗口的每秒步数
-    pub steps_per_second: f64,
-    /// Frames replaced before the GUI took them / 未被 GUI 取走即被替换的帧数
-    pub replaced: u64,
-    /// Why the worker stopped early, if it did / worker 提前停止的原因（若有）
-    pub halted: Option<String>,
-}
-
-/// Request sent to a [`PlayStarter`] / 发送给 [`PlayStarter`] 的启动请求
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayRequest {
-    /// Firmware image bytes / 固件映像字节
-    pub image: Vec<u8>,
-    /// Frame buffer text (`ADDR:WxH[:STRIDE]`) / 帧缓冲文本
-    pub frame: String,
-    /// Steps executed per published frame / 每发布一帧执行的步数
-    pub steps_per_frame: u64,
-    /// Whether to capture I2S audio / 是否捕获 I2S 音频
-    pub audio: bool,
-    /// Button pin bitmap the worker drives / worker 驱动的按键引脚位图
-    pub button_pins: u16,
-}
-
-/// Running play worker as seen by the GUI / GUI 视角的运行中 worker
-pub trait PlaySource {
-    /// Newest published frame, or `None` before the first one
-    /// 最新发布的帧；首帧之前为 `None`
-    fn latest_frame(&self) -> Option<Arc<PlayFrame>>;
-
-    /// Write the button mask (bit set = pressed = pin low)
-    /// 写入按键掩码（置位 = 按下 = 引脚低电平）
-    fn set_buttons(&self, mask: u16);
-
-    /// Statistics snapshot / 统计快照
-    fn stats(&self) -> PlayStats;
-
-    /// Whether the worker thread still runs / worker 线程是否仍在运行
-    fn is_running(&self) -> bool;
-
-    /// Button pins this worker drives / 本 worker 驱动的按键引脚
-    fn button_pins(&self) -> u16;
-
-    /// Stop the worker and return the final statistics / 停止 worker 并返回最终统计
-    fn shutdown(self: Box<Self>) -> PlayStats;
-}
-
-/// Factory that boots a [`PlaySource`] from a [`PlayRequest`]
-/// 用 [`PlayRequest`] 启动 [`PlaySource`] 的工厂
-///
-/// The host implements this with `rp2350_cli::play::PlaySession::start`; the
-/// ready-made adapter is [`CliPlayStarter`], which the native entry point
-/// attaches. Alternate hosts and tests may still inject their own worker.
-/// 宿主用 `rp2350_cli::play::PlaySession::start` 实现它；现成适配器为
-/// [`CliPlayStarter`]，由原生入口挂载。其它宿主与测试仍可注入自己的 worker。
-pub trait PlayStarter {
-    /// Boot a worker / 启动 worker
-    ///
-    /// # Errors
-    /// Returns the message to show in the status bar when the firmware cannot
-    /// be booted or the worker cannot be spawned.
-    /// 固件无法启动或 worker 无法创建时返回要显示在状态栏的消息。
-    fn start(&self, request: PlayRequest) -> Result<Box<dyn PlaySource>, String>;
-}
-
-impl<F> PlayStarter for F
-where
-    F: Fn(PlayRequest) -> Result<Box<dyn PlaySource>, String>,
-{
-    fn start(&self, request: PlayRequest) -> Result<Box<dyn PlaySource>, String> {
-        self(request)
-    }
-}
-
-/// Progress line of the status bar / 状态栏的进度行
-#[must_use]
-pub fn format_stats(stats: &PlayStats, frame: u64, running: bool) -> String {
-    let phase = if running {
-        "running / 运行中"
-    } else {
-        "stopped / 已停止"
-    };
-    let mut text = format!(
-        "frame={frame} steps={} fps={:.2} steps/s={:.0} replaced={} · {phase}",
-        stats.steps, stats.fps, stats.steps_per_second, stats.replaced
-    );
-    if let Some(halted) = &stats.halted {
-        text.push_str(" · halted / 停机: ");
-        text.push_str(halted);
-    }
-    text
-}
-
 /// The "Play / 游戏" tab / 「游戏」标签页
 ///
 /// Owns the optional worker, the uploaded texture and the toolbar text fields.
@@ -408,6 +311,11 @@ pub fn format_stats(stats: &PlayStats, frame: u64, running: bool) -> String {
 /// documented to join on drop), so closing the window cannot leak a spinner.
 /// 持有可选的 worker、已上传纹理与工具栏文本框。丢弃视图即丢弃 worker（来源实现
 /// 需在 drop 时 join），因此关闭窗口不会遗留后台线程。
+// 视图状态就是几个独立布尔开关（焦点提示、焦点、静默提示），拆成枚举只会增加
+// 状态机噪音，不提升可读性。
+// The view state is a handful of independent flags (focus hint, focus, silent
+// notice); an enum would add state-machine noise without clarity.
+#[allow(clippy::struct_excessive_bools)]
 pub struct PlayView {
     /// Running worker, if any / 运行中的 worker（若有）
     session: Option<Box<dyn PlaySource>>,
@@ -419,14 +327,13 @@ pub struct PlayView {
     last_frame: u64,
     /// Last statistics snapshot shown by the status bar / 状态栏显示的最近统计快照
     stats: PlayStats,
-    /// Firmware path typed by the user / 用户输入的固件路径
-    file: String,
-    /// Frame buffer text typed by the user / 用户输入的帧缓冲文本
-    fb: String,
-    /// Steps per frame typed by the user / 用户输入的每帧步数
-    steps_per_frame: String,
-    /// Whether audio capture is requested / 是否请求捕获音频
-    audio: bool,
+    /// Toolbar text fields (profile, firmware, frame, buttons, audio)
+    /// 工具栏文本字段（profile、固件、帧缓冲、按键、音频）
+    fields: PlayFields,
+    /// Running host audio output, if any / 运行中的宿主音频输出（若有）
+    audio_output: Option<AudioOutput>,
+    /// Whether the silent-backend notice was already appended / 静默后端提示是否已追加
+    audio_notice_shown: bool,
     /// Toolbar status of the last action / 最近一次操作的状态
     status: String,
     /// Current button mask / 当前按键掩码
@@ -447,10 +354,9 @@ impl Default for PlayView {
             texture: None,
             last_frame: 0,
             stats: PlayStats::default(),
-            file: DEFAULT_FIRMWARE.to_owned(),
-            fb: DEFAULT_FRAME_BUFFER.to_owned(),
-            steps_per_frame: DEFAULT_STEPS_PER_FRAME.to_owned(),
-            audio: false,
+            fields: PlayFields::default(),
+            audio_output: None,
+            audio_notice_shown: false,
             status: "idle / 空闲".to_owned(),
             buttons: 0,
             focus_hint: true,
@@ -505,26 +411,117 @@ impl PlayView {
         self.uploads
     }
 
-    /// Boot a worker from the toolbar fields / 用工具栏字段启动 worker
+    /// Whether the `Audio / 音频` box is ticked / 是否勾选「Audio / 音频」
+    #[must_use]
+    pub fn audio_enabled(&self) -> bool {
+        self.fields.audio
+    }
+
+    /// Tick or untick audio capture / 勾选或取消音频捕获
     ///
-    /// Reads the firmware file, then hands the request to the attached starter.
-    /// Every failure is written to the toolbar status: this method never panics
-    /// and never blocks the UI thread on the guest.
-    /// 读取固件文件后把请求交给已挂载的工厂。所有失败都写入工具栏状态：本方法不
-    /// panic，也不会在 UI 线程上阻塞等待客户机。
-    pub fn start(&mut self) {
-        let Some(steps_per_frame) = self
-            .steps_per_frame
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|steps| *steps > 0)
+    /// Audio is fixed per session: the call is ignored while a worker runs, so
+    /// the checkbox can never disagree with the worker that is already playing.
+    /// 音频按会话固定：worker 运行中调用会被忽略，因此复选框不会与已在播放的
+    /// worker 冲突。
+    pub fn set_audio(&mut self, enabled: bool) {
+        if !self.is_running() {
+            self.fields.audio = enabled;
+        }
+    }
+
+    /// Toolbar fields, for hosts that prefill them / 工具栏字段，供宿主预填
+    #[must_use]
+    pub fn fields(&self) -> &PlayFields {
+        &self.fields
+    }
+
+    /// Mutable toolbar fields / 可变的工具栏字段
+    pub fn fields_mut(&mut self) -> &mut PlayFields {
+        &mut self.fields
+    }
+
+    /// Active host audio backend (`"cpal"` / `"null"`), `None` when silent
+    /// 当前宿主音频后端（`"cpal"` / `"null"`），无输出时为 `None`
+    #[must_use]
+    pub fn audio_backend(&self) -> Option<&'static str> {
+        self.audio_output.as_ref().map(AudioOutput::backend)
+    }
+
+    /// Playback underruns counted by the host output / 宿主输出统计的欠载次数
+    #[must_use]
+    pub fn audio_underruns(&self) -> u64 {
+        self.audio_output.as_ref().map_or(0, AudioOutput::underruns)
+    }
+
+    /// Whether the host audio worker still runs / 宿主音频工作线程是否仍在运行
+    #[must_use]
+    pub fn audio_playing(&self) -> bool {
+        self.audio_output.as_ref().is_some_and(AudioOutput::playing)
+    }
+
+    /// Start the host output for the attached session when audio is enabled
+    /// 勾选音频时，为已挂载的会话启动宿主输出
+    ///
+    /// Runs only when the checkbox is ticked **and** the worker published a tap;
+    /// a worker without audio capture stays silent without an output.
+    /// 仅在勾选复选框**且** worker 发布了 tap 时启动；无音频捕获的 worker 不会创建
+    /// 输出，保持静默。
+    fn start_audio(&mut self) {
+        self.stop_audio();
+        if !self.fields.audio {
+            return;
+        }
+        let Some(source) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.audio_source())
         else {
-            "steps per frame must be a positive integer / 每帧步数必须是正整数"
-                .clone_into(&mut self.status);
             return;
         };
-        let image = match std::fs::read(self.file.trim()) {
+        let output = audio::start(source);
+        self.note_silent_backend(output.backend());
+        self.audio_output = Some(output);
+    }
+
+    /// Stop and join the host audio worker / 停止并 join 宿主音频工作线程
+    ///
+    /// Must run before the session is dropped: the output thread would otherwise
+    /// keep pulling from a tap owned by the released session.
+    /// 必须在会话丢弃前运行：否则输出线程会继续从已释放会话的 tap 取样本。
+    fn stop_audio(&mut self) {
+        if let Some(output) = self.audio_output.take() {
+            output.shutdown();
+        }
+    }
+
+    /// Append the silent-backend notice to the toolbar status at most once
+    /// 向工具栏状态最多追加一次静默后端提示
+    fn note_silent_backend(&mut self, backend: &str) {
+        if self.audio_notice_shown || backend != AUDIO_NULL {
+            return;
+        }
+        self.audio_notice_shown = true;
+        self.status.push_str(SILENT_NOTICE);
+    }
+
+    /// Boot a worker from the toolbar fields / 用工具栏字段启动 worker
+    ///
+    /// Validates the text fields ([`PlayFields::inputs`]), reads the firmware
+    /// file, then hands the request to the attached starter. Every failure is
+    /// written to the toolbar status: this method never panics and never blocks
+    /// the UI thread on the guest.
+    /// 先校验文本字段（[`PlayFields::inputs`]）、读取固件文件，再把请求交给已挂载的
+    /// 工厂。所有失败都写入工具栏状态：本方法不 panic，也不会在 UI 线程上阻塞等待
+    /// 客户机。
+    pub fn start(&mut self) {
+        let inputs = match self.fields.inputs() {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let image = match std::fs::read(&inputs.firmware) {
             Ok(image) => image,
             Err(error) => {
                 self.status = format!("cannot read firmware / 无法读取固件: {error}");
@@ -538,20 +535,40 @@ impl PlayView {
         };
         let request = PlayRequest {
             image,
-            frame: self.fb.trim().to_owned(),
-            steps_per_frame,
-            audio: self.audio,
-            button_pins: GBA_BUTTONS,
+            frame: inputs.frame.clone(),
+            steps_per_frame: inputs.steps_per_frame,
+            audio: inputs.audio,
+            button_pins: inputs.buttons,
         };
         match starter.start(request) {
             Ok(session) => {
-                self.attach(session);
+                // 状态行先就位，`attach` 里的音频静默提示才不会被覆盖。
+                // Set the status line first so the audio notice from `attach`
+                // is not overwritten.
                 self.status = format!(
-                    "running / 运行中 · {} · steps/frame / 每帧步数 {steps_per_frame}",
-                    self.fb.trim()
+                    "running / 运行中 · {} · steps/frame / 每帧步数 {}",
+                    inputs.frame, inputs.steps_per_frame
                 );
+                self.attach(session);
             }
             Err(message) => self.status = format!("start failed / 启动失败: {message}"),
+        }
+    }
+
+    /// Load the profile named by the toolbar into the fields
+    /// 载入工具栏指定的 profile 到各字段
+    ///
+    /// A malformed profile writes the parser message (`profile line N: ...`)
+    /// into the status line and leaves every field untouched; the load never
+    /// starts a session and never panics.
+    /// 非法的 profile 把解析器消息（`profile line N: ...`）写入状态行，字段保持不变；
+    /// 载入本身不会启动会话，也不会 panic。
+    fn load_profile(&mut self) {
+        match self.fields.load_profile() {
+            Ok(applied) => {
+                self.status = format!("profile loaded / 已载入 · {applied} values / 项");
+            }
+            Err(message) => self.status = format!("profile failed / 载入失败 — {message}"),
         }
     }
 
@@ -559,19 +576,34 @@ impl PlayView {
     ///
     /// Used by hosts that boot the worker themselves (for example with custom
     /// machine options) and by tests. The frame counter, mask and texture are
-    /// reset so a new session starts from a clean picture.
+    /// reset so a new session starts from a clean picture, and the host audio
+    /// output is (re)started when the `Audio / 音频` box is ticked. The previous
+    /// session's audio thread is joined before the session is replaced.
     /// 供自行启动 worker 的宿主（例如使用自定义机器选项）与测试使用。帧计数、掩码与
-    /// 纹理都会重置，因此新会话从干净画面开始。
+    /// 纹理都会重置，因此新会话从干净画面开始；勾选音频时会（重新）启动宿主输出。
+    /// 替换会话前会先 join 旧会话的音频线程。
     pub fn attach(&mut self, session: Box<dyn PlaySource>) {
+        // 旧会话的音频线程必须先 join，再替换会话。
+        // Join the old session's audio thread before swapping the session.
+        self.stop_audio();
+        self.audio_notice_shown = false;
         self.buttons = 0;
         self.last_frame = 0;
         self.stats = PlayStats::default();
         self.texture = None;
         self.session = Some(session);
+        // tap 只存在于新会话上：音频必须在会话挂载之后才启动。
+        // The tap lives on the new session, so audio starts after attaching it.
+        self.start_audio();
     }
 
     /// Stop the worker and report its final statistics / 停止 worker 并报告最终统计
+    ///
+    /// The host audio output stops first, so its thread never reads the tap of a
+    /// session that is being shut down. Returns in milliseconds.
+    /// 先停宿主音频输出，因此其线程绝不会读取正在关闭会话的 tap。毫秒级返回。
     pub fn stop(&mut self) {
+        self.stop_audio();
         if let Some(session) = self.session.take() {
             let stats = session.shutdown();
             self.status = format!(
@@ -591,22 +623,76 @@ impl PlayView {
         self.status_bar(ui);
     }
 
-    /// Toolbar row with the start/stop controls / 含启动/停止控件的工具栏行
+    /// Four input rows plus the start/stop row and the status line
+    /// 四行输入框，加启动/停止行与状态行
+    ///
+    /// Every parameter is a user field, so the view has no example defaults: the
+    /// profile row can fill them all at once. While a worker runs the whole input
+    /// area is greyed out (the session reads them only once, at start), leaving
+    /// Start and Stop clickable.
+    /// 每个参数都是用户输入框，因此视图没有示例默认值：profile 行可以一次填好全部。
+    /// worker 运行中输入区整体置灰（会话只在启动时读取它们），Start 与 Stop 仍可点击。
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let running = self.is_running();
+        // 载入动作在闭包之后执行：闭包同时借用了 `self.fields`，方法调用会让借用
+        // 检查器报冲突。
+        // The load runs after the closure: the closure borrows `self.fields`, so a
+        // method call inside it would conflict with the field borrows.
+        let mut load_profile = false;
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Profile / 配置");
+                ui.add(egui::TextEdit::singleline(&mut self.fields.profile).desired_width(240.0));
+                load_profile = ui.button("Load profile / 载入配置").clicked();
+            });
+            ui.horizontal(|ui| {
+                ui.label("FW / 固件");
+                ui.add(egui::TextEdit::singleline(&mut self.fields.firmware).desired_width(260.0));
+                ui.label("FB / 帧缓冲");
+                ui.add(egui::TextEdit::singleline(&mut self.fields.frame).desired_width(150.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Steps/frame / 每帧步数");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fields.steps_per_frame)
+                        .desired_width(90.0),
+                );
+                ui.label("Buttons / 按键掩码");
+                ui.add(egui::TextEdit::singleline(&mut self.fields.buttons).desired_width(70.0));
+                ui.checkbox(&mut self.fields.audio, "Audio / 音频");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Audio PIO block / 块");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fields.audio_block).desired_width(40.0),
+                );
+                ui.label("SM / 状态机");
+                ui.add(egui::TextEdit::singleline(&mut self.fields.audio_sm).desired_width(40.0));
+                ui.label("Rate / 采样率");
+                ui.add(egui::TextEdit::singleline(&mut self.fields.audio_rate).desired_width(70.0));
+                ui.label("Ch / 声道");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fields.audio_channels).desired_width(34.0),
+                );
+                ui.label("Capacity / 容量");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fields.audio_capacity).desired_width(70.0),
+                );
+            });
+        });
+        if load_profile {
+            self.load_profile();
+        }
         ui.horizontal(|ui| {
-            ui.label("FW / 固件");
-            ui.add(egui::TextEdit::singleline(&mut self.file).desired_width(220.0));
-            ui.label("FB / 帧缓冲");
-            ui.add(egui::TextEdit::singleline(&mut self.fb).desired_width(120.0));
-            ui.label("Steps/frame / 每帧步数");
-            ui.add(egui::TextEdit::singleline(&mut self.steps_per_frame).desired_width(90.0));
             if ui.button("Start / 启动").clicked() {
                 self.start();
             }
             if ui.button("Stop / 停止").clicked() {
                 self.stop();
             }
-            ui.checkbox(&mut self.audio, "Audio / 音频");
+            if running {
+                ui.label("inputs locked / 参数已锁定");
+            }
         });
         ui.horizontal(|ui| {
             ui.label(self.status.as_str());
@@ -705,18 +791,23 @@ impl PlayView {
         }
     }
 
-    /// Two-line status bar / 两行状态栏
+    /// Three-line status bar / 三行状态栏
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let running = self.is_running();
         ui.monospace(format_stats(&self.stats, self.last_frame, running));
         ui.monospace(format!("buttons / 按键: {}", describe_mask(self.buttons)));
+        // 音频行每帧重读输出线程的计数：欠载数实时增长，无需缓存。
+        // Reread the output counters every frame so underruns stay live.
+        ui.monospace(format_audio(self.audio_backend(), self.audio_underruns()));
     }
 }
 
 impl Drop for PlayView {
     fn drop(&mut self) {
-        // 关闭窗口时停止 worker：来源的 shutdown 会 join 线程。
-        // Stop the worker when the window closes; the source joins its thread.
+        // 关闭窗口时先停音频线程，再停 worker：来源的 shutdown 会 join 线程。
+        // Stop the audio thread first, then the worker; the source joins its
+        // thread on shutdown.
+        self.stop_audio();
         if let Some(session) = self.session.take() {
             let _ = session.shutdown();
         }

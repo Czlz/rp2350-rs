@@ -242,22 +242,69 @@ The script is assembled by
 ### `play` — background frame and input worker / 后台帧与输入 worker
 
 ```text
-rp2350 play --file <FIRMWARE> --fb <ADDR:WxH[:STRIDE]> [--steps-per-frame N]
-            [--frames N] [--buttons MASK] [--audio] [--trace-steps N]
+rp2350 play [--profile <FILE>] [--file <FIRMWARE>] [--fb <ADDR:WxH[:STRIDE]>]
+            [--steps-per-frame N] [--frames N] [--buttons MASK]
+            [--audio --audio-block N --audio-sm N] [--audio-rate HZ]
+            [--audio-channels N] [--audio-capacity N] [--trace-steps N]
             [--max-cycles N] [--arch arm|riscv] [--strict-decode]
 ```
 
+There are **no example-specific defaults** in the crate. The firmware path, the
+frame buffer, the steps per frame and the I2S wiring must come from a profile
+file or from the command line; without either the command fails with a message
+naming the missing option. This follows the project rule that example constants
+(frame buffer, button pins, I2S block/state machine/rate, firmware paths) live
+in `example/`, CLI arguments or profile files only.
+crate 内**没有示例专用默认值**。固件路径、帧缓冲、每帧步数与 I2S 接线必须来自
+profile 文件或命令行；两者都没有时命令直接失败并指出缺失的选项。这遵循项目规则：
+示例常量（帧缓冲、按键引脚、I2S 块/状态机/采样率、固件路径）只能出现在
+`example/`、CLI 参数或 profile 文件中。
+
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
 |---------------|----------------|----------------|
-| `--file` | required | Firmware (UF2 or ELF) / 固件 |
-| `--fb` | required | Guest frame buffer `ADDR:WxH[:STRIDE]`; `STRIDE` defaults to `W*2` / 客户机帧缓冲；跨度默认为 `W*2` |
-| `--steps-per-frame` | `2500000` | Guest steps executed per published frame / 每发布一帧执行的步数 |
+| `--profile` | none | `key = value` profile file; see below / profile 文件，格式见下 |
+| `--file` | required without `--profile` | Firmware (UF2 or ELF) / 固件 |
+| `--fb` | required without `--profile` | Guest frame buffer `ADDR:WxH[:STRIDE]`; `STRIDE` defaults to `W*2` / 客户机帧缓冲；跨度默认为 `W*2` |
+| `--steps-per-frame` | required without `--profile` | Guest steps executed per published frame / 每发布一帧执行的步数 |
 | `--frames` | unlimited | Stop after N frames (headless test mode) / 跑满 N 帧后停止（无头测试模式） |
-| `--buttons` | `0x3FF` | Bitmap of pins that act as buttons (GP0..GP9) / 作为按键的引脚位图 |
-| `--audio` | off | Install an `AudioTap` on PIO2 SM0 (the example firmware's I2S) / 在 PIO2 SM0 安装 `AudioTap` |
+| `--buttons` | `0` (drives no pin) | Bitmap of pins that act as buttons / 作为按键的引脚位图，`0` 表示不驱动任何引脚 |
+| `--audio` | off | Install an `AudioTap`; needs `--audio-block` and `--audio-sm` / 安装 `AudioTap`，需要 `--audio-block`/`--audio-sm` |
+| `--audio-block` / `--audio-sm` | required with `--audio` | PIO block and state machine that push the I2S words / 推送 I2S 字的 PIO 块与状态机 |
+| `--audio-rate` / `--audio-channels` / `--audio-capacity` | `48000` / `2` / `48000` | Generic sink metadata (samples retained) / 通用 sink 元数据（保留样本数） |
 | `--trace-steps` | `0` | Leading steps of the first frame printed as `[trace]` lines / 第一帧开头打印的 `[trace]` 步数 |
 | `--max-cycles` | `u64::MAX` | Total instruction budget; `u64::MAX` = unlimited / 总指令预算，`u64::MAX` 表示不限制 |
 | `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions / 架构覆盖 / 未定义指令即停机 |
+
+#### Profile format / profile 格式
+
+One `key = value` per line; `#` starts a whole-line comment and blank lines are
+ignored. Keys are trimmed, values keep their internal `=` (only the first `=`
+separates), LF and CRLF both parse, and unknown keys, duplicate keys, missing
+`=` and invalid values are errors that name the line number.
+每行一个 `key = value`；`#` 开头为整行注释，空行忽略。键两侧空白被裁剪，值内部
+可以包含 `=`（只有第一个 `=` 分隔键值），LF 与 CRLF 都可解析；未知键、重复键、
+缺 `=` 与非法值都返回带行号的错误。
+
+| Key / 键 | Value / 值 |
+|----------|-----------|
+| `firmware` | Firmware path / 固件路径 |
+| `frame` | `ADDR:WxH[:STRIDE]` (decimal or `0x` hex address/stride) |
+| `steps_per_frame` | Steps per published frame / 每帧步数 |
+| `max_frames` | Frame limit (`--frames`) |
+| `buttons` | `u16` bitmap, `0x` hex or decimal / 按键引脚位图 |
+| `audio` | `true` / `false` |
+| `audio_block` / `audio_sm` | PIO block and state machine / PIO 块与状态机 |
+| `audio_rate` / `audio_channels` / `audio_capacity` | Sink metadata / sink 元数据 |
+| `arch` | `arm` / `riscv` |
+| `strict_decode` | `true` / `false` |
+| `max_cycles` | Total instruction budget / 总指令预算 |
+
+Precedence is **command line > profile > built-in generic default**. A profile
+may set `audio = true` and still take `--audio-rate` from the command line; an
+`audio = true` without any block/state machine (in either place) is an error at
+resolution time.
+优先级为**命令行 > profile > 内置通用默认值**。profile 可以设置 `audio = true`
+而由命令行提供 `--audio-rate`；若两处都没有块/状态机，解析阶段直接报错。
 
 The subcommand boots the firmware on a worker thread, advances it by
 `--steps-per-frame` steps per frame, copies the guest frame buffer and prints
@@ -275,16 +322,18 @@ until the machine halts or the process is killed. A frame buffer that cannot be
 read completely (unmapped window) prints `[play] warn: frame buffer unreadable`
 once and the affected pixels are black; nothing panics.
 
-Measured on `emerald.uf2` (`--fb 0x20063DF4:240x160 --steps-per-frame 2500000
---frames 20`): **11.7–12.5 fps / 29.3–31.2 M steps/s** (two runs), 20 frames in
-1.6–1.7 s wall clock. Before the round-4 batched stepping and the word-wise
-`read_block` the same command measured 8.26 fps.
+Measured on `emerald.uf2` with `example/gba/profile.conf`
+(`--profile example/gba/profile.conf --frames 20`): **11.7–12.5 fps /
+29.3–31.2 M steps/s** (two runs), 20 frames in 1.6–1.7 s wall clock. Before the
+round-4 batched stepping and the word-wise `read_block` the same command
+measured 8.26 fps.
 该子命令在 worker 线程上启动固件，每帧推进 `--steps-per-frame` 步，拷贝客户机
 帧缓冲并为每帧打印一行。`--frames N` 跑满 N 帧后以状态码 0 退出；不带该参数时
 运行到机器停机或进程被杀。帧缓冲读不全（窗口未映射）时只打印一次
 `[play] warn: frame buffer unreadable`，缺失像素为黑色，不会 panic。
-`emerald.uf2` 实测：**11.7–12.5 fps / 29.3–31.2 M steps/s**（两次运行），20 帧约
-1.6–1.7 秒墙钟。第四轮批量步进与按字 `read_block` 之前，同一命令为 8.26 fps。
+`emerald.uf2` + `example/gba/profile.conf` 实测：**11.7–12.5 fps /
+29.3–31.2 M steps/s**（两次运行），20 帧约 1.6–1.7 秒墙钟。第四轮批量步进与按字
+`read_block` 之前，同一命令为 8.26 fps。
 
 #### Frame format and button semantics / 帧格式与按键语义
 
@@ -300,14 +349,16 @@ Measured on `emerald.uf2` (`--fb 0x20063DF4:240x160 --steps-per-frame 2500000
   means *pressed*, which drives the pin **low** through
   `GpioPads::set_external_pin`; a clear bit means released and drives it
   **high** (the firmware enables internal pull-ups). Only pins present in
-  `button_pins`/`--buttons` are driven, so other injected inputs are untouched.
+  `button_pins`/`--buttons` are driven, so other injected inputs are untouched;
+  `--buttons` defaults to `0`, which drives nothing at all.
   The mask is re-read every 4096 guest steps (not once per frame), so a press
   reaches the firmware within one slice of guest time even when a frame takes
   85 ms; a fast tap inside one frame can no longer be swallowed.
   掩码为 `u16` 位图（位 `n` = GP`n`）。置位表示**按下**，通过
   `GpioPads::set_external_pin` 把引脚拉**低**；清零表示松开并把引脚拉**高**
   （固件启用内部上拉）。只驱动 `button_pins`/`--buttons` 中置位的引脚，其它注入
-  输入不受影响。掩码**每 4096 客户机步**重新采样一次（不是每帧一次），因此即使
+  输入不受影响；`--buttons` 默认为 `0`，即完全不驱动引脚。
+  掩码**每 4096 客户机步**重新采样一次（不是每帧一次），因此即使
   一帧需要 85 ms，按下也能在一个切片内到达固件；帧内快速点按不再被吞掉。
 - **Triple buffer / 三缓冲**：the worker publishes `Arc<Frame>` into a
   single-slot "latest frame" mailbox. The producer never blocks; a frame the
@@ -844,15 +895,25 @@ pub struct Frame {
 }
 impl Frame { pub fn is_blank(&self) -> bool; }
 
+pub struct PlayAudioConfig {
+    pub block: usize,              // PIO block that pushes I2S words
+    pub sm: usize,                 // state machine inside that block
+    pub rate_hz: u32,              // sink metadata
+    pub channels: u8,
+    pub capacity: usize,           // samples retained by the sink
+}
+
 pub struct PlayConfig {
     pub frame: FrameSpec,
     pub steps_per_frame: u64,
     pub max_frames: Option<u64>,   // None = run until shutdown
-    pub button_pins: u16,          // GP0..GP9 by default (0x3FF)
-    pub audio: bool,               // install AudioTap on PIO2 SM0
+    pub button_pins: u16,          // 0 = drive no pin (no example default)
+    pub audio: Option<PlayAudioConfig>, // None = no capture
     pub trace_steps: usize,        // [trace] lines at the first frame
 }
-impl PlayConfig { pub fn new(frame: FrameSpec, steps_per_frame: u64) -> Self; }
+impl PlayConfig {
+    pub fn new(frame: FrameSpec, steps_per_frame: u64) -> Self; // buttons=0, audio=None
+}
 
 pub struct PlayStats {
     pub frames: u64,
@@ -865,7 +926,7 @@ pub struct PlayStats {
 pub struct PlaySession { /* worker handle */ }
 impl PlaySession {
     pub fn start(image: Vec<u8>, options: MachineOptions, config: PlayConfig)
-        -> Result<Self, String>;
+        -> Result<Self, String>;   // Err on out-of-range audio block/SM
     pub fn latest_frame(&self) -> Option<Arc<Frame>>;
     pub fn set_buttons(&self, mask: u16);
     pub fn buttons(&self) -> u16;
@@ -877,7 +938,15 @@ impl PlaySession {
     pub fn shutdown(self) -> PlayStats;   // stop + join + final stats
 }
 pub fn parse_button_mask(spec: &str) -> Result<u16, String>;
-pub fn run(options: &PlayOptions) -> anyhow::Result<()>;   // CLI implementation
+
+pub mod profile {                       // key = value profile files
+    pub struct Profile { /* every key is Option<_> */ }
+    pub struct ProfileError { pub line: usize, pub message: String }
+    pub fn parse(text: &str) -> Result<Profile, ProfileError>;
+}
+pub struct PlayArgs { /* raw CLI arguments, every field optional */ }
+pub struct PlayOptions { /* resolved: file, frame, steps, audio wiring, ... */ }
+pub fn run(args: &PlayArgs) -> anyhow::Result<()>;   // CLI implementation
 ```
 
 ### Threading model / 线程模型
@@ -924,12 +993,22 @@ The GUI does not need its own adapter: `rp2350-egui` ships `CliPlaySource` /
 
 ```rust
 use std::sync::Arc;
-use rp2350_cli::play::{Frame, FrameSpec, PlayConfig, PlaySession, PlayStats};
+use rp2350_cli::play::{
+    Frame, FrameSpec, PlayAudioConfig, PlayConfig, PlaySession, PlayStats,
+};
 use rp2350_cli::run::MachineOptions;
 
-let image = std::fs::read("emerald.uf2")?;
-let frame = FrameSpec::parse("0x20063DF4:240x160")?;
-let config = PlayConfig::new(frame, 2_500_000);      // ~2.5 M steps per game frame
+let image = std::fs::read("firmware.uf2")?;
+let frame = FrameSpec::parse("0x20000000:320x240")?;  // caller-supplied geometry
+let mut config = PlayConfig::new(frame, 1_000_000);    // caller-supplied cadence
+config.button_pins = 0x00FF;                            // caller-supplied pin map
+config.audio = Some(PlayAudioConfig {                   // None = no capture
+    block: 0,
+    sm: 0,
+    rate_hz: 48_000,
+    channels: 2,
+    capacity: 48_000,
+});
 let session = PlaySession::start(image, MachineOptions::default(), config)?;
 
 // once per egui update:

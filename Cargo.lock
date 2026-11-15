@@ -3490,6 +3490,7 @@ dependencies = [
  "egui_plot",
  "log",
  "rp2350-arm",
+ "rp2350-audio",
  "rp2350-cli",
  "rp2350-core",
  "rp2350-cpu",

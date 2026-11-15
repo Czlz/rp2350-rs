@@ -40,9 +40,13 @@ rp2350-egui/
     ├── canvas_view.rs    # Virtual Lab egui 绘制、输入与调色板侧栏（已落地 / landed）
     ├── palette.rs        # 内置设备调色板模板（已落地 / landed）
     ├── canvas_io.rs      # 画布文本格式 to_text/from_text（已落地 / landed）
-    ├── play_view.rs      # 游戏标签页：帧纹理、缩放、键盘映射（已落地 / landed）
+    ├── play_view.rs      # 游戏标签页：帧纹理、缩放、键盘映射、工具栏（已落地 / landed）
+    ├── play_view/types.rs # 帧/统计/请求/PlaySource/PlayStarter（已落地 / landed）
+    ├── play_view/fields.rs # 工具栏文本字段 → 数值 + profile 载入（已落地 / landed）
     ├── play_view/cli_source.rs # PlaySession → PlaySource 适配器（已接线 / wired）
+    ├── play_view/audio.rs # 宿主音频输出接线：AudioOutput 启动/状态行（rp2350-audio）
     ├── play_view/tests.rs # 游戏标签页测试（仅 test 构建 / test-only）
+    ├── play_view/params_tests.rs # 字段与 profile 测试（仅 test 构建 / test-only）
     ├── canvas_tests.rs   # 调色板/持久化测试（仅 test 构建 / test-only）
     └── main.rs           # binary entry / 二进制入口
 
@@ -226,26 +230,43 @@ that switching tabs preserves the canvas nodes and wires.
 ## PlayView / 游戏标签页
 
 「Play / 游戏」标签页（`play_view.rs`）把后台游玩 worker 发布的 RGB565 帧实时显示
-出来，并把键盘映射成 GBA 按键位图。它是 GUI 中**唯一**会写仿真器的视图（写的是
-按键掩码），其余面板仍然只读。
+出来，并把键盘映射成按键位图。它是 GUI 中**唯一**会写仿真器的视图（写的是按键
+掩码），也是唯一会驱动宿主音频的视图（`rp2350-audio`，见下「音频输出」）。
+
+**没有示例常量**（通用性规则）：固件路径、帧缓冲、每帧步数、按键引脚与 I2S 的
+PIO 块/状态机/采样率全部是工具栏输入框或 `key = value` profile 的内容，crate 内
+不预填任何示例值。启动时所有输入框均为空（音频 sink 的 48 kHz/2 声道/48 000 样本
+是**宿主**属性，因此作为通用默认值保留）。
 
 The "Play" tab (`play_view.rs`) shows the RGB565 frames published by the
-background play worker and maps the keyboard onto the GBA button bitmap. It is
-the only GUI view that writes to the simulator (a button mask); every other panel
+background play worker and maps the keyboard onto a button bitmap. It is the only
+GUI view that writes to the simulator (a button mask) and the only one that
+drives host audio (`rp2350-audio`, see "Audio output" below); every other panel
 stays read-only.
+
+There are **no example constants** (genericity rule): the firmware path, frame
+buffer, steps per frame, button pins and the I2S PIO block / state machine /
+rate come from toolbar text fields or a `key = value` profile. Every field starts
+empty; only the host audio sink metadata (48 kHz, 2 channels, 48 000 samples)
+keeps a generic default because it describes the host, not a firmware.
 
 ### Wiring model / 接线模型
 
 依赖方向为 **`rp2350-egui → rp2350-cli`**：旧的 `rp2350-cli → rp2350-egui` 依赖已删除
 （CLI 源码从未使用它，却造成包循环），因此本 crate 现在可以在
 `play_view/cli_source.rs` 里提供真实适配器 `CliPlaySource` / `CliPlayStarter`。视图本身
-仍只与两个 trait 交互，测试与其它宿主依然可以注入假 worker。
+仍只与两个 trait（`PlaySource` / `PlayStarter`）交互，测试与其它宿主依然可以注入假
+worker。引用 CLI 的地方只有两处：`cli_source.rs`（启动 worker）与 `fields.rs`
+（profile 文本与帧文本解析），因此测试无需真实会话也能覆盖除启动以外的全部逻辑。
 
 The dependency points **`rp2350-egui → rp2350-cli`**: the stale
 `rp2350-cli → rp2350-egui` edge (never used by CLI source, but a package cycle) is
 gone, so this crate ships the real adapter `CliPlaySource` / `CliPlayStarter` in
 `play_view/cli_source.rs`. The view still talks only to the two traits, so tests
-and alternate hosts can keep injecting a fake worker.
+and alternate hosts can keep injecting a fake worker. Only two modules reach into
+the CLI crate: `cli_source.rs` (booting a worker) and `fields.rs` (profile and
+frame text parsing), so tests can cover everything except booting without a real
+session.
 
 ```rust
 /// Running play worker as seen by the GUI / GUI 视角的运行中 worker
@@ -277,6 +298,10 @@ impl PlaySource for CliPlaySource {
     fn stats(&self) -> PlayStats { /* frames/steps/fps/steps_per_second + replaced */ }
     fn is_running(&self) -> bool { self.session.is_running() }
     fn button_pins(&self) -> u16 { self.session.button_pins() }
+    fn audio_source(&self) -> Option<Box<dyn SampleSource>> {
+        // `PlayConfig.audio` 为 `Some` 时把 AudioTap 交给 GUI 启动宿主输出
+        self.session.audio_tap().map(|tap| Box::new(tap) as Box<dyn SampleSource>)
+    }
     fn shutdown(self: Box<Self>) -> PlayStats { /* 先取 replaced，再 shutdown */ }
 }
 
@@ -285,12 +310,21 @@ pub struct CliPlayStarter;
 impl PlayStarter for CliPlayStarter {
     fn start(&self, request: PlayRequest) -> Result<Box<dyn PlaySource>, String> {
         let frame = FrameSpec::parse(request.frame.trim())?;
+        // 接线逐字段搬运；`None` = 不捕获，不做任何示例猜测。
+        // Copied field by field; `None` = no capture, with no example guess.
+        let audio = request.audio.map(|wiring| PlayAudioConfig {
+            block: wiring.block,
+            sm: wiring.sm,
+            rate_hz: wiring.rate_hz,
+            channels: wiring.channels,
+            capacity: wiring.capacity,
+        });
         let config = PlayConfig {
             frame,
             steps_per_frame: request.steps_per_frame,
             max_frames: None,
             button_pins: request.button_pins,
-            audio: request.audio,
+            audio,
             trace_steps: 0,
         };
         let options = MachineOptions { arch: None, max_cycles: u64::MAX, strict_decode: false };
@@ -299,6 +333,13 @@ impl PlayStarter for CliPlayStarter {
     }
 }
 ```
+
+`PlayRequest.audio` 是 `Option<AudioRequest>`，对应 `rp2350_cli::play::PlayConfig.audio`
+（`None` 表示完全不捕获）；`AudioRequest { block, sm, rate_hz, channels, capacity }`
+逐字段来自工具栏输入框或 profile，GUI 不提供任何示例默认值。
+`PlayRequest.audio` is `Option<AudioRequest>` and maps onto
+`rp2350_cli::play::PlayConfig.audio` (`None` = capture nothing); each field comes
+from a toolbar input or a profile, so the GUI contributes no example defaults.
 
 `arch: None` 让 UF2 家族 / ELF 自行选核，`max_cycles = u64::MAX` 表示交互式游玩没有
 指令预算上限（用 Stop 结束，而不是因预算停机）。`latest_frame()` 把 CLI 的
@@ -324,25 +365,73 @@ The native entry point attaches the ready-made starter, so the Play tab of
 `EmuApp::sample()` and `EmuApp::default()` stay unchanged.
 
 未挂载 starter 的 `PlayView::default()` 仍然可用（测试与 `EmuApp::sample()` 依赖这一点）：
-工具栏、占位画面与状态栏照常渲染，「Start / 启动」把
-`no play source attached / 未挂载游玩来源` 写进状态行，不 panic。
+工具栏、占位画面与状态栏照常渲染，不会 panic。Start 的校验顺序是「字段 →
+读固件 → starter」：字段缺失时状态行给出缺失项，字段齐全但没有 starter 时才写
+`no play source attached / 未挂载游玩来源`。
 
 A `PlayView::default()` without a starter still works (tests and `EmuApp::sample()`
-rely on it): the toolbar, the placeholder picture and the status bar still render;
-"Start" writes `no play source attached` into the status line instead of
-panicking.
+rely on it): the toolbar, the placeholder picture and the status bar still render
+and nothing panics. Start validates in the order "fields → firmware read →
+starter", so a missing field is named first and `no play source attached` only
+appears once the fields are complete.
 
 ### Toolbar and fields / 工具栏与字段
 
+工具栏分四行输入 + 一行 Start/Stop + 一行状态。worker 运行中输入区整体置灰
+（会话只在启动时读取参数），Start 与 Stop 仍可点击。
+
 | 字段 / Field | 默认值 / Default | 说明 / Notes |
 |--------------|------------------|--------------|
-| `file` | `DEFAULT_FIRMWARE` = `E:\Source\mcu\pico\rp2350\gba\pokeemerald-rp2350\rp2350\hw\build_emerald\emerald.uf2` | 启动时 `std::fs::read`；读失败写状态行 |
-| `fb` | `0x20063DF4:240x160` | `ADDR:WxH[:STRIDE]`，由宿主用 `FrameSpec::parse` 解析 |
-| `steps_per_frame` | `2500000` | 必须是正整数，否则写状态行 |
-| `audio` | `false` | 传给 `PlayConfig::audio`（当前仅捕获，无播放后端） |
-| `status` | `idle / 空闲` | `running` / `stopped` / `start failed` / `cannot read firmware` |
+| `profile` | 空 | profile 文件路径；点 `Load profile / 载入配置` 载入（见下节） |
+| `firmware` | 空 | 启动时 `std::fs::read`；读失败写状态行；未填时 Start 报 `missing firmware` |
+| `frame` | 空 | `ADDR:WxH[:STRIDE]`，`FrameSpec::parse` 校验；未填时报 `missing frame buffer` |
+| `steps_per_frame` | 空 | 正整数，否则状态行报 `steps per frame …` |
+| `buttons` | 空 | 按键掩码，`0x` 十六进制或十进制；空 = 不驱动任何引脚（`0`） |
+| `audio` | `false` | 启动前设定（运行中置灰）；`true` 时 worker 捕获 I2S，GUI 同时启动宿主输出 |
+| `audio_block` | 空 | 推送 I2S 字的 PIO 块（`0..3`）；开启音频时必填 |
+| `audio_sm` | 空 | 该块内的状态机（`0..4`）；开启音频时必填 |
+| `audio_rate` | `48000` | 写入音频 sink 的采样率（宿主属性，故有通用默认） |
+| `audio_channels` | `2` | 写入音频 sink 的声道数 |
+| `audio_capacity` | `48000` | sink 保留的样本数（48 kHz 下 1 秒） |
+| `status` | `idle / 空闲` | `running` / `stopped` / `start failed` / `profile loaded` / `profile failed` |
 
-按键位（`GP0..GP9`，按下 = 低电平，固件内部上拉）：
+字段的解析与校验集中在 `play_view/fields.rs`（`PlayFields::inputs`）：
+
+- 先查 `firmware`、`frame`（为空 → `missing firmware` / `missing frame buffer`，双语）；
+- 再查 `steps_per_frame`（必须 > 0）、`frame` 几何（`FrameSpec::parse`）、`buttons`
+  （`parse_button_mask`）；
+- 最后在音频开启时解析 `audio_*`：块/状态机为空报 `missing audio PIO block`，
+  非整数报 `bad audio … : expected an integer`，采样率/声道/容量为 0 报
+  `… must be greater than zero`。
+
+### Profile loading / profile 载入
+
+`profile` 输入框填文件路径后点 `Load profile / 载入配置`，`play_view/fields.rs`
+调用 `rp2350_cli::play::profile::parse`：
+
+| 键 / Key | 填充字段 / Field |
+|----------|------------------|
+| `firmware` | `firmware`（路径原样显示） |
+| `frame` | `frame`，重建为 `0xADDR:WxH[:STRIDE]`（紧凑 RGB565 时省略跨度） |
+| `steps_per_frame` | `steps_per_frame` |
+| `buttons` | `buttons`，重建为 `0xNNN` |
+| `audio` | `audio` 复选框 |
+| `audio_block` / `audio_sm` / `audio_rate` / `audio_channels` / `audio_capacity` | 对应的音频输入框 |
+
+- 只覆盖 profile 给出的键，其余字段保持用户当前输入；重复载入得到相同文本。
+- **解析失败不 panic、不启动**：状态行显示 `profile failed / 载入失败 — profile line N: …`
+  （行号来自解析器），字段保持不变。
+- 路径为空 → `profile path is empty / profile 路径为空`；读不到文件 →
+  `cannot read profile / 无法读取 profile …`。
+- 没有工具栏对应的键（`max_frames`、`arch`、`strict_decode`、`max_cycles`）被忽略：
+  GUI worker 始终不设预算（`max_cycles = u64::MAX`），架构由映像格式决定（`arch: None`）。
+- 示例 profile 见 `example/gba/profile.conf`（示例专用，不在 crate 内）。
+
+Profile loading is a second, file-level CLI touchpoint next to `cli_source`; it is
+the only way the GUI adopts guest-specific values other than typing them.
+
+按键位（`GP0..GP9`，按下 = 低电平，固件内部上拉）：`buttons` 掩码决定哪些引脚被
+驱动，键盘映射本身是固定的前端约定：
 
 | 键 / Key | 按键 / Button | 引脚 / Pin | 掩码位 / Bit |
 |----------|---------------|-----------|--------------|
@@ -378,12 +467,62 @@ the mask is not written. Mapping is pure (`KeyState`, `mask_from_keys`).
   < 1 时保留小数倍率缩小（80×60 窗口 → 80×53.3），始终居中、保持 3:2。
 - 极小窗口（80×60）只裁剪不 panic：画面可用尺寸钳制到 ≥ 1 px，零尺寸时跳过绘制。
 
+### 音频输出 / Audio output
+
+勾选「Audio / 音频」并填好 `audio_block`/`audio_sm`（采样率/声道/容量有通用默认值）
+后，GUI 会真的出声：`PlaySource::audio_source()` 把 worker 的 `AudioTap`（
+`PlayConfig.audio = Some(..)` 时由 `PlaySession` 安装在该块/状态机上）装箱交出，
+`PlayView` 用 `rp2350_audio::AudioOutput::start(tap, 96_000)` 启动一个有界的宿主音频
+工作线程（容量 1 s 的样本）。音频线程、会话、复选框的生命周期是：
+
+1. `start()`：状态行先写 `running`，再启动宿主输出；后端探测最多 1 s，返回后
+   `backend()` 立即有效。
+2. `stop()` / `Drop`：**先** `AudioOutput::shutdown()`（join 音频线程），**再**
+   `PlaySession::shutdown()`，因此输出线程绝不会读取已释放会话的 tap。
+3. 运行中全部输入框（含「Audio / 音频」复选框）置灰并显示
+   `inputs locked / 参数已锁定`：音频按会话固定，`PlayView::set_audio()` 在运行中
+   调用也会被忽略。
+
+`audio = false`（不捕获）时 worker 完全不碰 PIO FIFO，`audio_source()` 返回
+`None`，状态栏保持 `audio=off underruns=0`。
+
+启用真实声卡输出（`cpal`）需要 feature 转发；本 crate 默认**不**打开它：
+
+```bash
+cargo build -p rp2350-egui --features audio-playback   # audio-playback = ["rp2350-audio/playback"]
+cargo test  -p rp2350-egui --features audio-playback
+cargo run   -p rp2350-egui --features audio-playback   # 真实声卡输出
+```
+
+没有该 feature、或运行时没有可用输出设备时，`rp2350-audio` 走 **null 后端**：仍按
+墙钟消费样本、统计 underrun，但完全静默；`start()` 不会失败也不会 panic。此时状态栏
+显示 `audio=null`，状态行追加一次 `· 无声卡，静默运行 / no sound card, silent`
+（只追加一次，可用 `PlayView::status()` 断言）。
+
+With `Audio / 音频` ticked and `audio_block`/`audio_sm` filled in (rate, channels and
+capacity keep generic sink defaults) the GUI really plays sound:
+`PlaySource::audio_source()` hands out the worker's `AudioTap` (installed on that
+block/state machine when `PlayConfig.audio = Some(..)`) and `PlayView` starts a
+bounded host worker with `rp2350_audio::AudioOutput::start(tap, 96_000)`. The audio
+thread is always joined **before** the session (`stop()` and `Drop` alike), and
+every input (the checkbox included) is greyed out while a session runs. With
+`audio = false` the worker never touches a PIO FIFO, `audio_source()` returns
+`None` and the status bar stays `audio=off underruns=0`. Real `cpal` output is
+opt-in through `--features audio-playback`; without the feature or without a
+device the null backend consumes samples silently, `start()` still succeeds, the
+status bar shows `audio=null` and the one-time notice
+`无声卡，静默运行 / no sound card, silent` is appended to the status line.
+
 ### Status bar / 状态栏
 
 ```
 frame=<index> steps=<..> fps=<..> steps/s=<..> replaced=<..> · running|stopped
 buttons / 按键: A|Right
+audio=<backend> underruns=<n>
 ```
+
+`audio=` 是宿主输出后端（`cpal` / `null`），无输出时为 `audio=off underruns=0`；
+`underruns` 每帧从输出线程重读，持续增长说明客户机产样本慢于播放节奏。
 
 `halted` 存在时追加 ` · halted / 停机: <原因>`（例如指令预算耗尽、非法指令）。
 `replaced` 是「未被 GUI 取走即被替换」的帧数；它持续增长说明 UI 或渲染跟不上 worker
@@ -392,30 +531,45 @@ buttons / 按键: A|Right
 ### 帧率说明 / Frame rate
 
 worker 每帧执行 `steps_per_frame` 步后发布一帧，因此帧率 ≈ `steps/s / steps_per_frame`。
-当前实测约 **8 fps**（20.6 M steps/s，每帧 2.5 M 步），远低于 GBA 的 60 fps；画面
-能看，但动作偏慢。提高办法见 [`doc/playability-plan.md`](../playability-plan.md)
-的 P0（解释器热路径），或降低 `steps_per_frame`（画面更快但游戏内时间更慢）。
+用 `example/gba/profile.conf`（每帧 2.5 M 步）实测约 **8 fps**（20.6 M steps/s），
+远低于 GBA 的 60 fps；画面能看，但动作偏慢。提高办法见
+[`doc/playability-plan.md`](../playability-plan.md) 的 P0（解释器热路径），或降低
+`steps_per_frame`（画面更快但游戏内时间更慢）。
 
 The worker publishes one frame per `steps_per_frame` guest steps, so the frame
-rate is ≈ `steps/s / steps_per_frame`. The measured rate is about **8 fps**
-(20.6 M steps/s at 2.5 M steps/frame), far below the GBA's 60 fps: the picture is
-readable but slow. See the P0 rows of the playability plan for the way forward.
+rate is ≈ `steps/s / steps_per_frame`. With the values of
+`example/gba/profile.conf` (2.5 M steps/frame) the measured rate is about
+**8 fps** (20.6 M steps/s), far below the GBA's 60 fps: the picture is readable
+but slow. See the P0 rows of the playability plan for the way forward.
 
 ### Limits / 限制
 
-- **无音频输出接线**：`audio` 只打开 worker 的 I2S 捕获（`AudioTap`），GUI 没有播放
-  后端，也不消费采样；`rp2350-audio` 尚未接入本视图。
+- **没有示例默认值**：固件路径、帧缓冲、每帧步数、按键掩码与 I2S 接线都必须由用户
+  输入或从 profile 载入；未填 `firmware`/`frame`/`steps_per_frame` 时 Start 只写
+  状态行，不会启动也不会 panic。
+- **profile 只覆盖有输入框的键**：`max_frames`、`arch`、`strict_decode`、`max_cycles`
+  被忽略（GUI 始终不设预算、由映像选核）。
+- **音频 sink 元数据是宿主默认值**：`audio_rate`/`audio_channels`/`audio_capacity`
+  默认 48 kHz/2 声道/48 000 样本，可改；实际重采样与设备格式仍由 `rp2350-audio`
+  决定（最近邻重采样），GUI 不提供音量、静音或设备选择。
 - **无存档 / 无复位**：不能保存进度，也不能从 GUI 复位客户机；只能停止后重启。
-- **无手柄 / 无按键重绑**：键位写死为上表，不支持 gamepad 或自定义映射。
+- **无手柄 / 无按键重绑**：键盘→GP 的映射是固定前端约定（下表），但 `buttons` 掩码
+  决定哪些引脚真的被驱动，因此换固件时改掩码即可。
 - **无暂停 / 单步 / 截图**：只有 Start 与 Stop；帧率与步数由 `steps_per_frame` 决定。
 - 依赖宿主挂载 `PlayStarter`：`PlayView::default()` 仍无 starter（便于测试注入假实现），
   但原生入口 `main.rs` 已默认挂载 `CliPlayStarter`，所以 `cargo run -p rp2350-egui`
-  的「游戏」标签页可直接出画面。
-- The starter is still injectable (`PlayView::default()` has none, for tests and
-  alternate hosts), but the native `main.rs` attaches `CliPlayStarter` by default,
-  so the standalone `rp2350-egui` binary shows real frames. There is still no audio
-  output wiring (capture only), no save states, no reset, no gamepad or rebinding,
-  and no pause/step/screenshot.
+  的「游戏」标签页可直接出画面（仍需填入固件与帧缓冲）。
+- There are no example defaults: firmware path, frame buffer, steps per frame,
+  button mask and I2S wiring all come from user input or a profile, and Start only
+  writes the status line while a required field is missing. Profile keys without a
+  toolbar field (`max_frames`, `arch`, `strict_decode`, `max_cycles`) are ignored.
+  The sink metadata (48 kHz, 2 channels, 48 000 samples) is a host default and
+  editable, while resampling and device format stay with `rp2350-audio` (nearest
+  neighbour), with no volume, mute or device selection. Keyboard→GP mapping is a
+  fixed frontend convention, but the `buttons` mask decides which pins are really
+  driven. The starter is still injectable (`PlayView::default()` has none, for
+  tests and alternate hosts), and the native `main.rs` attaches `CliPlayStarter`.
+  There are still no save states, no reset, no gamepad, no pause/step/screenshot.
 
 ### Tests / 测试
 
@@ -433,27 +587,55 @@ readable but slow. See the P0 rows of the playability plan for the way forward.
 - 同一帧不重复上传（`uploads` 计数与 `last_frame`）；
 - 未获焦点不写掩码、获焦点后 `Z` → `0x001` 送达假来源；
 - 启动错误路径：读文件失败、未挂载 starter、非法 `steps_per_frame`、starter 返回
-  `Err` 都只写状态行；成功路径把 `PlayRequest`（映像、帧缓冲、步数、音频、引脚）
+  `Err` 都只写状态行；成功路径把 `PlayRequest`（映像、帧缓冲、步数、音频接线、引脚）
   交给 starter，`stop()` 调用一次 `shutdown`；
 - **真实适配器**（`CliPlaySource` / `CliPlayStarter`，用合成 UF2 启动真正的
-  `PlaySession`）：首帧发布后 `latest_frame()` 有值、`button_pins() == 0x3FF`、
-  `shutdown()` 后 `is_running() == false`；`set_buttons` 透传（读回一致）；统计中
-  `frames`/`steps` 单调递增且 `steps_per_second > 0`；同一帧重复轮询返回同一个
-  `Arc`（像素不重复拷贝）；非法帧文本 / 未知映像 / 零步数返回 `Err` 而不 panic；
+  `PlaySession`）：首帧发布后 `latest_frame()` 有值、`button_pins() == 0`（
+  `PlayConfig::new` 不驱动任何引脚）、`shutdown()` 后 `is_running() == false`；
+  `set_buttons` 透传（读回一致）；统计中 `frames`/`steps` 单调递增且
+  `steps_per_second > 0`；同一帧重复轮询返回同一个 `Arc`（像素不重复拷贝）；
+  非法帧文本 / 未知映像 / 零步数返回 `Err` 而不 panic；
 - 端到端：`PlayView` 挂载 `CliPlayStarter` + 临时 UF2 文件启动后，无头渲染循环
   能上传至少一帧，`stop()` 后状态为 `stopped / 已停止`；
 - 应用层：`ActiveView::Play` 在 760×600 与 80×60 下渲染，切到其它标签再切回后
-  状态保持。
+  状态保持；
+- **宿主音频**（`play_view/audio.rs`）：勾选音频且有 tap 时创建 `AudioOutput` 且
+  `backend()` ∈ {`cpal`, `null`}、`playing() == true`；未勾选时不创建输出且
+  `underruns() == 0`；`stop()` 在 2 s 内 join 音频线程（来源的 drop 标志置位）、
+  输出句柄清空；`format_audio` 的 `audio=<backend> underruns=<n>` / `audio=off`
+  格式；null 后端提示只追加一次（`cpal` 不提示）；`Drop` 同样 join 音频线程。
 
-English: RGB565 primaries plus bit replication, `color_image` padding and order,
-empty/single/combined key masks with the GP0..GP9 layout, live `KeyState::from_input`,
-integer/fractional `fit_size` cases, `format_stats`/`describe_mask`, idle
-placeholder rendering, headless 80×60 / 320×240 / 1280×720 rendering, upload
-deduplication per frame index, focus-gated mask delivery, every start/stop error
-path, the real `PlaySession` adapter (first frame, mask round-trip, monotonic
-statistics, cached `Arc`, bad frame text / unknown image / zero steps rejected),
-the end-to-end `CliPlayStarter` + headless render path, and the app-level Play tab
-that keeps its state across tab switches.
+`play_view/params_tests.rs`（字段与 profile，`#[cfg(test)] mod params_tests`）：
+
+- **无示例常量**：`PlayFields::default()` 的 `profile`/`firmware`/`frame`/
+  `steps_per_frame`/`buttons`/`audio_block`/`audio_sm` 全为空、音频关闭；只有 sink
+  元数据是通用默认值（`48000`/`2`/`48000`）；`PlayView::default()` 的输入框同样为空
+  （防止示例常量回归）；
+- 缺 `firmware` → `missing firmware`，缺 `frame` → `missing frame buffer`，两者都
+  **不启动**；非法帧文本 → `帧缓冲非法`；
+- `buttons` 空 = 0、`0x3FF` 与十进制 `63` 都被接受、`zzz` 报 `按键掩码`；
+- `audio=false` → `PlayRequest.audio == None`（即使块/状态机已填）；
+  `audio=true` → `Some(AudioRequest{block,sm,rate_hz,channels,capacity})` 且字段逐项
+  等于输入框；
+- 音频开启但字段缺失/非法 → `missing audio PIO block`、`bad audio PIO block`、
+  `greater than zero`，且不启动、不调用 starter；
+- `example/gba/profile.conf`（相对路径，文件不存在则跳过）载入后每个字段与
+  `rp2350_cli::play::profile::parse` 的结果逐项一致；
+- 非法 profile → 状态含 `profile line 3`，字段不变，`start()` 仍被拒绝；空路径 →
+  `profile path is empty`；
+- `format_frame` 对紧凑与带跨度规格往返稳定；
+- **真实 starter 的音频接线**：`audio: None` → `audio_source()` 为 `None`（未安装
+  tap）；`Some{rate 13440, channels 2}` → tap 的 `format()` 报告同样的采样率与声道；
+  越界 PIO 块（`9`）被 `PlaySession::start` 拒绝。
+
+English: the field/profile suite pins the genericity rule (every text field starts
+empty; only host sink metadata has a generic default), the missing
+firmware/frame rejections, the button mask parser, `audio = None` vs
+`Some(AudioRequest)` handover (observed through the recorded `PlayRequest` and,
+for the real starter, through `audio_source()`/`AudioFormat`), the audio field
+validation messages, the `example/gba/profile.conf` round-trip which is skipped
+when the file is absent, the `profile line N` rejection that leaves fields
+untouched, `format_frame` round-trips, and the out-of-range PIO block rejection.
 
 ---
 

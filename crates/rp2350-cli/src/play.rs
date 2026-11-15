@@ -13,6 +13,14 @@
 //! `Arc<Frame>` 发布。发布永不阻塞：未被取走的帧会被替换（并计数）。输入是宿主
 //! 写入的 `u16` 掩码，置位表示「按下」，即把对应 GPIO 拉低（固件启用内部上拉，
 //! 因此松开为高电平）。
+//!
+//! This module holds **no example-specific defaults**: the frame buffer, button
+//! pins and the I2S PIO block/state machine/rate arrive through [`PlayConfig`],
+//! normally built from [`PlayArgs`] (command line) plus an optional profile file
+//! (see [`profile`]).
+//! 本模块**不含示例专用默认值**：帧缓冲、按键引脚与 I2S 的 PIO 块/状态机/采样率
+//! 都由 [`PlayConfig`] 传入，通常来自 [`PlayArgs`]（命令行）加可选的 profile 文件
+//! （见 [`profile`]）。
 
 // 统计与几何换算在 u64/usize/f64 之间转换，这是帧率与像素格式统计的固有需求。
 // Statistics and geometry convert between u64/usize/f64, inherent to frame-rate
@@ -24,12 +32,14 @@
 )]
 
 mod frame;
+pub mod options;
+pub mod profile;
 #[cfg(test)]
 mod tests;
 
 pub use frame::{Frame, FrameSpec, SharedFrame};
+pub use options::{PlayArgs, PlayOptions};
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,12 +47,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rp2350_periph::pio::{PIO_BLOCKS, PIO_SM_COUNT};
 use rp2350_periph::{AudioSink, AudioTap};
 
-use crate::run::{ArchArg, Machine, MachineOptions};
-
-/// Button pins driven by default: GP0..GP9 (`0x3FF`) / 默认驱动的按键引脚
-pub const DEFAULT_BUTTON_PINS: u16 = 0x3FF;
+use crate::run::{Machine, MachineOptions};
 
 /// Worker thread name / worker 线程名
 const WORKER_NAME: &str = "rp2350-play";
@@ -65,21 +73,6 @@ const STATS_WINDOW_SECS: f64 = 1.0;
 /// 计算速率时使用的最小时间窗，避免早期快照得到 NaN
 const MIN_ELAPSED_SECS: f64 = 1e-6;
 
-/// PIO block of the example firmware's I2S state machine / 示例固件 I2S 状态机所在 PIO 块
-const AUDIO_BLOCK: usize = 2;
-
-/// State machine of the example firmware's I2S output / 示例固件 I2S 输出的状态机
-const AUDIO_SM: usize = 0;
-
-/// Sample rate assumed for captured I2S audio / 捕获 I2S 音频时假定的采样率
-const AUDIO_RATE_HZ: u32 = 48_000;
-
-/// Channel count assumed for captured I2S audio / 捕获 I2S 音频时假定的声道数
-const AUDIO_CHANNELS: u8 = 2;
-
-/// Samples retained by the audio tap (1 s stereo) / 音频 tap 保留的样本数（1 秒立体声）
-const AUDIO_CAPACITY: usize = 48_000;
-
 /// Largest frame buffer a session accepts (64 MiB) / 会话接受的最大帧缓冲（64 MiB）
 ///
 /// A typo in `--fb` must fail the start instead of aborting the process on a
@@ -89,6 +82,26 @@ const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Reason reported when the machine budget runs out / 机器预算耗尽时报告的原因
 const BUDGET_REASON: &str = "instruction budget exhausted / 指令预算耗尽";
+
+/// Wiring of the I2S capture tap / I2S 捕获 tap 的接线
+///
+/// All four guest-side values are example-specific, so they never have a crate
+/// default: they arrive from a profile or from `--audio-*` options.
+/// 四个客户机侧值都是示例专用的，因此 crate 不提供默认值：它们来自 profile 或
+/// `--audio-*` 选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayAudioConfig {
+    /// PIO block that pushes I2S words / 推送 I2S 字的 PIO 块索引
+    pub block: usize,
+    /// State machine index inside that block / 该块内的状态机索引
+    pub sm: usize,
+    /// Sample rate written into the audio sink / 写入音频 sink 的采样率
+    pub rate_hz: u32,
+    /// Channel count written into the audio sink / 写入音频 sink 的声道数
+    pub channels: u8,
+    /// Samples the sink retains / sink 保留的样本数
+    pub capacity: usize,
+}
 
 /// Configuration of one play session / 一次游玩会话的配置
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,25 +115,29 @@ pub struct PlayConfig {
     pub max_frames: Option<u64>,
     /// Bitmap of the GPIO pins used as buttons (bit `n` = GP`n`)
     /// 用作按键的 GPIO 引脚位图（位 `n` = GP`n`）
+    ///
+    /// `0` drives no pin at all; the frontend/profile owns the mapping.
+    /// `0` 表示不驱动任何引脚；映射由前端/profile 决定。
     pub button_pins: u16,
-    /// Capture I2S words through `AudioTap` / 通过 `AudioTap` 捕获 I2S 字
-    pub audio: bool,
+    /// Audio tap wiring, or `None` to leave the PIO FIFOs untouched
+    /// 音频 tap 接线；`None` 表示完全不碰 PIO FIFO
+    pub audio: Option<PlayAudioConfig>,
     /// Leading steps of the first frame printed as `[trace]` lines
     /// 第一帧开头以 `[trace]` 行打印的步数
     pub trace_steps: usize,
 }
 
 impl PlayConfig {
-    /// Configuration with no frame limit and no audio capture
-    /// 无帧数上限、不捕获音频的配置
+    /// Configuration with no frame limit, no buttons and no audio capture
+    /// 无帧数上限、不驱动按键、不捕获音频的配置
     #[must_use]
     pub fn new(frame: FrameSpec, steps_per_frame: u64) -> Self {
         Self {
             frame,
             steps_per_frame,
             max_frames: None,
-            button_pins: DEFAULT_BUTTON_PINS,
-            audio: false,
+            button_pins: 0,
+            audio: None,
             trace_steps: 0,
         }
     }
@@ -152,33 +169,6 @@ impl Default for PlayStats {
             halted: None,
         }
     }
-}
-
-/// Command-line options of the `play` subcommand / `play` 子命令的命令行选项
-#[derive(Debug, Clone)]
-pub struct PlayOptions {
-    /// Firmware file (UF2 or ELF) / 固件文件（UF2 或 ELF）
-    pub file: PathBuf,
-    /// Guest frame buffer / 客户机帧缓冲
-    pub frame: FrameSpec,
-    /// Steps executed per published frame / 每发布一帧所执行的步数
-    pub steps_per_frame: u64,
-    /// Stop after this many frames / 跑满该帧数后停止
-    pub max_frames: Option<u64>,
-    /// Button pin bitmap / 按键引脚位图
-    pub buttons: u16,
-    /// Capture I2S audio / 捕获 I2S 音频
-    pub audio: bool,
-    /// Architecture override / 架构覆盖
-    pub arch: Option<ArchArg>,
-    /// Halt on undefined instructions / 未定义指令即停机
-    pub strict_decode: bool,
-    /// Total instruction budget (`u64::MAX` = unlimited)
-    /// 总指令预算（`u64::MAX` 表示不限制）
-    pub max_cycles: u64,
-    /// Leading steps of the first frame printed as `[trace]` lines
-    /// 第一帧开头以 `[trace]` 行打印的步数
-    pub trace_steps: usize,
 }
 
 /// Parse a button mask (`0x` hex or decimal) / 解析按键掩码（`0x` 十六进制或十进制）
@@ -232,9 +222,10 @@ impl PlaySession {
     ///
     /// # Errors
     /// Returns a message when `steps_per_frame`/frame geometry is invalid, when
-    /// the worker thread cannot be spawned, or when the machine fails to boot.
-    /// `steps_per_frame`/帧几何非法、worker 线程无法创建，或机器启动失败时返回
-    /// 错误消息。
+    /// the audio block/state machine or sink metadata is out of range, when the
+    /// worker thread cannot be spawned, or when the machine fails to boot.
+    /// `steps_per_frame`/帧几何非法、音频块/状态机或 sink 元数据越界、worker 线程
+    /// 无法创建，或机器启动失败时返回错误消息。
     pub fn start(
         image: Vec<u8>,
         options: MachineOptions,
@@ -256,17 +247,40 @@ impl PlaySession {
                 config.frame.buffer_len()
             ));
         }
+        if let Some(audio) = config.audio {
+            if audio.block >= PIO_BLOCKS {
+                return Err(format!(
+                    "audio PIO block {} does not exist (valid 0..{PIO_BLOCKS}) / \
+                     音频 PIO 块 {} 不存在（有效范围 0..{PIO_BLOCKS}）",
+                    audio.block, audio.block
+                ));
+            }
+            if audio.sm >= PIO_SM_COUNT {
+                return Err(format!(
+                    "audio state machine {} does not exist (valid 0..{PIO_SM_COUNT}) / \
+                     音频状态机 {} 不存在（有效范围 0..{PIO_SM_COUNT}）",
+                    audio.sm, audio.sm
+                ));
+            }
+            if audio.rate_hz == 0 || audio.channels == 0 || audio.capacity == 0 {
+                return Err(
+                    "audio rate, channels and capacity must be greater than zero / \
+                     音频采样率、声道数与容量必须大于 0"
+                        .into(),
+                );
+            }
+        }
         let buttons = Arc::new(AtomicU16::new(0));
         let latest = Arc::new(Mutex::new(None));
         let replaced = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(PlayStats::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let audio = config.audio.then(|| {
+        let audio = config.audio.map(|audio| {
             AudioTap::new(AudioSink::new(
-                AUDIO_RATE_HZ,
-                AUDIO_CHANNELS,
-                AUDIO_CAPACITY,
+                audio.rate_hz,
+                audio.channels,
+                audio.capacity,
             ))
         });
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -356,7 +370,7 @@ impl PlaySession {
     }
 
     /// Audio tap installed on the worker's machine, if `config.audio` was set
-    /// 安装在 worker 机器上的音频 tap（`config.audio` 开启时才有）
+    /// 安装在 worker 机器上的音频 tap（`config.audio` 为 `Some` 时才有）
     #[must_use]
     pub fn audio_tap(&self) -> Option<AudioTap> {
         self.audio.clone()
@@ -520,9 +534,23 @@ fn run_worker(
         }
     };
     if let Some(tap) = audio {
-        machine
+        let wiring = config
+            .audio
+            .expect("a tap only exists for an audio configuration");
+        if !machine
             .peripherals_mut()
-            .set_audio_tap(AUDIO_BLOCK, AUDIO_SM, tap);
+            .set_audio_tap(wiring.block, wiring.sm, tap)
+        {
+            // 越界的块/状态机必须让启动失败，而不是静默不捕获。
+            // An out-of-range block/state machine must fail the start, never
+            // silently capture nothing.
+            let _ = ready.send(Err(format!(
+                "cannot install the audio tap on PIO block {} state machine {} / \
+                 无法在 PIO 块 {} 状态机 {} 上安装音频 tap",
+                wiring.block, wiring.sm, wiring.block, wiring.sm
+            )));
+            return;
+        }
     }
     if ready.send(Ok(())).is_err() {
         // 宿主已放弃会话（channel 关闭），不必继续跑机器。
@@ -636,17 +664,22 @@ impl RateWindow {
 
 /// Run the CLI `play` subcommand / 运行 CLI 的 `play` 子命令
 ///
-/// Prints one `[play] frame=…` line per published frame and a final summary. With
-/// `max_frames` set it exits after that many frames; otherwise it runs until the
-/// machine halts or the process is interrupted.
-/// 每发布一帧打印一行 `[play] frame=…`，结束打印汇总。设置了 `max_frames` 时跑满
-/// 即退出；否则运行到机器停机或进程被中断。
+/// Merges the raw arguments with an optional profile (see [`options::resolve`])
+/// and then prints one `[play] frame=…` line per published frame plus a final
+/// summary. With `max_frames` set it exits after that many frames; otherwise it
+/// runs until the machine halts or the process is interrupted.
+/// 先把原始参数与可选 profile 合并（见 [`options::resolve`]），之后每发布一帧打印
+/// 一行 `[play] frame=…`，结束打印汇总。设置了 `max_frames` 时跑满即退出；否则
+/// 运行到机器停机或进程被中断。
 ///
 /// # Errors
-/// Returns an error when the firmware cannot be read, the worker cannot start,
-/// or stdout cannot be written.
-/// 固件读取失败、worker 无法启动或 stdout 写入失败时返回错误。
-pub fn run(options: &PlayOptions) -> Result<()> {
+/// Returns an error when the profile is invalid, when required settings are
+/// missing, when the firmware cannot be read, when the worker cannot start, or
+/// when stdout cannot be written.
+/// profile 非法、必需设置缺失、固件读取失败、worker 无法启动或 stdout 写入失败时
+/// 返回错误。
+pub fn run(args: &PlayArgs) -> Result<()> {
+    let options = options::resolve(args).map_err(|message| anyhow::anyhow!(message))?;
     let image = std::fs::read(&options.file).with_context(|| {
         format!(
             "cannot read firmware / 无法读取固件: {}",

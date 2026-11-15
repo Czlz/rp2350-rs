@@ -157,42 +157,69 @@ enum Commands {
     /// Play a guest frame buffer in a background worker
     /// 在后台 worker 中播放客户机帧缓冲
     Play {
-        /// Firmware file (UF2 or ELF) / 固件文件（UF2 或 ELF）
-        #[arg(short, long)]
-        file: String,
+        /// Profile file with `key = value` lines (example/gba/profile.conf)
+        /// `key = value` 形式的 profile 文件（如 example/gba/profile.conf）
+        #[arg(long)]
+        profile: Option<PathBuf>,
 
-        /// Frame buffer spec `ADDR:WxH[:STRIDE]` / 帧缓冲规格
+        /// Firmware file (UF2 or ELF); required without --profile
+        /// 固件文件（UF2 或 ELF）；没有 --profile 时必填
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Frame buffer spec `ADDR:WxH[:STRIDE]`; required without --profile
+        /// 帧缓冲规格 `ADDR:WxH[:STRIDE]`；没有 --profile 时必填
         #[arg(long, value_name = "ADDR:WxH[:STRIDE]", value_parser = play::FrameSpec::parse)]
-        fb: play::FrameSpec,
+        fb: Option<play::FrameSpec>,
 
         /// Guest steps executed per published frame / 每发布一帧执行的客户机步数
-        #[arg(long, default_value_t = 2_500_000)]
-        steps_per_frame: u64,
+        #[arg(long)]
+        steps_per_frame: Option<u64>,
 
         /// Stop after this many frames (headless test mode)
         /// 跑满该帧数后停止（无 GUI 测试模式）
         #[arg(long)]
         frames: Option<u64>,
 
-        /// Button pin bitmap (bit set = pressed = pin low)
-        /// 按键引脚位图（置位 = 按下 = 引脚低电平）
-        #[arg(long, value_name = "MASK", default_value = "0x3FF", value_parser = play::parse_button_mask)]
-        buttons: u16,
+        /// Button pin bitmap (bit set = pressed = pin low); default drives no pin
+        /// 按键引脚位图（置位 = 按下 = 引脚低电平）；默认不驱动任何引脚
+        #[arg(long, value_name = "MASK", value_parser = play::parse_button_mask)]
+        buttons: Option<u16>,
 
-        /// Capture I2S audio words through an `AudioTap`
-        /// 通过 `AudioTap` 捕获 I2S 音频字
+        /// Capture I2S audio words through an `AudioTap` (needs --audio-block/--audio-sm)
+        /// 通过 `AudioTap` 捕获 I2S 音频字（需要 --audio-block/--audio-sm）
         #[arg(long)]
         audio: bool,
 
+        /// PIO block that pushes the I2S words / 推送 I2S 字的 PIO 块
+        #[arg(long)]
+        audio_block: Option<usize>,
+
+        /// State machine inside that PIO block / 该 PIO 块内的状态机
+        #[arg(long)]
+        audio_sm: Option<usize>,
+
+        /// Sample rate stored in the audio sink / 音频 sink 的采样率
+        #[arg(long)]
+        audio_rate: Option<u32>,
+
+        /// Channel count stored in the audio sink / 音频 sink 的声道数
+        #[arg(long)]
+        audio_channels: Option<u8>,
+
+        /// Samples retained by the audio sink / 音频 sink 保留的样本数
+        #[arg(long)]
+        audio_capacity: Option<usize>,
+
         /// Leading steps of the first frame printed as `[trace]` lines
         /// 第一帧开头以 `[trace]` 行打印的步数
-        #[arg(long, default_value_t = 0)]
-        trace_steps: usize,
+        #[arg(long)]
+        trace_steps: Option<usize>,
 
         /// Total instruction budget (`u64::MAX` = unlimited)
         /// 总指令预算（`u64::MAX` 表示不限制）
-        #[arg(long, default_value_t = u64::MAX)]
-        max_cycles: u64,
+        #[arg(long)]
+        max_cycles: Option<u64>,
 
         /// CPU architecture override / CPU 架构覆盖
         #[arg(long, value_enum)]
@@ -341,30 +368,42 @@ fn main() {
             finish(perfbench::run(&options), "perfbench failed / 基准测试失败");
         }
         Commands::Play {
+            profile,
             file,
             fb,
             steps_per_frame,
             frames,
             buttons,
             audio,
+            audio_block,
+            audio_sm,
+            audio_rate,
+            audio_channels,
+            audio_capacity,
             trace_steps,
             max_cycles,
             arch,
             strict_decode,
         } => {
-            let options = play::PlayOptions {
-                file: file.into(),
+            let args = play::PlayArgs {
+                profile,
+                file: file.map(Into::into),
                 frame: fb,
                 steps_per_frame,
                 max_frames: frames,
                 buttons,
                 audio,
+                audio_block,
+                audio_sm,
+                audio_rate,
+                audio_channels,
+                audio_capacity,
                 arch,
                 strict_decode,
                 max_cycles,
                 trace_steps,
             };
-            finish(play::run(&options), "play failed / 播放失败");
+            finish(play::run(&args), "play failed / 播放失败");
         }
         Commands::Gdb { file, port } => {
             let options = gdb_target::GdbOptions {
@@ -419,6 +458,7 @@ fn finish(result: anyhow::Result<()>, label: &str) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::path::Path;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("rp2350").chain(args.iter().copied()))
@@ -518,11 +558,15 @@ mod tests {
         let cli = parse(&[
             "play",
             "--file",
-            "emerald.uf2",
+            "fw.uf2",
             "--fb",
-            "0x20063DF4:240x160",
+            "0x20000000:240x160",
+            "--steps-per-frame",
+            "2500000",
             "--frames",
             "2",
+            "--buttons",
+            "0x3FF",
         ])
         .expect("parse play");
         let Commands::Play {
@@ -535,12 +579,83 @@ mod tests {
         else {
             panic!("expected the play subcommand");
         };
-        assert_eq!(fb.base, 0x2006_3DF4);
+        let fb = fb.expect("explicit frame buffer");
+        assert_eq!(fb.base, 0x2000_0000);
         assert_eq!(fb.width, 240);
         assert_eq!(fb.height, 160);
         assert_eq!(fb.stride_bytes, 480);
         assert_eq!(frames, Some(2));
-        assert_eq!(buttons, play::DEFAULT_BUTTON_PINS);
-        assert_eq!(steps_per_frame, 2_500_000);
+        assert_eq!(buttons, Some(0x3FF));
+        assert_eq!(steps_per_frame, Some(2_500_000));
+    }
+
+    #[test]
+    fn play_defaults_are_left_unset_for_the_profile_merge() {
+        // 无 `--profile` 时所有示例相关项都没有隐含默认值，由运行期解析报错。
+        // Without `--profile` nothing example-specific has an implicit default;
+        // the runtime resolution reports what is missing.
+        let cli = parse(&["play", "--frames", "2"]).expect("parse play");
+        let Commands::Play {
+            profile,
+            file,
+            fb,
+            steps_per_frame,
+            buttons,
+            audio,
+            audio_block,
+            audio_rate,
+            max_cycles,
+            trace_steps,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the play subcommand");
+        };
+        assert!(profile.is_none());
+        assert!(file.is_none());
+        assert!(fb.is_none());
+        assert!(steps_per_frame.is_none());
+        assert!(buttons.is_none());
+        assert!(!audio);
+        assert!(audio_block.is_none());
+        assert!(audio_rate.is_none());
+        assert!(max_cycles.is_none());
+        assert!(trace_steps.is_none());
+    }
+
+    #[test]
+    fn play_parses_profile_audio_wiring() {
+        let cli = parse(&[
+            "play",
+            "--profile",
+            "example/gba/profile.conf",
+            "--audio",
+            "--audio-block",
+            "2",
+            "--audio-sm",
+            "0",
+            "--audio-rate",
+            "13440",
+        ])
+        .expect("parse play");
+        let Commands::Play {
+            profile,
+            audio,
+            audio_block,
+            audio_sm,
+            audio_rate,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the play subcommand");
+        };
+        assert_eq!(
+            profile.as_deref(),
+            Some(Path::new("example/gba/profile.conf"))
+        );
+        assert!(audio);
+        assert_eq!(audio_block, Some(2));
+        assert_eq!(audio_sm, Some(0));
+        assert_eq!(audio_rate, Some(13_440));
     }
 }

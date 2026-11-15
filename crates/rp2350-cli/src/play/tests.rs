@@ -79,8 +79,8 @@ fn wait_for(session: &PlaySession, predicate: impl Fn(&PlayStats) -> bool) -> Pl
 
 #[test]
 fn frame_spec_parses_address_size_and_default_stride() {
-    let spec = FrameSpec::parse("0x20063DF4:240x160").expect("spec");
-    assert_eq!(spec.base, 0x2006_3DF4);
+    let spec = FrameSpec::parse("0x20000000:240x160").expect("spec");
+    assert_eq!(spec.base, 0x2000_0000);
     assert_eq!(spec.width, 240);
     assert_eq!(spec.height, 160);
     assert_eq!(spec.stride_bytes, 480);
@@ -347,30 +347,96 @@ fn start_rejects_invalid_configurations() {
 }
 
 #[test]
+fn play_config_defaults_are_generic() {
+    // 默认配置不驱动任何按键引脚、不捕获音频：示例接线必须由调用方显式给出。
+    // Generic defaults drive no button pin and capture no audio: example wiring
+    // must be supplied explicitly by the caller.
+    let config = PlayConfig::new(FrameSpec::new(SRAM_BASE, 4, 4), 10);
+    assert_eq!(config.button_pins, 0);
+    assert_eq!(config.audio, None);
+    assert_eq!(config.max_frames, None);
+    assert_eq!(config.trace_steps, 0);
+}
+
+#[test]
 fn audio_configuration_exposes_a_tap() {
     let config = PlayConfig {
-        audio: true,
+        audio: Some(PlayAudioConfig {
+            block: 0,
+            sm: 1,
+            rate_hz: 13_440,
+            channels: 2,
+            capacity: 1_000,
+        }),
         max_frames: Some(1),
         ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 200)
     };
     let session = PlaySession::start(spin_uf2(), spin_options(u64::MAX), config).expect("session");
     let tap = session.audio_tap().expect("audio tap");
-    assert_eq!(tap.rate_hz(), 48_000);
+    assert_eq!(tap.rate_hz(), 13_440);
     assert_eq!(tap.channels(), 2);
     wait_for(&session, |stats| stats.frames >= 1);
     let _ = session.shutdown();
 }
 
 #[test]
+fn audio_wiring_outside_the_pio_ranges_fails_the_start() {
+    let frame = FrameSpec::new(SRAM_BASE + 0x1000, 4, 4);
+    let bad_block = PlayConfig {
+        audio: Some(PlayAudioConfig {
+            block: usize::from(u8::MAX),
+            sm: 0,
+            rate_hz: 48_000,
+            channels: 2,
+            capacity: 1_000,
+        }),
+        ..PlayConfig::new(frame, 200)
+    };
+    let error = PlaySession::start(spin_uf2(), spin_options(u64::MAX), bad_block)
+        .err()
+        .expect("out-of-range block must fail");
+    assert!(error.contains("PIO block"), "{error}");
+
+    let bad_sm = PlayConfig {
+        audio: Some(PlayAudioConfig {
+            block: 0,
+            sm: usize::from(u8::MAX),
+            rate_hz: 48_000,
+            channels: 2,
+            capacity: 1_000,
+        }),
+        ..PlayConfig::new(frame, 200)
+    };
+    let error = PlaySession::start(spin_uf2(), spin_options(u64::MAX), bad_sm)
+        .err()
+        .expect("out-of-range state machine must fail");
+    assert!(error.contains("state machine"), "{error}");
+
+    let zero_rate = PlayConfig {
+        audio: Some(PlayAudioConfig {
+            block: 0,
+            sm: 0,
+            rate_hz: 0,
+            channels: 2,
+            capacity: 1_000,
+        }),
+        ..PlayConfig::new(frame, 200)
+    };
+    assert!(PlaySession::start(spin_uf2(), spin_options(u64::MAX), zero_rate).is_err());
+}
+
+#[test]
 fn buttons_setter_round_trips_and_drop_stops_the_worker() {
+    let pins = 0x0F;
     let config = PlayConfig {
         max_frames: Some(1),
+        button_pins: pins,
         ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 200)
     };
     let session = PlaySession::start(spin_uf2(), spin_options(u64::MAX), config).expect("session");
     session.set_buttons(0x2A);
     assert_eq!(session.buttons(), 0x2A);
-    assert_eq!(session.button_pins(), DEFAULT_BUTTON_PINS);
+    assert_eq!(session.button_pins(), pins);
     wait_for(&session, |stats| stats.frames >= 1);
     // Drop 必须安全停止线程：不能 panic，也不能重复 join。
     // Dropping must stop the thread safely: no panic and no double join.
@@ -456,7 +522,10 @@ fn step_frame_applies_the_current_button_mask() {
     // The mask must reach the pads at the start of a frame, so the firmware's
     // first pin read inside the frame already sees the press.
     let mut machine = machine();
-    let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 32);
+    let config = PlayConfig {
+        button_pins: 1 << 3,
+        ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 32)
+    };
     let stop = AtomicBool::new(false);
     let buttons = AtomicU16::new(1 << 3);
     let mut trace_left = 0;
@@ -476,7 +545,10 @@ fn buttons_are_resampled_inside_a_frame() {
     // The button mask must be re-read inside a frame, not only at frame
     // boundaries: a press arriving mid-frame must be visible to a later slice.
     let mut machine = machine();
-    let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 400_000);
+    let config = PlayConfig {
+        button_pins: 1 << 4,
+        ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 400_000)
+    };
     let stop = AtomicBool::new(false);
     let buttons = Arc::new(AtomicU16::new(0));
     let mut trace_left = 0;

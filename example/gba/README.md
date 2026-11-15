@@ -58,17 +58,40 @@ PPU + HSTX + core1 + I2S audio up (clk_sys 252000000 Hz); entering AgbMain()...
 ## 游玩 / Playing
 
 固件把每帧画到 SRAM 里的 `g_fb`（`0x20063DF4`，240×160 RGB565），模拟器按
-「每帧固定步数」推进并抓这个缓冲区；按键通过 `GP0..GP9` 注入。
+「每帧固定步数」推进并抓这个缓冲区；按键通过 `GP0..GP9` 注入，I2S 音频来自
+PIO2 的 SM0（13440 Hz 立体声）。这些**示例专用**值都在
+[`profile.conf`](profile.conf) 里，模拟器本身没有它们的默认值。
 
 ```bash
 # 无 GUI：跑 20 帧，打印每帧与汇总（当前约 12 fps / 30 M steps/s）
+rp2350-cli play --profile example/gba/profile.conf --frames 20
+
+# 等价的显式参数写法（不使用 profile）
 rp2350-cli play --file emerald.uf2 --fb 0x20063DF4:240x160 \
-    --steps-per-frame 2500000 --frames 20
+    --steps-per-frame 2500000 --buttons 0x3FF \
+    --audio --audio-block 2 --audio-sm 0 --audio-rate 13440 --frames 20
 
 # 带音频台（默认 null 后端；要真的出声需编译 cpal 后端）
 cargo run -p rp2350-egui --features audio-playback --release
 # 「游戏 / Play」标签页 → 填固件路径与帧缓冲 → Start
 ```
+
+profile 是逐行 `key = value`（`#` 为注释），命令行同名参数覆盖 profile：
+
+| key | 含义 |
+|-----|------|
+| `firmware` | 固件路径（`--file`） |
+| `frame` | `ADDR:WxH[:STRIDE]`（`--fb`） |
+| `steps_per_frame` | 每帧步数（`--steps-per-frame`） |
+| `max_frames` | 帧数上限（`--frames`） |
+| `buttons` | 按键引脚位图，`0x` 十六进制或十进制（`--buttons`） |
+| `audio` | `true/false`（`--audio`） |
+| `audio_block` / `audio_sm` | I2S 所在的 PIO 块与状态机（`--audio-block` / `--audio-sm`） |
+| `audio_rate` / `audio_channels` / `audio_capacity` | sink 采样率/声道数/容量（`--audio-*`） |
+| `arch` / `strict_decode` / `max_cycles` | 架构覆盖 / 未定义指令即停机 / 总预算 |
+
+没有 `--profile` 时 `--file`、`--fb`、`--steps-per-frame` 都必须显式给出，
+否则命令直接报错退出。
 
 GUI 按键（画面获焦后生效）：
 

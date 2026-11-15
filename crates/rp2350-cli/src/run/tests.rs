@@ -431,8 +431,8 @@ fn unused_pio_blocks_do_not_change_stepping() {
 
 #[test]
 fn memory_dump_specs_parse_decimal_and_hex() {
-    let dump = MemoryDump::parse("0x20063DF4:0x12C00:fb.bin").expect("spec");
-    assert_eq!(dump.address, 0x2006_3DF4);
+    let dump = MemoryDump::parse("0x20000000:0x12C00:fb.bin").expect("spec");
+    assert_eq!(dump.address, 0x2000_0000);
     assert_eq!(dump.length, 0x1_2C00);
     assert_eq!(dump.path, PathBuf::from("fb.bin"));
 
@@ -1165,9 +1165,15 @@ fn step_cores_respects_the_budget() {
     assert_eq!(machine.steps(), 3);
 }
 
-/// `emerald.uf2` used by the ignore-gated smoke test / 冒烟测试使用的固件
-const EMERALD_UF2: &str =
-    r"E:\Source\mcu\pico\rp2350\gba\pokeemerald-rp2350\rp2350\hw\build_emerald\emerald.uf2";
+/// Environment variable naming the firmware for the ignore-gated smoke test
+/// 冒烟测试所用的固件路径环境变量
+///
+/// Example: `$env:RP2350_EMERALD_UF2 = "…\emerald.uf2"`. The test is skipped
+/// when the variable is unset or the file is unreadable, because the image is
+/// not part of this repository.
+/// 例如 `$env:RP2350_EMERALD_UF2 = "…\emerald.uf2"`。映像不属于本仓库，因此变量
+/// 未设置或文件不可读时测试直接跳过。
+const EMERALD_UF2_ENV: &str = "RP2350_EMERALD_UF2";
 
 #[test]
 #[ignore = "long firmware smoke test / 长固件冒烟测试"]
@@ -1179,7 +1185,10 @@ fn emerald_runs_core1_hstx_without_bus_errors() {
     // `multicore_launch_core1_with_stack`; its first action is
     // `hstx_display_start`, so HSTX output words must become non-zero and no
     // bus error may occur.
-    let Ok(bytes) = std::fs::read(EMERALD_UF2) else {
+    let Some(path) = std::env::var_os(EMERALD_UF2_ENV) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
         return;
     };
     let options = MachineOptions {

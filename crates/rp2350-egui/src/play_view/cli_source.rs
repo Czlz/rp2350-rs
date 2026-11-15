@@ -18,10 +18,16 @@
 //! [`CliPlayStarter`] 用 [`FrameSpec::parse`] 解析工具栏的帧文本，以默认
 //! [`MachineOptions`]（`arch: None` 由映像格式选核，`max_cycles = u64::MAX`
 //! 使游戏运行到用户停止）启动 [`PlaySession`]，再用 [`CliPlaySource`] 包装。
+//!
+//! Audio wiring is passed straight through: [`PlayRequest::audio`] becomes
+//! `PlayConfig::audio` (`None` leaves the PIO FIFOs untouched), so the GUI never
+//! invents a PIO block, state machine or sample rate.
+//! 音频接线原样传递：[`PlayRequest::audio`] 变为 `PlayConfig::audio`（`None` 完全
+//! 不碰 PIO FIFO），因此 GUI 绝不会自行编造 PIO 块、状态机或采样率。
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rp2350_cli::play::{FrameSpec, PlayConfig, PlaySession};
+use rp2350_cli::play::{FrameSpec, PlayAudioConfig, PlayConfig, PlaySession};
 use rp2350_cli::run::MachineOptions;
 
 use super::{PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats};
@@ -105,6 +111,16 @@ impl PlaySource for CliPlaySource {
         self.session.button_pins()
     }
 
+    fn audio_source(&self) -> Option<Box<dyn rp2350_audio::SampleSource>> {
+        // `AudioTap` itself implements `SampleSource`; the tap is a clone of the
+        // one installed on the worker's PIO state machine.
+        // `AudioTap` 本身实现了 `SampleSource`；该 tap 是安装在 worker PIO 状态机
+        // 上的那份的克隆。
+        self.session
+            .audio_tap()
+            .map(|tap| Box::new(tap) as Box<dyn rp2350_audio::SampleSource>)
+    }
+
     fn shutdown(self: Box<Self>) -> PlayStats {
         // 帧替换计数必须在 shutdown 消费会话前取走。
         // Read the replace count before shutdown consumes the session.
@@ -132,6 +148,16 @@ impl PlayStarter for CliPlayStarter {
         if request.steps_per_frame == 0 {
             return Err("steps per frame must be positive / 每帧步数必须大于 0".to_owned());
         }
+        // 音频接线逐字段搬运：`None` 表示完全不捕获，不做任何示例猜测。
+        // The wiring is copied field by field: `None` means "capture nothing", with
+        // no example guess of any kind.
+        let audio = request.audio.map(|wiring| PlayAudioConfig {
+            block: wiring.block,
+            sm: wiring.sm,
+            rate_hz: wiring.rate_hz,
+            channels: wiring.channels,
+            capacity: wiring.capacity,
+        });
         let config = PlayConfig {
             frame,
             steps_per_frame: request.steps_per_frame,
@@ -139,7 +165,7 @@ impl PlayStarter for CliPlayStarter {
             // No frame limit and no trace output: an interactive game runs until stopped.
             max_frames: None,
             button_pins: request.button_pins,
-            audio: request.audio,
+            audio,
             trace_steps: 0,
         };
         let options = MachineOptions {
