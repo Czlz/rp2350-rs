@@ -66,7 +66,7 @@
 > | P1-1/2/3 | `play` worker、egui PlayView、示例 profile | cli + egui + example | ✅ |
 > | P2-1/2/3 | I2S 捕获、`rp2350-audio`、GUI 音频输出 | periph + audio + egui | ✅ |
 > | P3-1 | CLI 挂载 PSRAM（= GAP-08b） | cli | ✅ |
-> | P3-3 | 长时间 soak（headless，≥30 分钟模拟时间） | 主会话 | ⏳ |
+> | P3-3 | 长时间 soak（headless） | 主会话 | ✅ 2 G 步完整运行 + 30 分钟采样，工作集恒定（见 performance.md §10） |
 > | P4-1 | 时钟树（XOSC/ROSC/PLL/CLOCKS + 超频） | periph + core | ✅ |
 > | P4-2 | 动态频率接入全部计时消费者 | periph + core + cli + usb-host | ✅ |
 > | P4-2b | SysTick/PendSV 异常号与向量 | arm + periph | ✅ |
