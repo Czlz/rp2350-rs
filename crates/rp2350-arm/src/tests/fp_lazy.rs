@@ -12,7 +12,7 @@ use super::*;
 use crate::conditions::ITBlockState;
 use crate::fpu::{fpccr, fpexc, fpscr, sys_reg};
 use crate::nvic::Nvic;
-use crate::registers::CortexM33Registers;
+use crate::registers::{CONTROL_FPCA, CortexM33Registers};
 
 /// Initial MSP used by the fixture / 测试夹具使用的初始 MSP
 const MSP_TOP: u32 = 0x2000_1000;
@@ -52,11 +52,12 @@ impl FpFixture {
         }
     }
 
-    /// Fixture with a live FP context (`FPEXC.EN` set, S0 = 1.0)
-    /// 带活跃浮点上下文的夹具（`FPEXC.EN` 置位，S0 = 1.0）
+    /// Fixture with a live FP context (`FPEXC.EN` and `CONTROL.FPCA` set, S0 = 1.0)
+    /// 带活跃浮点上下文的夹具（`FPEXC.EN` 与 `CONTROL.FPCA` 置位，S0 = 1.0）
     fn with_live_fp() -> Self {
         let mut fixture = Self::new();
         fixture.regs.fpu.fpexc |= fpexc::EN;
+        fixture.regs.control |= CONTROL_FPCA;
         fixture.regs.fpu.write_s(0, 0x3F80_0000);
         fixture
     }
@@ -101,18 +102,35 @@ impl FpFixture {
 #[test]
 fn fpccr_reset_value_and_writable_bits() {
     let mut core = CortexM33Core::new(CpuId::Core0);
-    // Cortex-M33 reset value: ASPEN=1, LSPEN=1, LSPACT=0.
-    // Cortex-M33 复位值：ASPEN=1、LSPEN=1、LSPACT=0。
-    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0xC000_0000));
+    // Cortex-M33 reset value ASPEN=1/LSPEN=1/LSPACT=0 plus the hard-wired TS.
+    // Cortex-M33 复位值 ASPEN=1/LSPEN=1/LSPACT=0，再叠加恒为 1 的 TS。
+    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0xC400_0000));
 
-    // Only ASPEN and LSPEN are writable; LSPACT and reserved bits read 0.
-    // 只有 ASPEN 与 LSPEN 可写；LSPACT 与保留位读 0。
+    // Only the behaviour bits are writable: LSPACT is hardware-managed and TS
+    // cannot be cleared.
+    // 只有行为位可写：LSPACT 由硬件管理，TS 无法被清除。
     core.system_write(sys_reg::FPCCR, 0xFFFF_FFFF);
-    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0xC000_0000));
+    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0xFC00_000A));
     core.system_write(sys_reg::FPCCR, 0);
-    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0));
+    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0x0400_0000));
     core.system_write(sys_reg::FPCCR, 1 << 31);
-    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0x8000_0000));
+    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0x8400_0000));
+}
+
+#[test]
+fn fpccr_ts_reads_one_after_every_write() {
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    assert_ne!(core.system_read(sys_reg::FPCCR).unwrap() & fpccr::TS, 0);
+    core.system_write(sys_reg::FPCCR, 0);
+    assert_eq!(
+        core.system_read(sys_reg::FPCCR).unwrap() & fpccr::TS,
+        fpccr::TS,
+        "TS is hard-wired to 1 / TS 恒为 1"
+    );
+    // Reset also restores TS when the whole register is rebuilt.
+    // 整个寄存器重建时复位值同样包含 TS。
+    core.reset();
+    assert_eq!(core.system_read(sys_reg::FPCCR), Some(0xC400_0000));
 }
 
 #[test]
@@ -144,7 +162,7 @@ fn inactive_fpu_keeps_standard_frame() {
     assert_eq!(fixture.regs.lr, 0xFFFF_FFF9);
     assert!(!fixture.regs.fpu.lspact());
     assert_eq!(fixture.regs.fpu.fpcar, 0);
-    assert_eq!(fixture.regs.fpu.fpccr, 0xC000_0000);
+    assert_eq!(fixture.regs.fpu.fpccr, 0xC400_0000);
 }
 
 #[test]
@@ -387,4 +405,156 @@ fn fpdscr_does_not_change_arithmetic_rounding() {
     assert_eq!(core.registers.fpu.s[0], 0x3EAA_AAAB);
     assert_eq!(core.system_read(sys_reg::FPDSCR), Some(fpscr::RMODE_MASK));
     assert_eq!(core.registers.fpu.fpscr & fpscr::RMODE_MASK, 0);
+}
+
+#[test]
+fn fpu_instruction_raises_control_fpca() {
+    let mut bus = fpu_test_bus(0x0000_0101);
+    let mut cycles = 0u64;
+    // VMOV S0, R0
+    bus.write_u16(0x0100, 0xEE00, &mut cycles).unwrap();
+    bus.write_u16(0x0102, 0x0A10, &mut cycles).unwrap();
+
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    core.boot(&mut bus).unwrap();
+    assert_eq!(core.registers.control & CONTROL_FPCA, 0);
+    core.write_register(0, 0x3F80_0000);
+
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    // ARMv8-M: executing an FP instruction with CPACR access sets FPCA.
+    // ARMv8-M：CPACR 允许时执行浮点指令即置位 FPCA。
+    assert_eq!(core.registers.control & CONTROL_FPCA, CONTROL_FPCA);
+    assert!(core.registers.fp_context_active());
+}
+
+#[test]
+fn denied_fpu_access_does_not_raise_control_fpca() {
+    let mut bus = fpu_test_bus(0x0000_0101);
+    let mut cycles = 0u64;
+    bus.write_u32(0x0000_0018, 0x0000_0301, &mut cycles)
+        .unwrap();
+    // VMOV S0, R0 — CPACR is cleared below, so it must fault instead.
+    // VMOV S0, R0 —— 下方清除 CPACR，因此必须触发故障。
+    bus.write_u16(0x0100, 0xEE00, &mut cycles).unwrap();
+    bus.write_u16(0x0102, 0x0A10, &mut cycles).unwrap();
+
+    let mut core = CortexM33Core::new(CpuId::Core0);
+    core.boot(&mut bus).unwrap();
+    core.system_write(SCB_CPACR, 0);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.registers.control & CONTROL_FPCA, 0);
+    assert_ne!(core.cfsr & exceptions::CFSR_UFSR_NOCP, 0);
+}
+
+#[test]
+fn clronret_clears_fpca_when_returning_a_basic_frame() {
+    let mut fixture = FpFixture::new();
+    // Entry stacked a basic frame: no FP state belongs to the thread.
+    // 进入时压入基础帧：线程没有浮点状态。
+    fixture.enter();
+    assert_eq!(fixture.regs.lr & 0x10, 0x10, "basic frame / 基础帧");
+    assert!(!fixture.regs.fp_context_active());
+
+    // The handler itself uses the FPU, which raises FPCA/FPEXC.EN.
+    // 处理程序自身使用浮点单元，从而置位 FPCA/FPEXC.EN。
+    fixture.regs.control |= CONTROL_FPCA;
+    fixture.regs.fpu.fpexc |= fpexc::EN;
+    fixture.regs.fpu.write_fpccr(fpccr::CLRONRET);
+
+    fixture.exit();
+
+    // CLRONRET deactivates the FP context of the returned basic frame.
+    // CLRONRET 关闭基础帧返回后的浮点上下文。
+    assert_eq!(fixture.regs.control & CONTROL_FPCA, 0);
+    assert_eq!(fixture.regs.fpu.fpexc & fpexc::EN, 0);
+    assert!(!fixture.regs.fp_context_active());
+    assert_eq!(fixture.regs.msp, MSP_TOP);
+}
+
+#[test]
+fn fpca_survives_a_basic_frame_return_without_clronret() {
+    let mut fixture = FpFixture::new();
+    fixture.enter();
+    fixture.regs.control |= CONTROL_FPCA;
+    fixture.regs.fpu.fpexc |= fpexc::EN;
+    // Reset FPCCR: ASPEN | LSPEN | TS, no CLRONRET.
+    // 复位 FPCCR：ASPEN | LSPEN | TS，无 CLRONRET。
+    assert!(!fixture.regs.fpu.clear_on_return());
+
+    fixture.exit();
+
+    assert_eq!(fixture.regs.control & CONTROL_FPCA, CONTROL_FPCA);
+    assert!(fixture.regs.fp_context_active());
+    assert_eq!(fixture.regs.msp, MSP_TOP);
+}
+
+#[test]
+fn clronrets_also_clears_on_return_in_the_single_security_state() {
+    let mut fixture = FpFixture::new();
+    fixture.enter();
+    fixture.regs.control |= CONTROL_FPCA;
+    fixture.regs.fpu.fpexc |= fpexc::EN;
+    // Without TrustZone the secure-only CLRONRETS acts on the only state.
+    // 没有 TrustZone 时，仅安全态可见的 CLRONRETS 作用于唯一状态。
+    fixture.regs.fpu.write_fpccr(fpccr::CLRONRETS);
+
+    fixture.exit();
+
+    assert_eq!(fixture.regs.control & CONTROL_FPCA, 0);
+    assert!(!fixture.regs.fp_context_active());
+}
+
+#[test]
+fn clronret_zeroes_caller_saved_context_on_extended_return() {
+    let mut fixture = FpFixture::with_live_fp();
+    fixture.regs.fpu.fpscr = 0x0000_0004;
+    fixture.regs.fpu.write_s(15, 0x4120_0000);
+    fixture
+        .regs
+        .fpu
+        .write_fpccr(fpccr::ASPEN | fpccr::LSPEN | fpccr::CLRONRET);
+    fixture.enter();
+    // The handler touches the FPU, so the lazy context is committed and then
+    // unstacked on return; CLRONRET must wipe S0-S15 and FPSCR afterwards.
+    // 处理程序使用浮点单元，惰性上下文被提交并在返回时卸载；随后 CLRONRET
+    // 必须清零 S0-S15 与 FPSCR。
+    assert!(
+        exceptions::commit_lazy_fp_context(
+            &mut fixture.bus,
+            &mut fixture.regs,
+            &mut fixture.cycles
+        )
+        .unwrap()
+    );
+
+    fixture.exit();
+
+    assert_eq!(fixture.regs.msp, MSP_TOP);
+    assert!(fixture.regs.fpu.s[..16].iter().all(|word| *word == 0));
+    assert_eq!(fixture.regs.fpu.fpscr, 0);
+    // The FP context stays active: S16-S31 (callee saved) still belong to the
+    // interrupted thread, only the caller-saved half is dropped.
+    // 浮点上下文仍活跃：S16-S31（被调用者保存）仍属于被打断的线程，只丢弃
+    // 调用者保存的那一半。
+    assert!(fixture.regs.fp_context_active());
+}
+
+#[test]
+fn clronret_keeps_live_registers_when_the_lazy_frame_was_never_committed() {
+    let mut fixture = FpFixture::with_live_fp();
+    fixture
+        .regs
+        .fpu
+        .write_fpccr(fpccr::ASPEN | fpccr::LSPEN | fpccr::CLRONRET);
+    fixture.enter();
+    assert!(fixture.regs.fpu.lspact(), "nothing written yet / 尚未写入");
+
+    // The handler never executes a VFP instruction, so the registers still
+    // hold the interrupted context and must survive the return.
+    // 处理程序未执行任何浮点指令，寄存器仍是被打断的上下文，必须原样保留。
+    fixture.exit();
+
+    assert_eq!(fixture.regs.fpu.s[0], 0x3F80_0000);
+    assert!(!fixture.regs.fpu.lspact());
+    assert_eq!(fixture.regs.msp, MSP_TOP);
 }

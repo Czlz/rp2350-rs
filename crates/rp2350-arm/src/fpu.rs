@@ -70,30 +70,80 @@ pub mod fpexc {
 
 /// FPCCR bit definitions / FPCCR 位定义
 ///
-/// Layout follows the ARMv8-M `FPCCR` (no Security Extension): `ASPEN` in bit
-/// 31, `LSPEN` in bit 30 and the hardware-managed `LSPACT` in bit 0. Bits that
-/// this model does not implement (`LSPENS`, `CLRONRET`, `CLRONRETS`, `TS`,
-/// `USER`, `THREAD` and the readiness flags) read as zero. The reset value is
-/// `0xC000_0000`, i.e. automatic and lazy state preservation both enabled, as
-/// documented for the Cortex-M33.
-/// 布局遵循 ARMv8-M 的 `FPCCR`（无安全扩展）：`ASPEN` 位于 bit 31，`LSPEN`
-/// 位于 bit 30，硬件管理的 `LSPACT` 位于 bit 0。本模型未实现的位
-/// （`LSPENS`、`CLRONRET`、`CLRONRETS`、`TS`、`USER`、`THREAD` 与就绪标志）
-/// 读为 0。复位值为 `0xC000_0000`，即自动压栈与惰性压栈都使能，与
-/// Cortex-M33 手册一致。
+/// Layout follows the ARMv8-M `FPCCR` (B3.4.7, banked security view collapsed
+/// into one): `ASPEN` in bit 31, `LSPEN` 30, `LSPENS` 29, `CLRONRET` 28,
+/// `CLRONRETS` 27, `TS` 26, `THREAD` 3, `USER` 1 and the hardware-managed
+/// `LSPACT` in bit 0.
+///
+/// Behaviour modelled here / 本模型建模的行为：
+/// - `TS` is hard-wired to 1 on this FPv5 implementation: reads return 1 and
+///   writes are ignored, so the reset value always contains it. This stands in
+///   for "the FP context is treated as secure, hence the callee-saved registers
+///   are part of the frame".
+/// - `CLRONRET` and `CLRONRETS` are both acted upon by the exception-return
+///   path. Because there is no TrustZone model, the secure (`CLRONRETS`) and
+///   non-secure (`CLRONRET`) variants collapse onto the single security state;
+///   either bit requests the clear.
+/// - `LSPENS`, `THREAD` and `USER` are plain storage: no secure state exists
+///   that `LSPENS` could protect, and the model never allocates a frame from
+///   unprivileged or handler-less contexts, so there is nothing to report
+///   through `THREAD`/`USER`.
+///
+/// `TS` reads as 1, writes to it are discarded, and the reset value is
+/// `0xC400_0000` (`ASPEN | LSPEN | TS`), i.e. automatic and lazy state
+/// preservation both enabled, as documented for the Cortex-M33.
+/// 布局遵循 ARMv8-M 的 `FPCCR`（B3.4.7，安全/非安全分组视图合并为一份）：
+/// `ASPEN` 位 31、`LSPEN` 30、`LSPENS` 29、`CLRONRET` 28、`CLRONRETS` 27、
+/// `TS` 26、`THREAD` 3、`USER` 1，以及硬件管理、位于位 0 的 `LSPACT`。
+///
+/// 本模型建模的行为：
+/// - 本 FPv5 实现把 `TS` 恒定为 1：读为 1、写入被忽略，因此复位值始终包含该位。
+///   其含义是「浮点上下文按安全上下文处理」，被调用者保存寄存器属于栈帧。
+/// - `CLRONRET` 与 `CLRONRETS` 都由异常返回路径生效。由于没有 TrustZone 模型，
+///   安全（`CLRONRETS`）与非安全（`CLRONRET`）两个变体折叠到唯一的安全状态：
+///   任一位置位即请求清除。
+/// - `LSPENS`、`THREAD`、`USER` 仅作存储：没有可被 `LSPENS` 保护的安全状态，
+///   而模型也不会从非特权或无处理程序上下文中分配栈帧，因此 `THREAD`/`USER`
+///   无内容可上报。
+///
+/// `TS` 读为 1、写入被丢弃，复位值为 `0xC400_0000`（`ASPEN | LSPEN | TS`），
+/// 即自动压栈与惰性压栈都使能，与 Cortex-M33 手册一致。
 pub mod fpccr {
     /// Automatic state preservation enable / 自动状态保存使能
+    ///
+    /// Enables setting `CONTROL.FPCA` when a floating-point instruction
+    /// executes. / 使浮点指令执行时置位 `CONTROL.FPCA`。
     pub const ASPEN: u32 = 1 << 31;
     /// Lazy state preservation enable / 惰性状态保存使能
     pub const LSPEN: u32 = 1 << 30;
+    /// Lazy state preservation enable, secure only — stored only
+    /// 仅安全态可见的惰性状态保存使能 —— 仅存储
+    pub const LSPENS: u32 = 1 << 29;
+    /// Clear caller-saved FP registers on exception return
+    /// 异常返回时清除调用者保存的浮点寄存器
+    pub const CLRONRET: u32 = 1 << 28;
+    /// Clear-on-return control, secure only — folded onto the single state
+    /// 仅安全态可见的异常返回清除控制 —— 折叠到唯一状态
+    pub const CLRONRETS: u32 = 1 << 27;
+    /// Treat the floating-point registers as secure; hard-wired to 1
+    /// 把浮点寄存器按安全上下文处理；恒为 1
+    pub const TS: u32 = 1 << 26;
+    /// Thread mode when the FP frame was allocated — stored only
+    /// 分配浮点栈帧时的线程模式 —— 仅存储
+    pub const THREAD: u32 = 1 << 3;
+    /// Unprivileged level when the FP frame was allocated — stored only
+    /// 分配浮点栈帧时的非特权级别 —— 仅存储
+    pub const USER: u32 = 1 << 1;
     /// Lazy state preservation active, hardware managed, read-only
     /// 惰性状态保存进行中，硬件管理，只读
     pub const LSPACT: u32 = 1 << 0;
-    /// Bits writable by software through `system_write`
-    /// 可经 `system_write` 由软件写入的位
-    pub const WRITABLE_MASK: u32 = ASPEN | LSPEN;
-    /// Reset value: `ASPEN | LSPEN` / 复位值：`ASPEN | LSPEN`
-    pub const RESET: u32 = ASPEN | LSPEN;
+    /// Bits writable by software through `system_write` (`TS` excluded)
+    /// 可经 `system_write` 由软件写入的位（不含 `TS`）
+    pub const WRITABLE_MASK: u32 = ASPEN | LSPEN | LSPENS | CLRONRET | CLRONRETS | THREAD | USER;
+    /// Bits that always read as one / 恒读为 1 的位
+    pub const READ_ONE_MASK: u32 = TS;
+    /// Reset value: `ASPEN | LSPEN | TS` / 复位值：`ASPEN | LSPEN | TS`
+    pub const RESET: u32 = ASPEN | LSPEN | TS;
 }
 
 /// FPCAR bit definitions / FPCAR 位定义
@@ -184,9 +234,12 @@ pub struct FpuRegisters {
     pub fpexc: u32,
     /// Floating-point context control register / 浮点上下文控制寄存器
     ///
-    /// Holds `FPCCR.ASPEN`, `FPCCR.LSPEN` and the hardware-managed
-    /// `FPCCR.LSPACT` bit. / 保存 `FPCCR.ASPEN`、`FPCCR.LSPEN` 与硬件管理的
-    /// `FPCCR.LSPACT` 位。
+    /// Holds the software-writable configuration bits (`ASPEN`, `LSPEN`,
+    /// `LSPENS`, `CLRONRET`/`CLRONRETS`, `THREAD`, `USER`), the hard-wired
+    /// `TS` bit and the hardware-managed `FPCCR.LSPACT` bit.
+    /// 保存软件可写的配置位（`ASPEN`、`LSPEN`、`LSPENS`、
+    /// `CLRONRET`/`CLRONRETS`、`THREAD`、`USER`）、恒为 1 的 `TS` 位以及
+    /// 硬件管理的 `FPCCR.LSPACT` 位。
     pub fpccr: u32,
     /// Floating-point context address register / 浮点上下文地址寄存器
     ///
@@ -202,9 +255,9 @@ impl FpuRegisters {
     /// Create a zeroed FPU register file in reset state
     /// 创建复位状态下清零的 FPU 寄存器文件
     ///
-    /// `FPCCR` starts at its ARM reset value (`ASPEN | LSPEN`); `FPCAR` and
-    /// `FPDSCR` reset to zero. / `FPCCR` 以 ARM 复位值（`ASPEN | LSPEN`）启动；
-    /// `FPCAR` 与 `FPDSCR` 复位为 0。
+    /// `FPCCR` starts at its ARM reset value (`ASPEN | LSPEN | TS`); `FPCAR`
+    /// and `FPDSCR` reset to zero. / `FPCCR` 以 ARM 复位值
+    /// （`ASPEN | LSPEN | TS`）启动；`FPCAR` 与 `FPDSCR` 复位为 0。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -234,14 +287,41 @@ impl FpuRegisters {
         }
     }
 
+    /// Report whether the exception-return path must clear the FP context
+    /// 报告异常返回路径是否需要清除浮点上下文
+    ///
+    /// `CLRONRET` (non-secure) and `CLRONRETS` (secure) both request the clear.
+    /// With no TrustZone model both bits apply to the single security state, so
+    /// either one enables the behaviour: the caller-saved registers S0-S15 and
+    /// FPSCR are cleared when an extended frame is returned, and the FP context
+    /// is deactivated (`CONTROL.FPCA`/`FPEXC.EN` cleared) when the returned
+    /// frame carries no floating-point state.
+    /// `CLRONRET`（非安全）与 `CLRONRETS`（安全）都请求该清除。由于本模型没有
+    /// TrustZone，两位都作用于唯一的安全状态，因此任一位置位即生效：返回扩展帧
+    /// 时清除调用者保存寄存器 S0-S15 与 FPSCR；返回不含浮点状态的帧时关闭浮点
+    /// 上下文（清 `CONTROL.FPCA`/`FPEXC.EN`）。
+    #[must_use]
+    pub fn clear_on_return(&self) -> bool {
+        self.fpccr & (fpccr::CLRONRET | fpccr::CLRONRETS) != 0
+    }
+
+    /// Report `FPCCR.TS`; always true on this model
+    /// 报告 `FPCCR.TS`；本模型恒为真
+    #[must_use]
+    pub fn ts(&self) -> bool {
+        self.fpccr & fpccr::TS != 0
+    }
+
     /// Write `FPCCR`; only software-writable bits are stored
     /// 写入 `FPCCR`；只保存软件可写位
     ///
-    /// `LSPACT` is hardware managed and keeps its current value, matching the
-    /// read-only nature of the bit. / `LSPACT` 由硬件管理并保持当前值，与该位
-    /// 只读的性质一致。
+    /// `LSPACT` is hardware managed and keeps its current value, and `TS` is
+    /// hard-wired to 1, so software can neither clear it nor observe a zero.
+    /// `LSPACT` 由硬件管理并保持当前值，`TS` 恒为 1，因此软件既不能清除它，
+    /// 也不会观察到 0。
     pub fn write_fpccr(&mut self, value: u32) {
-        self.fpccr = (self.fpccr & fpccr::LSPACT) | (value & fpccr::WRITABLE_MASK);
+        self.fpccr =
+            (self.fpccr & fpccr::LSPACT) | fpccr::READ_ONE_MASK | (value & fpccr::WRITABLE_MASK);
     }
 
     /// Write `FPCAR`; the three low bits are reserved and forced to zero
@@ -260,12 +340,12 @@ impl FpuRegisters {
     /// 处理来自私有外设总线的浮点系统寄存器访问
     ///
     /// Returns `Some(value)` when `addr` is `FPCCR`, `FPCAR` or `FPDSCR`, with
-    /// the read-back value after a write. `LSPACT` is hardware managed, so
-    /// software writes to `FPCCR` cannot change it, and `FPCAR`/`FPDSCR`
-    /// filter their reserved or unmodeled bits.
+    /// the read-back value after a write. `LSPACT` is hardware managed and `TS`
+    /// is hard-wired, so software writes to `FPCCR` cannot change either, and
+    /// `FPCAR`/`FPDSCR` filter their reserved or unmodeled bits.
     /// 当 `addr` 为 `FPCCR`、`FPCAR` 或 `FPDSCR` 时返回 `Some(value)`，写入后
-    /// 返回回读值。`LSPACT` 由硬件管理，软件写 `FPCCR` 不会改变它；
-    /// `FPCAR`/`FPDSCR` 会过滤保留位与未建模位。
+    /// 返回回读值。`LSPACT` 由硬件管理、`TS` 恒为 1，因此软件写 `FPCCR` 都
+    /// 不会改变它们；`FPCAR`/`FPDSCR` 会过滤保留位与未建模位。
     pub fn system_access(&mut self, addr: u32, write: bool, value: u32) -> Option<u32> {
         match addr {
             sys_reg::FPCCR => {
@@ -360,24 +440,52 @@ mod tests {
     #[test]
     fn reset_fpccr_enables_automatic_and_lazy_preservation() {
         let fpu = FpuRegisters::new();
-        // Cortex-M33 复位值：ASPEN=1、LSPEN=1、LSPACT=0。
-        // Cortex-M33 reset value: ASPEN=1, LSPEN=1, LSPACT=0.
-        assert_eq!(fpu.fpccr, 0xC000_0000);
+        // Cortex-M33 复位值：ASPEN=1、LSPEN=1、LSPACT=0；本模型叠加恒为 1 的 TS。
+        // Cortex-M33 reset value: ASPEN=1, LSPEN=1, LSPACT=0, plus the
+        // hard-wired TS bit of this model.
+        assert_eq!(fpu.fpccr, 0xC400_0000);
+        assert!(fpu.ts());
         assert!(!fpu.lspact());
+        assert!(!fpu.clear_on_return());
         assert_eq!(fpu.fpcar, 0);
         assert_eq!(fpu.fpdscr, 0);
     }
 
     #[test]
-    fn fpccr_write_ignores_lspact_and_reserved_bits() {
+    fn fpccr_write_ignores_lspact_ts_and_reserved_bits() {
         let mut fpu = FpuRegisters::new();
         fpu.set_lspact(true);
         fpu.write_fpccr(0xFFFF_FFFF);
-        assert_eq!(fpu.fpccr, 0xC000_0001);
+        // Everything writable is stored except TS (hard-wired) and LSPACT.
+        // 除恒为 1 的 TS 与硬件管理的 LSPACT 外，可写位全部保存。
+        assert_eq!(fpu.fpccr, fpccr::WRITABLE_MASK | fpccr::TS | fpccr::LSPACT);
         fpu.write_fpccr(0);
-        assert_eq!(fpu.fpccr, 0x0000_0001);
+        assert_eq!(fpu.fpccr, 0x0400_0001, "TS cannot be cleared");
+        assert!(fpu.ts());
         fpu.set_lspact(false);
-        assert_eq!(fpu.fpccr, 0);
+        assert_eq!(fpu.fpccr, 0x0400_0000);
+    }
+
+    #[test]
+    fn fpccr_stores_behavior_bits_and_ignores_reserved_ones() {
+        let mut fpu = FpuRegisters::new();
+        // LSPENS[29], CLRONRET[28], CLRONRETS[27], THREAD[3], USER[1].
+        // LSPENS[29]、CLRONRET[28]、CLRONRETS[27]、THREAD[3]、USER[1]。
+        fpu.write_fpccr(0x3800_000A);
+        assert_eq!(fpu.fpccr, 0x3C00_000A);
+        assert!(fpu.clear_on_return());
+        // Only CLRONRET alone still requests the clear (single security state).
+        // 单安全态下仅 CLRONRET 置位同样请求清除。
+        fpu.write_fpccr(fpccr::CLRONRET);
+        assert!(fpu.clear_on_return());
+        fpu.write_fpccr(fpccr::CLRONRETS);
+        assert!(fpu.clear_on_return());
+        fpu.write_fpccr(0);
+        assert!(!fpu.clear_on_return());
+        // Reserved bits [25:11] stay zero.
+        // 保留位 [25:11] 读为 0。
+        fpu.write_fpccr(0x03FF_F800);
+        assert_eq!(fpu.fpccr, 0x0400_0000);
     }
 
     #[test]

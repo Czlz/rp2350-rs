@@ -493,13 +493,24 @@ impl CortexM33Core {
             // 加载/存储、系统寄存器访问）之前，把被中断上下文的 S0-S15 与
             // FPSCR 写入异常进入时由 FPCAR 预留的区域并清除 LSPACT，保证每个
             // 栈帧只提交一次。FPU 未活跃时该分支不生效。
+            // 同一条路径还负责置位 CONTROL.FPCA（ARMv8-M 的「浮点上下文活跃」
+            // 位）：只要 CPACR 允许访问，执行浮点指令就会置位，之后由异常返回
+            // 的 CLRONRET 路径清除。
             // Lazy FP stacking: before the first VFP instruction in a handler
             // (arithmetic, transfers, loads/stores, system registers), commit
             // the interrupted context's S0-S15 and FPSCR to the area reserved
             // by FPCAR at exception entry and clear LSPACT, so each frame is
             // saved exactly once. Inactive when no lazy frame is pending.
-            if self.registers.fpu.lspact() && fpu::is_fpu_encoding(instr32) {
-                exceptions::commit_lazy_fp_context(bus, &mut self.registers, cycles)?;
+            // The same hook raises CONTROL.FPCA (the ARMv8-M "FP context
+            // active" bit) whenever CPACR grants access; the CLRONRET path of
+            // exception return clears it again.
+            if fpu::is_fpu_encoding(instr32) {
+                if self.registers.fp_access_enabled() {
+                    self.registers.control |= registers::CONTROL_FPCA;
+                }
+                if self.registers.fpu.lspact() {
+                    exceptions::commit_lazy_fp_context(bus, &mut self.registers, cycles)?;
+                }
             }
             execute_thumb32(
                 instr32,

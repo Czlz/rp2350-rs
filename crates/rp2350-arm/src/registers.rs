@@ -5,11 +5,19 @@ use crate::fpu::{FpuRegisters, cpacr, fpexc};
 
 /// CONTROL.FPCA — floating-point context active / CONTROL.FPCA —— 浮点上下文活跃
 ///
-/// The core does not track this bit: no decoder hooks set it, and `MSR CONTROL`
-/// only stores `bits[1:0]`. Exception stacking therefore uses `FPEXC.EN` as the
-/// "FPU has been used" indicator. See [`CortexM33Registers::fp_context_active`].
-/// 核心不跟踪该位：解码器没有置位钩子，且 `MSR CONTROL` 只保存 `bits[1:0]`。
-/// 因此异常压栈改用 `FPEXC.EN` 作为「浮点单元已被使用」的判据，详见
+/// The model keeps this bit in [`CortexM33Registers::control`] and raises it
+/// whenever a floating-point instruction executes with CPACR access granted
+/// (see `CortexM33Core::step_instruction`). Exception return clears it when
+/// `FPCCR.CLRONRET`/`CLRONRETS` request a clear and the returned frame carries
+/// no floating-point context. `MSR CONTROL` still stores only `bits[1:0]`, so a
+/// direct software write of `FPCA` is discarded; the bit is set and cleared by
+/// hardware only. See [`CortexM33Registers::fp_context_active`] for the
+/// frame-selection predicate.
+/// 本模型把该位保存在 [`CortexM33Registers::control`] 中，并在每条通过 CPACR
+/// 检查的浮点指令执行时置位（见 `CortexM33Core::step_instruction`）。当
+/// `FPCCR.CLRONRET`/`CLRONRETS` 请求清除且返回的栈帧不含浮点上下文时，异常
+/// 返回会清除它。`MSR CONTROL` 仍只保存 `bits[1:0]`，因此软件直接写 `FPCA`
+/// 会被丢弃；该位仅由硬件置位与清除。帧选择判据见
 /// [`CortexM33Registers::fp_context_active`]。
 pub const CONTROL_FPCA: u32 = 1 << 2;
 
@@ -202,18 +210,21 @@ impl CortexM33Registers {
     /// 报告是否存在活跃的浮点上下文
     ///
     /// ARMv8-M selects the extended exception frame from `CONTROL.FPCA`. This
-    /// core does not track `FPCA` (see [`CONTROL_FPCA`]): instead `FPEXC.EN`,
-    /// which every executed FPU instruction sets after the CPACR check, is used
-    /// as the equivalent "the FPU has been used" indicator. The substitution is
-    /// exact for firmware that never writes `CONTROL.FPCA` directly, which is
-    /// what the supported images do.
-    /// ARMv8-M 用 `CONTROL.FPCA` 决定是否使用扩展异常帧。本核心不跟踪 `FPCA`
-    /// （见 [`CONTROL_FPCA`]），改用 `FPEXC.EN` 作为等价的「浮点单元已被使用」
-    /// 判据——每条通过 CPACR 检查的浮点指令都会置该位。对于从不直接写
-    /// `CONTROL.FPCA` 的固件（当前支持的映像均如此），该替换是等价的。
+    /// model tracks `FPCA` (raised by every executed FPU instruction after the
+    /// CPACR check, cleared by `FPCCR.CLRONRET`) **and** keeps `FPEXC.EN` as a
+    /// fallback: the bit is set by the same instructions but is never cleared
+    /// by a software `MSR CONTROL`, so a context can never be silently lost.
+    /// The disjunction is therefore a superset of the architectural predicate
+    /// and leaves the pre-existing frame-selection behaviour untouched while
+    /// making `FPCA` observable through `MRS CONTROL`.
+    /// ARMv8-M 用 `CONTROL.FPCA` 决定是否使用扩展异常帧。本模型跟踪 `FPCA`
+    /// （每条通过 CPACR 检查的浮点指令置位，`FPCCR.CLRONRET` 清除），同时保留
+    /// `FPEXC.EN` 作为回退：同一条指令会置该位，且软件 `MSR CONTROL` 不会清除
+    /// 它，因此上下文绝不会被静默丢弃。该逻辑或是架构判据的超集，既保持既有
+    /// 帧选择行为不变，又让 `FPCA` 可通过 `MRS CONTROL` 观察。
     #[must_use]
     pub fn fp_context_active(&self) -> bool {
-        self.fpu.fpexc & fpexc::EN != 0
+        self.control & CONTROL_FPCA != 0 || self.fpu.fpexc & fpexc::EN != 0
     }
 
     /// Report whether CPACR grants access to coprocessor `cp`

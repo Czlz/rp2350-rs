@@ -23,9 +23,9 @@ use rp2350_core::error::CoreError;
 use rp2350_core::types::Address;
 
 use super::conditions::ITBlockState;
-use super::fpu::{FpuRegisters, fpccr};
+use super::fpu::{FpuRegisters, fpccr, fpexc};
 use super::nvic::Nvic;
-use super::registers::CortexM33Registers;
+use super::registers::{CONTROL_FPCA, CortexM33Registers};
 
 /// ITSTATE bits inside xPSR (`[26:25,15:10]`) / xPSR 中的 ITSTATE 位
 pub const XPSR_IT_MASK: u32 = 0x0600_FC00;
@@ -528,6 +528,10 @@ pub fn enter_exception(
 /// Exit an exception handler — full sequence
 /// 退出异常处理程序 —— 完整序列
 ///
+/// Also applies `FPCCR.CLRONRET`/`CLRONRETS`: see the FP-clear block at the end
+/// of the function. / 同时应用 `FPCCR.CLRONRET`/`CLRONRETS`：见函数末尾的浮点
+/// 清除分支。
+///
 /// Returns `Ok(new_sp)` — the SP after unstacking.
 /// 返回 `Ok(new_sp)` —— 出栈后的 SP。
 pub fn exit_exception(
@@ -564,8 +568,9 @@ pub fn exit_exception(
     // S0-S15 and FPSCR are restored from the FP context area of this frame
     // (S0 sits at frame base + 0x20).
     let extended_frame = exc_return_info.has_fp;
+    let lazy_pending = regs.fpu.lspact();
     if extended_frame {
-        if regs.fpu.lspact() {
+        if lazy_pending {
             // Nothing was written to the reserved area; discard it.
             // 预留区未写入任何内容，直接丢弃。
             regs.fpu.set_lspact(false);
@@ -605,6 +610,35 @@ pub fn exit_exception(
         } else {
             regs.control & !0x2
         };
+    }
+
+    // ---- FPCCR.CLRONRET / CLRONRETS ----
+    // 异常返回清除：
+    // 两位任一置位即生效（本模型无 TrustZone，安全与非安全折叠到唯一状态）。
+    // 扩展帧且处理程序确实卸载了浮点上下文时，按 ARM B3.4.7 清除调用者保存的
+    // S0-S15 与 FPSCR；返回的帧不含浮点上下文（EXC_RETURN bit4 = 1，基础帧）
+    // 时，则关闭浮点上下文：清 CONTROL.FPCA 与 FPEXC.EN，使后续异常进入重新
+    // 使用基础帧。惰性帧未提交（LSPACT 仍为 1）时不清理寄存器——它们仍属于
+    // 被打断的上下文。
+    // Either bit enables the clear (no TrustZone model, so the secure and
+    // non-secure variants collapse onto one state). An extended frame that was
+    // actually unstacked clears the caller-saved S0-S15 and FPSCR per ARM
+    // B3.4.7; a frame without floating-point context (`EXC_RETURN` bit 4 = 1)
+    // instead deactivates the FP context by clearing `CONTROL.FPCA` and
+    // `FPEXC.EN`, so the next exception entry uses a basic frame again. A
+    // pending lazy frame (`LSPACT` still set) keeps its registers untouched —
+    // they still belong to the interrupted context.
+    if regs.fpu.clear_on_return() {
+        if extended_frame && !lazy_pending {
+            for index in 0..16u8 {
+                regs.fpu.write_s(index, 0);
+            }
+            regs.fpu.fpscr = 0;
+            *cycles += 4; // Zeroing the FP context / 清零浮点上下文
+        } else if !extended_frame {
+            regs.control &= !CONTROL_FPCA;
+            regs.fpu.fpexc &= !fpexc::EN;
+        }
     }
 
     Ok(())

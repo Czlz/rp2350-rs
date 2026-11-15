@@ -18,7 +18,7 @@
 | `execute_thumb16` | Thumb-16 decoder + executor (~90 instructions) |
 | `execute_thumb32` | Thumb-32 decoder + executor (60+ ALU / Load-Store / system instructions) |
 | `execute_thumb32::dsp` | Packed SIMD add/subtract (`SADD8` … `USAX`), halving (`SH*`/`UH*`), saturating `Q*`/`UQ*`, `QADD`/`QSUB`/`QDADD`/`QDSUB`, `SSAT`/`USAT`/`SSAT16`/`USAT16`, `SEL` |
-| `execute_thumb32::multiply` | `MUL`/`MLA`/`MLS`, long multiplies, divides, and the DSP multiply family (`SMULxy`, `SMULW*`, `SMLAW*`, `SMMUL`/`SMMLA`/`SMMLS`, `SMLAD`/`SMLSD`/`SMUAD`/`SMUSD`, `SMLALD`/`SMLSLD`, `USAD8`) |
+| `execute_thumb32::multiply` | `MUL`/`MLA`/`MLS`, long multiplies (`SMULL`/`UMULL`/`SMLAL`/`UMLAL`/`SMLALxy`), divides, and the DSP multiply family (`SMULxy`, `SMULW*`, `SMLAW*`, `SMMUL`/`SMMLA`/`SMMLS`, `SMLAD`/`SMLSD`/`SMUAD`/`SMUSD`, `SMLALD`/`SMLSLD`, `USAD8`) |
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
@@ -324,6 +324,18 @@ DSP coverage / DSP 覆盖清单:
 - **Most-significant-word multiply subtract**: `SMMLS`/`SMMLSR` compute
   `(Ra<<32 - Rn*Rm)` and keep the high word, adding the rounding constant
   `0x8000_0000` before the extraction for `SMMLSR`.
+- **Halfword-accumulating long multiply**: `SMLALBB`/`SMLALBT`/`SMLALTB`/
+  `SMLALTT` add one signed 16×16 product of the selected halfwords to
+  `RdHi:RdLo`. `RdLo` is `bits[15:12]`, `RdHi` is `bits[11:8]`, bit 5 of
+  `bits[7:4]` selects the top halfword of `Rn` and bit 4 the top halfword of
+  `Rm`. The product is exact and the 64-bit accumulation wraps modulo 2^64
+  exactly like the ARM pseudocode `result<63:0> = product +
+  SInt(R[dHi]:R[dLo])`; no flag is modified. `bits[7:6] = 0b10` is the
+  discriminator against `SMLAL` (`bits[7:4] = 0b0000`) and
+  `SMLALD`/`SMLALDX` (`bits[7:4] = 0b110x`); every other pattern, and any PC
+  operand, stays undefined. Encodings verified with `arm-none-eabi-as`:
+  `fbc2 0183`/`fbc2 0193`/`fbc2 01a3`/`fbc2 01b3` for
+  `SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT r0, r1, r2, r3`.
 - **Packed parallel add/subtract** (`execute_thumb32::dsp`):
   `SADD8/SSUB8/SADD16/SSUB16`, `UADD8/USUB8/UADD16/USUB16` and the
   exchanged forms `SASX/SSAX/UASX/USAX`. Each byte/halfword lane is
@@ -375,7 +387,7 @@ Flag rules / 标志规则 (ARM ARM):
 | `QADD`/`QSUB`/`QDADD`/`QDSUB` | unchanged | set when saturated (sticky) | unchanged |
 | `SSAT`/`USAT`/`SSAT16`/`USAT16` | unchanged | set when saturated (sticky) | unchanged |
 | `SMLAxy`, `SMLAWy`, `SMLAD`/`SMLADX`, `SMLSD`/`SMLSDX`, `SMUAD`/`SMUADX`, `SMUSD`/`SMUSDX` | unchanged | set on 32-bit overflow (sticky) | unchanged |
-| `SMLALD`/`SMLALDX`, `SMLSLD`/`SMLSLDX`, `SMULxy`, `SMULWy`, `SMMUL`/`SMMLA`/`SMMLS`, `USAD8`/`USADA8`, `SXTAB16`/`UXTAB16` | unchanged | unchanged | unchanged |
+| `SMLALD`/`SMLALDX`, `SMLSLD`/`SMLSLDX`, `SMLALxy`, `SMULxy`, `SMULWy`, `SMMUL`/`SMMLA`/`SMMLS`, `USAD8`/`USADA8`, `SXTAB16`/`UXTAB16` | unchanged | unchanged | unchanged |
 | `SEL` | read only | unchanged | unchanged |
 
 `Q` is cumulative: a saturating or overflowing instruction only ever sets it,
@@ -386,14 +398,11 @@ it once afterwards. GE never participates in the `GE`/`LT` condition codes
 because the architecturally checked value is the single infinite-precision
 sum `0x7FFF_FFFF`.
 
-仍未实现 / still undefined: `SMLALxy` (`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`,
-the 64-bit accumulating halfword products). Everything else in the DSP
-add/subtract, halving, saturating and multiply chapters that ARMv8-M defines
-for Cortex-M33 is decoded.
+The DSP multiply chapter is now complete for Cortex-M33: `SMLALxy` (the
+64-bit accumulating halfword products) was the last missing encoding.
 
-仍未实现：`SMLALxy`（`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`，即 64 位累加的
-半字乘积）。DSP 加/减、折半、饱和与乘法章节中 ARMv8-M 为 Cortex-M33 定义的
-其余编码均已解码。
+DSP 乘法章节对 Cortex-M33 已完整：`SMLALxy`（64 位累加的半字乘积）是最后
+一条缺失编码。
 
 `SSAT`/`USAT`/`SSAT16`/`USAT16` live in the data-processing
 (plain-binary-immediate) group; the top-level decoder routes
@@ -429,6 +438,16 @@ DSP 覆盖清单：
   回绕且不修改任何标志。
 - **高字乘减**：`SMMLS`/`SMMLSR` 计算 `(Ra<<32 - Rn*Rm)` 并取高字，
   `SMMLSR` 在取高字前加舍入常量 `0x8000_0000`。
+- **半字长累加乘**：`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT` 把选定半字的一个
+  有符号 16×16 乘积累加到 `RdHi:RdLo`。`RdLo` 为 `bits[15:12]`、`RdHi` 为
+  `bits[11:8]`，`bits[7:4]` 的位 5 选择 `Rn` 的高半字、位 4 选择 `Rm` 的高
+  半字。乘积为精确值，64 位累加按模 2^64 回绕，与 ARM 伪代码
+  `result<63:0> = product + SInt(R[dHi]:R[dLo])` 一致；不修改任何标志。
+  `bits[7:6] = 0b10` 是与 `SMLAL`（`bits[7:4] = 0b0000`）及
+  `SMLALD`/`SMLALDX`（`bits[7:4] = 0b110x`）区分的判据；其余组合与任何 PC
+  操作数保持未定义。编码已用 `arm-none-eabi-as` 核对：
+  `SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT r0, r1, r2, r3` 分别为
+  `fbc2 0183`/`fbc2 0193`/`fbc2 01a3`/`fbc2 01b3`。
 - **打包并行加/减**（`execute_thumb32::dsp`）：
   `SADD8/SSUB8/SADD16/SSUB16`、`UADD8/USUB8/UADD16/USUB16` 以及交换形式
   `SASX/SSAX/UASX/USAX`。每个字节/半字通道独立运算并按 2^8/2^16 回绕。
@@ -466,15 +485,15 @@ DSP 覆盖清单：
 标志规则（ARM ARM）见上文英文表格：并行 `S*`/`U*` 与交换形式写 GE；
 折半 `SH*`/`UH*` 组不写任何标志；饱和形式只置保持型 Q；乘加类
 （`SMLAxy`、`SMLAWy`、`SMLAD`/`SMLSD`/`SMUAD`/`SMUSD`）在 32 位上溢时置 Q；
+`SMLALxy` 与长双乘形式一样按模 2^64 回绕且不写任何标志。
 `SEL` 只读 GE。`Q` 为累积位，饱和/上溢指令只会置位，因此软件需先用
 `MSR APSR_nzcvq` 显式清除，执行完序列后再统一测试。
 GE 绝不参与 `GE`/`LT` 条件码（后者仍比较 `N == V`）。累加后再判断的规则对
 `SMLAD` 尤其重要：乘积 `0x4000_0000 + 0x4000_0000 - 1` **不会**置 `Q`，
 因为架构检查的是最终那一个无限精度和 `0x7FFF_FFFF`。
 
-仍未实现：`SMLALxy`（`SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`，即 64 位累加的
-半字乘积）。DSP 加/减、折半、饱和与乘法章节中 ARMv8-M 为 Cortex-M33 定义的
-其余编码均已解码。
+DSP 乘法章节对 Cortex-M33 已完整：`SMLALxy`（`SMLALBB`/`SMLALBT`/`SMLALTB`/
+`SMLALTT`，即 64 位累加的半字乘积）是最后一条缺失编码，现已实现。
 
 `APSR.GE` 存放于 `xpsr[19:16]`（`apsr_ge`/`set_apsr_ge`），
 `set_apsr_nzcv` 与异常压栈都会保留它，并可通过 `MRS APSR` /
@@ -610,8 +629,10 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
 - **Lazy / extended exception frames** (see the dedicated section below):
   `FPCCR`, `FPCAR` and `FPDSCR` are modeled at `0xE000EF34`, `0xE000EF38`
   and `0xE000EF3C`; exception entry reserves or stacks the 17-word FP
-  context according to `FPCCR.ASPEN`/`LSPEN`, and exception return reclaims
-  or restores it.
+  context according to `FPCCR.ASPEN`/`LSPEN`, exception return reclaims or
+  restores it, and `FPCCR.CLRONRET`/`CLRONRETS` clear the caller-saved
+  context on return. `CONTROL.FPCA` is tracked and raised by every FPU
+  instruction.
 
 - **状态**：S0-S31，`D0-D15` 为 S 对别名；`FPSCR`、`FPEXC`；`CPACR`
   CP0-CP7 与 CP10-CP11 读写。
@@ -654,7 +675,8 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
 - **惰性 / 扩展异常帧**（详见下一节）：在 `0xE000EF34`、`0xE000EF38`、
   `0xE000EF3C` 建模 `FPCCR`、`FPCAR`、`FPDSCR`；异常进入按
   `FPCCR.ASPEN`/`LSPEN` 预留或立即压入 17 字浮点上下文，异常返回按需
-  回收或恢复。
+  回收或恢复，并由 `FPCCR.CLRONRET`/`CLRONRETS` 在返回时清除调用者保存
+  上下文。`CONTROL.FPCA` 被跟踪，并由每条浮点指令置位。
 
 ### Lazy FP Stacking and Extended Frames / 惰性浮点压栈与扩展帧
 
@@ -663,31 +685,56 @@ and `system_write` / 全部通过 `CpuCore::system_read` 与 `system_write` 访�
 
 | Address | Register | Modeled bits | Reset |
 |---------|----------|--------------|-------|
-| `0xE000EF34` | `FPCCR` | `ASPEN`[31], `LSPEN`[30], `LSPACT`[0] (read-only) | `0xC000_0000` |
+| `0xE000EF34` | `FPCCR` | behaviour: `ASPEN`[31], `LSPEN`[30], `CLRONRET`[28], `CLRONRETS`[27], `LSPACT`[0] (read-only); hard-wired: `TS`[26]; storage only: `LSPENS`[29], `THREAD`[3], `USER`[1] | `0xC400_0000` |
 | `0xE000EF38` | `FPCAR` | `[31:3]` address; `[2:0]` reserved, forced to 0 on write | `0` |
 | `0xE000EF3C` | `FPDSCR` | `AHP`[26], `DN`[25], `FZ`[24], `RMode`[23:22] | `0` |
 
-`FPCCR` bits other than `ASPEN`/`LSPEN`/`LSPACT` read as zero, and `LSPACT`
-is hardware-managed (software writes to it are ignored). `FPDSCR` is plain
+`FPCCR` field classes / `FPCCR` 字段分类 (ARM ARM B3.4.7):
+
+| Bits | Field | Class | Behaviour / 行为 |
+|------|-------|-------|------------------|
+| [31] | `ASPEN` | stored | automatic state preservation enable; the model records `CONTROL.FPCA` on FPU execution regardless, and frame selection also consults `FPEXC.EN`. / 自动状态保存使能；本模型执行浮点指令时总记录 `CONTROL.FPCA`，帧选择另外参考 `FPEXC.EN`。 |
+| [30] | `LSPEN` | behaviour | lazy reservation on entry (`1`) vs immediate save (`0`). / 进入时惰性预留（1）或立即保存（0）。 |
+| [29] | `LSPENS` | storage | no secure state exists that it could protect `LSPEN` from, so writes to `LSPEN` are never gated. / 没有可供它保护 `LSPEN` 的安全状态，因此 `LSPEN` 的写入永不被拦截。 |
+| [28] | `CLRONRET` | behaviour | exception return clears the caller-saved FP context, see below. / 异常返回清除调用者保存的浮点上下文，见下文。 |
+| [27] | `CLRONRETS` | behaviour | same effect as `CLRONRET` (single security state). / 与 `CLRONRET` 等效（单安全态）。 |
+| [26] | `TS` | hard-wired 1 | reads 1, writes ignored, present after reset. / 读为 1、写忽略、复位后保持 1。 |
+| [25:4] | reserved | read 0 | `THREAD`[3] is the only exception, see next row. / 唯一例外是下一行的 `THREAD`[3]。 |
+| [3] | `THREAD` | storage | the model never allocates a frame from Handler mode, so nothing to report. / 模型不会从 Handler 模式分配栈帧，无内容可上报。 |
+| [2] | `S` | read 0 | no TrustZone. / 无 TrustZone。 |
+| [1] | `USER` | storage | the core always runs privileged. / 核心恒以特权执行。 |
+| [0] | `LSPACT` | hardware | set while a lazy frame is still pending, cleared by the commit or the return. / 惰性帧待保存时置位，提交或返回时清除。 |
+
+`TS` reads as 1 on this model even though the Cortex-M33 reset value has it
+clear: with a single security state the FP context is always treated as secure,
+so the callee-saved half of the bank is part of the frame. `LSPACT` is
+hardware-managed (software writes to it are ignored). `FPDSCR` is plain
 storage: no arithmetic path reads it, so the rounding mode always stays
 round-to-nearest-even. `FPCAR` keeps the reserved FP context area 8-byte
 aligned.
 
-`FPCCR` 中除 `ASPEN`/`LSPEN`/`LSPACT` 之外的位读为 0，`LSPACT` 由硬件管理
-（软件写入被忽略）。`FPDSCR` 为纯存储：没有任何算术路径读取它，舍入模式
-恒为就近偶数。`FPCAR` 保证预留的浮点上下文区按 8 字节对齐。
+本模型把 `TS` 恒读为 1，而 Cortex-M33 的复位值中该位为 0：单安全态下浮点上下文
+始终按安全上下文处理，因此寄存器组中被调用者保存的那一半属于栈帧。`LSPACT`
+由硬件管理（软件写入被忽略）。`FPDSCR` 为纯存储：没有任何算术路径读取它，
+舍入模式恒为就近偶数。`FPCAR` 保证预留的浮点上下文区按 8 字节对齐。
 
-**"FP is active" / 「浮点活跃」判据**: ARMv8-M uses `CONTROL.FPCA`, but this
-core does not track that bit (`MSR CONTROL` only stores `bits[1:0]`). It uses
-`FPEXC.EN` instead — every FPU instruction executed after the CPACR check
-sets it — through `CortexM33Registers::fp_context_active`. The two are
-equivalent for firmware that never writes `CONTROL.FPCA` directly, which is
-true for the supported images.
+**"FP is active" / 「浮点活跃」判据**: ARMv8-M uses `CONTROL.FPCA`. The core
+tracks it: `CortexM33Core::step_instruction` raises `FPCA` for every Thumb-32
+encoding that belongs to the FPU whenever `CPACR` grants access, exactly like
+the architectural rule, and the `CLRONRET` return path clears it again.
+`CortexM33Registers::fp_context_active` returns `CONTROL.FPCA ||
+FPEXC.EN`; `FPEXC.EN` (set by the same instructions, never cleared by
+`MSR CONTROL`) acts as a fallback so a context can never be silently lost.
+`MSR CONTROL` still stores only `bits[1:0]`, so software writes of `FPCA` are
+discarded — the bit is hardware-driven in this model.
 
-ARMv8-M 用 `CONTROL.FPCA` 判定，但本核心不跟踪该位（`MSR CONTROL` 只保存
-`bits[1:0]`），改用 `FPEXC.EN`（每条通过 CPACR 检查的浮点指令都会置位），
-通过 `CortexM33Registers::fp_context_active` 暴露。对于从不直接写
-`CONTROL.FPCA` 的固件（当前支持的映像均如此）二者等价。
+ARMv8-M 用 `CONTROL.FPCA` 判定。本核心跟踪该位：当 `CPACR` 允许访问时，
+`CortexM33Core::step_instruction` 对每条属于浮点单元的 Thumb-32 编码置位
+`FPCA`，与架构规则一致；`CLRONRET` 返回路径会再次清除它。
+`CortexM33Registers::fp_context_active` 返回 `CONTROL.FPCA || FPEXC.EN`；
+`FPEXC.EN`（由同样的指令置位，且不会被 `MSR CONTROL` 清除）作为回退，
+保证上下文绝不会被静默丢弃。`MSR CONTROL` 仍只保存 `bits[1:0]`，因此软件
+写 `FPCA` 会被丢弃 —— 该位在本模型中由硬件驱动。
 
 **Exception entry / 异常进入** (`exceptions::enter_exception`):
 
@@ -762,6 +809,18 @@ CP0 GPIO / CP4 DCP 等非浮点协处理器访问不会触发；判据为
   reclaimed (plus the 4-byte aligner word when stacked xPSR bit 9 is set).
 - `EXC_RETURN` bit 4 = 1 → standard frame: only the 8-word state frame is
   reclaimed and the FP registers are untouched.
+- `FPCCR.CLRONRET`/`CLRONRETS` (`clear_on_return`): either bit enables the
+  clear, because with no TrustZone model the secure (`CLRONRETS`) and
+  non-secure (`CLRONRET`) variants collapse onto the single security state.
+  An extended frame that was actually unstacked (`LSPACT = 0`) additionally
+  zeroes S0-S15 and FPSCR after the restore, as ARMv8-M requires
+  (`CLRONRET` exists so privileged FP data cannot leak to unprivileged
+  software across an exception return); S16-S31 and the `FPCA`/`FPEXC.EN`
+  context stay live. A basic frame (`EXC_RETURN` bit 4 = 1) instead
+  deactivates the context: `CONTROL.FPCA` and `FPEXC.EN` are cleared, so the
+  next exception entry starts from a standard frame again. A pending lazy
+  frame (`LSPACT` still 1) keeps its registers untouched — they still belong
+  to the interrupted context.
 - MSP/PSP selection and `EXC_RETURN` validation are unchanged. The
   `EXC_RETURN` encodings therefore become `0xFFFF_FFF1`/`0xFFFF_FFE1`
   (handler), `0xFFFF_FFF9`/`0xFFFF_FFE9` (thread MSP) and
@@ -772,6 +831,15 @@ CP0 GPIO / CP4 DCP 等非浮点协处理器访问不会触发；判据为
 - bit4 = 0 且 `LSPACT = 0` → 从本帧浮点区（帧底 + 0x20）恢复 S0-S15 与
   FPSCR，然后回收预留区（若压栈 xPSR 的 bit 9 置位，再补回 4 字节对齐字）。
 - bit4 = 1 → 标准帧：只回收 8 字状态帧，浮点寄存器不动。
+- `FPCCR.CLRONRET`/`CLRONRETS`（`clear_on_return`）：任一位即可启用清除，
+  因为本模型没有 TrustZone，安全（`CLRONRETS`）与非安全（`CLRONRET`）两个
+  变体折叠到唯一的安全状态。若返回的扩展帧确实卸载了上下文（`LSPACT = 0`），
+  在恢复之后额外把 S0-S15 与 FPSCR 清零，符合 ARMv8-M 的意图（`CLRONRET`
+  的存在就是为了防止特权浮点数据跨异常返回泄漏给非特权软件）；S16-S31 与
+  `FPCA`/`FPEXC.EN` 上下文保持活跃。返回基础帧（`EXC_RETURN` bit4 = 1）时
+  则关闭上下文：清除 `CONTROL.FPCA` 与 `FPEXC.EN`，使下一次异常进入重新使用
+  标准帧。惰性帧尚未提交（`LSPACT` 仍为 1）时寄存器原样保留 —— 它们仍属于
+  被打断的上下文。
 - MSP/PSP 选择与 `EXC_RETURN` 校验逻辑保持不变。因此 `EXC_RETURN` 取值为
   `0xFFFF_FFF1`/`0xFFFF_FFE1`（Handler）、`0xFFFF_FFF9`/`0xFFFF_FFE9`
   （Thread MSP）、`0xFFFF_FFFD`/`0xFFFF_FFED`（Thread PSP），bit4 = 0 表示
@@ -790,15 +858,24 @@ single architectural register pair.
 （帧底 + 0x20）推导，因此内层返回不会破坏外层帧。`FPCAR` 与 `LSPACT` 只描述
 最内层帧，与架构中唯一的一对寄存器一致。
 
-**Not modeled / 未建模**: `FPCCR.LSPENS`/`CLRONRET`/`CLRONRETS`/`TS`/
-`USER`/`THREAD`, `FPDSCR` influencing arithmetic, `CONTROL.FPCA` tracking,
-double precision and FPSCR traps. The secure/non-secure FP banks of the
-TrustZone configuration are not modeled; the register values above are the
-non-secure reset values.
+**Not modeled / 未建模**: `FPCCR.LSPENS`/`THREAD`/`USER` are storage only (no
+secure state for `LSPENS` to protect, and the core never allocates a frame
+from Handler or unprivileged mode so `THREAD`/`USER` have nothing to report);
+`ASPEN = 0` does not suppress `CONTROL.FPCA` in this model; software writes of
+`CONTROL.FPCA` through `MSR CONTROL` are discarded (the bit is hardware
+driven); `FPDSCR` does not influence arithmetic; double precision and FPSCR
+traps are absent. The secure/non-secure FP banks of the TrustZone
+configuration are not modeled, so `CLRONRETS` collapses onto the single
+non-secure state, and `TS` is hard-wired to 1 instead of following the
+Cortex-M33 reset value of 0.
 
-未建模：`FPCCR.LSPENS`/`CLRONRET`/`CLRONRETS`/`TS`/`USER`/`THREAD`、
-`FPDSCR` 对算术的影响、`CONTROL.FPCA` 跟踪、双精度与 FPSCR 陷阱。
-TrustZone 的安全/非安全浮点寄存器组未建模；上述复位值为非安全复位值。
+未建模：`FPCCR.LSPENS`/`THREAD`/`USER` 仅作存储（没有可供 `LSPENS` 保护的安全
+状态；核心也不会从 Handler 或非特权模式分配栈帧，因此 `THREAD`/`USER` 无内容
+可上报）；本模型中 `ASPEN = 0` 不会抑制 `CONTROL.FPCA`；软件经 `MSR CONTROL`
+写 `CONTROL.FPCA` 会被丢弃（该位由硬件驱动）；`FPDSCR` 不影响算术；不实现
+双精度与 FPSCR 陷阱。TrustZone 的安全/非安全浮点寄存器组未建模，因此
+`CLRONRETS` 折叠到唯一的非安全状态，`TS` 恒为 1 而非遵循 Cortex-M33 的复位
+值 0。
 
 ### Not implemented / 未实现清单
 

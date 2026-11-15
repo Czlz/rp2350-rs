@@ -2,13 +2,14 @@
 //! Thumb-32 乘法与除法指令
 //!
 //! Covers MUL/MLA/MLS, the long multiplies SMULL/UMULL/SMLAL/UMLAL, the
-//! signed/unsigned divide instructions, and the DSP multiply family:
+//! halfword-accumulating long multiply `SMLALxy`, the signed/unsigned divide
+//! instructions, and the DSP multiply family:
 //! `SMULxy`/`SMLAxy`, `SMULWB`/`SMULWT`, `SMLAWB`/`SMLAWT`, `SMMUL`/`SMMLA`,
 //! `SMMLS`/`SMMLSR`, the dual forms `SMLAD`/`SMLSD`/`SMUAD`/`SMUSD` (with their
 //! `X` exchanges) and the long dual forms `SMLALD`/`SMLSLD`.
-//! 覆盖 MUL/MLA/MLS、长乘法 SMULL/UMULL/SMLAL/UMLAL、有符号/无符号除法，
-//! 以及 DSP 乘法族：`SMULxy`/`SMLAxy`、`SMULWB`/`SMULWT`、
-//! `SMLAWB`/`SMLAWT`、`SMMUL`/`SMMLA`、`SMMLS`/`SMMLSR`、
+//! 覆盖 MUL/MLA/MLS、长乘法 SMULL/UMULL/SMLAL/UMLAL、半字长累加乘
+//! `SMLALxy`、有符号/无符号除法，以及 DSP 乘法族：`SMULxy`/`SMLAxy`、
+//! `SMULWB`/`SMULWT`、`SMLAWB`/`SMLAWT`、`SMMUL`/`SMMLA`、`SMMLS`/`SMMLSR`、
 //! 双乘形式 `SMLAD`/`SMLSD`/`SMUAD`/`SMUSD`（含 `X` 交换）与长双乘形式
 //! `SMLALD`/`SMLSLD`。
 
@@ -179,12 +180,23 @@ pub(super) fn execute(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
             StepResult::Ok
         }
         // SMLAL: signed 64-bit accumulate. `bits7_4` = 0b1100/0b1101 selects
-        // the dual form SMLALD/SMLALDX instead.
+        // the dual form SMLALD/SMLALDX instead, and 0b10yz the halfword form
+        // SMLALxy.
         // SMLAL：有符号 64 位累加。`bits7_4` = 0b1100/0b1101 时改为双乘形式
-        // SMLALD/SMLALDX。
+        // SMLALD/SMLALDX，0b10yz 时改为半字形式 SMLALxy。
         0xC => {
             if bits7_4 & 0b1110 == 0b1100 {
                 return execute_dual_long(instr, regs, false);
+            }
+            // SMLALxy: the `10` prefix of bits[7:6] separates it from SMLAL
+            // (0b0000), the reserved 0b00xx/0b01xx patterns and SMLALD
+            // (0b110x). Bit 5 picks the top halfword of Rn, bit 4 the top
+            // halfword of Rm.
+            // SMLALxy：bits[7:6] 的 `10` 前缀把它与 SMLAL（0b0000）、保留的
+            // 0b00xx/0b01xx 以及 SMLALD（0b110x）区分开。位 5 选择 Rn 的高
+            // 半字，位 4 选择 Rm 的高半字。
+            if bits7_4 & 0b1100 == 0b1000 {
+                return execute_smlal_halfwords(instr, regs);
             }
             if bits7_4 != 0 {
                 return StepResult::Undefined;
@@ -341,6 +353,57 @@ fn execute_dual_long(instr: u32, regs: &mut CortexM33Registers, subtract: bool) 
     };
     let accumulator = ((u64::from(regs.read(rd_hi)) << 32) | u64::from(regs.read(rd_lo))) as i64;
     let result = accumulator.wrapping_add(products) as u64;
+    regs.write(rd_lo, result as u32);
+    regs.write(rd_hi, (result >> 32) as u32);
+    StepResult::Ok
+}
+
+/// Execute `SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`
+/// 执行 `SMLALBB`/`SMLALBT`/`SMLALTB`/`SMLALTT`
+///
+/// `RdHi:RdLo = RdHi:RdLo + (Rn.<x> * Rm.<y>)`, where `<x>`/`<y>` are `B`
+/// (low halfword) or `T` (top halfword). `RdLo` is the low word
+/// (`bits[15:12]`), `RdHi` the high word (`bits[11:8]`). The product is
+/// infinite-precision signed and the accumulation wraps modulo 2^64, exactly
+/// like the ARM pseudocode (`result<63:0> = product + SInt(R[dHi]:R[dLo])`),
+/// so the 32-bit halves wrap independently of any flags. No flag is modified.
+/// `RdHi:RdLo = RdHi:RdLo + (Rn.<x> * Rm.<y>)`，其中 `<x>`/`<y>` 为 `B`
+/// （低半字）或 `T`（高半字）。`RdLo` 为低字（`bits[15:12]`），`RdHi` 为高字
+/// （`bits[11:8]`）。乘积为无限精度有符号值，累加按模 2^64 回绕，与 ARM 伪
+/// 代码（`result<63:0> = product + SInt(R[dHi]:R[dLo])`）完全一致，因此两个
+/// 32 位半部独立回绕。不修改任何标志。
+fn execute_smlal_halfwords(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
+    let rn = ((instr >> 16) & 0xF) as u8;
+    let rd_lo = ((instr >> 12) & 0xF) as u8;
+    let rd_hi = ((instr >> 8) & 0xF) as u8;
+    let control = ((instr >> 4) & 0xF) as u8;
+    let rm = (instr & 0xF) as u8;
+    // bits[7:6] = 0b10 is the only allocated prefix; bit 5 selects Rn's top
+    // halfword and bit 4 Rm's. PC operands and RdLo == RdHi are unpredictable.
+    // bits[7:6] = 0b10 是唯一分配的编码前缀；位 5 选择 Rn 的高半字，位 4
+    // 选择 Rm 的高半字。PC 操作数与 RdLo == RdHi 属不可预测编码。
+    if control & 0b1100 != 0b1000
+        || rd_lo == 15
+        || rd_hi == 15
+        || rd_lo == rd_hi
+        || rn == 15
+        || rm == 15
+    {
+        return StepResult::Undefined;
+    }
+    let n_half = if control & 0b10 != 0 {
+        i64::from((regs.read(rn) >> 16) as i16)
+    } else {
+        i64::from(regs.read(rn) as i16)
+    };
+    let m_half = if control & 0b01 != 0 {
+        i64::from((regs.read(rm) >> 16) as i16)
+    } else {
+        i64::from(regs.read(rm) as i16)
+    };
+    let product = n_half.wrapping_mul(m_half);
+    let accumulator = (u64::from(regs.read(rd_hi)) << 32) | u64::from(regs.read(rd_lo));
+    let result = (accumulator as i64).wrapping_add(product) as u64;
     regs.write(rd_lo, result as u32);
     regs.write(rd_hi, (result >> 32) as u32);
     StepResult::Ok
