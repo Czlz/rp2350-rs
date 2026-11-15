@@ -65,7 +65,7 @@ keyboard/gamepad input, audio output, and no crashes.
 
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
-| P2-1 | I2S 采样捕获：PIO TX FIFO 推送（CPU 与 DMA 两条路径）进入 `AudioSink` 环形缓冲；`take_audio_samples()` | `rp2350-periph` | 32 个字 → 64 个 i16；复位清空；DMA/CPU 两条路径都有测试 |
+| P2-1 | I2S 采样捕获：PIO TX FIFO 推送（CPU 与 DMA 两条路径）进入 `AudioSink` 环形缓冲；`take_audio_samples()`（已提供捕获口 `AudioTap`/`BootPeripherals::set_audio_tap`） | `rp2350-periph` | 32 个字 → 64 个 i16；复位清空；DMA/CPU 两条路径都有测试 |
 | P2-2 | 音频播放插件：`plugins/i2s-audio`（或 `rp2350-virt-periph` 内建可选 `cpal`）把 `AudioSink` 样本按 13440 Hz 立体声播放；缺失设备时静默降级 | `plugins/` + `rp2350-virt-periph` | 插件加载测试；无设备不 panic；文档 |
 
 ### P3 完善 / Polish

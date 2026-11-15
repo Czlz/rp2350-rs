@@ -37,6 +37,7 @@ use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
 use super::Pio;
 use super::regs::EXECCTRL_EXEC_STALLED;
+use crate::audio::AudioTap;
 use crate::gpio_pads::GpioPads;
 use crate::irq::{IrqAssert, PIO_IRQ_LINES};
 
@@ -93,6 +94,12 @@ impl SharedPio {
     /// The block samples only pads whose `IO_BANK0.FUNCSEL` selects it and
     /// publishes its driven levels back into the same matrix.
     /// 该块只采样 `IO_BANK0.FUNCSEL` 选中它的 pad，并把驱动电平发布回同一矩阵。
+    ///
+    /// No audio capture tap is installed: audio is opt-in through
+    /// [`SharedPio::set_audio_tap`], so mounts that never touch I2S pay nothing
+    /// on the FIFO push path beyond one `Option` check.
+    /// 不安装音频捕获 tap：音频通过 [`SharedPio::set_audio_tap`] 显式启用，因此
+    /// 从不接触 I2S 的挂载在 FIFO 压入路径上除一次 `Option` 判断外没有额外开销。
     #[must_use]
     pub fn with_pads(index: u8, irq: IrqAssert, pads: GpioPads) -> Self {
         Self {
@@ -126,6 +133,24 @@ impl SharedPio {
     /// Run `f` against the shared register file / 在共享寄存器文件上执行 `f`
     pub fn with<R>(&self, f: impl FnOnce(&Pio) -> R) -> R {
         f(&self.inner.lock())
+    }
+
+    /// Install an I2S capture tap on state machine `sm`
+    /// 在状态机 `sm` 上安装 I2S 捕获 tap
+    ///
+    /// The bus adapter and this handle share one register file, so both CPU and
+    /// DMA writes to `TXF0..TXF3` are captured once the tap is installed. Only
+    /// one state machine per block is captured.
+    /// 总线适配器与本句柄共享同一个寄存器文件，因此安装 tap 后 CPU 与 DMA 对
+    /// `TXF0..TXF3` 的写入都会被捕获。每个块只捕获一个状态机。
+    pub fn set_audio_tap(&self, tap: AudioTap, sm: usize) {
+        self.with_mut(|pio| pio.set_audio_tap(tap, sm));
+    }
+
+    /// Capture tap currently installed on this block / 本块当前安装的捕获 tap
+    #[must_use]
+    pub fn audio_tap(&self) -> Option<AudioTap> {
+        self.with(|pio| pio.audio_tap().cloned())
     }
 
     /// Run `f` against the shared register file and publish IRQ flags

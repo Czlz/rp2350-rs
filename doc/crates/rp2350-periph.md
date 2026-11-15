@@ -443,6 +443,87 @@ RP2350 `RXFn_PUTGET*` 寄存器，以及 `0x16C..0x184` 的
 
 ---
 
+## I2S / Audio tap
+
+Firmware that plays audio over an I2S DAC usually streams 32-bit words into a
+PIO TX FIFO, one interleaved stereo frame per word, with the DMA channel paced by
+the state machine's TX DREQ. The emulator does **not** model the I2S bit clock or
+the shift register, but it can hand the pushed words to the host as `i16`
+samples.
+
+固件通过 I2S DAC 播放音频时，通常由 DMA 通道按状态机 TX DREQ 节拍，把每个立体
+声帧一个的 32 位字写入 PIO TX FIFO。模拟器**不**建模 I2S 位时钟与移位寄存器，
+但可以把压入的字以 `i16` 样本形式交给宿主。
+
+### Wiring point / 接线点
+
+`Pio::write32` 对 `TXF0..TXF3` 的写入与 DMA 经总线写同一组偏移，都汇聚到
+`Pio::push_tx(index, value)`；因此只需在这个函数里检查一次已安装的 tap：
+
+```text
+CPU  str  →  TXF0..TXF3 (MMIO)  ─┐
+DMA  run  →  bus write PIO TXF  ─┴→ Pio::push_tx(sm, word) → AudioTap → AudioSink
+```
+
+- `AudioTap::new(AudioSink::new(rate_hz, channels, capacity))` creates the
+  shared sink; `Pio::set_audio_tap(tap, sm)` (or `SharedPio::set_audio_tap`,
+  `BootPeripherals::set_audio_tap(block_index, sm, tap)`) installs it on exactly
+  one `(block, sm)` pair. Other state machines and other blocks are not captured.
+- `BootPeripherals::mount` installs **no** tap: capture is a host/example
+  decision. Without a tap the push path performs a single `Option` check and the
+  FIFO behaviour is unchanged.
+- `BootPeripherals::audio_tap()` returns a clone of the most recently installed
+  handle; clones share one sink, so a playback plugin can drain it concurrently.
+- Resetting a PIO block keeps the tap wiring but clears the captured samples.
+- 每个块只捕获一个状态机；`BootPeripherals::mount` **不**自动安装 tap，
+  未安装时压入路径只做一次 `Option` 判断；复位保留接线并清空已捕获样本。
+
+### Sample format / 样本格式
+
+`AudioSink::push_word(word)` appends two `i16` samples:
+
+| Bits | Sample | Role |
+|------|--------|------|
+| `[15:0]` | `(word & 0xFFFF) as u16 as i16` | first sample of the frame (left) |
+| `[31:16]` | `(word >> 16) as u16 as i16` | second sample (right) |
+
+`0x8000_7FFF` therefore becomes `[32767, -32768]`. `take_samples(max)` drains
+oldest-first and `rate_hz`/`channels` are metadata for the playback plugin (the
+pokeemerald firmware uses 13 440 Hz stereo). 低半字先于高半字播放，两半都是二
+进制补码 `i16`；`take_samples` 从最旧开始取走。
+
+### Capacity and drops / 容量与丢弃策略
+
+The sink is a bounded `VecDeque<i16>`. When it already holds `capacity` samples
+a push evicts the **oldest** sample and increments `dropped()`; it never blocks,
+never panics and never grows past the capacity. `clear()` discards buffered
+samples but keeps the cumulative drop counter, and a zero-capacity sink drops
+every sample. 缓冲为有界 `VecDeque<i16>`：满时淘汰**最旧**样本并递增
+`dropped()`，不阻塞、不 panic、不超容量；`clear()` 清空样本但保留累计丢样计数。
+
+```rust
+use rp2350_periph::{AudioSink, AudioTap, BootPeripherals};
+
+let tap = AudioTap::new(AudioSink::new(13_440, 2, 32_768));
+peripherals.set_audio_tap(2, 0, tap.clone());
+// ... run the firmware / 运行固件 ...
+let samples: Vec<i16> = tap.take_samples(4096);
+```
+
+### Not modelled / 未建模项
+
+I2S bit timing (BCK/LRCK edges, the Philips one-bit channel delay), the PIO
+`OUT`/autopull shift register details and the DAC itself are not modelled: the
+capture hook observes FIFO **pushes**, not the serialised wire, so sample values
+and order are exact while their real-time pacing is not. DMA pacing, FIFO depth
+and DREQ gating still follow the PIO/DMA models above. I2S 位时序
+（BCK/LRCK 边沿、Philips 一比特声道延迟）、PIO `OUT`/autopull 移位寄存器细节与
+DAC 本身未建模：捕获钩子观察的是 FIFO **压入**而非串行线上数据，因此样本值与
+顺序精确、实时节拍不精确。DMA 节拍、FIFO 深度与 DREQ 门控仍遵循上文的
+PIO/DMA 模型。
+
+---
+
 ## HSTX / 高速发送
 
 The HSTX model covers the two datasheet register windows, the 8-entry

@@ -20,6 +20,7 @@
 
 pub mod adc;
 mod alias;
+pub mod audio;
 pub mod boot;
 pub mod bootram;
 pub mod busctrl;
@@ -56,6 +57,7 @@ pub mod watchdog;
 pub mod xip_qmi;
 pub mod xosc;
 
+pub use audio::{AudioSink, AudioTap};
 pub use boot::{BootPeripherals, Core1Launch, Timebase};
 pub use cycle::CycleSink;
 pub use dma::Dma;
@@ -65,6 +67,8 @@ pub use pio::{Pio, SharedPio};
 pub use traits::Peripheral;
 pub use uart::UartSink;
 
+#[cfg(test)]
+mod audio_tests;
 #[cfg(test)]
 mod dma_tests;
 #[cfg(test)]

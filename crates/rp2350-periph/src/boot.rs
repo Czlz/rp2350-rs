@@ -31,6 +31,7 @@ use rp2350_core::bus::{AddressBus, BusResult};
 use rp2350_core::mmio::{MMIO_BLOCK_SIZE, MmioRouter, MmioWindow, mount_device};
 
 use super::adc::Adc;
+use super::audio::AudioTap;
 use super::bootram::BootRam;
 use super::busctrl::BusCtrl;
 use super::clocks::Clocks;
@@ -169,6 +170,14 @@ pub struct BootPeripherals {
     dma: Dma,
     hstx: Hstx,
     pio: [SharedPio; PIO_BLOCKS],
+    /// Audio tap installed by the host, if any / 宿主安装的音频 tap（若有）
+    ///
+    /// Kept so [`BootPeripherals::audio_tap`] can hand the same shared sink back
+    /// to another consumer. The authoritative installation lives inside the PIO
+    /// block; this field only remembers the most recent one.
+    /// 保存该句柄使 [`BootPeripherals::audio_tap`] 能把同一共享缓冲交给另一个消费
+    /// 者。实际的安装状态位于 PIO 块内部，本字段只记录最近一次安装。
+    audio_tap: Option<AudioTap>,
     irq: IrqAssert,
     system_writes: SystemWriteLog,
     core1_release: Arc<AtomicBool>,
@@ -305,6 +314,7 @@ impl BootPeripherals {
             dma,
             hstx,
             pio,
+            audio_tap: None,
             irq,
             system_writes,
             core1_release,
@@ -576,6 +586,43 @@ impl BootPeripherals {
     /// `f` 返回后会刷新本块的中断线。序号大于 2 时直接返回 `None`，不执行闭包。
     pub fn with_pio<R>(&self, index: usize, f: impl FnOnce(&mut Pio) -> R) -> Option<R> {
         self.pio.get(index).map(|block| block.with_mut(f))
+    }
+
+    /// Install an I2S capture tap on `(block_index, sm)` / 在 `(block_index, sm)` 上安装 I2S 捕获 tap
+    ///
+    /// Every word accepted into state machine `sm`'s TX FIFO is appended to
+    /// `tap`, no matter whether the CPU or a DMA channel wrote it, because both
+    /// paths reach [`Pio::push_tx`]. [`BootPeripherals::mount`] deliberately
+    /// installs no tap: capturing is a host/example decision, so firmware that
+    /// ignores audio pays one `Option` check on the FIFO push path.
+    /// Returns `false` and leaves the tap untouched when `block_index` is not a
+    /// valid PIO block.
+    /// 状态机 `sm` 的 TX FIFO 接受的每个字都会追加到 `tap`，无论写入来自 CPU 还是
+    /// DMA 通道，因为两条路径都会到达 [`Pio::push_tx`]。
+    /// [`BootPeripherals::mount`] 有意不安装 tap：是否捕获由宿主/示例决定，因此
+    /// 不关心音频的固件在 FIFO 压入路径上只承担一次 `Option` 判断。
+    /// `block_index` 不是合法 PIO 块时返回 `false` 且不改变 tap。
+    pub fn set_audio_tap(&mut self, block_index: usize, sm: usize, tap: AudioTap) -> bool {
+        let Some(block) = self.pio.get(block_index) else {
+            return false;
+        };
+        let installed = tap.clone();
+        block.with_mut(|pio| pio.set_audio_tap(installed, sm));
+        self.audio_tap = Some(tap);
+        true
+    }
+
+    /// Audio tap installed by the most recent [`Self::set_audio_tap`] call
+    /// 最近一次 [`Self::set_audio_tap`] 安装的音频 tap
+    ///
+    /// The returned handle shares one [`crate::AudioSink`] with the PIO block, so
+    /// a second consumer can drain samples concurrently. Returns `None` before
+    /// any tap was installed.
+    /// 返回的句柄与 PIO 块共享同一个 [`crate::AudioSink`]，因此第二个消费者可以
+    /// 并发取走样本。尚未安装 tap 时返回 `None`。
+    #[must_use]
+    pub fn audio_tap(&self) -> Option<AudioTap> {
+        self.audio_tap.clone()
     }
 
     /// Refresh all six PIO interrupt lines from the raw `IRQ` flags

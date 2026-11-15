@@ -10,6 +10,9 @@
 //! selectors ([`crate::BootPeripherals::sync_pio_dreqs`]); no FIFO state is
 //! copied. Processor interrupt routing is provided by [`SharedPio`], which maps
 //! the eight `IRQ` flags onto the block's two shared `PIOx_IRQ_n` lines.
+//! TX FIFO pushes can optionally be captured into an [`crate::AudioTap`] that a
+//! host installs on one state machine with [`Pio::set_audio_tap`]; without a tap
+//! the push path only performs one `Option` check.
 //! RP2350 有三个 PIO 块（`PIO0`/`PIO1`/`PIO2`），分别位于 `0x5020_0000`、
 //! `0x5030_0000` 与 `0x5040_0000`。本模块建模寄存器文件、32 字指令存储、四个
 //! 状态机寄存器窗口、4 深度 TX/RX FIFO（可合并为 8 深度）、GPIO 引脚映射与
@@ -18,6 +21,8 @@
 //! 选择器（[`crate::BootPeripherals::sync_pio_dreqs`]），不复制任何 FIFO 状态。
 //! 处理器中断路由由 [`SharedPio`] 提供，它把八个 `IRQ` 标志映射到本块的两条共享
 //! `PIOx_IRQ_n` 线。
+//! TX FIFO 压入可选择被宿主通过 [`Pio::set_audio_tap`] 安装到某个状态机的
+//! [`crate::AudioTap`] 捕获；未安装 tap 时压入路径只做一次 `Option` 判断。
 //!
 //! Reset values are taken from the RP2350 register headers (`PIO_*_RESET`):
 //! `FSTAT = 0x0F00_0F00`, `SMx_CLKDIV = 0x0001_0000`,
@@ -49,6 +54,7 @@ use super::gpio_pads::GpioPads;
 use super::io_bank0::PinFunction;
 use super::map;
 use crate::alias::{apply_alias, split_alias};
+use crate::audio::AudioTap;
 // PIO 寄存器常量沿用数据手册命名并集中平铺，通配导入让寄存器映射保持直观。
 // PIO register constants follow datasheet names and are declared in one place, so
 // a glob import keeps the register map readable.
@@ -105,6 +111,14 @@ pub struct Pio {
     host_inputs: u32,
     /// Shared pad matrix; `None` for a standalone block / 共享 pad 矩阵；独立块为 `None`
     pads: Option<GpioPads>,
+    /// Optional I2S capture tap and the state machine whose TX FIFO it observes
+    /// 可选的 I2S 捕获 tap，以及它观察的状态机
+    ///
+    /// Only `push_tx` for the selected state machine feeds the tap; every other
+    /// state machine and every block without a tap pays one `Option` check.
+    /// 只有被选中状态机的 `push_tx` 会写入该 tap；其它状态机以及未安装 tap 的块
+    /// 只承担一次 `Option` 判断。
+    audio: Option<(AudioTap, usize)>,
     /// Output levels driven by `OUT`/`SET`/side-set / `OUT`/`SET`/side-set 驱动的输出电平
     output_levels: u32,
     /// Output enables driven by `OUT PINDIRS`/`SET PINDIRS`/side-set
@@ -134,6 +148,7 @@ impl Pio {
             input_levels: 0,
             host_inputs: 0,
             pads: None,
+            audio: None,
             output_levels: 0,
             output_enables: 0,
             imem: [0; IMEM_WORDS],
@@ -286,6 +301,66 @@ impl Pio {
             self.fdebug |= FDEBUG_RXSTALL << index;
         }
         pushed
+    }
+
+    /// Push a word into the state machine TX FIFO from the device side
+    /// 从设备侧向状态机 TX FIFO 压入一个字
+    ///
+    /// This is the single entry point for both the CPU (`TXF0..TXF3` writes) and
+    /// the DMA controller (bus writes to the same offsets), so an installed
+    /// [`AudioTap`] observes every accepted word without touching either path.
+    /// Returns `false` when the FIFO is full or `index` is out of range; a
+    /// rejected word sets the sticky `FDEBUG.TXOVER` flag and is not captured.
+    /// 这是 CPU（写 `TXF0..TXF3`）与 DMA 控制器（总线写同一组偏移）共同的入口，
+    /// 因此已安装的 [`AudioTap`] 无需改动任何一条路径即可观察到每个被接受的字。
+    /// FIFO 已满或 `index` 越界时返回 `false`；被拒绝的字会置位粘滞的
+    /// `FDEBUG.TXOVER` 标志且不会被捕获。
+    pub fn push_tx(&mut self, index: usize, value: u32) -> bool {
+        let Some(machine) = self.sm.get_mut(index) else {
+            return false;
+        };
+        if !machine.tx.push(value) {
+            self.fdebug |= FDEBUG_TXOVER << index;
+            return false;
+        }
+        // 只有被 tap 选中的状态机才写入样本流；未安装 tap 时这里只是空判断。
+        // Only the state machine selected by the tap feeds the sample stream;
+        // with no tap installed this is an empty check.
+        if let Some((tap, sm)) = &self.audio {
+            if *sm == index {
+                tap.push_word(value);
+            }
+        }
+        true
+    }
+
+    /// Install an I2S capture tap on one state machine / 在一个状态机上安装 I2S 捕获 tap
+    ///
+    /// Every word accepted into state machine `sm`'s TX FIFO is then appended to
+    /// `tap`, whether it arrives from the CPU or from DMA. Only one state machine
+    /// per block is captured; installing a new tap replaces the previous one.
+    /// A block with no tap installed captures nothing and performs no extra work
+    /// on the push path.
+    /// 此后状态机 `sm` 的 TX FIFO 接受的每个字都会追加到 `tap`，无论它来自 CPU
+    /// 还是 DMA。每个块只捕获一个状态机；安装新 tap 会替换旧的。未安装 tap 的块
+    /// 不捕获任何数据，压入路径也没有额外工作。
+    pub fn set_audio_tap(&mut self, tap: AudioTap, sm: usize) {
+        self.audio = Some((tap, sm));
+    }
+
+    /// Remove the installed capture tap / 移除已安装的捕获 tap
+    ///
+    /// TX FIFO pushes are then not captured at all; the sink itself is left
+    /// untouched so the host can still drain what was captured before.
+    /// 此后 TX FIFO 压入完全不被捕获；缓冲本身保持不变，宿主仍可取走此前捕获的内容。
+    pub fn clear_audio_tap(&mut self) {
+        self.audio = None;
+    }
+
+    /// Capture tap currently installed on this block / 本块当前安装的捕获 tap
+    #[must_use]
+    pub fn audio_tap(&self) -> Option<&AudioTap> {
+        self.audio.as_ref().map(|(tap, _)| tap)
     }
 
     /// Pop a word from the state machine TX FIFO as the state machine would
@@ -521,10 +596,10 @@ impl MmioDevice for Pio {
         }
         if (TXF0..=TXF3).contains(&offset) {
             let index = ((offset - TXF0) / 4) as usize;
-            if self.sm[index].tx.push(value) {
-                return true;
-            }
-            self.fdebug |= FDEBUG_TXOVER << index;
+            // 已满时 push_tx 置位 FDEBUG.TXOVER；与之前的语义一致，写入仍被接受。
+            // On a full FIFO push_tx raises FDEBUG.TXOVER; the write is still
+            // accepted, matching the previous semantics.
+            let _ = self.push_tx(index, value);
             return true;
         }
         match offset {
@@ -574,12 +649,20 @@ impl MmioDevice for Pio {
     }
 
     fn reset(&mut self) {
-        // 寄存器与引脚向量回到复位值，但共享 pad 矩阵句柄属于宿主接线，必须保留。
+        // 寄存器与引脚向量回到复位值，但共享 pad 矩阵句柄与音频 tap 属于宿主接线，
+        // 必须保留；复位同时清空已捕获的样本，避免旧音频跨复位残留。
         // Registers and pin vectors return to their reset values; the shared pad
-        // handle belongs to the host wiring and must survive the reset.
+        // handle and the audio tap belong to the host wiring and must survive the
+        // reset. Resetting also clears captured samples so stale audio cannot
+        // survive across a reset.
         let pads = self.pads.clone();
+        let audio = self.audio.clone();
         *self = Self::new(self.index);
         self.pads = pads;
+        self.audio = audio;
+        if let Some((tap, _)) = &self.audio {
+            tap.clear();
+        }
         self.publish_outputs();
     }
 }
