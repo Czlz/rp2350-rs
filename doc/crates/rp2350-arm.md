@@ -952,6 +952,14 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   - `VMOV` core register ↔ S register, `VMOV` two core registers ↔ D register.
   - `VMOV.F32 Sd, #imm` (VFP 8-bit immediate expansion).
   - `VMRS` / `VMSR` (FPSCR, FPEXC) including `VMRS APSR_nzcv, FPSCR`.
+- **Alignment**: `VLDR` / `VSTR` / `VLDM` / `VSTM` require a word-aligned
+  address. A non-word-aligned address raises `CFSR.UFSR.UNALIGNED` **regardless
+  of `CCR.UNALIGN_TRP`**: ARMv8-M B2.3.6 lists `VLDR`, `VSTR`, `VLDM` and
+  `VSTM` among the accesses that always generate an alignment fault, and only
+  `LDR`/`LDRH`/`STR`/`STRH` are gated by the trap bit. The access is abandoned
+  before any transfer: memory, the S/D register and the base write-back all
+  stay unchanged, and the stacked return address is the faulting instruction.
+  The 64-bit `VLDR`/`VSTR` forms only require 4-byte alignment, not 8-byte.
 - **Arithmetic** (single precision, Stage 3, `execute_thumb32::fpu_arith`):
   `VADD`, `VSUB`, `VMUL`, `VNMUL`, `VMLA`/`VMLS`, `VNMLA`/`VNMLS`, `VDIV`,
   the fused `VFMA`/`VFMS`/`VFNMA`/`VFNMS` family, plus `VMOV.F32 Sd, Sm`,
@@ -1006,6 +1014,12 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   `VLDM`/`VSTM`（含 `VPUSH`/`VPOP` 别名，IA/DB，可带写回）、
   `VMOV` 内核↔S、`VMOV` 两个内核↔D、`VMOV.F32 Sd, #imm`、
   `VMRS`/`VMSR`（含 `VMRS APSR_nzcv, FPSCR`）。
+- **对齐**：`VLDR`/`VSTR`/`VLDM`/`VSTM` 要求地址按字对齐。地址未按字对齐时
+  置 `CFSR.UFSR.UNALIGNED`，**与 `CCR.UNALIGN_TRP` 无关**：ARMv8-M B2.3.6
+  把 `VLDR`/`VSTR`/`VLDM`/`VSTM` 列为始终产生对齐故障的访问，只有
+  `LDR`/`LDRH`/`STR`/`STRH` 受该陷阱位控制。故障在任何传输之前发生：
+  内存、S/D 寄存器与基址写回均保持不变，压栈返回地址是故障指令。64 位
+  `VLDR`/`VSTR` 只要求 4 字节对齐，不要求 8 字节。
 - **算术**（单精度，Stage 3，`execute_thumb32::fpu_arith`）：`VADD`、
   `VSUB`、`VMUL`、`VNMUL`、`VMLA`/`VMLS`、`VNMLA`/`VNMLS`、`VDIV`、
   融合乘加 `VFMA`/`VFMS`/`VFNMA`/`VFNMS`，以及 `VMOV.F32 Sd, Sm`、
@@ -1568,7 +1582,7 @@ are identical for all sources:
 |---------------|-------------|--------------------|
 | Undefined instruction / 未定义指令 | `UFSR.UNDEFINSTR` (16) | UsageFault 6 if `USGFAULTENA` **and** priority allows, else HardFault 3 + `HFSR.FORCED` |
 | Illegal `EXC_RETURN` / 非法返回 | `UFSR.INVSTATE` (17) | same / 同上 |
-| Unaligned data access with `CCR.UNALIGN_TRP = 1` / `CCR.UNALIGN_TRP = 1` 时的未对齐数据访问 | `UFSR.UNALIGNED` (21) | same / 同上 |
+| Unaligned data access with `CCR.UNALIGN_TRP = 1`, or any non-word-aligned `VLDR`/`VSTR`/`VLDM`/`VSTM` / `CCR.UNALIGN_TRP = 1` 时的未对齐数据访问，或任何未按字对齐的 `VLDR`/`VSTR`/`VLDM`/`VSTM` | `UFSR.UNALIGNED` (21) | same / 同上 |
 | `SDIV`/`UDIV` by zero with `CCR.DIV_0_TRP = 1` / `CCR.DIV_0_TRP = 1` 时的除零 | `UFSR.DIVBYZERO` (22) | same / 同上 |
 | Coprocessor access denied / 协处理器拒绝 | `UFSR.NOCP` (19) | same / 同上 |
 | `SVC` / 监管调用 | — | SVCall 11 (pending in `SHCSR.SVCALLPENDED`) |
@@ -1614,8 +1628,37 @@ are identical for all sources:
 | `AIRCR` | `0xE000_ED0C` | A write is accepted only with `VECTKEY = 0x05FA`; `PRIS` (14) is stored; `SYSRESETREQ` (2) latches a one-shot event read by `take_system_reset_request()`; `VECTRESET` (0) is latched for diagnostics (`vect_reset_requested()`); `VECTKEYSTAT` reads `0xFA05`, write-only request bits read 0. |
 | `SHPR1` | `0xE000_ED18` | Byte 0 MemManage (4), byte 1 BusFault (5), byte 2 UsageFault (6), implemented priority bits only; byte 3 reserved reads 0. The three priorities take part in entry, `BASEPRI` masking and preemption. |
 | `CCR` | `0xE000_ED14` | `STKALIGN` (9) reads as one (RAO/WI); `UNALIGN_TRP` (3) and `DIV_0_TRP` (4) gate the traps; `NONBASETHRDENA` (0), `USERSETMPEND` (1) and `BFHFNMIGN` (8) are **storage only**. Reserved bits read 0. |
-| `MMFAR` | `0xE000_ED34` | Address field only; validity is `CFSR.MMARVALID`. No MemManage source exists yet, so software-written values simply read back. |
-| `BFAR` | `0xE000_ED38` | Address field only; validity is `CFSR.BFARVALID`. Trapped unaligned accesses record their address here **without** setting `BFARVALID` (see below). |
+| `MMFAR` | `0xE000_ED34` | Address field only; validity is `CFSR.MMARVALID`. No MemManage source exists, so the model never sets `MMARVALID`; software-written address values read back and software clears the status bit (W1C). The PPB replays and mirrors those writes; a value recorded by a core fault path is not visible through the PPB read-back window. |
+| `BFAR` | `0xE000_ED38` | Address field only; validity is `CFSR.BFARVALID`. Trapped unaligned accesses (including FPU transfers) record their address here **without** setting `BFARVALID`; no BusFault source exists, so the model never sets it. Software clears the status bit (W1C). Firmware writes are replayed and mirrored by the PPB; the core-recorded diagnostic address stays core-only. |
+
+**Fault address validity (`MMARVALID` / `BFARVALID`) / 故障地址有效性**
+
+`MMFAR` and `BFAR` hold an address only; validity is reported exclusively by
+`CFSR.MMARVALID` (bit 7) and `CFSR.BFARVALID` (bit 15). This model never sets
+either bit from a fault:
+
+- No MemManage or BusFault exception source exists. MPU and access-violation
+  checks are not modelled, and bus errors surface as `CoreError` to the host
+  instead of entering a fault handler, so there is no event to mark valid.
+- `UFSR.UNALIGNED` has no architecturally defined fault-address register. A
+  trapped unaligned access (integer or FPU) stores its address in `BFAR` for
+  host diagnostics but leaves both `MMARVALID` and `BFARVALID` clear, so
+  software sees the architecturally correct "no valid address" state.
+
+Both status bits are write-one-to-clear; the model never sets them, so they
+read 0 unless a host/test writes the status word directly.
+
+`MMFAR` 与 `BFAR` 只保存地址；有效性只由 `CFSR.MMARVALID`（位 7）与
+`CFSR.BFARVALID`（位 15）表示。本模型从不因故障置位这两个位：
+
+- 本模型没有 MemManage/BusFault 异常源：MPU 与访问违例检查未建模，总线错误
+  以 `CoreError` 上报宿主而不是进入故障处理程序，因此没有可标记为有效的事件。
+- `UFSR.UNALIGNED` 在架构上没有定义故障地址寄存器。被捕获的未对齐访问
+  （整数或浮点）把地址存入 `BFAR` 供宿主诊断，但 `MMARVALID` 与 `BFARVALID`
+  都保持清零，使软件看到架构正确的「无有效地址」状态。
+
+两个状态位都是写 1 清零；本模型从不置位它们，因此除非宿主/测试直接写入状态字，
+它们恒读 0。
 
 The table above is the complete modelled fault surface. **Still unmodelled /
 仍未建模**: TrustZone secure/non-secure state (there is one register file and one
@@ -1646,7 +1689,9 @@ extended FP frame).
 - `UNALIGN_TRP = 0` (reset): unaligned `LDR`/`LDRH`/`LDRSH`/`STR`/`STRH`,
   `LDM`/`STM`, `PUSH`/`POP`, `LDRD`/`STRD`, `LDREX`/`STREX` and the
   acquire/release forms execute as unaligned accesses, exactly as this model did
-  before `CCR` existed. Byte accesses are always naturally aligned.
+  before `CCR` existed. Byte accesses are always naturally aligned. FPU
+  transfers are **not** part of this permissive set: they always fault when not
+  word-aligned (see below).
 - `UNALIGN_TRP = 1`: any data access whose address violates its natural
   alignment raises `CFSR.UFSR.UNALIGNED` (bit 21), routed to UsageFault (6) when
   `SHCSR.USGFAULTENA = 1` and the priority allows, otherwise escalated to
@@ -1660,22 +1705,34 @@ extended FP frame).
   reserved for precise BusFaults, `MMFAR` for MemManage).
 - Instruction fetch alignment is not affected by `UNALIGN_TRP`: a Thumb PC with
   bit 0 clear is rejected by `BX`/`BLX`/PC writes as `INVSTATE`, as before.
-- FPU data transfers (`VLDR`/`VSTR`) and coprocessor transfers are **not** gated
-  by `UNALIGN_TRP` in this model; they keep using the bus exactly as before.
-  ARMv8-M does not support unaligned FPU data accesses, so this remains a
-  documented divergence until a dedicated task models the FPU alignment rule.
-- The model deliberately gates **all** of the listed forms on `UNALIGN_TRP`.
-  The ARMv8-M architecture additionally makes `LDM`/`STM`, `PUSH`/`POP`,
-  `LDRD`/`STRD` and the exclusive accesses always fault when unaligned, even
-  with `UNALIGN_TRP = 0`; this model keeps the long-standing permissive
-  behaviour for those forms when the bit is clear, as required to preserve the
-  pre-`CCR` firmware behaviour.
+- FPU loads/stores (`VLDR`/`VSTR`/`VLDM`/`VSTM`) require a word-aligned address
+  and raise `UFSR.UNALIGNED` **even when `UNALIGN_TRP = 0`**. ARMv8-M B2.3.6
+  lists non-word-aligned `VLDR`, `VSTR`, `VLDM` and `VSTM` (with the multiple,
+  dualword and atomic forms) among the accesses that always generate an
+  alignment fault; `CCR.UNALIGN_TRP` only extends the trap to plain
+  `LDR`/`LDRH`/`STR`/`STRH`. The access is abandoned before any transfer: no
+  memory write, no S/D register update and no base write-back; the stacked
+  return address is the faulting instruction. The 64-bit forms only require
+  4-byte alignment. See the FPU chapter for the instruction-level rule.
+- **Known deliberate divergence / 已知有意差异** — the model gates the
+  multiple/dualword/atomic forms (`LDM`/`STM`, `PUSH`/`POP`, `LDRD`/`STRD`,
+  `LDREX`/`STREX`, `LDA`/`STL`) on `UNALIGN_TRP` even though ARMv8-M makes them
+  **always** fault when unaligned (B2.3.6). Reason: the pre-`CCR` emulator
+  executed those forms byte-wise and real firmware (MicroPython/CircuitPython)
+  ran with them, so making them unconditionally faulting would change existing
+  firmware-visible behaviour and risk FV-1/FV-2/FV-3. Risk: software that
+  relies on the architectural always-fault rule for an unaligned
+  `LDM`/`STM`/`LDRD`/`STRD`/exclusive will not see a fault while
+  `UNALIGN_TRP = 0`; setting `UNALIGN_TRP = 1` restores full alignment
+  checking. This divergence is intentional and may only be revisited together
+  with firmware verification. FPU transfers are **not** part of it.
 
 **未对齐访问（`UNALIGN_TRP`，位 3）**
 
 - `UNALIGN_TRP = 0`（复位值）：未对齐的 `LDR`/`LDRH`/`LDRSH`/`STR`/`STRH`、
   `LDM`/`STM`、`PUSH`/`POP`、`LDRD`/`STRD`、`LDREX`/`STREX` 与获取/释放形式按
-  未对齐访问执行，与 `CCR` 存在之前的行为完全一致。字节访问天然对齐。
+  未对齐访问执行，与 `CCR` 存在之前的行为完全一致。字节访问天然对齐。浮点传输
+  **不**属于这一宽松集合：地址未按字对齐时始终故障（见下）。
 - `UNALIGN_TRP = 1`：任何地址违反自然对齐的数据访问产生
   `CFSR.UFSR.UNALIGNED`（位 21）；`SHCSR.USGFAULTENA = 1` 且优先级允许时进入
   UsageFault（6），否则带 `HFSR.FORCED` 升级为 HardFault（3）。访问被放弃：
@@ -1686,13 +1743,22 @@ extended FP frame).
   BusFault、`MMFAR` 属于 MemManage）。
 - 取指对齐不受 `UNALIGN_TRP` 影响：bit0 为 0 的 Thumb PC 仍由
   `BX`/`BLX`/写 PC 以 `INVSTATE` 拒绝，与之前一致。
-- 浮点数据传输（`VLDR`/`VSTR`）与协处理器传输在本模型中**不**受
-  `UNALIGN_TRP` 控制，仍按原总线路径执行。ARMv8-M 不支持未对齐的浮点数据访问，
-  因此这一差异在文档中保留，待后续专门任务补齐 FPU 对齐规则。
-- 本模型有意让上述**全部**形式都受 `UNALIGN_TRP` 控制。ARMv8-M 还规定
-  `LDM`/`STM`、`PUSH`/`POP`、`LDRD`/`STRD` 与独占访问在未对齐时**始终**故障
-  （即使 `UNALIGN_TRP = 0`）；本模型在该位清零时保留长期以来的宽松行为，以维持
-  `CCR` 引入前的固件可见行为。
+- 浮点加载/存储（`VLDR`/`VSTR`/`VLDM`/`VSTM`）要求地址按字对齐，并在
+  `UNALIGN_TRP = 0` 时**同样**产生 `UFSR.UNALIGNED`。ARMv8-M B2.3.6 把未按字
+  对齐的 `VLDR`/`VSTR`/`VLDM`/`VSTM`（连同多寄存器、双字与原子形式）列为始终
+  产生对齐故障的访问；`CCR.UNALIGN_TRP` 只把陷阱扩展到普通
+  `LDR`/`LDRH`/`STR`/`STRH`。故障在任何传输之前发生：不写内存、不更新 S/D
+  寄存器、不写回基址；压栈返回地址是故障指令。64 位形式只要求 4 字节对齐。
+  指令级规则见 FPU 章节。
+- **已知有意差异** —— 本模型让多寄存器/双字/原子形式（`LDM`/`STM`、
+  `PUSH`/`POP`、`LDRD`/`STRD`、`LDREX`/`STREX`、`LDA`/`STL`）也受
+  `UNALIGN_TRP` 控制，而 ARMv8-M 规定它们未对齐时**始终**故障（B2.3.6）。
+  原因：`CCR` 引入前的模拟器按字节执行这些形式，真实固件
+  （MicroPython/CircuitPython）依赖该行为；改为无条件故障会改变既有的固件可见
+  行为，危及 FV-1/FV-2/FV-3。风险：依赖架构「始终故障」规则的软件在
+  `UNALIGN_TRP = 0` 时不会看到未对齐 `LDM`/`STM`/`LDRD`/`STRD`/独占访问故障；
+  置位 `UNALIGN_TRP = 1` 即恢复完整对齐检查。该差异是有意保留的，只能在配套
+  固件验证的前提下重新评估。浮点传输**不**属于该差异。
 
 **Divide by zero (`DIV_0_TRP`, bit 4)**
 
@@ -1744,16 +1810,23 @@ BusFault（5）、第 2 字节 UsageFault（6），第 3 字节保留读 0。只
 使用解码后的值。`SHPR2`/`SHPR3` 继续承载 SVCall/PendSV/SysTick。
 
 > **PPB replay / PPB 回放**: in the full machine the `rp2350-periph` PPB stub
-> replays `VTOR`, `CPACR`, `ICSR`, `SHPR2`/`SHPR3`, `SCR`, `STIR`, the NVIC and
-> `SHCSR`/`CFSR`/`HFSR`/`AIRCR`, so firmware-side fault enables, write-one-to-
-> clear fault status and `SYSRESETREQ` take effect. `CCR` and `SHPR1` are still
-> not replayed; until that wiring lands (outside this crate), host code must
-> program them through `CpuCore::system_write`.
+> replays `VTOR`, `CPACR`, `ICSR`, `CCR`, `SHPR1`/`SHPR2`/`SHPR3`, `SCR`,
+> `STIR`, `MMFAR`, `BFAR`, the NVIC and `SHCSR`/`CFSR`/`HFSR`/`AIRCR`, so
+> firmware-side fault enables, the `UNALIGN_TRP`/`DIV_0_TRP` traps, fault
+> priorities, write-one-to-clear fault status and `SYSRESETREQ` take effect.
+> The PPB keeps a read-back cache that mirrors the core's write rules, but
+> there is no core→PPB channel: status the core sets on its own (`CFSR`/`HFSR`
+> bits, live `SHCSR` views, a `BFAR` diagnostic address, a future `MMFAR`
+> value) is not visible to firmware reads through the PPB window. See
+> [`rp2350-periph`](rp2350-periph.md#read-back-limits--读回限制).
 > **PPB 回放**：完整机器中 `rp2350-periph` 的 PPB 桩会回放 `VTOR`、`CPACR`、
-> `ICSR`、`SHPR2`/`SHPR3`、`SCR`、`STIR`、NVIC 以及
-> `SHCSR`/`CFSR`/`HFSR`/`AIRCR`，因此固件侧的故障使能、写 1 清零的故障状态与
-> `SYSRESETREQ` 都会生效。`CCR` 与 `SHPR1` 仍未回放；在该接线（不在本 crate）
-> 落地前，宿主必须通过 `CpuCore::system_write` 编程。
+> `ICSR`、`CCR`、`SHPR1`/`SHPR2`/`SHPR3`、`SCR`、`STIR`、`MMFAR`、`BFAR`、
+> NVIC 以及 `SHCSR`/`CFSR`/`HFSR`/`AIRCR`，因此固件侧的故障使能、
+> `UNALIGN_TRP`/`DIV_0_TRP` 陷阱、故障优先级、写 1 清零的故障状态与
+> `SYSRESETREQ` 都会生效。PPB 保留一份复现核写入规则的读回缓存，但不存在
+> 核→PPB 通道：核自行置位的状态（`CFSR`/`HFSR` 位、`SHCSR` 实时视图、`BFAR`
+> 诊断地址、未来的 `MMFAR` 值）无法通过 PPB 窗口被固件读到。详见
+> [`rp2350-periph`](rp2350-periph.md#read-back-limits--读回限制)。
 
 ---
 

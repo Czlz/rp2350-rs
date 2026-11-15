@@ -2311,11 +2311,15 @@ immediately, exactly like a real store into the system control space.
 | `SCB_ICSR` | `0xE000_ED04` | NMI/PendSV/SysTick pending set/clear / NMI/PendSV/SysTick 挂起置位与清除 |
 | `SCB_AIRCR` | `0xE000_ED0C` | `VECTKEY` gate, `PRIS`, `SYSRESETREQ`/`VECTRESET` latches / `VECTKEY` 门控、`PRIS`、复位锁存 |
 | `SCB_SCR` | `0xE000_ED10` | `SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND` / 睡眠与事件位 |
+| `SCB_CCR` | `0xE000_ED14` | `UNALIGN_TRP`/`DIV_0_TRP` traps plus `STKALIGN` and the three storage-only bits / 未对齐与除零陷阱及 `STKALIGN`、三个仅存储位 |
+| `SCB_SHPR1` | `0xE000_ED18` | MemManage/BusFault/UsageFault priorities / MemManage/BusFault/UsageFault 优先级 |
 | `SCB_SHPR2` | `0xE000_ED1C` | SVCall priority / SVCall 优先级 |
 | `SCB_SHPR3` | `0xE000_ED20` | PendSV and SysTick priorities / PendSV 与 SysTick 优先级 |
 | `SCB_SHCSR` | `0xE000_ED24` | `MEMFAULTENA`/`BUSFAULTENA`/`USGFAULTENA`; `*ACT`/`SVCALLPENDED` are live core views / 三个故障使能；活跃与挂起位为核内实时视图 |
 | `SCB_CFSR` | `0xE000_ED28` | MMFSR/BFSR/UFSR status, write-one-to-clear / 故障状态，写 1 清零 |
 | `SCB_HFSR` | `0xE000_ED2C` | `VECTTBL`/`FORCED`/`DEBUGEVT`, write-one-to-clear / 写 1 清零 |
+| `SCB_MMFAR` | `0xE000_ED34` | MemManage fault address field; validity is `CFSR.MMARVALID` / MemManage 故障地址字段；有效性由 `CFSR.MMARVALID` 表示 |
+| `SCB_BFAR` | `0xE000_ED38` | BusFault fault address field; validity is `CFSR.BFARVALID` / BusFault 故障地址字段；有效性由 `CFSR.BFARVALID` 表示 |
 | `SCB_CPACR` | `0xE000_ED88` | CP0–CP7 (GPIOC/DCP) and CP10–CP11 (FPU) keys / 协处理器访问键 |
 | `SCB_STIR` | `0xE000_EF00` | Software-triggered external interrupt / 软件触发外部中断 |
 | NVIC | `0xE000_E100..=0xE000_E4FF` | `ISER`/`ICER`/`ISPR`/`ICPR`/`IPR` / NVIC 使能、挂起与优先级 |
@@ -2327,26 +2331,61 @@ PPB 内：回放 SysTick 计数器会让它重复计时。
 
 ### Read-back shadow / 读回影子
 
-`SHCSR`, `CFSR`, `HFSR` and `AIRCR` are architecturally owned by the core, so the
-PPB keeps a **cache only** and applies the same write rules the core applies.
-`SHCSR` stores the three fault enables (`0x0007_0000`); `CFSR`/`HFSR` are
-write-one-to-clear (writing 0 changes nothing); an `AIRCR` write is accepted only
-when `bits[31:16] == 0x05FA` and then stores `PRIS` only. `AIRCR` always reads
-`VECTKEYSTAT = 0xFA05_0000` and the write-only reset requests read as zero. The
-cache never becomes a second source of truth: fault escalation, live `*ACT`/
-`SVCALLPENDED` views and the reset latch are computed inside `rp2350-arm`.
-`SHCSR`、`CFSR`、`HFSR` 与 `AIRCR` 架构上属于核，因此 PPB 只保留**缓存**，并套用
-核的写入规则。`SHCSR` 保存三个故障使能（`0x0007_0000`）；`CFSR`/`HFSR` 写 1
-清零（写 0 不变）；`AIRCR` 仅当 `bits[31:16] == 0x05FA` 时接受写入，且只保存
-`PRIS`。`AIRCR` 恒读 `VECTKEYSTAT = 0xFA05_0000`，只写的复位请求读 0。缓存绝不
-成为第二真相源：故障升级、`*ACT`/`SVCALLPENDED` 实时视图与复位锁存都在
-`rp2350-arm` 内计算。
+`SHCSR`, `CFSR`, `HFSR`, `AIRCR`, `CCR`, `SHPR1`, `MMFAR` and `BFAR` are
+architecturally owned by the core, so the PPB keeps a **cache only** and applies
+the same write rules the core applies. `SHCSR` stores the three fault enables
+(`0x0007_0000`); `CFSR`/`HFSR` are write-one-to-clear (writing 0 changes
+nothing); an `AIRCR` write is accepted only when `bits[31:16] == 0x05FA` and
+then stores `PRIS` only. `AIRCR` always reads `VECTKEYSTAT = 0xFA05_0000` and
+the write-only reset requests read as zero. `CCR` re-reads `STKALIGN` as one on
+every write and stores only `NONBASETHRDENA`, `USERSETMPEND`, `UNALIGN_TRP`,
+`DIV_0_TRP` and `BFHFNMIGN` (`0x0000_011B`); reserved bits never retain a
+write, so the reset value is `0x0000_0200`. `SHPR1` stores the implemented
+priority bits of bytes 0/1/2 (`0x00E0_E0E0`) and reads the reserved byte 3 as
+zero. `MMFAR`/`BFAR` are read/write address fields in ARMv8-M: the whole word is
+cached so firmware read-back matches the core, but `CFSR.MMARVALID`/
+`BFARVALID` stay core-owned, so an address write can never forge a valid fault
+address. The cache never becomes a second source of truth: fault escalation,
+live `*ACT`/`SVCALLPENDED` views and the reset latch are computed inside
+`rp2350-arm`.
+`SHCSR`、`CFSR`、`HFSR`、`AIRCR`、`CCR`、`SHPR1`、`MMFAR` 与 `BFAR` 架构上属于核，
+因此 PPB 只保留**缓存**，并套用核的写入规则。`SHCSR` 保存三个故障使能
+（`0x0007_0000`）；`CFSR`/`HFSR` 写 1 清零（写 0 不变）；`AIRCR` 仅当
+`bits[31:16] == 0x05FA` 时接受写入，且只保存 `PRIS`。`AIRCR` 恒读
+`VECTKEYSTAT = 0xFA05_0000`，只写的复位请求读 0。`CCR` 每次写入都重新把
+`STKALIGN` 读为 1，只保存 `NONBASETHRDENA`、`USERSETMPEND`、`UNALIGN_TRP`、
+`DIV_0_TRP` 与 `BFHFNMIGN`（`0x0000_011B`）；保留位永不保留写入，因此复位值
+为 `0x0000_0200`。`SHPR1` 保存第 0/1/2 字节中已实现的优先级位
+（`0x00E0_E0E0`），保留的第 3 字节读 0。`MMFAR`/`BFAR` 在 ARMv8-M 中是读写
+地址字段：整字缓存使固件读回与核一致，但 `CFSR.MMARVALID`/`BFARVALID` 归核
+所有，地址写入绝不可能伪造有效故障地址。缓存绝不成为第二真相源：故障升级、
+`*ACT`/`SVCALLPENDED` 实时视图与复位锁存都在 `rp2350-arm` 内计算。
 
 A write without `VECTKEY` is ignored by the core and leaves both the cache and the
 reset latch unchanged, which is why `firmware` disassembly that clears `PRIS`
 with a bare `0x0000_xxxx` store has no effect.
 无 `VECTKEY` 的写入被核忽略，缓存与复位锁存都不变，因此用裸 `0x0000_xxxx` 写入
 清 `PRIS` 的固件不会有任何效果。
+
+#### Read-back limits / 读回限制
+
+There is no core→PPB channel. Status that the core sets on its own — `CFSR`/
+`HFSR` fault bits, `SHCSR` active/pending bits, the `BFAR` address recorded by a
+trapped unaligned access, the `MMFAR` value a future MemManage source would
+write, and `ICSR.VECTPENDING`/`VECTACTIVE` — is **not** copied back into the PPB
+cache. A firmware read through the PPB window therefore returns only what
+firmware itself last wrote (or the reset value); in particular `MMFAR`/`BFAR`
+read as `0` until software writes them, even after the core recorded a fault
+address. `CFSR`/`HFSR` writes still clear the core latches because the write is
+replayed, but the PPB read-back cannot confirm what the core latched. Host-side
+diagnostics must use `CpuCore::system_read`, not the bus PPB window.
+不存在核→PPB 通道。核自行置位的状态——`CFSR`/`HFSR` 故障位、`SHCSR` 的活跃/挂起
+位、未对齐陷阱记入 `BFAR` 的地址、未来 MemManage 源会写入的 `MMFAR`，以及
+`ICSR.VECTPENDING`/`VECTACTIVE`——都**不会**回填到 PPB 缓存。因此固件经 PPB 窗口
+读到的只是自己最后写入的值（或复位值）；特别是 `MMFAR`/`BFAR` 在软件写入前恒读
+`0`，即使核内已经记录了故障地址。`CFSR`/`HFSR` 的写入仍会因回放而清除核内锁存，
+但 PPB 读回无法确认核内锁存内容。宿主侧诊断必须使用 `CpuCore::system_read`，
+而不是总线上的 PPB 窗口。
 
 ### System reset request / 系统复位请求
 
