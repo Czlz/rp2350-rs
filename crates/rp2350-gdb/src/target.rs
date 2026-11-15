@@ -60,6 +60,29 @@ pub mod regs {
     pub const COUNT: u32 = 17;
 }
 
+/// GDB thread identifier / GDB 线程标识符
+///
+/// Thread 1 is core 0 (the boot core) and thread 2 is core 1 (the Arm
+/// secondary core). The numbering matches GDB's `qfThreadInfo` reply, which is
+/// `m1,2` on a dual-core target.
+/// 线程 1 是 core0（启动核心），线程 2 是 core1（Arm 第二核心）。编号与 GDB
+/// `qfThreadInfo` 回复一致：双核目标回复 `m1,2`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ThreadId(pub u32);
+
+impl ThreadId {
+    /// Boot core (core 0) / 启动核心（core0）
+    pub const CORE0: Self = Self(1);
+    /// Arm secondary core (core 1) / Arm 第二核心（core1）
+    pub const CORE1: Self = Self(2);
+
+    /// Raw thread number used on the wire / 线上使用的原始线程编号
+    #[must_use]
+    pub const fn number(self) -> u32 {
+        self.0
+    }
+}
+
 /// How the target should resume execution / 目标应如何恢复执行
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeMode {
@@ -212,6 +235,120 @@ pub trait GdbTarget: Send {
     #[must_use]
     fn register_count(&self) -> u32 {
         regs::COUNT
+    }
+
+    /// Number of threads exposed to GDB / 暴露给 GDB 的线程数量
+    ///
+    /// The default is a single thread, so existing single-core targets keep
+    /// answering `qfThreadInfo` with `m1` without any code change.
+    /// 默认为单线程，因此现有单核目标无需改动即可以 `m1` 应答 `qfThreadInfo`。
+    #[must_use]
+    fn thread_count(&self) -> usize {
+        1
+    }
+
+    /// Thread identifier at `index` (`0..thread_count()`)
+    /// `index`（`0..thread_count()`）处的线程标识符
+    ///
+    /// Returns `None` for indexes past the thread table. The default numbers
+    /// threads `1..=thread_count()`, so a target only has to override
+    /// [`Self::thread_count`] to expose more cores.
+    /// 超出线程表返回 `None`。默认按 `1..=thread_count()` 编号，因此目标只需
+    /// 覆盖 [`Self::thread_count`] 即可暴露更多核心。
+    #[must_use]
+    fn thread_id(&self, index: usize) -> Option<ThreadId> {
+        (index < self.thread_count())
+            .then(|| ThreadId(u32::try_from(index + 1).unwrap_or(u32::MAX)))
+    }
+
+    /// Human-readable thread name served by `qThreadExtraInfo`
+    /// 由 `qThreadExtraInfo` 提供的可读线程名
+    #[must_use]
+    fn thread_name(&self, thread: ThreadId) -> String {
+        match thread {
+            ThreadId::CORE0 => "core0".to_string(),
+            ThreadId::CORE1 => "core1".to_string(),
+            other => format!("thread {}", other.number()),
+        }
+    }
+
+    /// Current CPU state of `thread`, or `None` for an unknown thread
+    /// `thread` 的当前 CPU 状态；未知线程返回 `None`
+    ///
+    /// The default reports the whole target state for [`ThreadId::CORE0`].
+    /// 默认对 [`ThreadId::CORE0`] 报告整个目标的状态。
+    #[must_use]
+    fn thread_state(&self, thread: ThreadId) -> Option<CpuState> {
+        (thread == ThreadId::CORE0).then(|| self.status().state)
+    }
+
+    /// Read a register of `thread` by GDB register number
+    /// 按 GDB 寄存器编号读取 `thread` 的寄存器
+    ///
+    /// # Errors
+    /// Returns [`GdbError::Unsupported`] for threads the default adapter does
+    /// not know, and [`GdbError::InvalidRegister`] for unknown registers.
+    /// 默认适配器不认识的线程返回 [`GdbError::Unsupported`]，未知寄存器返回
+    /// [`GdbError::InvalidRegister`]。
+    fn read_thread_register(&mut self, thread: ThreadId, register: u32) -> Result<u32, GdbError> {
+        if thread == ThreadId::CORE0 {
+            self.read_register(register)
+        } else {
+            Err(GdbError::Unsupported("thread register access"))
+        }
+    }
+
+    /// Write a register of `thread` by GDB register number
+    /// 按 GDB 寄存器编号写入 `thread` 的寄存器
+    ///
+    /// # Errors
+    /// Mirrors [`Self::read_thread_register`]. / 与
+    /// [`Self::read_thread_register`] 一致。
+    fn write_thread_register(
+        &mut self,
+        thread: ThreadId,
+        register: u32,
+        value: u32,
+    ) -> Result<(), GdbError> {
+        if thread == ThreadId::CORE0 {
+            self.write_register(register, value)
+        } else {
+            Err(GdbError::Unsupported("thread register access"))
+        }
+    }
+
+    /// Continue only `thread` / 仅继续 `thread`
+    ///
+    /// The default falls back to a whole-target continue, so a target without
+    /// per-core control still answers the packet legally.
+    /// 默认回退为整目标继续，因此没有按核控制能力的目标仍能合法应答该包。
+    ///
+    /// # Errors
+    /// See [`Self::resume`]. / 参见 [`Self::resume`]。
+    fn continue_thread(&mut self, _thread: ThreadId) -> Result<StopReply, GdbError> {
+        self.resume(ResumeMode::Continue)
+    }
+
+    /// Single-step only `thread` / 仅单步 `thread`
+    ///
+    /// The default falls back to a whole-target step.
+    /// 默认回退为整目标单步。
+    ///
+    /// # Errors
+    /// See [`Self::resume`]. / 参见 [`Self::resume`]。
+    fn step_thread(&mut self, _thread: ThreadId) -> Result<StopReply, GdbError> {
+        self.resume(ResumeMode::Step)
+    }
+
+    /// Thread that produced the most recent stop reply
+    /// 产生最近一次停止回复的线程
+    ///
+    /// The RSP layer appends `thread:<n>;` to every stop reply from this value;
+    /// the default keeps single-core targets on thread 1.
+    /// RSP 层用该值给每个停止回复追加 `thread:<n>;`；默认让单核目标停在线程 1。
+    #[must_use]
+    fn stopped_thread(&self) -> ThreadId {
+        ThreadId::CORE0
     }
 
     /// Static XML target description served by `qXfer:features:read`
@@ -423,6 +560,14 @@ mod tests {
         assert_eq!(regs::PC, 15);
         assert_eq!(regs::XPSR, 16);
         assert_eq!(regs::COUNT, 17);
+    }
+
+    #[test]
+    fn thread_ids_number_core0_and_core1() {
+        assert_eq!(ThreadId::CORE0.number(), 1);
+        assert_eq!(ThreadId::CORE1.number(), 2);
+        assert!(ThreadId::CORE0 < ThreadId::CORE1);
+        assert_eq!(ThreadId(7).number(), 7);
     }
 
     #[test]

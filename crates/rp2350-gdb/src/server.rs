@@ -12,8 +12,10 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 
+use rp2350_cpu::CpuState;
+
 use crate::rsp::{ACK, NACK, Session, decode_packet, encode_packet};
-use crate::target::{GdbError, GdbTarget, ResumeMode, StopReply, TargetStatus};
+use crate::target::{GdbError, GdbTarget, ResumeMode, StopReply, TargetStatus, ThreadId};
 
 /// Blocking GDB Remote Serial Protocol server / 阻塞式 GDB 远程串行协议服务器
 pub struct GdbServer {
@@ -139,6 +141,47 @@ impl GdbServer {
 // TCP 服务器以 trait object 持有目标；转发实现让泛型 `Session` 无需修改 API
 // 即可使用。
 impl GdbTarget for Box<dyn GdbTarget + Send> {
+    fn thread_count(&self) -> usize {
+        (**self).thread_count()
+    }
+
+    fn thread_id(&self, index: usize) -> Option<ThreadId> {
+        (**self).thread_id(index)
+    }
+
+    fn thread_name(&self, thread: ThreadId) -> String {
+        (**self).thread_name(thread)
+    }
+
+    fn thread_state(&self, thread: ThreadId) -> Option<CpuState> {
+        (**self).thread_state(thread)
+    }
+
+    fn read_thread_register(&mut self, thread: ThreadId, register: u32) -> Result<u32, GdbError> {
+        (**self).read_thread_register(thread, register)
+    }
+
+    fn write_thread_register(
+        &mut self,
+        thread: ThreadId,
+        register: u32,
+        value: u32,
+    ) -> Result<(), GdbError> {
+        (**self).write_thread_register(thread, register, value)
+    }
+
+    fn continue_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
+        (**self).continue_thread(thread)
+    }
+
+    fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
+        (**self).step_thread(thread)
+    }
+
+    fn stopped_thread(&self) -> ThreadId {
+        (**self).stopped_thread()
+    }
+
     fn register_count(&self) -> u32 {
         (**self).register_count()
     }
@@ -572,7 +615,7 @@ mod tests {
             let supported = client.transact("qSupported:multiprocess+");
             assert!(supported.contains("PacketSize="));
             assert!(supported.contains("QStartNoAckMode+"));
-            assert_eq!(client.transact("?"), "S05");
+            assert_eq!(client.transact("?"), "T05thread:1;");
             assert_eq!(client.transact("vMustReplyEmpty"), "");
         });
     }
@@ -583,7 +626,7 @@ mod tests {
             assert_eq!(client.transact("g"), "1111111122222222");
             assert_eq!(client.transact("M20000000,4:a1b2c3d4"), "OK");
             assert_eq!(client.transact("m20000000,4"), "a1b2c3d4");
-            assert_eq!(client.transact("c"), "S05");
+            assert_eq!(client.transact("c"), "T05thread:1;");
         });
     }
 
@@ -594,7 +637,7 @@ mod tests {
             // `?` 的真实校验和为 0x3f；0x00 强制不匹配。
             client.send_frame("$?#00");
             assert_eq!(client.read_byte(), b'-', "bad checksum must be nacked");
-            assert_eq!(client.transact("?"), "S05");
+            assert_eq!(client.transact("?"), "T05thread:1;");
         });
     }
 
@@ -609,7 +652,7 @@ mod tests {
 
             client.send_payload("?");
             assert_eq!(client.read_byte(), b'$', "no '+' in no-ack mode");
-            assert_eq!(client.read_packet_body(), "S05");
+            assert_eq!(client.read_packet_body(), "T05thread:1;");
         });
     }
 

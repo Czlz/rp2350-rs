@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use rp2350_core::FLASH_XIP_BASE;
-use rp2350_gdb::{RspSession, decode_packet, encode_packet};
+use rp2350_gdb::{RspSession, decode_packet, encode_hex, encode_packet};
 
 use super::*;
 use crate::run::ArchArg;
@@ -263,7 +263,7 @@ fn read_watchpoint_stops_on_the_load_with_rwatch() {
     );
     assert_eq!(
         session.handle_packet("c").as_deref(),
-        Some("T05rwatch:20000000;")
+        Some("T05rwatch:20000000;thread:1;")
     );
     assert_eq!(session.target().status().pc, CODE_BASE + 4);
 }
@@ -292,7 +292,7 @@ fn access_watchpoint_stops_on_a_read() {
     );
     assert_eq!(
         session.handle_packet("c").as_deref(),
-        Some("T05awatch:20000000;")
+        Some("T05awatch:20000000;thread:1;")
     );
 }
 
@@ -308,7 +308,7 @@ fn access_watchpoint_stops_on_a_write() {
     );
     assert_eq!(
         session.handle_packet("c").as_deref(),
-        Some("T05awatch:20000000;")
+        Some("T05awatch:20000000;thread:1;")
     );
 }
 
@@ -379,6 +379,188 @@ fn monitor_unknown_command_is_silently_accepted() {
     );
 }
 
+#[test]
+fn threads_expose_core0_and_core1() {
+    let target = target();
+    assert_eq!(target.thread_count(), 2);
+    assert_eq!(target.thread_id(0), Some(ThreadId::CORE0));
+    assert_eq!(target.thread_id(1), Some(ThreadId::CORE1));
+    assert_eq!(target.thread_id(2), None);
+    assert_eq!(target.thread_name(ThreadId::CORE0), "core0");
+    assert_eq!(target.thread_name(ThreadId::CORE1), "core1");
+    assert_eq!(
+        target.thread_state(ThreadId::CORE0),
+        Some(target.machine.cpu_state())
+    );
+    // core1 在 SIO FIFO 启动前保持 Reset。 / core1 stays Reset until launched.
+    assert_eq!(target.thread_state(ThreadId::CORE1), Some(CpuState::Reset));
+    assert_eq!(target.thread_state(ThreadId(3)), None);
+}
+
+#[test]
+fn thread_state_mapping_covers_every_cpu_state() {
+    assert_eq!(stop_reason_for_state(CpuState::Reset), StopReason::Reset);
+    assert_eq!(
+        stop_reason_for_state(CpuState::Running),
+        StopReason::SingleStep
+    );
+    assert_eq!(
+        stop_reason_for_state(CpuState::Sleeping),
+        StopReason::Sleeping
+    );
+    assert_eq!(stop_reason_for_state(CpuState::Halted), StopReason::Halted);
+    assert_eq!(
+        stop_reason_for_state(CpuState::Breakpoint),
+        StopReason::Breakpoint
+    );
+    assert_eq!(stop_reason_for_state(CpuState::Faulted), StopReason::Fault);
+}
+
+#[test]
+fn core1_registers_are_read_only_and_limited_to_pc_and_sp() {
+    let mut target = target();
+    let pc = target.machine.core1_pc().expect("core1 pc");
+    let sp = target.machine.core1_sp().expect("core1 sp");
+
+    assert_eq!(
+        target
+            .read_thread_register(ThreadId::CORE1, regs::PC)
+            .expect("core1 pc"),
+        pc
+    );
+    assert_eq!(
+        target
+            .read_thread_register(ThreadId::CORE1, regs::SP)
+            .expect("core1 sp"),
+        sp
+    );
+    // 其余 core1 通用寄存器未建模，读为 0。 / Other core1 GPRs read as zero.
+    assert_eq!(
+        target
+            .read_thread_register(ThreadId::CORE1, regs::R0)
+            .expect("core1 r0"),
+        0
+    );
+    assert!(matches!(
+        target.write_thread_register(ThreadId::CORE1, regs::R0, 1),
+        Err(GdbError::Unsupported(_))
+    ));
+    assert!(matches!(
+        target.read_thread_register(ThreadId(3), regs::R0),
+        Err(GdbError::InvalidRegister(3))
+    ));
+
+    // core0 仍可正常读写。 / core0 stays readable and writable.
+    target
+        .write_thread_register(ThreadId::CORE0, regs::R0, 0xA5A5_5A5A)
+        .expect("core0 write");
+    assert_eq!(
+        target
+            .read_thread_register(ThreadId::CORE0, regs::R0)
+            .expect("core0 r0"),
+        0xA5A5_5A5A
+    );
+}
+
+#[test]
+fn stepping_core1_reports_thread_two_and_advances_both_cores() {
+    let mut target = target();
+    let steps = target.machine.steps();
+    let reply = target.step_thread(ThreadId::CORE1).expect("step core1");
+
+    // core1 仍为 Reset，因此上报其真实状态与 PC。
+    // core1 is still in Reset, so its real state and PC are reported.
+    assert_eq!(reply.reason, StopReason::Reset);
+    assert_eq!(reply.pc, target.machine.core1_pc().expect("core1 pc"));
+    assert_eq!(target.stopped_thread(), ThreadId::CORE1);
+    // 已知退化：Machine::step 双核同步推进。 / Documented degradation.
+    assert_eq!(target.machine.steps(), steps + 1);
+}
+
+#[test]
+fn continuing_core0_reports_thread_one() {
+    let mut target = target();
+    target.instruction_budget = 1;
+    let reply = target.continue_thread(ThreadId::CORE0).expect("continue");
+
+    assert_eq!(reply.reason, StopReason::InstructionLimit);
+    assert_eq!(reply.pc, target.machine.pc());
+    assert_eq!(target.stopped_thread(), ThreadId::CORE0);
+}
+
+#[test]
+fn breakpoint_thread_identifies_each_core() {
+    let mut target = target();
+    let core1_pc = target.machine.core1_pc().expect("core1 pc");
+    target.set_breakpoint(core1_pc).expect("core1 breakpoint");
+    assert_eq!(target.breakpoint_thread(), Some(ThreadId::CORE1));
+
+    let core0_pc = target.machine.pc();
+    target.set_breakpoint(core0_pc).expect("core0 breakpoint");
+    // core0 优先检查。 / core0 is checked first.
+    assert_eq!(target.breakpoint_thread(), Some(ThreadId::CORE0));
+
+    target.clear_breakpoint(core0_pc).expect("clear core0");
+    target.clear_breakpoint(core1_pc).expect("clear core1");
+    assert_eq!(target.breakpoint_thread(), None);
+}
+
+#[test]
+fn rsp_thread_enumeration_and_selection_drive_core1_registers() {
+    let target = target();
+    let pc = target.machine.core1_pc().expect("core1 pc");
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("qfThreadInfo").as_deref(),
+        Some("m1,2")
+    );
+    assert_eq!(session.handle_packet("qsThreadInfo").as_deref(), Some("l"));
+    assert_eq!(session.handle_packet("qC").as_deref(), Some("QC1"));
+    assert_eq!(session.handle_packet("Hg2").as_deref(), Some("OK"));
+    assert_eq!(session.handle_packet("qC").as_deref(), Some("QC2"));
+    assert_eq!(session.handle_packet("T2").as_deref(), Some("OK"));
+    assert_eq!(session.handle_packet("T3").as_deref(), Some("E01"));
+    let expected = encode_hex(&pc.to_le_bytes());
+    assert_eq!(
+        session.handle_packet("pf").as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn rsp_vcont_step_core1_reports_thread_two() {
+    let target = target();
+    let pc = target.machine.core1_pc().expect("core1 pc");
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;s:2").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_eq!(session.target().stopped_thread(), ThreadId::CORE1);
+    let expected = encode_hex(&pc.to_le_bytes());
+    assert_eq!(
+        session.handle_packet("pf").as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn rsp_vcont_continue_all_is_equivalent_to_plain_continue() {
+    let mut target = target();
+    target
+        .set_breakpoint(FLASH_XIP_BASE + 2)
+        .expect("breakpoint");
+    let mut session = RspSession::new(target);
+
+    assert_eq!(
+        session.handle_packet("vCont;c:1;c:2").as_deref(),
+        Some("T05thread:1;")
+    );
+    assert_eq!(session.target().stopped_thread(), ThreadId::CORE0);
+}
+
 /// One TCP round trip against the real server and machine target
 /// 针对真实服务器与机器目标的一次 TCP 往返
 #[test]
@@ -400,10 +582,10 @@ fn tcp_session_drives_the_machine_over_rsp() {
 
     let supported = transact(&mut stream, "qSupported:multiprocess+");
     assert!(supported.contains("PacketSize="));
-    assert_eq!(transact(&mut stream, "?"), "S05");
+    assert_eq!(transact(&mut stream, "?"), "T05thread:1;");
     assert_eq!(transact(&mut stream, "m10000000,4"), "03480449");
     assert_eq!(transact(&mut stream, "Z0,10000002,2"), "OK");
-    assert_eq!(transact(&mut stream, "c"), "S05");
+    assert_eq!(transact(&mut stream, "c"), "T05thread:1;");
     assert_eq!(transact(&mut stream, "pf"), "02000010");
 
     drop(stream);

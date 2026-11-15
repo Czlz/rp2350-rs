@@ -22,7 +22,8 @@ use rp2350_core::watch;
 use rp2350_cpu::CpuState;
 use rp2350_gdb::target::regs;
 use rp2350_gdb::{
-    GdbError, GdbServer, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, WatchKind,
+    GdbError, GdbServer, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, ThreadId,
+    WatchKind,
 };
 
 use crate::run::{Machine, MachineOptions};
@@ -126,6 +127,9 @@ pub struct MachineTarget {
     instruction_budget: u64,
     /// Set by `monitor halt`; cleared by `monitor reset` / `monitor halt` 置位，`monitor reset` 清除
     halt_requested: bool,
+    /// Thread targeted by the current resume and last stop reply
+    /// 当前恢复目标及最近停止回复所属的线程
+    last_thread: ThreadId,
 }
 
 impl MachineTarget {
@@ -140,6 +144,7 @@ impl MachineTarget {
             last_stop: None,
             instruction_budget: DEFAULT_CONTINUE_BUDGET,
             halt_requested: false,
+            last_thread: ThreadId::CORE0,
         }
     }
 
@@ -293,6 +298,11 @@ impl MachineTarget {
                 if let Some((address, kind)) = self.changed_watchpoint() {
                     return self.watch_stop(address, kind);
                 }
+                if self.last_thread == ThreadId::CORE1 {
+                    if let Some(reason) = self.core1_stop() {
+                        return self.stop_reply(reason);
+                    }
+                }
                 self.stop_reply(StopReason::SingleStep)
             }
             Ok(state) => self.stop_reply(self.reason_for_state(state)),
@@ -314,9 +324,11 @@ impl MachineTarget {
         let mut resume_from_breakpoint = true;
 
         loop {
-            let pc = self.machine.pc();
-            if !resume_from_breakpoint && self.breakpoints.contains(&pc) {
-                return self.stop_reply(StopReason::Breakpoint);
+            if !resume_from_breakpoint {
+                if let Some(thread) = self.breakpoint_thread() {
+                    self.last_thread = thread;
+                    return self.stop_reply(StopReason::Breakpoint);
+                }
             }
             resume_from_breakpoint = false;
 
@@ -339,6 +351,11 @@ impl MachineTarget {
                     }
                     if let Some((address, kind)) = self.changed_watchpoint() {
                         return self.watch_stop(address, kind);
+                    }
+                    if self.last_thread == ThreadId::CORE1 {
+                        if let Some(reason) = self.core1_stop() {
+                            return self.stop_reply(reason);
+                        }
                     }
                 }
                 Ok(state) => return self.stop_reply(self.reason_for_state(state)),
@@ -419,12 +436,72 @@ impl MachineTarget {
         }
     }
 
-    /// Build a stop reply from the current PC / 根据当前 PC 构造停止回复
+    /// Shared resume path for whole-target and per-thread requests
+    /// 整目标与按线程恢复的共用路径
+    ///
+    /// `Machine::step` always retires one core-0 and one core-1 instruction, so
+    /// a single-thread request still advances both cores; only the reported
+    /// thread (and PC) follows the request. See the crate docs for this
+    /// documented degradation.
+    /// `Machine::step` 总是各执行一条 core0 与 core1 指令，因此单线程请求仍会
+    /// 推进两个核心；只有上报的线程（与 PC）跟随请求。该退化语义见 crate 文档。
+    fn run(&mut self, mode: ResumeMode, thread: ThreadId) -> StopReply {
+        self.last_watch = None;
+        // 丢弃停止期间宿主读取留下的读命中，只报告本次恢复内的访问。
+        // Drop hits recorded by host reads while stopped; report only accesses
+        // that happen during this resume.
+        let _ = watch::take_read_hit();
+        self.last_thread = thread;
+        let reply = if self.halt_requested {
+            self.stop_reply(StopReason::Halted)
+        } else {
+            match mode {
+                ResumeMode::Step => self.single_step(),
+                ResumeMode::Continue => self.continue_until_stop(),
+            }
+        };
+        self.last_stop = Some(reply.reason);
+        reply
+    }
+
+    /// Build a stop reply from the active thread's PC / 根据当前线程的 PC 构造停止回复
     fn stop_reply(&self, reason: StopReason) -> StopReply {
         StopReply {
             reason,
-            pc: self.machine.pc(),
+            pc: self.thread_pc(self.last_thread),
         }
+    }
+
+    /// Program counter of `thread`, falling back to core 0
+    /// `thread` 的程序计数器；无 core1 时回退到 core0
+    fn thread_pc(&self, thread: ThreadId) -> u32 {
+        match thread {
+            ThreadId::CORE1 => self.machine.core1_pc().unwrap_or_else(|| self.machine.pc()),
+            _ => self.machine.pc(),
+        }
+    }
+
+    /// First core whose PC sits on an instruction breakpoint
+    /// 首个 PC 位于指令断点上的核心
+    fn breakpoint_thread(&self) -> Option<ThreadId> {
+        if self.breakpoints.contains(&self.machine.pc()) {
+            return Some(ThreadId::CORE0);
+        }
+        let core1_pc = self.machine.core1_pc()?;
+        self.breakpoints
+            .contains(&core1_pc)
+            .then_some(ThreadId::CORE1)
+    }
+
+    /// Report a core-1 stop when only core 1 stopped during a resume
+    /// 恢复期间仅 core1 停止时上报 core1
+    ///
+    /// Core 1 stays in `Reset` until the SIO FIFO launch protocol hands it
+    /// vectors; `Running` means it is still healthy.
+    /// core1 在 SIO FIFO 启动协议交出向量前保持 `Reset`；`Running` 表示仍然正常。
+    fn core1_stop(&self) -> Option<StopReason> {
+        let state = self.machine.core1_state()?;
+        (state != CpuState::Running).then(|| self.reason_for_state(state))
     }
 }
 
@@ -438,6 +515,29 @@ fn stop_reason_for_state(state: CpuState) -> StopReason {
         CpuState::Faulted => StopReason::Fault,
         CpuState::Halted => StopReason::Halted,
         CpuState::Reset => StopReason::Reset,
+    }
+}
+
+/// Read a core-1 register through the read-only diagnostics of [`Machine`]
+/// 通过 [`Machine`] 的只读诊断读取 core1 寄存器
+///
+/// [`Machine`] publishes no per-core register file (only `core1_pc`,
+/// `core1_sp` and `core1_state`), so PC and SP are real values while the other
+/// general-purpose registers read as zero; writes are rejected by
+/// [`MachineTarget::write_thread_register`].
+/// [`Machine`] 没有公开按核寄存器组（只有 `core1_pc`、`core1_sp` 与
+/// `core1_state`），因此 PC 与 SP 是真实值，其余通用寄存器读为 0；写入由
+/// [`MachineTarget::write_thread_register`] 拒绝。
+fn core1_register(machine: &Machine, register: u32) -> Result<u32, GdbError> {
+    match register {
+        regs::PC => machine
+            .core1_pc()
+            .ok_or(GdbError::InvalidRegister(register)),
+        regs::SP => machine
+            .core1_sp()
+            .ok_or(GdbError::InvalidRegister(register)),
+        regs::R0..=regs::XPSR => Ok(0),
+        _ => Err(GdbError::InvalidRegister(register)),
     }
 }
 
@@ -575,21 +675,79 @@ impl GdbTarget for MachineTarget {
     }
 
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError> {
-        self.last_watch = None;
-        // 丢弃停止期间宿主读取留下的读命中，只报告本次恢复内的访问。
-        // Drop hits recorded by host reads while stopped; report only accesses
-        // that happen during this resume.
-        let _ = watch::take_read_hit();
-        let reply = if self.halt_requested {
-            self.stop_reply(StopReason::Halted)
+        // Plain `c`/`s` targets core 0; a core-1 breakpoint or stop overrides
+        // the reported thread inside the resume loop.
+        // 普通 `c`/`s` 以 core0 为目标；core1 断点或停机会在恢复循环内改写上报线程。
+        Ok(self.run(mode, ThreadId::CORE0))
+    }
+
+    fn continue_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
+        Ok(self.run(ResumeMode::Continue, thread))
+    }
+
+    fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
+        Ok(self.run(ResumeMode::Step, thread))
+    }
+
+    fn stopped_thread(&self) -> ThreadId {
+        self.last_thread
+    }
+
+    fn thread_count(&self) -> usize {
+        // RISC-V builds have no core 1, so they keep a single-thread table.
+        // RISC-V 构建没有 core1，因此保持单线程表。
+        if self.machine.core1_state().is_some() {
+            2
         } else {
-            match mode {
-                ResumeMode::Step => self.single_step(),
-                ResumeMode::Continue => self.continue_until_stop(),
-            }
-        };
-        self.last_stop = Some(reply.reason);
-        Ok(reply)
+            1
+        }
+    }
+
+    fn thread_id(&self, index: usize) -> Option<ThreadId> {
+        match index {
+            0 => Some(ThreadId::CORE0),
+            1 if self.machine.core1_state().is_some() => Some(ThreadId::CORE1),
+            _ => None,
+        }
+    }
+
+    fn thread_name(&self, thread: ThreadId) -> String {
+        match thread {
+            ThreadId::CORE0 => "core0".to_string(),
+            ThreadId::CORE1 => "core1".to_string(),
+            other => format!("thread {}", other.number()),
+        }
+    }
+
+    fn thread_state(&self, thread: ThreadId) -> Option<CpuState> {
+        match thread {
+            ThreadId::CORE0 => Some(self.machine.cpu_state()),
+            ThreadId::CORE1 => self.machine.core1_state(),
+            _ => None,
+        }
+    }
+
+    fn read_thread_register(&mut self, thread: ThreadId, register: u32) -> Result<u32, GdbError> {
+        match thread {
+            ThreadId::CORE0 => self.read_register(register),
+            ThreadId::CORE1 => core1_register(&self.machine, register),
+            other => Err(GdbError::InvalidRegister(other.number())),
+        }
+    }
+
+    fn write_thread_register(
+        &mut self,
+        thread: ThreadId,
+        register: u32,
+        value: u32,
+    ) -> Result<(), GdbError> {
+        match thread {
+            ThreadId::CORE0 => self.write_register(register, value),
+            ThreadId::CORE1 => Err(GdbError::Unsupported(
+                "core1 registers are read-only / core1 寄存器只读",
+            )),
+            other => Err(GdbError::InvalidRegister(other.number())),
+        }
     }
 
     fn status(&self) -> TargetStatus {

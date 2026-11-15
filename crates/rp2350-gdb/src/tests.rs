@@ -11,7 +11,7 @@ use rp2350_cpu::CpuState;
 
 use crate::rsp::Session;
 use crate::target::{
-    GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, WatchKind,
+    GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, ThreadId, WatchKind,
 };
 
 /// Mock target that records watchpoint requests and can simulate a stop
@@ -302,11 +302,11 @@ fn watchpoint_stop_reply_uses_t05_and_the_hit_address() {
 
     assert_eq!(
         session.handle_packet("c").as_deref(),
-        Some("T05watch:20000010;")
+        Some("T05watch:20000010;thread:1;")
     );
     assert_eq!(
         session.handle_packet("vCont;c").as_deref(),
-        Some("T05watch:20000010;")
+        Some("T05watch:20000010;thread:1;")
     );
 }
 
@@ -319,11 +319,11 @@ fn read_watchpoint_stop_reply_uses_rwatch() {
 
     assert_eq!(
         session.handle_packet("c").as_deref(),
-        Some("T05rwatch:20000020;")
+        Some("T05rwatch:20000020;thread:1;")
     );
     assert_eq!(
         session.handle_packet("s").as_deref(),
-        Some("T05rwatch:20000020;")
+        Some("T05rwatch:20000020;thread:1;")
     );
 }
 
@@ -336,7 +336,7 @@ fn access_watchpoint_stop_reply_uses_awatch() {
 
     assert_eq!(
         session.handle_packet("vCont;c:1").as_deref(),
-        Some("T05awatch:20000030;")
+        Some("T05awatch:20000030;thread:1;")
     );
 }
 
@@ -345,7 +345,7 @@ fn watchpoint_stop_without_an_address_degrades_to_t05() {
     let mut target = WatchTarget::supporting();
     target.reason = Some(StopReason::ReadWatch);
     let mut session = Session::new(target);
-    assert_eq!(session.handle_packet("c").as_deref(), Some("T05"));
+    assert_eq!(session.handle_packet("c").as_deref(), Some("T05thread:1;"));
 }
 
 #[test]
@@ -445,7 +445,7 @@ fn qrcmd_rejects_malformed_hex_and_non_utf8_payloads() {
     assert_eq!(session.target().monitor.len(), 0);
     // 非法 monitor 包后会话仍可用。
     // The session survives malformed monitor packets.
-    assert_eq!(session.handle_packet("?").as_deref(), Some("S05"));
+    assert_eq!(session.handle_packet("?").as_deref(), Some("T05thread:1;"));
 }
 
 #[test]
@@ -453,4 +453,389 @@ fn qrcmd_without_a_payload_is_not_a_monitor_command() {
     let mut session = Session::new(WatchTarget::supporting());
     assert_eq!(session.handle_packet("qRcmd").as_deref(), Some(""));
     assert_eq!(session.target().monitor.len(), 0);
+}
+
+/// Dual-thread mock target used by the thread-model tests
+/// 线程模型测试使用的双线程 mock 目标
+struct MultiTarget {
+    /// Number of threads in the table / 线程表中的线程数
+    threads: usize,
+    /// Thread reported by `stopped_thread` / `stopped_thread` 上报的线程
+    stopped: ThreadId,
+    /// Stop reason returned by every resume / 每次恢复返回的停止原因
+    reason: StopReason,
+    /// Watchpoint hit address reported to the RSP layer
+    /// 上报给 RSP 层的监视点命中地址
+    hit: Option<u32>,
+    /// `(thread, mode)` for every resume; `None` means all threads
+    /// 每次恢复的 `(线程, 模式)`；`None` 表示全部线程
+    resumed: Vec<(Option<ThreadId>, ResumeMode)>,
+    /// `(thread, register)` for every thread register read
+    /// 每次线程寄存器读的 `(线程, 寄存器)`
+    reads: Vec<(ThreadId, u32)>,
+    /// `(thread, register, value)` for every thread register write
+    /// 每次线程寄存器写的 `(线程, 寄存器, 值)`
+    writes: Vec<(ThreadId, u32, u32)>,
+}
+
+impl MultiTarget {
+    /// Two-thread target with both cores alive / 两个核心均在线的双线程目标
+    fn dual() -> Self {
+        Self {
+            threads: 2,
+            stopped: ThreadId::CORE0,
+            reason: StopReason::Breakpoint,
+            hit: None,
+            resumed: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }
+    }
+}
+
+impl GdbTarget for MultiTarget {
+    fn register_count(&self) -> u32 {
+        1
+    }
+
+    fn thread_count(&self) -> usize {
+        self.threads
+    }
+
+    fn thread_id(&self, index: usize) -> Option<ThreadId> {
+        (index < self.threads).then(|| ThreadId(u32::try_from(index + 1).unwrap_or(u32::MAX)))
+    }
+
+    fn thread_name(&self, thread: ThreadId) -> String {
+        match thread {
+            ThreadId::CORE0 => "core0".to_string(),
+            ThreadId::CORE1 => "core1".to_string(),
+            other => format!("thread {}", other.number()),
+        }
+    }
+
+    fn thread_state(&self, thread: ThreadId) -> Option<CpuState> {
+        (thread.number() as usize <= self.threads).then_some(CpuState::Running)
+    }
+
+    fn read_register(&mut self, register: u32) -> Result<u32, GdbError> {
+        Ok(0x1000 + register)
+    }
+
+    fn write_register(&mut self, _register: u32, _value: u32) -> Result<(), GdbError> {
+        Ok(())
+    }
+
+    fn read_thread_register(&mut self, thread: ThreadId, register: u32) -> Result<u32, GdbError> {
+        self.reads.push((thread, register));
+        Ok((thread.number() << 8) | register)
+    }
+
+    fn write_thread_register(
+        &mut self,
+        thread: ThreadId,
+        register: u32,
+        value: u32,
+    ) -> Result<(), GdbError> {
+        self.writes.push((thread, register, value));
+        Ok(())
+    }
+
+    fn read_memory(&mut self, _address: u32, length: usize) -> Result<Vec<u8>, GdbError> {
+        Ok(vec![0; length])
+    }
+
+    fn write_memory(&mut self, _address: u32, _bytes: &[u8]) -> Result<(), GdbError> {
+        Ok(())
+    }
+
+    fn set_breakpoint(&mut self, _address: u32) -> Result<(), GdbError> {
+        Ok(())
+    }
+
+    fn clear_breakpoint(&mut self, _address: u32) -> Result<(), GdbError> {
+        Ok(())
+    }
+
+    fn has_breakpoint(&self, _address: u32) -> bool {
+        false
+    }
+
+    fn watchpoint_hit(&self) -> Option<u32> {
+        self.hit
+    }
+
+    fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError> {
+        self.resumed.push((None, mode));
+        Ok(StopReply {
+            reason: self.reason,
+            pc: 0x2000_0100,
+        })
+    }
+
+    fn continue_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
+        self.resumed.push((Some(thread), ResumeMode::Continue));
+        Ok(StopReply {
+            reason: self.reason,
+            pc: 0x2000_0100,
+        })
+    }
+
+    fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError> {
+        self.resumed.push((Some(thread), ResumeMode::Step));
+        Ok(StopReply {
+            reason: self.reason,
+            pc: 0x2000_0100,
+        })
+    }
+
+    fn stopped_thread(&self) -> ThreadId {
+        self.stopped
+    }
+
+    fn status(&self) -> TargetStatus {
+        TargetStatus {
+            state: CpuState::Halted,
+            stop_reason: None,
+            pc: 0x2000_0100,
+            total_cycles: 0,
+        }
+    }
+}
+
+#[test]
+fn qf_thread_info_enumerates_both_threads_and_ends_with_l() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("qfThreadInfo").as_deref(),
+        Some("m1,2")
+    );
+    assert_eq!(session.handle_packet("qsThreadInfo").as_deref(), Some("l"));
+    // A new `qfThreadInfo` restarts the enumeration.
+    // 新的 `qfThreadInfo` 重新开始枚举。
+    assert_eq!(
+        session.handle_packet("qfThreadInfo").as_deref(),
+        Some("m1,2")
+    );
+    assert_eq!(session.handle_packet("qsThreadInfo").as_deref(), Some("l"));
+}
+
+#[test]
+fn q_thread_extra_info_returns_hex_encoded_names() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("qThreadExtraInfo,1").as_deref(),
+        Some("636f726530")
+    );
+    assert_eq!(
+        session.handle_packet("qThreadExtraInfo,2").as_deref(),
+        Some("636f726531")
+    );
+    for packet in ["qThreadExtraInfo,3", "qThreadExtraInfo,zz"] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("E01"),
+            "{packet}"
+        );
+    }
+}
+
+#[test]
+fn thread_selection_routes_register_packets() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(session.handle_packet("Hg2").as_deref(), Some("OK"));
+    assert_eq!(session.handle_packet("qC").as_deref(), Some("QC2"));
+    assert_eq!(session.handle_packet("p0").as_deref(), Some("00020000"));
+    assert_eq!(session.handle_packet("P0=78563412").as_deref(), Some("OK"));
+    assert_eq!(session.handle_packet("g").as_deref(), Some("00020000"));
+    assert_eq!(
+        session.target().reads,
+        vec![(ThreadId::CORE1, 0), (ThreadId::CORE1, 0)]
+    );
+    assert_eq!(
+        session.target().writes,
+        vec![(ThreadId::CORE1, 0, 0x1234_5678)]
+    );
+
+    // `Hg0`/`Hg-1` mean “any thread” and fall back to the stopped thread.
+    // `Hg0`/`Hg-1` 表示“任意线程”，回退到停止线程。
+    for packet in ["Hg0", "Hg-1"] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("OK"),
+            "{packet}"
+        );
+        assert_eq!(session.handle_packet("qC").as_deref(), Some("QC1"));
+    }
+    assert_eq!(session.handle_packet("Hc2").as_deref(), Some("OK"));
+    for packet in ["Hg3", "Hc3"] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("E01"),
+            "{packet}"
+        );
+    }
+    assert_eq!(session.handle_packet("Hx1").as_deref(), Some(""));
+}
+
+#[test]
+fn thread_alive_query_checks_the_thread_table() {
+    let mut session = Session::new(MultiTarget::dual());
+    for packet in ["T1", "T2", "T0", "T-1"] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("OK"),
+            "{packet}"
+        );
+    }
+    for packet in ["T3", "Tzz", "T"] {
+        assert_eq!(
+            session.handle_packet(packet).as_deref(),
+            Some("E01"),
+            "{packet}"
+        );
+    }
+}
+
+#[test]
+fn vcont_step_core1_targets_only_that_thread() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("vCont;s:2").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_eq!(
+        session.target().resumed,
+        vec![(Some(ThreadId::CORE1), ResumeMode::Step)]
+    );
+}
+
+#[test]
+fn vcont_continue_core1_targets_only_that_thread() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("vCont;c:2").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_eq!(
+        session.target().resumed,
+        vec![(Some(ThreadId::CORE1), ResumeMode::Continue)]
+    );
+}
+
+#[test]
+fn vcont_continue_all_and_explicit_lists_are_equivalent() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("vCont;c").as_deref(),
+        Some("T05thread:1;")
+    );
+    assert_eq!(
+        session.handle_packet("vCont;c:1;c:2").as_deref(),
+        Some("T05thread:1;")
+    );
+    assert_eq!(
+        session.target().resumed,
+        vec![(None, ResumeMode::Continue), (None, ResumeMode::Continue)]
+    );
+}
+
+#[test]
+fn vcont_signal_forms_are_accepted() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("vCont;C05").as_deref(),
+        Some("T05thread:1;")
+    );
+    assert_eq!(
+        session.handle_packet("vCont;S05:2").as_deref(),
+        Some("T05thread:2;")
+    );
+    assert_eq!(
+        session.target().resumed,
+        vec![
+            (None, ResumeMode::Continue),
+            (Some(ThreadId::CORE1), ResumeMode::Step)
+        ]
+    );
+}
+
+#[test]
+fn vcont_stop_and_invalid_actions_reply_legally() {
+    let mut session = Session::new(MultiTarget::dual());
+    assert_eq!(
+        session.handle_packet("vCont;t").as_deref(),
+        Some("T02thread:1;")
+    );
+    assert_eq!(
+        session.handle_packet("vCont;t:2").as_deref(),
+        Some("T02thread:2;")
+    );
+    assert_eq!(session.handle_packet("vCont;x").as_deref(), Some(""));
+    assert_eq!(session.handle_packet("vCont;c:9").as_deref(), Some("E01"));
+    assert_eq!(session.handle_packet("vCont;c;s").as_deref(), Some("E01"));
+    assert_eq!(session.target().resumed, Vec::new());
+}
+
+#[test]
+fn stop_replies_carry_the_stopped_thread() {
+    let mut target = MultiTarget::dual();
+    target.stopped = ThreadId::CORE1;
+    target.reason = StopReason::Breakpoint;
+    let mut session = Session::new(target);
+    // Plain `c` reports the thread that actually stopped.
+    // 普通 `c` 上报实际停止的线程。
+    assert_eq!(session.handle_packet("c").as_deref(), Some("T05thread:2;"));
+    // `?` reuses the same stopped thread without resuming.
+    // `?` 复用同一停止线程且不恢复执行。
+    assert_eq!(session.handle_packet("?").as_deref(), Some("T05thread:2;"));
+    assert_eq!(session.target().resumed.len(), 1);
+}
+
+#[test]
+fn boxed_targets_forward_thread_hooks() {
+    let mut boxed: Box<dyn GdbTarget + Send> = Box::new(MultiTarget::dual());
+    assert_eq!(boxed.thread_count(), 2);
+    assert_eq!(boxed.thread_id(0), Some(ThreadId::CORE0));
+    assert_eq!(boxed.thread_id(1), Some(ThreadId::CORE1));
+    assert_eq!(boxed.thread_name(ThreadId::CORE1), "core1");
+    assert_eq!(boxed.thread_state(ThreadId::CORE0), Some(CpuState::Running));
+    assert_eq!(
+        boxed
+            .read_thread_register(ThreadId::CORE1, 3)
+            .expect("core1 register"),
+        0x203
+    );
+    boxed
+        .write_thread_register(ThreadId::CORE1, 0, 1)
+        .expect("core1 write");
+    assert_eq!(boxed.stopped_thread(), ThreadId::CORE0);
+    assert_eq!(
+        boxed.step_thread(ThreadId::CORE1).expect("step").reason,
+        StopReason::Breakpoint
+    );
+    assert_eq!(
+        boxed
+            .continue_thread(ThreadId::CORE1)
+            .expect("continue")
+            .reason,
+        StopReason::Breakpoint
+    );
+}
+
+#[test]
+fn watch_stop_reply_appends_the_thread_field() {
+    let mut target = MultiTarget::dual();
+    target.stopped = ThreadId::CORE1;
+    target.reason = StopReason::Watchpoint;
+    target.hit = Some(0x2000_0010);
+    let mut session = Session::new(target);
+    assert_eq!(
+        session.handle_packet("vCont;c:1").as_deref(),
+        Some("T05watch:20000010;thread:1;")
+    );
+    assert_eq!(
+        session.handle_packet("vCont;c:2").as_deref(),
+        Some("T05watch:20000010;thread:2;")
+    );
 }

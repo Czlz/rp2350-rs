@@ -243,16 +243,18 @@ rp2350 gdb --file <ELF> [--port 3333]
 `gdb` reads the ELF, builds the same `Machine` as `run`, prints the image summary,
 core description and start vectors, then hands the machine to
 `GdbServer`/`MachineTarget` and blocks in `serve`. The adapter forwards GDB
-register numbers `0..=15` to the core register file and `16` to XPSR; memory
-packets go through `Machine::bus` byte accesses. Breakpoints are PC comparisons
-(no `BKPT` patching), and `Continue` runs at most 1 000 000 instructions per
+register numbers `0..=15` to the core register file and `16` to XPSR, routing
+`g`/`G`/`p`/`P` through the thread selected by `Hg` (thread 1 = core 0,
+thread 2 = core 1); memory packets go through `Machine::bus` byte accesses and
+are shared by both cores. Breakpoints are PC comparisons (no `BKPT` patching),
+and `Continue` runs at most 1 000 000 instructions per
 request so an accidental infinite loop cannot block the server. Write
 watchpoints (`watch`, RSP `Z2`) are sampled after every executed instruction:
 `MachineTarget` keeps a byte snapshot per watchpoint and stops with
-`T05watch:<addr>;` as soon as any covered byte changes. Read watchpoints
+`T05watch:<addr>;thread:<n>;` as soon as any covered byte changes. Read watchpoints
 (`rwatch`, `Z3`) use the core's runtime read hook and stop with
-`T05rwatch:<addr>;`; access watchpoints (`awatch`, `Z4`) stop with
-`T05awatch:<addr>;` on either path. Only SRAM
+`T05rwatch:<addr>;thread:<n>;`; access watchpoints (`awatch`, `Z4`) stop with
+`T05awatch:<addr>;thread:<n>;` on either path. Only SRAM
 (`0x2000_0000..0x2008_2000`) is accepted — peripheral/USB windows are rejected
 with `E01` because sampling them would pop FIFOs or advance device state.
 `monitor` commands reach the adapter through `qRcmd`: `monitor reset` rebuilds
@@ -261,13 +263,15 @@ DMA/HSTX summaries, `monitor halt` makes the next `c`/`s` stop with SIGINT, and
 unknown commands are logged and answered with `OK`.
 `gdb` 读取 ELF、构建与 `run` 相同的 `Machine`，打印映像摘要、核心描述与启动
 向量，然后把机器交给 `GdbServer`/`MachineTarget` 并阻塞在 `serve`。适配器把
-GDB 寄存器号 `0..=15` 转发到核心寄存器组、`16` 转发到 XPSR；内存包通过
-`Machine::bus` 的字节访问完成。断点按 PC 比较（不写入 `BKPT`），单次
-`Continue` 最多执行 1 000 000 条指令，避免意外死循环阻塞服务器。写监视点
+GDB 寄存器号 `0..=15` 转发到核心寄存器组、`16` 转发到 XPSR，并按 `Hg` 选定的
+线程（线程 1 = core0，线程 2 = core1）路由 `g`/`G`/`p`/`P`；内存包通过
+`Machine::bus` 的字节访问完成，由两个核心共享。断点按 PC 比较（不写入 `BKPT`），
+单次 `Continue` 最多执行 1 000 000 条指令，避免意外死循环阻塞服务器。写监视点
 （`watch`，RSP `Z2`）在每条指令执行后采样：`MachineTarget` 为每个监视点保存
-字节快照，任一被覆盖字节变化即返回 `T05watch:<addr>;` 停止。读监视点
-（`rwatch`，`Z3`）使用核心的运行期读钩子，命中返回 `T05rwatch:<addr>;`；访问
-监视点（`awatch`，`Z4`）在读或写任一路径命中时返回 `T05awatch:<addr>;`。仅接受
+字节快照，任一被覆盖字节变化即返回 `T05watch:<addr>;thread:<n>;` 停止。读监视点
+（`rwatch`，`Z3`）使用核心的运行期读钩子，命中返回
+`T05rwatch:<addr>;thread:<n>;`；访问监视点（`awatch`，`Z4`）在读或写任一路径命中
+时返回 `T05awatch:<addr>;thread:<n>;`。仅接受
 SRAM（`0x2000_0000..0x2008_2000`）；外设/USB 窗口会以 `E01` 拒绝，因为采样它们
 会弹出 FIFO 或推进设备状态。`monitor` 命令经 `qRcmd` 到达适配器：`monitor reset`
 按启动向量重建 PC/SP，`monitor info` 打印 core0/core1 状态、步数与 DMA/HSTX
@@ -279,15 +283,20 @@ cargo run -p rp2350-cli -- gdb --file firmware.elf --port 3333
 # 另一个终端 / another terminal
 arm-none-eabi-gdb firmware.elf
 (gdb) target remote 127.0.0.1:3333
+(gdb) info threads         # 2 个线程：1 = core0，2 = core1
+(gdb) thread 2             # 切换到 core1
+(gdb) info registers pc    # core1 的 PC（core1 只读）
+(gdb) vCont;s:2            # 仅请求 core1 单步（双核同步退化）
+(gdb) thread 1
 (gdb) break main
 (gdb) continue
 (gdb) info registers
 (gdb) watch counter        # 写监视点：仅 SRAM 变量
-(gdb) continue             # 命中：T05watch:20000000;
+(gdb) continue             # 命中：T05watch:20000000;thread:1;
 (gdb) rwatch *(unsigned int*)0x20081FF0   # 读监视点 Z3
-(gdb) continue             # 命中：T05rwatch:20081ff0;
+(gdb) continue             # 命中：T05rwatch:20081ff0;thread:1;
 (gdb) awatch *(unsigned int*)0x20081FF0   # 访问监视点 Z4（读写均触发）
-(gdb) continue             # 命中：T05awatch:20081ff0;
+(gdb) continue             # 命中：T05awatch:20081ff0;thread:1;
 (gdb) monitor info         # core0/core1、步数、DMA/HSTX 摘要
 (gdb) monitor halt         # 之后的 c/s 立即停止（SIGINT）
 (gdb) monitor reset        # PC/SP 回到启动向量
@@ -300,12 +309,14 @@ arm-none-eabi-gdb firmware.elf
 - `resume` 通过 `Machine::step` 执行，因此 boot ROM 陷阱、中断泵送、PPB 系统
   写入回放与外设时基都保持有效；`StopReply` 的 `Breakpoint`/`SingleStep`/
   `Watchpoint`/`ReadWatch`/`AccessWatch`/`Fault`/`Sleeping`/`Halted`/`Reset`/
-  `InstructionLimit` 映射为对应 GDB 信号（`S05` / `T05watch:<addr>;` /
-  `T05rwatch:<addr>;` / `T05awatch:<addr>;` / `S0b` / `S02`）。
+  `InstructionLimit` 映射为对应 GDB 信号（`T05thread:<n>;` /
+  `T05watch:<addr>;thread:<n>;` / `T05rwatch:<addr>;thread:<n>;` /
+  `T05awatch:<addr>;thread:<n>;` / `T0bthread:<n>;` / `T02thread:<n>;`）。
   `resume` uses `Machine::step`, so boot ROM traps, interrupt pumping, PPB
   replay and the peripheral timebase stay active; stop reasons map to GDB
-  signals (`S05` / `T05watch:<addr>;` / `T05rwatch:<addr>;` /
-  `T05awatch:<addr>;` / `S0b` / `S02`).
+  signals (`T05thread:<n>;` / `T05watch:<addr>;thread:<n>;` /
+  `T05rwatch:<addr>;thread:<n>;` / `T05awatch:<addr>;thread:<n>;` /
+  `T0bthread:<n>;` / `T02thread:<n>;`).
 - 写监视点比较的是**值变化**而非“发生写入”：写入相同字节不会停止。快照读取
   使用局部周期计数器，不推进 `Machine::steps` 或外设时基。
   Watchpoints compare **values**, not the act of writing: storing identical
@@ -324,13 +335,37 @@ arm-none-eabi-gdb firmware.elf
   `--max-cycles` 未暴露。
   The machine budget is pinned to `u64::MAX`; stopping is driven only by GDB
   `c`/`s` requests and breakpoints (no `--max-cycles` flag).
-- 单步/继续同样推进 core1：`Machine::step` 先执行一条 core0 指令再执行一条
-  core1 指令，因此 `s`/`c` 不会让 core1 停摆，但 GDB 只能观察/修改 core0 的
-  寄存器与内存（无多核线程模型）。
-  Single-steps and continues advance core 1 too: `Machine::step` retires one
-  core-0 instruction and then one core-1 instruction, so `s`/`c` never starve
-  core 1 — but GDB only observes and edits core 0's registers (no multi-core
-  thread model).
+- 线程模型：`MachineTarget` 在 Arm 目标上暴露两个线程（`m1,2`），线程 1 是
+  core0、线程 2 是 core1；RISC-V 目标没有 core1，保持单线程（`m1`）。`qfThreadInfo`
+  首包列全部 id，`qsThreadInfo` 回复 `l` 结束。`thread 2` 后 `info registers pc`
+  读取 core1 的 PC，`vCont;s:2` 只请求 core1 单步。
+  Thread model: `MachineTarget` exposes two threads on Arm targets (`m1,2`) —
+  thread 1 is core 0 and thread 2 is core 1; RISC-V targets have no core 1 and
+  keep a single-thread table (`m1`). `qfThreadInfo` lists every id in its first
+  packet and `qsThreadInfo` ends the list with `l`. After `thread 2`,
+  `info registers pc` reads core 1's PC and `vCont;s:2` requests a core-1 step.
+- core1 寄存器只读：`Machine` 只公开 `core1_pc`/`core1_sp`/`core1_state`，因此
+  线程 2 的 `p f`（PC）与 `p d`（SP）是真实值，其余通用寄存器读 0，任何写入
+  回复 `E01`（`GdbError::Unsupported`）。core1 断点通过 PC 比较检测，命中时停止
+  回复带 `thread:2;`。
+  Core-1 registers are read-only: `Machine` only publishes
+  `core1_pc`/`core1_sp`/`core1_state`, so thread 2's `p f` (PC) and `p d` (SP)
+  are real, the other general-purpose registers read 0, and every write replies
+  `E01` (`GdbError::Unsupported`). Core-1 breakpoints use PC comparison and their
+  stop reply carries `thread:2;`.
+- 单步/继续由 `Machine::step` 驱动：它每次都先执行一条 core0 指令再执行一条
+  core1 指令。因此 `vCont;s:2`（或 `thread 2` 后的 `s`）**无法让 core0 停住**，
+  这是已文档化的退化语义；只有上报的线程号与 PC 跟随请求。
+  Single-steps and continues run through `Machine::step`, which retires one core-0
+  instruction and then one core-1 instruction. `vCont;s:2` (or `s` after
+  `thread 2`) therefore cannot freeze core 0 — a documented degradation; only the
+  reported thread and PC follow the request.
+- 停止回复统一带 `thread:<n>;`：普通停止 `T05thread:1;`、监视点停止
+  `T05watch:<addr>;thread:2;`，`?` 复用最近停止线程。`monitor info` 仍打印
+  core0/core1 摘要。
+  Stop replies always carry `thread:<n>;`: a normal stop is `T05thread:1;`, a
+  watchpoint stop is `T05watch:<addr>;thread:2;`, and `?` reuses the last stopped
+  thread. `monitor info` still prints the core 0/1 summary.
 - 客户端断开后 `serve` 继续接受下一个连接，目标状态（内存、寄存器、断点、
   监视点）保留，仅无应答模式协商会被重置。
   After a client disconnects `serve` keeps accepting; target state (memory,
@@ -364,8 +399,12 @@ arm-none-eabi-gdb firmware.elf
   (core 0/1 state, step count, DMA/HSTX summaries) and `halt` (the next `c`/`s`
   stops immediately with SIGINT; `reset` clears it). Unknown commands are logged
   with `log::info!` and answered with `OK`, so the session never breaks.
-- 单客户端串行、无 TLS、无多核 `vCont`；细节见 `doc/crates/rp2350-gdb.md`。
-  Single sequential client, no TLS, no multi-core `vCont`; see
+- 已支持双核线程模型（core0/core1）与 `vCont` 单核选择；受 `Machine::step`
+  双核同步步进限制，单核 resume 只改变上报线程。单客户端串行、无 TLS；细节见
+  `doc/crates/rp2350-gdb.md`。
+  The dual-core thread model (core 0/core 1) and single-thread `vCont` selection
+  are supported; because `Machine::step` advances both cores, a single-core
+  resume only changes the reported thread. One sequential client and no TLS; see
   `doc/crates/rp2350-gdb.md`.
 - 不做 Flash 编程：Flash 窗口对客户机写保护，`M`/`load` 写 Flash 会以 `E01`
   失败；SRAM 与已映射的可写 MMIO 可正常写入。
@@ -772,13 +811,16 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
 - **Not modelled / 未建模项**：DMA arbitration between cores, `WFI`/`WFE`/`SEV`
   as scheduling points (still no-ops in the current tree; the sleep work landed as
   `9a6b088` and was reverted pending blocking `SIO_FIFO_RD`/FIFO-IRQ semantics),
-  core-1 debug attachment and a multi-core GDB `vCont`/thread model. Core 1 has no
+  core-1 writable registers and true per-core stepping: GDB now exposes core 1 as
+  thread 2 with read-only PC/SP, and `Machine::step` still advances both cores in
+  lock-step. Core 1 has no
   modelled mask ROM: a launch jumps straight to `entry`, reproducing the post-ROM
   state, and only the trap stubs (`rom_table_lookup` at `0x74`, the ROM function
   table) are dispatched.
   **未建模项**：双核之间的 DMA 仲裁、作为调度点的 `WFI`/`WFE`/`SEV`（当前仍为空
   操作；睡眠语义曾以 `9a6b088` 落地但因缺少阻塞式 `SIO_FIFO_RD`/FIFO IRQ 而回退）、
-  core1 调试接入与多核 GDB `vCont`/线程模型。core1 不建模掩膜 ROM：启动直接跳到
+  core1 可写寄存器与真正的按核步进：GDB 现已把 core1 暴露为线程 2（PC/SP 只读），
+  而 `Machine::step` 仍双核同步推进。core1 不建模掩膜 ROM：启动直接跳到
   `entry` 并复现 post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与
   ROM 函数表）。
 

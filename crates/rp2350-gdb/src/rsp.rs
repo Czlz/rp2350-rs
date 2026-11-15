@@ -10,8 +10,9 @@
 //! [`Session`]。会话不接触 socket，因此所有包处理路径均可单元测试。
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
-use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason, WatchKind};
+use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason, ThreadId, WatchKind};
 use crate::target_xml::{ANNEX, ANNEX_ERROR};
 
 /// Positive acknowledgement byte sent by GDB / GDB 发送的肯定应答字节
@@ -24,9 +25,6 @@ pub const ERROR_REPLY: &str = "E01";
 /// Maximum payload size advertised through `qSupported`
 /// 通过 `qSupported` 声明的最大载荷尺寸
 pub const MAX_PACKET_SIZE: usize = 0x0fff;
-
-/// Default stop reply (`S05`, SIGTRAP) / 默认停止回复（`S05`，SIGTRAP）
-const DEFAULT_STOP: &str = "S05";
 
 /// Acknowledgement parsed from the transport byte stream
 /// 从传输字节流解析出的应答
@@ -246,6 +244,15 @@ pub struct Session<T: GdbTarget> {
     /// Watchpoints requested by GDB, keyed by `(address, length, kind)`
     /// GDB 请求的监视点，以 `(地址, 长度, 类型)` 为键
     watchpoints: BTreeSet<(u32, usize, WatchKind)>,
+    /// Thread selected by `Hg` for register reads/writes (`None` = any)
+    /// `Hg` 选定的寄存器读写线程（`None` 表示任意）
+    general_thread: Option<ThreadId>,
+    /// Thread selected by `Hc` for continue/step (`None` = any)
+    /// `Hc` 选定的继续/单步线程（`None` 表示任意）
+    continue_selection: Option<ThreadId>,
+    /// Next thread index returned by `qsThreadInfo`
+    /// `qsThreadInfo` 下次返回的线程索引
+    thread_cursor: usize,
 }
 
 impl<T: GdbTarget> Session<T> {
@@ -256,6 +263,9 @@ impl<T: GdbTarget> Session<T> {
             target,
             no_ack_mode: false,
             watchpoints: BTreeSet::new(),
+            general_thread: None,
+            continue_selection: None,
+            thread_cursor: 0,
         }
     }
 
@@ -329,22 +339,20 @@ impl<T: GdbTarget> Session<T> {
             return Ok(String::new());
         };
         match first {
-            b'?' => Ok(DEFAULT_STOP.to_string()),
+            b'?' => Ok(self.attach_reply()),
             b'g' => self.read_all_registers(),
             b'G' => self.write_all_registers(&payload[1..]),
             b'p' => self.read_register(&payload[1..]),
             b'P' => self.write_register(&payload[1..]),
             b'm' => self.read_memory(&payload[1..]),
             b'M' => self.write_memory(&payload[1..]),
-            b'c' | b'C' => self.resume(ResumeMode::Continue),
-            b's' | b'S' => self.resume(ResumeMode::Step),
+            b'c' | b'C' => self.resume_selected(ResumeMode::Continue),
+            b's' | b'S' => self.resume_selected(ResumeMode::Step),
             b'Z' => self.change_breakpoint(&payload[1..], true),
             b'z' => self.change_breakpoint(&payload[1..], false),
             b'D' => Ok("OK".to_string()),
-            b'H' => Ok(match payload.as_bytes().get(1) {
-                Some(b'g' | b'c') => "OK".to_string(),
-                _ => String::new(),
-            }),
+            b'H' => self.select_thread(&payload[1..]),
+            b'T' => Ok(self.thread_alive(&payload[1..])),
             b'Q' => Ok(self.handle_extended(payload)),
             b'v' => self.handle_v(payload),
             b'q' => self.handle_query(payload),
@@ -383,9 +391,10 @@ impl<T: GdbTarget> Session<T> {
     /// 以 32 位小端十六进制读取所有寄存器（`g`）
     fn read_all_registers(&mut self) -> Result<String, Error> {
         let count = self.target.register_count();
+        let thread = self.selected_thread();
         let mut reply = String::new();
         for register in 0..count {
-            let value = self.target.read_register(register)?;
+            let value = self.target.read_thread_register(thread, register)?;
             reply.push_str(&encode_u32_le(value));
         }
         Ok(reply)
@@ -398,13 +407,14 @@ impl<T: GdbTarget> Session<T> {
             return Err(Error::InvalidArgument);
         }
         let count = self.target.register_count();
+        let thread = self.selected_thread();
         for (index, chunk) in bytes.chunks_exact(4).enumerate() {
             let register = u32::try_from(index).map_err(|_| Error::InvalidArgument)?;
             if register >= count {
                 return Err(Error::InvalidArgument);
             }
             let value = u32::from_le_bytes(chunk.try_into().map_err(|_| Error::InvalidArgument)?);
-            self.target.write_register(register, value)?;
+            self.target.write_thread_register(thread, register, value)?;
         }
         Ok("OK".to_string())
     }
@@ -412,7 +422,8 @@ impl<T: GdbTarget> Session<T> {
     /// Read one register (`p N`) / 读取单个寄存器（`p N`）
     fn read_register(&mut self, args: &str) -> Result<String, Error> {
         let register = parse_u32_hex(args)?;
-        let value = self.target.read_register(register)?;
+        let thread = self.selected_thread();
+        let value = self.target.read_thread_register(thread, register)?;
         Ok(encode_u32_le(value))
     }
 
@@ -421,7 +432,8 @@ impl<T: GdbTarget> Session<T> {
         let (register, value) = args.split_once('=').ok_or(Error::InvalidArgument)?;
         let register = parse_u32_hex(register)?;
         let value = decode_u32_le(value)?;
-        self.target.write_register(register, value)?;
+        let thread = self.selected_thread();
+        self.target.write_thread_register(thread, register, value)?;
         Ok("OK".to_string())
     }
 
@@ -528,16 +540,99 @@ impl<T: GdbTarget> Session<T> {
     /// 继续或单步执行并格式化停止回复（`c`/`s`/`vCont`）
     fn resume(&mut self, mode: ResumeMode) -> Result<String, Error> {
         let reply = self.target.resume(mode)?;
-        let keyword = match reply.reason {
-            StopReason::Watchpoint => "watch",
-            StopReason::ReadWatch => "rwatch",
-            StopReason::AccessWatch => "awatch",
-            _ => return Ok(format!("S{:02x}", reply.signal())),
+        Ok(self.stop_packet(reply.reason, self.target.stopped_thread()))
+    }
+
+    /// Resume with the `Hc` selection applied / 按 `Hc` 选择恢复执行
+    fn resume_selected(&mut self, mode: ResumeMode) -> Result<String, Error> {
+        match (self.continue_selection, mode) {
+            (Some(thread), ResumeMode::Continue) => self.continue_thread(thread),
+            (Some(thread), ResumeMode::Step) => self.step_thread(thread),
+            (None, mode) => self.resume(mode),
+        }
+    }
+
+    /// Continue only `thread` and format the stop reply / 仅继续指定线程并格式化停止回复
+    fn continue_thread(&mut self, thread: ThreadId) -> Result<String, Error> {
+        let reply = self.target.continue_thread(thread)?;
+        Ok(self.stop_packet(reply.reason, thread))
+    }
+
+    /// Single-step only `thread` and format the stop reply / 仅单步指定线程并格式化停止回复
+    fn step_thread(&mut self, thread: ThreadId) -> Result<String, Error> {
+        let reply = self.target.step_thread(thread)?;
+        Ok(self.stop_packet(reply.reason, thread))
+    }
+
+    /// Thread addressed by register packets / 寄存器包访问的线程
+    fn selected_thread(&self) -> ThreadId {
+        self.general_thread
+            .unwrap_or_else(|| self.target.stopped_thread())
+    }
+
+    /// `?` attach reply with the current thread / 带当前线程的 `?` 附加回复
+    fn attach_reply(&self) -> String {
+        self.stop_packet(StopReason::Breakpoint, self.target.stopped_thread())
+    }
+
+    /// Format a stop reply, always carrying `thread:<n>;`
+    /// 格式化停止回复，始终带 `thread:<n>;`
+    ///
+    /// Watchpoint stops prepend their `watch:`/`rwatch:`/`awatch:` field; all
+    /// other reasons only carry the signal and the thread.
+    /// 监视点停止先写 `watch:`/`rwatch:`/`awatch:` 字段；其他原因只带信号与线程。
+    fn stop_packet(&self, reason: StopReason, thread: ThreadId) -> String {
+        let signal = reason.signal();
+        let keyword = match reason {
+            StopReason::Watchpoint => Some("watch"),
+            StopReason::ReadWatch => Some("rwatch"),
+            StopReason::AccessWatch => Some("awatch"),
+            _ => None,
         };
-        let Some(address) = self.target.watchpoint_hit() else {
-            return Ok(format!("T{:02x}", reply.signal()));
+        match (keyword, self.target.watchpoint_hit()) {
+            (Some(keyword), Some(address)) => format!(
+                "T{signal:02x}{keyword}:{address:x};thread:{};",
+                thread.number()
+            ),
+            _ => format!("T{signal:02x}thread:{};", thread.number()),
+        }
+    }
+
+    /// `Hg<n>` / `Hc<n>`: record the selected thread / 记录选定的线程
+    ///
+    /// `0` and `-1` mean “any thread”, which is stored as `None`; an id outside
+    /// the target's thread table replies `E01`.
+    /// `0` 与 `-1` 表示“任意线程”，存为 `None`；超出目标线程表的编号回复 `E01`。
+    fn select_thread(&mut self, args: &str) -> Result<String, Error> {
+        let Some(operator) = args.as_bytes().first().copied() else {
+            return Ok(String::new());
         };
-        Ok(format!("T{:02x}{keyword}:{address:x};", reply.signal()))
+        if !matches!(operator, b'g' | b'c') {
+            return Ok(String::new());
+        }
+        let thread = parse_thread_id(&args[1..])?;
+        if let Some(thread) = thread {
+            if !thread_known(&self.target, thread.number()) {
+                return Ok(ERROR_REPLY.to_string());
+            }
+        }
+        if operator == b'g' {
+            self.general_thread = thread;
+        } else {
+            self.continue_selection = thread;
+        }
+        Ok("OK".to_string())
+    }
+
+    /// `T<n>`: report whether a thread is alive / 报告线程是否存在
+    fn thread_alive(&self, args: &str) -> String {
+        match parse_thread_id(args) {
+            Ok(Some(thread)) if thread_known(&self.target, thread.number()) => "OK".to_string(),
+            // `0`/`-1` asks about all threads and is alive while any exist.
+            // `0`/`-1` 询问全部线程，只要存在线程即为存活。
+            Ok(None) if self.target.thread_count() > 0 => "OK".to_string(),
+            _ => ERROR_REPLY.to_string(),
+        }
     }
 
     /// Handle `Q...` extension packets / 处理 `Q...` 扩展包
@@ -550,34 +645,85 @@ impl<T: GdbTarget> Session<T> {
         }
     }
 
-    /// Handle `v...` packets, including minimal single-thread `vCont`
-    /// 处理 `v...` 包，包括最小单线程 `vCont`
+    /// Handle `v...` packets, including multi-thread `vCont`
+    /// 处理 `v...` 包，包括多线程 `vCont`
     fn handle_v(&mut self, payload: &str) -> Result<String, Error> {
         if payload == "vCont?" {
-            return Ok("vCont;c;s".to_string());
+            return Ok("vCont;c;C;s;S;t".to_string());
         }
         let Some(actions) = payload.strip_prefix("vCont;") else {
             return Ok(String::new());
         };
-        let mut parts = actions.split(';');
-        let Some(action) = parts.next() else {
+        self.vcont(actions)
+    }
+
+    /// Parse and execute a `vCont` action list / 解析并执行 `vCont` 动作列表
+    ///
+    /// `c`/`C<sig>` continue and `s`/`S<sig>` step; `t` stops. A missing
+    /// `:<tid>` means every thread, and an explicit list covering all threads is
+    /// equivalent to the bare form. Mixed continue/step lists cannot be
+    /// satisfied by this target, so they reply `E01`; unknown actions reply an
+    /// empty packet as RSP requires.
+    /// `c`/`C<sig>` 继续、`s`/`S<sig>` 单步、`t` 停止。省略 `:<tid>` 表示全部
+    /// 线程；覆盖全部线程的显式列表与裸形式等价。本目标无法满足继续/单步混用的
+    /// 列表，因此回复 `E01`；未知动作按 RSP 约定回复空包。
+    fn vcont(&mut self, actions: &str) -> Result<String, Error> {
+        let mut parsed = Vec::new();
+        for action in actions.split(';').filter(|part| !part.is_empty()) {
+            let Some(entry) = parse_vcont_action(action) else {
+                return Ok(String::new());
+            };
+            parsed.push(entry);
+        }
+        let Some(&(action, _)) = parsed.first() else {
             return Ok(String::new());
         };
-        // Multiple actions describe multi-core control, which is out of scope.
-        // 多个动作描述多核控制，不在本阶段范围内。
-        if parts.next().is_some() {
-            return Ok(String::new());
+        if parsed.iter().any(|(kind, _)| *kind != action) {
+            return Ok(ERROR_REPLY.to_string());
         }
-        let action = action.split(':').next().unwrap_or_default();
+        if action == VContAction::Stop {
+            let thread = parsed
+                .iter()
+                .find_map(|(_, thread)| *thread)
+                .unwrap_or_else(|| self.selected_thread());
+            // `t` stops without a real stop event: SIGINT plus the thread.
+            // `t` 停止但没有真实停止事件：使用 SIGINT 并附带线程号。
+            return Ok(format!("T02thread:{};", thread.number()));
+        }
+
+        if parsed.iter().any(|(_, thread)| thread.is_none()) {
+            return match action {
+                VContAction::Continue => self.resume(ResumeMode::Continue),
+                _ => self.resume(ResumeMode::Step),
+            };
+        }
+        let mut threads = Vec::new();
+        for (_, thread) in &parsed {
+            let thread = thread.expect("threadless actions were handled above");
+            if !thread_known(&self.target, thread.number()) {
+                return Ok(ERROR_REPLY.to_string());
+            }
+            threads.push(thread);
+        }
+        let covers_all = threads.contains(&ThreadId::CORE0)
+            && (self.target.thread_count() == 1 || threads.contains(&ThreadId::CORE1));
+        if covers_all {
+            return match action {
+                VContAction::Continue => self.resume(ResumeMode::Continue),
+                _ => self.resume(ResumeMode::Step),
+            };
+        }
+        let [thread] = threads.as_slice() else {
+            return Ok(ERROR_REPLY.to_string());
+        };
         match action {
-            "c" => self.resume(ResumeMode::Continue),
-            "s" => self.resume(ResumeMode::Step),
-            _ => Ok(String::new()),
+            VContAction::Continue => self.continue_thread(*thread),
+            _ => self.step_thread(*thread),
         }
     }
 
     /// Reply to `q...` queries / 回复 `q...` 查询
-    fn query_reply(&self, payload: &str) -> String {
+    fn query_reply(&mut self, payload: &str) -> String {
         // `qXfer:features:read:<annex>:<offset>,<length>` is the only `qXfer`
         // object served today; everything else falls through to the empty
         // reply that tells GDB the object is unsupported.
@@ -602,19 +748,53 @@ impl<T: GdbTarget> Session<T> {
         if payload.starts_with("qAttached") {
             return "1".to_string();
         }
+        // Thread enumeration: the first packet lists every id, and the next
+        // `qsThreadInfo` terminates the list with `l` (the cursor is reset by
+        // each new `qfThreadInfo`).
+        // 线程枚举：首个包列出全部 id，随后 `qsThreadInfo` 以 `l` 结束列表
+        // （每次新的 `qfThreadInfo` 都会重置游标）。
         if payload == "qfThreadInfo" {
-            // One stopped thread; without this GDB declares "Thread 1 exited"
-            // and refuses to continue. / 只有一个线程；缺少该回复时 GDB 会判定
-            // “Thread 1 exited” 并拒绝继续。
-            return "m1".to_string();
+            self.thread_cursor = 0;
+            return self.thread_list_chunk();
         }
         if payload == "qsThreadInfo" {
-            return "l".to_string();
+            return self.thread_list_chunk();
+        }
+        if let Some(args) = payload.strip_prefix("qThreadExtraInfo,") {
+            let Ok(thread) = u32::from_str_radix(args, 16) else {
+                return ERROR_REPLY.to_string();
+            };
+            let thread = ThreadId(thread);
+            if !thread_known(&self.target, thread.number()) {
+                return ERROR_REPLY.to_string();
+            }
+            return encode_hex(self.target.thread_name(thread).as_bytes());
         }
         if payload == "qC" {
-            return "QC1".to_string();
+            return format!("QC{:x}", self.selected_thread().number());
         }
         String::new()
+    }
+
+    /// Next `qfThreadInfo`/`qsThreadInfo` chunk / 下一个线程枚举分块
+    fn thread_list_chunk(&mut self) -> String {
+        let count = self.target.thread_count();
+        if self.thread_cursor >= count {
+            return "l".to_string();
+        }
+        let mut reply = String::from("m");
+        for (position, index) in (self.thread_cursor..count).enumerate() {
+            if position > 0 {
+                reply.push(',');
+            }
+            let number = self.target.thread_id(index).map_or_else(
+                || u32::try_from(index + 1).unwrap_or(u32::MAX),
+                ThreadId::number,
+            );
+            let _ = write!(reply, "{number:x}");
+        }
+        self.thread_cursor = count;
+        reply
     }
 
     /// Serve one `qXfer:features:read` transfer for `target.xml`
@@ -648,6 +828,61 @@ impl<T: GdbTarget> Session<T> {
         };
         crate::target_xml::read_chunk(xml.as_bytes(), offset, length)
     }
+}
+
+/// Thread action parsed from one `vCont` entry / 从一条 `vCont` 条目解析出的动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VContAction {
+    /// `c` / `C<sig>`: continue / 继续
+    Continue,
+    /// `s` / `S<sig>`: single-step / 单步
+    Step,
+    /// `t`: stop / 停止
+    Stop,
+}
+
+/// Parse one `vCont` action (`c`, `C05`, `s:2`, `S05:1`, `t`, …)
+/// 解析一条 `vCont` 动作（`c`、`C05`、`s:2`、`S05:1`、`t` 等）
+///
+/// Returns `None` for unknown actions so the caller can answer with an empty
+/// packet. / 未知动作返回 `None`，调用方可回复空包。
+fn parse_vcont_action(text: &str) -> Option<(VContAction, Option<ThreadId>)> {
+    let (action, thread) = match text.split_once(':') {
+        Some((action, thread)) => (action, parse_thread_id(thread).ok().flatten()),
+        None => (text, None),
+    };
+    let mut bytes = action.bytes();
+    let kind = match bytes.next()? {
+        b'c' if action.len() == 1 => VContAction::Continue,
+        b'C' if action[1..].bytes().all(|byte| byte.is_ascii_hexdigit()) => VContAction::Continue,
+        b's' if action.len() == 1 => VContAction::Step,
+        b'S' if action[1..].bytes().all(|byte| byte.is_ascii_hexdigit()) => VContAction::Step,
+        b't' if action.len() == 1 => VContAction::Stop,
+        _ => return None,
+    };
+    Some((kind, thread))
+}
+
+/// Parse a GDB thread id / 解析 GDB 线程编号
+///
+/// `0` and `-1` mean "all threads" and become `None`.
+/// `0` 与 `-1` 表示“全部线程”，解析为 `None`。
+fn parse_thread_id(text: &str) -> Result<Option<ThreadId>, Error> {
+    if text == "-1" {
+        return Ok(None);
+    }
+    let number = u32::from_str_radix(text, 16).map_err(|_| Error::InvalidHex)?;
+    Ok((number != 0).then_some(ThreadId(number)))
+}
+
+/// Whether `number` is present in the target's thread table
+/// `number` 是否存在于目标的线程表中
+fn thread_known(target: &impl GdbTarget, number: u32) -> bool {
+    (0..target.thread_count()).any(|index| {
+        target
+            .thread_id(index)
+            .is_some_and(|id| id.number() == number)
+    })
 }
 
 /// Parse a hexadecimal `u32` / 解析十六进制 `u32`

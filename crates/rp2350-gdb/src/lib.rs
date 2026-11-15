@@ -29,7 +29,9 @@ pub use rsp::{
     unescape_binary,
 };
 pub use server::GdbServer;
-pub use target::{GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, WatchKind};
+pub use target::{
+    GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, ThreadId, WatchKind,
+};
 pub use target_xml::{ANNEX as TARGET_XML_ANNEX, ANNEX_ERROR as TARGET_XML_ERROR, TARGET_XML};
 
 // 协议测试放在 lib.rs，使 rsp.rs 的实现保持在单文件 500 行代码上限内；
@@ -248,7 +250,10 @@ mod rsp_tests {
 
     #[test]
     fn attach_query_reports_sigtrap() {
-        assert_eq!(session().handle_packet("?").as_deref(), Some("S05"));
+        assert_eq!(
+            session().handle_packet("?").as_deref(),
+            Some("T05thread:1;")
+        );
     }
 
     #[test]
@@ -269,6 +274,14 @@ mod rsp_tests {
         assert_eq!(session.handle_packet("qAttached").as_deref(), Some("1"));
         assert_eq!(session.handle_packet("Hg0").as_deref(), Some("OK"));
         assert_eq!(session.handle_packet("Hc1").as_deref(), Some("OK"));
+        assert_eq!(session.handle_packet("T1").as_deref(), Some("OK"));
+        // 单线程目标不存在线程 2。 / A single-thread target has no thread 2.
+        assert_eq!(session.handle_packet("Hg2").as_deref(), Some("E01"));
+        assert_eq!(session.handle_packet("T2").as_deref(), Some("E01"));
+        assert_eq!(
+            session.handle_packet("qThreadExtraInfo,2").as_deref(),
+            Some("E01")
+        );
         assert_eq!(session.handle_packet("D").as_deref(), Some("OK"));
         assert_eq!(session.handle_packet("k"), None);
     }
@@ -352,10 +365,13 @@ mod rsp_tests {
     #[test]
     fn continue_and_step_return_stop_replies() {
         let mut session = session();
-        assert_eq!(session.handle_packet("c").as_deref(), Some("S05"));
-        assert_eq!(session.handle_packet("C05").as_deref(), Some("S05"));
-        assert_eq!(session.handle_packet("s").as_deref(), Some("S05"));
-        assert_eq!(session.handle_packet("S05").as_deref(), Some("S05"));
+        for packet in ["c", "C05", "s", "S05"] {
+            assert_eq!(
+                session.handle_packet(packet).as_deref(),
+                Some("T05thread:1;"),
+                "{packet}"
+            );
+        }
     }
 
     #[test]
@@ -363,13 +379,25 @@ mod rsp_tests {
         let mut session = session();
         assert_eq!(
             session.handle_packet("vCont?").as_deref(),
-            Some("vCont;c;s")
+            Some("vCont;c;C;s;S;t")
         );
-        assert_eq!(session.handle_packet("vCont;c:1").as_deref(), Some("S05"));
-        assert_eq!(session.handle_packet("vCont;s").as_deref(), Some("S05"));
-        // Multi-action vCont is deliberately unsupported at this layer.
-        // 多动作 vCont 在本层故意不支持。
-        assert_eq!(session.handle_packet("vCont;c;s").as_deref(), Some(""));
+        assert_eq!(
+            session.handle_packet("vCont;c:1").as_deref(),
+            Some("T05thread:1;")
+        );
+        assert_eq!(
+            session.handle_packet("vCont;s").as_deref(),
+            Some("T05thread:1;")
+        );
+        assert_eq!(
+            session.handle_packet("vCont;t").as_deref(),
+            Some("T02thread:1;")
+        );
+        // 继续与单步混用无法由本目标满足。 / Mixed actions are unsupported.
+        assert_eq!(session.handle_packet("vCont;c;s").as_deref(), Some("E01"));
+        // 未知动作按 RSP 约定回复空包。 / Unknown actions reply an empty packet.
+        assert_eq!(session.handle_packet("vCont;x").as_deref(), Some(""));
+        assert_eq!(session.handle_packet("vCont;s:2").as_deref(), Some("E01"));
     }
 
     #[test]
@@ -537,7 +565,7 @@ mod rsp_tests {
         }
         // The session is still usable after a malformed transfer request.
         // 非法传输请求后会话仍可用。
-        assert_eq!(session.handle_packet("?").as_deref(), Some("S05"));
+        assert_eq!(session.handle_packet("?").as_deref(), Some("T05thread:1;"));
     }
 
     #[test]

@@ -46,12 +46,24 @@ pub trait GdbTarget: Send {
     fn clear_access_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;
     fn watchpoint_hit(&self) -> Option<u32>;                   // default: None
     fn monitor_command(&mut self, command: &str) -> String;    // default: empty (= OK)
+    fn thread_count(&self) -> usize;                           // default: 1
+    fn thread_id(&self, index: usize) -> Option<ThreadId>;     // default: index+1
+    fn thread_name(&self, thread: ThreadId) -> String;
+    fn thread_state(&self, thread: ThreadId) -> Option<CpuState>;
+    fn read_thread_register(&mut self, thread: ThreadId, register: u32)
+        -> Result<u32, GdbError>;
+    fn write_thread_register(&mut self, thread: ThreadId, register: u32, value: u32)
+        -> Result<(), GdbError>;
+    fn continue_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError>;
+    fn step_thread(&mut self, thread: ThreadId) -> Result<StopReply, GdbError>;
+    fn stopped_thread(&self) -> ThreadId;                      // default: core0
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError>;
     fn status(&self) -> TargetStatus;
 }
 ```
 
 支持类型 / Supporting types：
+- `ThreadId(u32)`：`CORE0 = 1`、`CORE1 = 2`；`number()` 返回线上编号
 - `ResumeMode`：`Continue` / `Step`
 - `WatchKind`：`Write`（`Z2`）/ `Read`（`Z3`）/ `Access`（`Z4`）
 - `StopReply { reason: StopReason, pc: u32 }`；`signal()` 返回 GDB 信号号
@@ -155,15 +167,15 @@ impl<T: GdbTarget> RspSession<T> {
 | Packet | Reply / 回复 | Notes |
 |--------|--------------|-------|
 | `qSupported[:features]` | `PacketSize=fff;qXfer:features:read+;QStartNoAckMode+;vContSupported+;hwbreak+[;watchpoint+]` | 特性协商；`watchpoint+` 仅在目标支持监视点时追加（写/读/访问三类共用，不区分）；声明 `qXfer:features:read` 后 GDB 会主动读取 `target.xml` |
-| `?` | `S05` | 附加查询（SIGTRAP） |
-| `g` | 每寄存器 4 字节小端 hex | 寄存器批量读 |
+| `?` | `T05thread:<n>;` | 附加查询（SIGTRAP，带当前线程） |
+| `g` | 每寄存器 4 字节小端 hex | 寄存器批量读；按当前线程路由 |
 | `G<hex>` | `OK` | 批量写；长度须为 4 的倍数且不超出寄存器数 |
-| `p N` | 8 位小端 hex | 单个寄存器读 |
-| `P N=<hex>` | `OK` | 单个寄存器写 |
+| `p N` | 8 位小端 hex | 单个寄存器读；按当前线程路由 |
+| `P N=<hex>` | `OK` | 单个寄存器写；按当前线程路由 |
 | `m addr,len` | 小写 hex 字节串 | 长度上限 `MAX_PACKET_SIZE`（0x0fff） |
 | `M addr,len:data` | `OK` | 数据字节数必须等于 `len` |
-| `c` / `C<sig>` | `S<sig>`（通常 `S05`） | `GdbTarget::resume(Continue)` |
-| `s` / `S<sig>` | `S<sig>` | `GdbTarget::resume(Step)` |
+| `c` / `C<sig>` | `T<sig>thread:<n>;`（通常 `T05`） | `GdbTarget::resume(Continue)`；带 `Hc` 选择时只继续该线程 |
+| `s` / `S<sig>` | `T<sig>thread:<n>;` | `GdbTarget::resume(Step)`；带 `Hc` 选择时只单步该线程 |
 | `Z0,addr,kind` / `z0,addr,kind` | `OK` | 软件断点（kind 校验，忽略值） |
 | `Z1,addr,kind` / `z1,addr,kind` | `OK` | 硬件断点（复用目标的断点模型） |
 | `Z2,addr,kind` / `z2,addr,kind` | `OK` | 写监视点（`watch`）；`kind` 为字节数（1/2/4/8） |
@@ -172,11 +184,15 @@ impl<T: GdbTarget> RspSession<T> {
 | `qRcmd,<hex>` | `<hex 输出>` / `OK` | monitor 命令：`hex` 是 UTF-8 命令的十六进制；目标返回文本按 hex 回复，空文本回复 `OK` |
 | `D` | `OK` | detach |
 | `k` | 无回复 | 传输层应随后关闭连接 |
-| `qC` | `QC1` | 单核阶段固定线程 1 |
+| `qC` | `QC<n>` | 当前线程（`Hg` 选择，否则最近停止线程） |
 | `qAttached` | `1` | 已附加到现有目标 |
-| `Hg<id>` / `Hc<id>` | `OK` | 线程选择空成功 |
-| `vCont?` | `vCont;c;s` | 最小单线程能力 |
-| `vCont;c[:id]` / `vCont;s[:id]` | `S05` 或 `T05watch:<addr>;` | 单动作；多动作返回空包（多核待实现） |
+| `qfThreadInfo` | `m1,2` | 线程枚举首包（单核目标 `m1`） |
+| `qsThreadInfo` | `l` | 枚举结束；`qfThreadInfo` 会重置游标 |
+| `qThreadExtraInfo,<hex-id>` | 线程名的 hex（如 `636f726531` = `core1`） | 未知线程 `E01` |
+| `Hg<id>` / `Hc<id>` | `OK`（越界 `E01`） | 记录寄存器/继续线程；`0`/`-1` 表示全部 |
+| `T<id>` | `OK` / `E01` | 查询线程是否存活 |
+| `vCont?` | `vCont;c;C;s;S;t` | 多线程动作能力 |
+| `vCont;<action>[:<tid>][;...]` | `T<sig>thread:<n>;`、`E01` 或空包 | 见下文“线程模型与 `vCont`” |
 | `QStartNoAckMode` | `OK` | 置位 `no_ack_mode()`，状态化 |
 | `qXfer:features:read:target.xml:<off>,<len>` | `m<chunk>` / `l<chunk>` | 按字节切片的目标描述；`len=0`、`off` 到界或越界均返回空 `l` |
 | `qXfer:features:read:<其他 annex>:...` | `E00` | 未提供的 annex；参数非法同样 `E00` |
@@ -210,6 +226,58 @@ return an empty string, so a typo never makes GDB error out.
 Error mapping: target failures (invalid register, bus error, address overflow)
 and malformed arguments reply `E01` while the session stays usable; unknown
 commands return an empty packet.
+
+### Threads and `vCont` / 线程模型与 `vCont`
+
+线程编号由 `GdbTarget::thread_count`/`thread_id` 决定：默认单线程（`m1`），
+双核目标暴露 `m1,2`，其中 1 是 core0（启动核）、2 是 core1。`qfThreadInfo`
+的首个包列出全部线程 id，后续 `qsThreadInfo` 回复 `l` 结束；再次发送
+`qfThreadInfo` 会重置游标。
+Thread ids come from `GdbTarget::thread_count`/`thread_id`: the default is a
+single thread (`m1`) and a dual-core target exposes `m1,2`, where 1 is core 0
+(the boot core) and 2 is core 1. The first `qfThreadInfo` packet lists every id
+and the following `qsThreadInfo` replies `l`, ending the list; a fresh
+`qfThreadInfo` resets the cursor.
+
+`Hg<n>` 选择 `g`/`G`/`p`/`P` 路由的线程（`0`/`-1` 表示任意线程，回退到最近
+停止线程）；`Hc<n>` 选择 `c`/`s` 与 `vCont` 省略线程号时使用的线程。内存包
+`m`/`M` 不区分线程（两个核心共享同一条总线）。`T<n>` 用于存活探测，返回
+`OK` 或 `E01`。
+`Hg<n>` selects the thread used by `g`/`G`/`p`/`P` (`0`/`-1` means any thread and
+falls back to the last stopped thread); `Hc<n>` selects the thread for `c`/`s`
+and for `vCont` actions without an explicit id. Memory packets `m`/`M` are
+thread-agnostic because both cores share one bus. `T<n>` probes liveness and
+replies `OK` or `E01`.
+
+`vCont` 语法：`vCont;<action>[:<tid>][;...]`，动作可为 `c`/`C<sig>`（继续）、
+`s`/`S<sig>`（单步）或 `t`（停止）。省略 `:<tid>`、`tid = -1`/`0` 均表示全部
+线程；`c:1;c:2` 与裸 `c` 等价。继续与单步混用的列表无法由本目标满足，回复
+`E01`；未知动作回复空包；越界线程号回复 `E01`。`vCont;t` 以
+`T02thread:<n>;`（SIGINT）应答。
+`vCont` syntax is `vCont;<action>[:<tid>][;...]` with `c`/`C<sig>` (continue),
+`s`/`S<sig>` (step) or `t` (stop). A missing `:<tid>`, `tid = -1` and `tid = 0`
+all mean every thread, and `c:1;c:2` is equivalent to a bare `c`. Mixed
+continue/step lists cannot be satisfied by this target and reply `E01`; unknown
+actions reply an empty packet and out-of-range ids reply `E01`. `vCont;t` answers
+`T02thread:<n>;` (SIGINT).
+
+停止回复统一带线程字段：普通停止为 `T05thread:1;`，监视点停止为
+`T05watch:<addr>;thread:2;`（字段顺序不敏感）。线程号来自
+`GdbTarget::stopped_thread`，`MachineTarget` 在 core1 断点/core1 停机时上报 2。
+Every stop reply carries the thread field: a normal stop is `T05thread:1;` and a
+watchpoint stop is `T05watch:<addr>;thread:2;` (field order is not significant).
+The number comes from `GdbTarget::stopped_thread`; `MachineTarget` reports 2
+when a core-1 breakpoint or core-1 stop is what ended the resume.
+
+> 单线程选择只影响**上报线程与 PC**：没有按核步进 API 的目标（如
+> `MachineTarget`，其 `Machine::step` 各推进 core0/core1 一条指令）会退化为
+> 双核同步步进。`step_thread(2)` 时 core0 也会前进一条指令，这一点由
+> `crates/rp2350-cli/src/gdb_target/tests.rs` 锁定。
+> A single-thread selection only affects the **reported thread and PC**: targets
+> without a per-core step API (such as `MachineTarget`, whose `Machine::step`
+> retires one core-0 *and* one core-1 instruction) degrade to lock-step dual-core
+> stepping. `step_thread(2)` also advances core 0 by one instruction; the CLI
+> adapter tests lock this behaviour down.
 
 `QStartNoAckMode` 注意：传输层必须在发送 `OK` 之后才进入无应答模式；分发器只
 记录协商状态。
@@ -390,9 +458,11 @@ survives because one `Session` is shared for the whole `serve` call.
 - 性能：未安装过读监视的进程每次 SRAM 读只多一次 relaxed 原子 load；安装后每次读
   多一次 thread-local 判断。门控只置位不复位（区间按线程存放），因此不会出现另一
   线程撤除监视导致本线程漏报；写监视点仍按指令采样。
-- `vCont` 仅单动作单线程；多核动作列表返回空包。
-- `qRcmd` monitor 命令由目标定义；库层默认全部返回 `OK`（无输出）。无
-  `qfThreadInfo` / `qsThreadInfo`。
+- 线程模型上限为两核（core0/core1）；`CortexM33Target` 仍是单线程目标（默认
+  `thread_count() == 1`）。`MachineTarget` 暴露两线程，但 core1 寄存器只读且仅
+  PC/SP 为真实值（其余读 0），单线程 `vCont`/`Hc` 选择退化为双核同步步进。
+- 继续与单步混用的 `vCont` 动作列表返回 `E01`；不支持 `vCont;r`（range step）。
+- `qRcmd` monitor 命令由目标定义；库层默认全部返回 `OK`（无输出）。
 - `stop()` 只清标志，不能中断阻塞中的 `accept`（需要连接一次才退出）。
 
 - The CLI `gdb` subcommand is wired (`--file <ELF>`, default port 3333); there
@@ -420,10 +490,15 @@ survives because one `Session` is shared for the whole `serve` call.
   The gate is sticky (the range lives per thread), so another thread disarming
   its watch can never make this thread miss hits. Write watchpoints keep
   sampling once per instruction.
-- `vCont` is single-action single-thread only; multi-core action lists return
-  an empty packet.
+- The thread model tops out at two cores (core 0/core 1); `CortexM33Target` stays
+  a single-thread target (default `thread_count() == 1`). `MachineTarget`
+  exposes two threads, but core-1 registers are read-only and only PC/SP carry
+  real values (everything else reads 0); a single-thread `vCont`/`Hc` selection
+  degrades to lock-step dual-core stepping.
+- Mixed continue/step `vCont` action lists reply `E01`; `vCont;r` (range step) is
+  not supported.
 - `qRcmd` monitor commands are defined by the target; the library default
-  answers everything with `OK` (no output). No `qfThreadInfo` / `qsThreadInfo`.
+  answers everything with `OK` (no output).
 - `stop()` only clears a flag; it cannot interrupt a blocked `accept` (one
   connection is needed before `serve` returns).
 
@@ -435,7 +510,7 @@ survives because one `Session` is shared for the whole `serve` call.
 use rp2350_gdb::{GdbTarget, RspSession, encode_packet};
 
 let mut session = RspSession::new(target);
-assert_eq!(session.handle_packet("?").as_deref(), Some("S05"));
+assert_eq!(session.handle_packet("?").as_deref(), Some("T05thread:1;"));
 assert_eq!(session.handle_packet("g").is_some(), true);
 
 let frame = encode_packet("m20000000,4");
