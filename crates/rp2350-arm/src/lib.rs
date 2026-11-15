@@ -34,6 +34,7 @@ pub mod dual_core;
 pub mod exceptions;
 pub mod execute_thumb16;
 pub mod execute_thumb32;
+pub mod faults;
 mod fetch_cache;
 pub mod fpu;
 pub mod nvic;
@@ -198,6 +199,8 @@ pub struct CortexM33Core {
     vtor: u32,
     /// Configurable Fault Status Register (SCB->CFSR) / 可配置故障状态寄存器
     cfsr: u32,
+    /// Fault enables, `HFSR` and `AIRCR` state / 故障使能、`HFSR` 与 `AIRCR` 状态
+    faults: faults::FaultState,
     /// IT block state machine / IT 块状态机
     it_state: ITBlockState,
     /// Current execution state / 当前执行状态
@@ -261,6 +264,7 @@ impl CortexM33Core {
             systick: SysTick::new(),
             vtor: 0,
             cfsr: 0,
+            faults: faults::FaultState::new(),
             it_state: ITBlockState::new(),
             state: CpuState::Reset,
             pending_irq: None,
@@ -336,33 +340,21 @@ impl CortexM33Core {
         self.apply_boot_vectors();
     }
 
-    /// Select whether undefined instructions halt or are skipped
-    /// 选择未定义指令是停机还是跳过
+    /// Select whether undefined instructions halt or are delivered as faults
+    /// 选择未定义指令是停机还是按故障投递
     ///
-    /// In strict mode the next undefined instruction makes [`CpuCore::step`]
-    /// return [`CoreError::UndefinedInstruction`] and leaves the core halted.
-    /// The default is to warn once per distinct opcode and skip it.
-    /// 严格模式下，下一条未定义指令会让 [`CpuCore::step`] 返回
-    /// [`CoreError::UndefinedInstruction`] 并使核心停机。默认行为是对每个
-    /// 不同的操作码告警一次后跳过。
+    /// The default is **architectural**: the undefined instruction raises
+    /// `CFSR.UFSR.UNDEFINSTR`, escalates to HardFault when UsageFault is
+    /// disabled, and enters the handler at `VTOR + 0x0C`. Strict mode is a host
+    /// diagnostic option: the next undefined instruction makes
+    /// [`CpuCore::step`] return [`CoreError::UndefinedInstruction`] and leaves
+    /// the core halted, with the opcode and width in the error.
+    /// 默认行为是**架构行为**：未定义指令置位 `CFSR.UFSR.UNDEFINSTR`，在
+    /// UsageFault 未使能时升级为 HardFault，并从 `VTOR + 0x0C` 进入处理程序。
+    /// 严格模式是宿主诊断选项：下一条未定义指令会让 [`CpuCore::step`] 返回
+    /// [`CoreError::UndefinedInstruction`] 并使核心停机，错误中携带操作码与宽度。
     pub fn set_strict_decode(&mut self, strict: bool) {
         self.strict_decode = strict;
-    }
-
-    /// Report an undefined instruction, deduplicated by opcode
-    /// 按操作码去重地报告未定义指令
-    fn note_undefined(&mut self, pc: u32, opcode: u32, width: u8) -> Result<(), CoreError> {
-        if self.strict_decode {
-            return Err(CoreError::UndefinedInstruction { pc, opcode, width });
-        }
-        if self.undefined_seen.insert((width, opcode)) {
-            log::warn!(
-                "undefined instruction at PC {pc:#010X}: opcode {opcode:#010X} \
-                 ({width} bytes), skipped / 未定义指令 PC {pc:#010X}: \
-                 opcode {opcode:#010X}（{width} 字节），已跳过"
-            );
-        }
-        Ok(())
     }
 
     /// Write the program status register (XPSR)
@@ -386,6 +378,7 @@ impl CortexM33Core {
         self.systick = SysTick::new();
         self.vtor = 0;
         self.cfsr = 0;
+        self.faults = faults::FaultState::new();
         self.it_state = ITBlockState::new();
         self.pending_irq = None;
         self.active_exceptions.clear();
@@ -909,69 +902,17 @@ impl CortexM33Core {
         Ok(())
     }
 
-    /// Shared tail: synchronous UsageFault entry and undefined-instruction report
-    /// 共享尾部：同步用法故障进入与未定义指令报告
-    #[inline]
-    fn finish_instruction(
-        &mut self,
-        bus: &mut dyn AddressBus,
-        cycles: &mut u64,
-        old_pc: u32,
-        raw_opcode: u32,
-        width: u8,
-        result: StepResult,
-    ) -> Result<StepResult, CoreError> {
-        // 同步用法故障（当前仅 NOCP）：设置 CFSR 并立即进入 UsageFault。
-        // Synchronous UsageFault (currently only NOCP): set CFSR and enter
-        // the UsageFault handler immediately with a standard stack frame.
-        if self.registers.take_usage_fault() {
-            self.cfsr |= exceptions::CFSR_UFSR_NOCP;
-            let in_handler = !self.active_exceptions.is_empty();
-            let thread_psp = self.registers.control & 0x2 != 0;
-            exceptions::enter_exception(
-                bus,
-                &mut self.registers,
-                &mut self.nvic,
-                &mut self.scb,
-                u32::from(exceptions::EXC_USAGE_FAULT),
-                self.vtor,
-                &mut self.it_state,
-                cycles,
-            )?;
-            if !in_handler {
-                // 系统异常默认写入 0xFFFF_FFF1；从 Thread 模式进入时按
-                // MSP/PSP 选择正确的 EXC_RETURN，并保留 enter_exception 根据
-                // 帧类型写入的 bit 4（0 = 扩展帧）。
-                // System exceptions default to 0xFFFF_FFF1; entering from
-                // Thread mode selects the MSP/PSP-specific EXC_RETURN while
-                // preserving the frame-type bit 4 written by enter_exception.
-                let extended = self.registers.lr & 0x10 == 0;
-                self.registers.lr = if thread_psp { 0xFFFF_FFFD } else { 0xFFFF_FFF9 };
-                if extended {
-                    self.registers.lr &= !0x10;
-                }
-            }
-            self.active_exceptions.push(exceptions::EXC_USAGE_FAULT);
-            return Ok(StepResult::Ok);
-        }
-
-        if matches!(result, StepResult::Undefined) {
-            self.note_undefined(old_pc, raw_opcode, width)?;
-        }
-
-        Ok(result)
-    }
-
     /// Check for pending exceptions and initiate exception entry if needed
     /// 检查挂起异常并在需要时发起异常进入
     ///
-    /// The arbitration covers external NVIC lines, PendSV (14) and SysTick (15)
-    /// in one numeric-priority pass, so a SysTick underflow enters exception 15
-    /// at `VTOR + 0x3C` instead of being mistaken for external IRQ 15
-    /// (exception 31). See [`Self::pending_exception`].
-    /// 仲裁在一次数值优先级遍历中同时覆盖外部 NVIC 线、PendSV（14）与
-    /// SysTick（15），因此 SysTick 下溢进入异常 15 且向量位于 `VTOR + 0x3C`，
-    /// 而不会被误当作外部 IRQ 15（异常 31）。见 [`Self::pending_exception`]。
+    /// The arbitration covers external NVIC lines, NMI (2), SVCall (11), PendSV
+    /// (14) and SysTick (15) in one ranked pass, so a SysTick underflow enters
+    /// exception 15 at `VTOR + 0x3C` instead of being mistaken for external IRQ
+    /// 15 (exception 31). See [`Self::pending_exception`].
+    /// 仲裁在一次等级遍历中同时覆盖外部 NVIC 线、NMI（2）、SVCall（11）、
+    /// PendSV（14）与 SysTick（15），因此 SysTick 下溢进入异常 15 且向量位于
+    /// `VTOR + 0x3C`，而不会被误当作外部 IRQ 15（异常 31）。
+    /// 见 [`Self::pending_exception`]。
     fn check_pending_exceptions(
         &mut self,
         bus: &mut dyn AddressBus,

@@ -95,6 +95,14 @@ pub const EXCEPTION_STACK_FRAME_WITH_FP_SIZE: u32 =
 /// CFSR.UFSR.NOCP：协处理器访问被拒绝（CFSR 位 19）
 pub const CFSR_UFSR_NOCP: u32 = 1 << 19;
 
+/// Exception number for NMI / 不可屏蔽中断的异常号
+pub const EXC_NMI: u16 = 2;
+/// Exception number for HardFault / 硬故障的异常号
+pub const EXC_HARDFAULT: u16 = 3;
+/// Exception number for MemManage / 存储器管理故障的异常号
+pub const EXC_MEMMANAGE: u16 = 4;
+/// Exception number for BusFault / 总线故障的异常号
+pub const EXC_BUSFAULT: u16 = 5;
 /// Exception number for UsageFault / 用法故障的异常号
 pub const EXC_USAGE_FAULT: u16 = 6;
 /// Exception number for SVCall / SVCall 的异常号
@@ -129,11 +137,21 @@ pub struct ExcReturnInfo {
 
 /// Parse an EXC_RETURN value
 /// 解析 EXC_RETURN 值
+///
+/// A legal ARMv8-M `EXC_RETURN` keeps `bits[31:8]` all ones (`0xFFFF_FFxx`) and
+/// has the reserved bit 1 clear. Values that still match the `0xFFFF_FF` prefix
+/// but violate those rules are *illegal returns*: [`is_exc_return_prefix`]
+/// recognises them, [`write_pc`] raises `CFSR.INVSTATE`, and the core takes a
+/// fault instead of branching to an unmapped address like `0xFFFF_FFFA`.
+/// 合法的 ARMv8-M `EXC_RETURN` 要求 `bits[31:8]` 全为 1（`0xFFFF_FFxx`）且保留位
+/// bit1 为 0。仍带 `0xFFFF_FF` 前缀但违反这些规则的值属于**非法返回**：
+/// [`is_exc_return_prefix`] 能识别它们，[`write_pc`] 会置位 `CFSR.INVSTATE`，
+/// 核心随后进入故障异常，而不是跳转到 `0xFFFF_FFFA` 这类未映射地址。
 #[must_use]
 pub fn decode_exc_return(lr: u32) -> Option<ExcReturnInfo> {
-    // EXC_RETURN values have prefix 0xFFFX_XXXX
-    // EXC_RETURN 值具有前缀 0xFFFX_XXXX
-    if (lr & 0xF000_0000) != 0xF000_0000 {
+    // EXC_RETURN values have prefix 0xFFFX_XXXX and reserved bit 1 clear.
+    // EXC_RETURN 值具有前缀 0xFFFX_XXXX，且保留位 bit1 为 0。
+    if !is_exc_return_prefix(lr) || (lr & 0x2) != 0 {
         return None;
     }
 
@@ -145,6 +163,19 @@ pub fn decode_exc_return(lr: u32) -> Option<ExcReturnInfo> {
         // bit 4 为 1 表示标准帧，为 0 表示带浮点的扩展帧。
         has_fp: (lr & 0x10) == 0,
     })
+}
+
+/// Whether `value` carries the architectural `EXC_RETURN` prefix
+/// `value` 是否带有架构 `EXC_RETURN` 前缀
+///
+/// The prefix check is deliberately separate from [`decode_exc_return`]: a
+/// value can look like a return yet be illegal, and that distinction is what
+/// turns an architecturally invalid return into `INVSTATE` instead of a branch.
+/// 前缀检查刻意与 [`decode_exc_return`] 分开：一个值可能看起来像返回但实际非法，
+/// 正是这一区分把架构上的非法返回变成 `INVSTATE` 故障，而不是一次分支。
+#[must_use]
+pub fn is_exc_return_prefix(value: u32) -> bool {
+    (value & 0xFFFF_FF00) == 0xFFFF_FF00
 }
 
 /// Apply `BXWritePC` / `LoadWritePC` semantics to a value written to PC
@@ -168,13 +199,26 @@ pub fn decode_exc_return(lr: u32) -> Option<ExcReturnInfo> {
 ///
 /// Returns `true` when the caller must raise `StepResult::ExceptionReturn`.
 /// 返回 `true` 表示调用方须返回 `StepResult::ExceptionReturn`。
+///
+/// An illegal value with the `EXC_RETURN` prefix (for example
+/// `0xFFFF_FFF2`, whose reserved bit 1 is set) is not a branch target: the
+/// write raises a pending `INVSTATE` fault and leaves `PC` at the next
+/// instruction, which [`crate::CortexM33Core`] turns into HardFault/UsageFault
+/// at the end of the step.
+/// 带 `EXC_RETURN` 前缀的非法值（例如置位保留位 bit1 的 `0xFFFF_FFF2`）不是
+/// 分支目标：该写入会挂起 `INVSTATE` 故障并让 `PC` 保持在下一条指令，由
+/// [`crate::CortexM33Core`] 在本步结束时升级为 HardFault/UsageFault。
 #[must_use]
 pub fn write_pc(regs: &mut CortexM33Registers, value: u32) -> bool {
     if decode_exc_return(value).is_some() {
         regs.lr = value;
         true
     } else {
-        regs.pc = value & !1u32;
+        if is_exc_return_prefix(value) {
+            regs.raise_invstate_fault();
+        } else {
+            regs.pc = value & !1u32;
+        }
         false
     }
 }
@@ -382,18 +426,21 @@ pub fn fetch_exception_vector(
 /// Enter an exception handler — full sequence
 /// 进入异常处理程序 —— 完整序列
 ///
-/// `exception_number` is the ARMv8-M exception number: 14 for PendSV, 15 for
-/// SysTick, `16 + n` for external interrupt `n`. The vector is always fetched
-/// from `VTOR + 4 * exception_number`, so the SysTick handler lives at
+/// `exception_number` is the ARMv8-M exception number: 2 for NMI, 3 for
+/// HardFault, 11 for SVCall, 14 for PendSV, 15 for SysTick and `16 + n` for an
+/// external interrupt `n`. The vector is always fetched from
+/// `VTOR + 4 * exception_number`, so the SysTick handler lives at
 /// `VTOR + 0x3C` and the PendSV handler at `VTOR + 0x38`.
-/// `exception_number` 为 ARMv8-M 异常号：PendSV 为 14、SysTick 为 15、外部中断
-/// `n` 为 `16 + n`。向量总是取自 `VTOR + 4 * exception_number`，因此 SysTick
-/// 处理程序位于 `VTOR + 0x3C`、PendSV 处理程序位于 `VTOR + 0x38`。
+/// `exception_number` 为 ARMv8-M 异常号：NMI 为 2、HardFault 为 3、SVCall 为 11、
+/// PendSV 为 14、SysTick 为 15、外部中断 `n` 为 `16 + n`。向量总是取自
+/// `VTOR + 4 * exception_number`，因此 SysTick 处理程序位于 `VTOR + 0x3C`、
+/// PendSV 处理程序位于 `VTOR + 0x38`。
 ///
-/// `scb` receives the pending clear of an entered PendSV/SysTick exception; the
-/// external NVIC is cleared through `nvic` for `16 + n` exceptions.
-/// `scb` 接收已进入的 PendSV/SysTick 异常的挂起清除；`16 + n` 外部异常则通过
-/// `nvic` 清除。
+/// `scb` receives the pending clear of an entered NMI/SVCall/PendSV/SysTick
+/// exception; the external NVIC is cleared through `nvic` for `16 + n`
+/// exceptions.
+/// `scb` 接收已进入的 NMI/SVCall/PendSV/SysTick 异常的挂起清除；`16 + n`
+/// 外部异常则通过 `nvic` 清除。
 ///
 /// Returns `Ok(())` on success, with registers and SP updated.
 /// 成功返回 `Ok(())`，寄存器和 SP 已更新。
@@ -548,11 +595,13 @@ pub fn enter_exception(
         nvic.set_active(irq);
         nvic.clear_pending(irq);
     } else {
-        // PendSV/SysTick 的挂起位是一次性锁存：取走异常即清除。其它系统异常
-        // （UsageFault/SVCall 等）在本块中没有挂起状态，调用无副作用。
-        // The PendSV/SysTick pending bit is a one-shot latch: taking the
-        // exception clears it. Other system exceptions (UsageFault/SVCall) have
-        // no pending state here, so the call is a no-op for them.
+        // NMI/SVCall/PendSV/SysTick 的挂起位是一次性锁存：取走异常即清除。
+        // 其它系统异常（MemManage/BusFault/UsageFault/HardFault）由同步故障路径
+        // 直接进入，没有锁存，调用无副作用。
+        // The NMI/SVCall/PendSV/SysTick pending bits are one-shot latches:
+        // taking the exception clears them. Other system exceptions
+        // (MemManage/BusFault/UsageFault/HardFault) are entered synchronously
+        // with no latch, so the call is a no-op for them.
         scb.clear_pending(exception_number as u16);
     }
 

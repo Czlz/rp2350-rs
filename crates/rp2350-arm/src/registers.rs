@@ -95,6 +95,16 @@ pub struct CortexM33Registers {
     /// A synchronous UsageFault is pending from the instruction just executed
     /// 刚执行的指令已引发待处理的同步用法故障
     pub(crate) pending_usage_fault: bool,
+    /// A write to PC carried an illegal `EXC_RETURN` value
+    /// 写 PC 时携带了非法的 `EXC_RETURN` 值
+    ///
+    /// The flag is the `CFSR.UFSR.INVSTATE` source. It is separate from
+    /// [`Self::pending_usage_fault`] because the core must report a different
+    /// CFSR bit and may route the fault to HardFault instead of UsageFault.
+    /// 该标志是 `CFSR.UFSR.INVSTATE` 的来源。它与 [`Self::pending_usage_fault`]
+    /// 分开保存，因为核心需要报告不同的 CFSR 位，并可能把故障升级为 HardFault
+    /// 而不是 UsageFault。
+    pub(crate) pending_invstate: bool,
 }
 
 impl CortexM33Registers {
@@ -120,6 +130,7 @@ impl CortexM33Registers {
             cpacr: 0,
             exclusive: None,
             pending_usage_fault: false,
+            pending_invstate: false,
         }
     }
 
@@ -260,6 +271,18 @@ impl CortexM33Registers {
     /// 取出并清除待处理的同步用法故障标志
     pub(crate) fn take_usage_fault(&mut self) -> bool {
         core::mem::take(&mut self.pending_usage_fault)
+    }
+
+    /// Mark a pending `INVSTATE` fault (illegal `EXC_RETURN` written to PC)
+    /// 标记待处理的 `INVSTATE` 故障（写 PC 时携带了非法 `EXC_RETURN`）
+    pub(crate) fn raise_invstate_fault(&mut self) {
+        self.pending_invstate = true;
+    }
+
+    /// Take and clear the pending `INVSTATE` fault flag
+    /// 取出并清除待处理的 `INVSTATE` 故障标志
+    pub(crate) fn take_invstate_fault(&mut self) -> bool {
+        core::mem::take(&mut self.pending_invstate)
     }
 
     /// Arm this core's exclusive monitor for `addr` with byte size `size`

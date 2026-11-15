@@ -442,14 +442,20 @@ pub fn execute_thumb16(
                         // BX carries EXC_RETURN: let the core perform the return sequence.
                         return Ok(StepResult::ExceptionReturn);
                     }
-                    if target & 0x1 == 0 && crate::exceptions::decode_exc_return(target).is_none() {
-                        // Not Thumb target → ARM mode (not supported by M33)
-                        // 非 Thumb 目标 → ARM 模式（M33 不支持）
-                        regs.xpsr |= 0x200_0000; // UsageFault: INVSTATE
-                        return Err(CoreError::BusError {
-                            addr: target,
-                            kind: rp2350_core::error::BusErrorKind::NoDevice,
-                        });
+                    if crate::exceptions::is_exc_return_prefix(target) {
+                        // 非法 EXC_RETURN：write_pc 已挂起 INVSTATE，绝不能把它
+                        // 当成普通的 ARM 状态分支目标。
+                        // Illegal EXC_RETURN: write_pc latched INVSTATE; it must
+                        // never be treated as an ordinary ARM-state branch target.
+                        return Ok(StepResult::Ok);
+                    }
+                    if target & 0x1 == 0 {
+                        // 非 Thumb 目标 → ARM 状态（M33 不支持）：INVSTATE 故障。
+                        // A non-Thumb target selects ARM state, which the M33 does
+                        // not support: raise INVSTATE instead of halting on a
+                        // fabricated bus error.
+                        regs.raise_invstate_fault();
+                        return Ok(StepResult::Ok);
                     }
                     regs.pc = target & !1u32;
                     return Ok(StepResult::BranchTaken);

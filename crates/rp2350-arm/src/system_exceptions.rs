@@ -1,19 +1,22 @@
-//! PendSV / SysTick system-exception arbitration and delivery
-//! PendSV / SysTick 系统异常仲裁与投递
+//! System-exception arbitration and delivery (NMI / SVCall / PendSV / SysTick)
+//! 系统异常仲裁与投递（NMI / SVCall / PendSV / SysTick）
 //!
-//! ARMv8-M exception numbers are not a flat NVIC index: `PendSV` is 14 and
-//! `SysTick` is 15, and only external interrupts use `16 + n`. This module
-//! implements the arbitration between those two system exceptions and the
-//! external interrupt lines: numeric-priority ordering, the lowest exception
-//! number as tie-break, the `PRIMASK`/`FAULTMASK`/`BASEPRI` gates and the
-//! "only a strictly higher priority may preempt" rule. It also owns the
-//! `SCB_ICSR` read/write view (`PENDSTSET`/`PENDSTCLR`/`PENDSVSET`/
-//! `PENDSVCLR`/`VECTPENDING`).
-//! ARMv8-M 的异常号并不是扁平的 NVIC 索引：`PendSV` 为 14、`SysTick` 为 15，
-//! 只有外部中断才用 `16 + n`。本模块实现这两个系统异常与外部中断线之间的仲裁：
-//! 数值优先级排序、同优先级取最小异常号、`PRIMASK`/`FAULTMASK`/`BASEPRI` 门控，
-//! 以及「只有严格更高优先级才能抢占」的规则；同时负责 `SCB_ICSR` 的读写视图
-//! （`PENDSTSET`/`PENDSTCLR`/`PENDSVSET`/`PENDSVCLR`/`VECTPENDING`）。
+//! ARMv8-M exception numbers are not a flat NVIC index: `NMI` is 2, `HardFault`
+//! is 3, `SVCall` is 11, `PendSV` is 14 and `SysTick` is 15, and only external
+//! interrupts use `16 + n`. This module implements the arbitration between
+//! those system exceptions and the external interrupt lines: fixed-priority
+//! NMI/HardFault first, then numeric-priority ordering with the lowest
+//! exception number as tie-break, the `PRIMASK`/`FAULTMASK`/`BASEPRI` gates and
+//! the "only a strictly higher priority may preempt" rule. It also owns the
+//! `SCB_ICSR` read/write view (`NMIPENDSET`/`PENDSTSET`/`PENDSTCLR`/
+//! `PENDSVSET`/`PENDSVCLR`/`VECTPENDING`).
+//! ARMv8-M 的异常号并不是扁平的 NVIC 索引：`NMI` 为 2、`HardFault` 为 3、
+//! `SVCall` 为 11、`PendSV` 为 14、`SysTick` 为 15，只有外部中断才用 `16 + n`。
+//! 本模块实现这些系统异常与外部中断线之间的仲裁：固定优先级的 NMI/HardFault
+//! 优先，其后按数值优先级排序、同优先级取最小异常号，并应用
+//! `PRIMASK`/`FAULTMASK`/`BASEPRI` 门控与「只有严格更高优先级才能抢占」的规则；
+//! 同时负责 `SCB_ICSR` 的读写视图（`NMIPENDSET`/`PENDSTSET`/`PENDSTCLR`/
+//! `PENDSVSET`/`PENDSVCLR`/`VECTPENDING`）。
 
 // 仲裁代码直接操作异常号与优先级掩码，属于异常控制器仿真的固有写法。
 // Arbitration manipulates exception numbers and priority masks directly, which
@@ -25,7 +28,8 @@ use std::fmt;
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
-use crate::exceptions::{self, EXC_PENDSV, EXC_SYSTICK};
+use crate::exceptions::{EXC_HARDFAULT, EXC_NMI, EXC_PENDSV, EXC_SVCALL, EXC_SYSTICK};
+use crate::faults::{RANK_CONFIGURABLE_BASE, RANK_HARDFAULT, RANK_NMI};
 use crate::scb::icsr;
 use crate::{CortexM33Core, FIRST_EXTERNAL_EXCEPTION, scr};
 
@@ -91,25 +95,35 @@ impl fmt::Display for SystemExceptionState {
 }
 
 impl CortexM33Core {
-    /// Highest-priority pending exception as `(exception number, priority)`
-    /// 最高优先级的挂起异常，形式为 `(异常号, 优先级)`
+    /// Highest-priority pending exception as `(exception number, rank)`
+    /// 最高优先级的挂起异常，形式为 `(异常号, 优先级等级)`
     ///
-    /// External interrupts come from [`crate::Nvic::find_highest_priority`]
-    /// (enabled, pending and not active), PendSV and SysTick from
+    /// NMI is checked first because it has the highest fixed priority in the
+    /// architecture (ARMv8-M B1.5.4: Reset > NMI > HardFault). External
+    /// interrupts come from [`crate::Nvic::find_highest_priority`] (enabled,
+    /// pending and not active); PendSV, SysTick and SVCall come from
     /// [`crate::scb::Scb`]. Ties compare the exception number, which is exactly
     /// the ARMv8-M rule: a numerically smaller exception number wins, so
-    /// PendSV (14) beats SysTick (15) and both beat every external interrupt.
-    /// 外部中断来自 [`crate::Nvic::find_highest_priority`]（已使能、挂起且非活跃），
-    /// PendSV 与 SysTick 来自 [`crate::scb::Scb`]。并列时比较异常号，这正是
-    /// ARMv8-M 的规则：异常号更小者胜，因此 PendSV（14）优先于 SysTick（15），
-    /// 两者都优先于任何外部中断。
+    /// SVCall (11) beats PendSV (14), which beats SysTick (15), and all three
+    /// beat every external interrupt.
+    /// 首先检查 NMI，因为它在架构中具有最高固定优先级（ARMv8-M B1.5.4：
+    /// Reset > NMI > HardFault）。外部中断来自 [`crate::Nvic::find_highest_priority`]
+    /// （已使能、挂起且非活跃）；PendSV、SysTick 与 SVCall 来自
+    /// [`crate::scb::Scb`]。并列时比较异常号，这正是 ARMv8-M 的规则：异常号更小者胜，
+    /// 因此 SVCall（11）优先于 PendSV（14），后者优先于 SysTick（15），三者都优先于
+    /// 任何外部中断。
     #[must_use]
     pub(crate) fn pending_exception(&self) -> Option<(u16, u8)> {
-        let mut best = self
-            .nvic
-            .find_highest_priority()
-            .map(|irq| (FIRST_EXTERNAL_EXCEPTION + irq, self.nvic.get_priority(irq)));
-        for number in [EXC_PENDSV, EXC_SYSTICK] {
+        // NMI 不可屏蔽且高于所有可配置异常，直接短路。
+        // NMI is non-maskable and above every configurable exception.
+        if self.scb.nmi_pending() {
+            return Some((EXC_NMI, RANK_NMI));
+        }
+        let mut best = self.nvic.find_highest_priority().map(|irq| {
+            let number = FIRST_EXTERNAL_EXCEPTION + irq;
+            (number, self.exception_priority(number))
+        });
+        for number in [EXC_SVCALL, EXC_PENDSV, EXC_SYSTICK] {
             if !self.scb.is_pending(number) {
                 continue;
             }
@@ -123,19 +137,34 @@ impl CortexM33Core {
         best
     }
 
-    /// Priority of an exception number, active or pending
-    /// 异常号的优先级（活跃或挂起）
+    /// Priority rank of an exception number, active or pending
+    /// 异常号的优先级等级（活跃或挂起）
     ///
-    /// PendSV and SysTick decode their `SHPR3` bytes, external interrupts their
-    /// NVIC `IPR` byte. The fixed-priority system exceptions modelled here
-    /// (`UsageFault`, `SVCall`) report priority 0, the highest configurable
-    /// level, so no configurable exception can preempt them.
-    /// PendSV 与 SysTick 解码 `SHPR3` 字节，外部中断解码 NVIC `IPR` 字节。此处建模的
-    /// 固定优先级系统异常（`UsageFault`、`SVCall`）报告优先级 0，即可配置的最高
-    /// 级别，因此任何可配置异常都不能抢占它们。
+    /// NMI and HardFault use the architecture's fixed ranks (0 and 1);
+    /// configurable exceptions map to `2 + priority`, so a smaller rank always
+    /// preempts a larger one. PendSV, SysTick and SVCall decode their
+    /// `SHPR2`/`SHPR3` bytes, external interrupts their NVIC `IPR` byte, and
+    /// the fault exceptions report configurable priority 0 until `SHPR1` is
+    /// modelled.
+    /// NMI 与 HardFault 使用架构固定等级（0 与 1）；可配置异常映射为
+    /// `2 + 优先级`，因此等级更小者总能抢占。PendSV、SysTick 与 SVCall 解码各自的
+    /// `SHPR2`/`SHPR3` 字节，外部中断解码 NVIC `IPR` 字节；`SHPR1` 尚未建模前，
+    /// 故障异常报告可配置优先级 0。
     #[must_use]
     pub(crate) fn exception_priority(&self, exception_number: u16) -> u8 {
         match exception_number {
+            EXC_NMI => RANK_NMI,
+            EXC_HARDFAULT => RANK_HARDFAULT,
+            _ => RANK_CONFIGURABLE_BASE + self.configurable_priority(exception_number),
+        }
+    }
+
+    /// Raw configurable priority of an exception number
+    /// 异常号的可配置优先级原始值
+    #[must_use]
+    fn configurable_priority(&self, exception_number: u16) -> u8 {
+        match exception_number {
+            EXC_SVCALL => self.scb.svcall_priority(),
             EXC_PENDSV => self.scb.pendsv_priority(),
             EXC_SYSTICK => self.scb.systick_priority(),
             number if number >= FIRST_EXTERNAL_EXCEPTION => {
@@ -148,27 +177,47 @@ impl CortexM33Core {
     /// Whether an exception may be taken right now
     /// 当前是否允许取该异常
     ///
-    /// `PRIMASK` and `FAULTMASK` block every configurable exception (PendSV and
-    /// SysTick included), `BASEPRI` blocks priorities numerically at or above
-    /// its value, and an already active exception is only preempted by a
+    /// NMI bypasses `PRIMASK`, `FAULTMASK`, `BASEPRI` and every active-exception
+    /// comparison except an active NMI. HardFault bypasses the same masks and is
+    /// blocked only by an active NMI or HardFault. For configurable exceptions,
+    /// `FAULTMASK` blocks everything, `PRIMASK` blocks everything except SVCall
+    /// (a synchronous supervisor call latched by `SVCALLPENDED`; keeping it
+    /// pending only because `PRIMASK` is set would deadlock a supervisor call
+    /// made from a critical section), `BASEPRI` blocks priorities numerically at
+    /// or above its value, and an active exception is only preempted by a
     /// strictly higher priority. Tail-chaining an equal priority is decided by
     /// the exception return path, not here.
-    /// `PRIMASK` 与 `FAULTMASK` 屏蔽所有可配置异常（含 PendSV 与 SysTick），
-    /// `BASEPRI` 屏蔽数值大于等于其值的优先级，已活跃异常只能被严格更高的优先级
-    /// 抢占。同优先级的尾链由异常返回路径决定，不在此处判断。
+    /// NMI 绕过 `PRIMASK`、`FAULTMASK`、`BASEPRI` 与除「NMI 已活跃」外的所有
+    /// 活跃比较。HardFault 同样绕过这些屏蔽，只被活跃的 NMI 或 HardFault 阻止。
+    /// 对可配置异常：`FAULTMASK` 屏蔽全部；`PRIMASK` 屏蔽除 SVCall 外的全部
+    /// （同步监管调用由 `SVCALLPENDED` 锁存，仅因 `PRIMASK` 置位就让它永久挂起
+    /// 会让临界区中的监管调用死锁）；`BASEPRI` 屏蔽数值大于等于其值的优先级；
+    /// 活跃异常只能被严格更高的优先级抢占。同优先级的尾链由异常返回路径决定，
+    /// 不在此处判断。
     #[must_use]
-    pub(crate) fn exception_entry_allowed(&self, priority: u8) -> bool {
-        if self.registers.primask & 1 != 0 || self.registers.faultmask & 1 != 0 {
+    pub(crate) fn exception_entry_allowed(&self, exception_number: u16, rank: u8) -> bool {
+        match exception_number {
+            EXC_NMI => return !self.active_exceptions.contains(&EXC_NMI),
+            EXC_HARDFAULT => {
+                return !self.active_exceptions.contains(&EXC_NMI)
+                    && !self.active_exceptions.contains(&EXC_HARDFAULT);
+            }
+            _ => {}
+        }
+        if self.registers.faultmask & 1 != 0 {
             return false;
         }
-        if !self
-            .nvic
-            .basepri_allows_priority(priority, self.registers.basepri)
-        {
+        if self.registers.primask & 1 != 0 && exception_number != EXC_SVCALL {
+            return false;
+        }
+        if !self.nvic.basepri_allows_priority(
+            self.configurable_priority(exception_number),
+            self.registers.basepri,
+        ) {
             return false;
         }
         match self.active_exceptions.last() {
-            Some(&active) => priority < self.exception_priority(active),
+            Some(&active) => rank < self.exception_priority(active),
             None => true,
         }
     }
@@ -176,10 +225,11 @@ impl CortexM33Core {
     /// Whether some enabled external interrupt or system exception is pending
     /// 是否有已使能的外部中断或系统异常挂起
     ///
-    /// Used by the `WFI`/`WFE`/`SLEEPONEXIT` wake conditions: SysTick and PendSV
-    /// pending latches wake the core exactly like an enabled NVIC line.
-    /// 用于 `WFI`/`WFE`/`SLEEPONEXIT` 的唤醒条件：SysTick 与 PendSV 挂起锁存
-    /// 与已使能的 NVIC 线一样能唤醒核心。
+    /// Used by the `WFI`/`WFE`/`SLEEPONEXIT` wake conditions: SysTick, PendSV,
+    /// SVCall and NMI pending latches wake the core exactly like an enabled NVIC
+    /// line.
+    /// 用于 `WFI`/`WFE`/`SLEEPONEXIT` 的唤醒条件：SysTick、PendSV、SVCall 与
+    /// NMI 挂起锁存与已使能的 NVIC 线一样能唤醒核心。
     #[must_use]
     pub(crate) fn has_pending_exception(&self) -> bool {
         self.nvic.has_runnable() || self.scb.has_pending()
@@ -189,8 +239,12 @@ impl CortexM33Core {
     /// 取最高优先级的挂起异常（若允许进入）
     ///
     /// Returns `true` when an exception was entered; the caller must then skip
-    /// the instruction at the restored `PC` for this step.
+    /// the instruction at the restored `PC` for this step. Entry goes through
+    /// [`CortexM33Core::enter_exception_checked`], so a stack-limit overflow or
+    /// a stacking bus error escalates to HardFault instead of halting the core.
     /// 进入异常时返回 `true`；调用方随后必须在本步跳过恢复出的 `PC` 处指令。
+    /// 进入经由 [`CortexM33Core::enter_exception_checked`]，因此栈上限溢出或压栈
+    /// 总线错误会升级为 HardFault，而不是让核心停机。
     ///
     /// # Errors
     /// Propagates a bus error from vector fetch or stack push.
@@ -203,23 +257,37 @@ impl CortexM33Core {
         let Some((number, priority)) = self.pending_exception() else {
             return Ok(false);
         };
-        if !self.exception_entry_allowed(priority) {
+        if !self.exception_entry_allowed(number, priority) {
             return Ok(false);
         }
-        exceptions::enter_exception(
-            bus,
-            &mut self.registers,
-            &mut self.nvic,
-            &mut self.scb,
-            u32::from(number),
-            self.vtor,
-            &mut self.it_state,
-            cycles,
-        )?;
-        self.active_exceptions.push(number);
+        let entered = self.enter_exception_checked(bus, cycles, number)?;
+        self.active_exceptions.push(entered);
         // 异常进入是 ARMv8-M 的事件源。 / Exception entry is an ARMv8-M event.
         self.event_register = true;
         Ok(true)
+    }
+
+    /// Set the SVCall exception pending (`SHCSR.SVCALLPENDED`)
+    /// 置位 SVCall 异常挂起（`SHCSR.SVCALLPENDED`）
+    ///
+    /// Called when an `SVC` instruction retires. A 0-to-1 transition raises a
+    /// `SEVONPEND` event, exactly like the other system-exception latches.
+    /// 在 `SVC` 指令退役时调用。0→1 跳变会产生 `SEVONPEND` 事件，与其它系统异常
+    /// 锁存一致。
+    pub fn pend_svcall(&mut self) {
+        if self.scb.set_svcall_pending() && self.scr & scr::SEVONPEND != 0 {
+            self.event_register = true;
+        }
+    }
+
+    /// Set the NMI exception pending (`ICSR.NMIPENDSET`)
+    /// 置位 NMI 异常挂起（`ICSR.NMIPENDSET`）
+    ///
+    /// NMI is non-maskable; the pending latch can only be cleared by taking the
+    /// exception, and a 0-to-1 transition raises the `SEVONPEND` event.
+    /// NMI 不可屏蔽；挂起锁存只能由取走异常清除，0→1 跳变会产生 `SEVONPEND` 事件。
+    pub fn pend_nmi(&mut self) {
+        self.pend_system_exception(EXC_NMI);
     }
 
     /// Set the PendSV exception pending (`ICSR.PENDSVSET` write semantics)
@@ -273,14 +341,20 @@ impl CortexM33Core {
 
     /// Apply an `SCB_ICSR` write / 应用一次 `SCB_ICSR` 写入
     ///
-    /// `PENDSVSET`/`PENDSTSET` pend, `PENDSVCLR`/`PENDSTCLR` clear; the set bits
-    /// read back as the latches, the clear bits read as zero. `PENDSTSET` also
-    /// sets `SYST_CSR.COUNTFLAG`. All other bits are reserved or read-only and
-    /// are ignored on write.
-    /// `PENDSVSET`/`PENDSTSET` 置挂起，`PENDSVCLR`/`PENDSTCLR` 清除；置位位读回为
-    /// 锁存，清除位读为 0。`PENDSTSET` 同时置位 `SYST_CSR.COUNTFLAG`。其余位为保留
-    /// 或只读，写入时忽略。
+    /// `NMIPENDSET`/`PENDSVSET`/`PENDSTSET` pend, `PENDSVCLR`/`PENDSTCLR` clear;
+    /// the set bits read back as the latches, the clear bits read as zero.
+    /// Writing 0 to `NMIPENDSET` is ignored — NMI has no software clear, only
+    /// taking exception 2 clears it. `PENDSTSET` also sets
+    /// `SYST_CSR.COUNTFLAG`. All other bits are reserved or read-only and are
+    /// ignored on write.
+    /// `NMIPENDSET`/`PENDSVSET`/`PENDSTSET` 置挂起，`PENDSVCLR`/`PENDSTCLR` 清除；
+    /// 置位位读回为锁存，清除位读为 0。向 `NMIPENDSET` 写 0 被忽略——NMI 没有软件
+    /// 清除位，只有取走异常 2 才能清除。`PENDSTSET` 同时置位 `SYST_CSR.COUNTFLAG`。
+    /// 其余位为保留或只读，写入时忽略。
     pub(crate) fn write_icsr(&mut self, value: u32) {
+        if value & icsr::NMIPENDSET != 0 {
+            self.pend_nmi();
+        }
         if value & icsr::PENDSVSET != 0 {
             self.pend_pendsv();
         }
@@ -298,12 +372,12 @@ impl CortexM33Core {
     /// Compose the `SCB_ICSR` read value / 组合 `SCB_ICSR` 读值
     ///
     /// `VECTACTIVE` is `IPSR`, `VECTPENDING` is the exception number reported by
-    /// [`Self::pending_exception`], `RETTOBASE` is set while at most one
-    /// exception is active, and `ISRPENDING` reports any pending NVIC line even
-    /// when it is disabled.
+    /// [`Self::pending_exception`] (including NMI = 2 and SVCall = 11),
+    /// `RETTOBASE` is set while at most one exception is active, and
+    /// `ISRPENDING` reports any pending NVIC line even when it is disabled.
     /// `VECTACTIVE` 为 `IPSR`，`VECTPENDING` 为 [`Self::pending_exception`] 报告的
-    /// 异常号，最多只有一个活跃异常时置位 `RETTOBASE`，`ISRPENDING` 报告任何挂起的
-    /// NVIC 线（即使未使能）。
+    /// 异常号（含 NMI = 2 与 SVCall = 11），最多只有一个活跃异常时置位
+    /// `RETTOBASE`，`ISRPENDING` 报告任何挂起的 NVIC 线（即使未使能）。
     pub(crate) fn read_icsr(&self) -> u32 {
         let mut value = self.registers.xpsr & icsr::EXCEPTION_NUMBER_MASK;
         if self.nvic.has_any_pending() {
@@ -314,6 +388,9 @@ impl CortexM33Core {
         }
         if self.active_exceptions.len() <= 1 {
             value |= icsr::RETTOBASE;
+        }
+        if self.scb.nmi_pending() {
+            value |= icsr::NMIPENDSET;
         }
         if self.scb.pendsv_pending() {
             value |= icsr::PENDSVSET;

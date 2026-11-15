@@ -22,11 +22,12 @@
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
-| `scb` | `SCB_ICSR` PendSV/SysTick pending latches and `SHPR2`/`SHPR3` priorities |
-| `system_exceptions` | PendSV (14) / SysTick (15) arbitration, delivery, `ICSR` view and diagnostics |
+| `scb` | `SCB_ICSR` NMI/PendSV/SysTick pending latches, `SVCall` latch, `SHPR2`/`SHPR3` priorities |
+| `faults` | `SHCSR` enables/views, `CFSR`/`HFSR` status, `AIRCR` (`VECTKEY`/`PRIS`/`SYSRESETREQ`), fault escalation |
+| `system_exceptions` | NMI (2) / SVCall (11) / PendSV (14) / SysTick (15) arbitration, delivery, `ICSR` view and diagnostics |
 | `scr` | `SCR` sleep-control bits (`SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND`) |
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
-| `system_access` | System control space routing (`SCB_VTOR`/`SCB_ICSR`/`SCB_SHPR2`/`SCB_SHPR3`/`SCB_CPACR`/`SCB_CFSR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
+| `system_access` | System control space routing (`SCB_VTOR`/`SCB_ICSR`/`SCB_AIRCR`/`SCB_SHCSR`/`SCB_CFSR`/`SCB_HFSR`/`SCB_SHPR2`/`SCB_SHPR3`/`SCB_CPACR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
 | `fetch_cache` | Direct-mapped flash XIP instruction fetch cache (private, enabled per core) |
 | `decode_cache` | Direct-mapped decoded-instruction cache: length, raw word, dispatch tag per flash `PC` |
 | `execute_thumb16::fast` | Hot Thumb-16 executors shared by the decoder and the decode-cache fast path |
@@ -43,8 +44,9 @@ pub struct CortexM33Core {
     pub core_id: CpuId,          // Core 0 or 1
     pub registers: CortexM33Registers,
     pub nvic: Nvic,              // external IRQ lines 0..=255 only
-    pub scb: Scb,                // PendSV/SysTick latches + SHPR2/SHPR3
+    pub scb: Scb,                // NMI/SVCall/PendSV/SysTick latches + SHPR2/SHPR3
     pub systick: SysTick,
+    // private: faults: faults::FaultState  // SHCSR enables, HFSR, AIRCR
 }
 
 impl CortexM33Core {
@@ -56,7 +58,7 @@ impl CortexM33Core {
         -> Result<(), CoreError>;
     pub fn boot_at(&mut self, msp: u32, reset: u32, vector_base: u32);
 
-    // Decoding / 译码
+    // Decoding / 译码（strict 是宿主诊断选项，默认按硬件投递 HardFault）
     pub fn set_strict_decode(&mut self, strict: bool);
     pub fn write_xpsr(&mut self, value: u32);
 
@@ -64,9 +66,19 @@ impl CortexM33Core {
     pub fn set_flash_fetch_cache(&mut self, enabled: bool);
 
     // System exceptions / 系统异常
+    pub fn pend_nmi(&mut self);            // ICSR.NMIPENDSET
+    pub fn pend_svcall(&mut self);         // SHCSR.SVCALLPENDED
     pub fn pend_pendsv(&mut self);         // ICSR.PENDSVSET
     pub fn pend_systick(&mut self);        // ICSR.PENDSTSET + COUNTFLAG
     pub fn system_exception_state(&self) -> SystemExceptionState;
+
+    // Faults / 故障
+    pub fn shcsr(&self) -> u32;            // enables + live ACT/PENDED views
+    pub fn hfsr(&self) -> u32;
+    pub fn aircr(&self) -> u32;            // VECTKEYSTAT | PRIS
+    pub fn write_aircr(&mut self, value: u32) -> bool;
+    pub fn take_system_reset_request(&mut self) -> bool;
+    pub fn vect_reset_requested(&self) -> bool;
 }
 
 impl CpuCore for CortexM33Core {
@@ -421,31 +433,36 @@ impl SleepReason {
   replayed once data arrives and then retires exactly once.
 * `check_pending_exceptions` honours `FAULTMASK` and `BASEPRI` in addition to
   `PRIMASK`, applies the strictly-higher-priority preemption rule, and arbitrates
-  external interrupts together with PendSV (14) and SysTick (15); the sleep wake
-  path uses the same gate, so a sleeping core never enters an exception it should
-  keep masked.
+  external interrupts together with NMI (2), SVCall (11), PendSV (14) and
+  SysTick (15); the sleep wake path uses the same gate, so a sleeping core never
+  enters an exception it should keep masked. NMI and HardFault are fixed-priority
+  exceptions and bypass every mask.
+* `check_pending_exceptions` 在 `PRIMASK` 之外还遵守 `FAULTMASK` 与 `BASEPRI`，
+  应用「严格更高优先级才能抢占」规则，并把外部中断与 NMI（2）、SVCall（11）、
+  PendSV（14）、SysTick（15）一起仲裁；睡眠唤醒路径使用同一门控，因此睡眠核绝不
+  会进入应保持屏蔽的异常。NMI 与 HardFault 为固定优先级异常，绕过所有屏蔽。
 
 **Not modelled**: the electrical effect of `SLEEPDEEP` (power-down, clock
-gating, state retention), `WFE`'s optional timeout (`-w`), NMI/HardFault/SVCall
-delivery, and the `rp2350-cli` forwarding of a peripheral `SysTickCounter`
-expiry into [`CortexM33Core::pend_systick`] (the core side is implemented and
-covered by unit tests; until the driver forwards
+gating, state retention), `WFE`'s optional timeout (`-w`), and the `rp2350-cli`
+forwarding of a peripheral `SysTickCounter` expiry into
+[`CortexM33Core::pend_systick`] (the core side is implemented and covered by
+unit tests; until the driver forwards
 `BootPeripherals::take_systick_pending()`, a machine run keeps the expiry in the
 peripheral latch). `SEVONPEND` covers NVIC external interrupts, `STIR`/`ISPR`
-writes, `ICSR.PENDSVSET`/`PENDSTSET` and the SysTick underflow. A host that never
-signals an event and never enables an interrupt will see a `WFE`/`WFI` sleeper
-stay asleep while the machine clock keeps running — that is the hardware
-behaviour, and the CLI reports it as a `[run] sleep stall` diagnostic instead of
-hanging silently.
+writes, `ICSR.NMIPENDSET`/`PENDSVSET`/`PENDSTSET` and the SysTick underflow. A
+host that never signals an event and never enables an interrupt will see a
+`WFE`/`WFI` sleeper stay asleep while the machine clock keeps running — that is
+the hardware behaviour, and the CLI reports it as a `[run] sleep stall`
+diagnostic instead of hanging silently.
 
 未建模：`SLEEPDEEP` 的电气效果（掉电、时钟门控、状态保持）、`WFE` 的可选超时
-（`-w`）、NMI/HardFault/SVCall 投递，以及 `rp2350-cli` 把外设 `SysTickCounter`
-到期转发给 [`CortexM33Core::pend_systick`]（核侧已实现并有单元测试；在驱动转发
+（`-w`），以及 `rp2350-cli` 把外设 `SysTickCounter` 到期转发给
+[`CortexM33Core::pend_systick`]（核侧已实现并有单元测试；在驱动转发
 `BootPeripherals::take_systick_pending()` 之前，机器运行会把到期留在外设锁存中）。
-`SEVONPEND` 覆盖 NVIC 外部中断、`STIR`/`ISPR` 写入、`ICSR.PENDSVSET`/`PENDSTSET`
-与 SysTick 下溢。若宿主从不发送事件、也从不使能中断，`WFE`/`WFI` 睡眠者会保持
-睡眠而机器时钟继续推进——这正是硬件行为，CLI 以 `[run] sleep stall` 诊断报告，
-而不是静默耗尽预算。
+`SEVONPEND` 覆盖 NVIC 外部中断、`STIR`/`ISPR` 写入、
+`ICSR.NMIPENDSET`/`PENDSVSET`/`PENDSTSET` 与 SysTick 下溢。若宿主从不发送事件、
+也从不使能中断，`WFE`/`WFI` 睡眠者会保持睡眠而机器时钟继续推进——这正是硬件行为，
+CLI 以 `[run] sleep stall` 诊断报告，而不是静默耗尽预算。
 
 ### `SysTick`
 
@@ -615,6 +632,13 @@ pub fn decode32(pc: u32, word: u32) -> Entry;
   一次命中记入与取指路径完全相同的周期（16 位指令 3 个、32 位指令 6 个），快路径
   也保留原始的逐分支周期记账——包括「**已执行**的分支不额外记周期」这一点，因为
   通用分支在共享尾部之前就返回了。
+- Empty slots carry tag 0, which is also the value of `PC = 0`; `lookup` rejects
+  `Kind::Empty` explicitly so a jump to address 0 falls back to a bus fetch
+  instead of executing a phantom `word = 0` instruction. This matters for the
+  boot-ROM window and for a HardFault whose vector is 0.
+  空槽位的标签为 0，而 `PC = 0` 也是 0；`lookup` 显式拒绝 `Kind::Empty`，因此跳转到
+  地址 0 会回落到总线取指，而不是执行一条虚构的 `word = 0` 指令。这对 boot ROM
+  窗口以及向量为 0 的 HardFault 都很重要。
 - Inside an IT block every instruction still runs the full decoder, so slot
   consumption and the `setflags = !InITBlock()` flag suppression are untouched.
   `--strict-decode`, `watch`, `trace` and GDB single-step/breakpoints keep their
@@ -957,14 +981,15 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   bits are **not** modeled; NaN propagation follows IEEE-754 quiet-NaN rules.
 - **Enable/fault**: every FPU encoding checks CPACR first. Denied access
   raises a synchronous UsageFault through the real exception path:
-  `CFSR.UFSR.NOCP` set, exception number 6, standard frame stacked on
-  MSP/PSP per CONTROL, `EXC_RETURN` 0xFFFFFFF9 / 0xFFFFFFFD / 0xFFFFFFF1.
-  The stacked PC is the faulting instruction (PC is rewound before entry).
-  Because this emulator enters at the image entry point (the mask-ROM boot
-  ROM is not executed), booting applies the boot ROM's post-ROM state and
+  `CFSR.UFSR.NOCP` set, exception number 6 when `SHCSR.USGFAULTENA = 1`,
+  otherwise escalated to HardFault (3) with `HFSR.FORCED`; standard frame
+  stacked on MSP/PSP per CONTROL, `EXC_RETURN` 0xFFFFFFF9 / 0xFFFFFFFD /
+  0xFFFFFFF1. The stacked PC is the faulting instruction (PC is rewound before
+  entry). Because this emulator enters at the image entry point (the mask-ROM
+  boot ROM is not executed), booting applies the boot ROM's post-ROM state and
   leaves CP10/CP11 enabled. A power-on register file still has CPACR
   cleared, and writing CPACR to 0 is fully honored, so the NOCP path is
-  reachable and tested.
+  reachable and tested both with and without the UsageFault enable.
 - **Lazy / extended exception frames** (see the dedicated section below):
   `FPCCR`, `FPCAR` and `FPDSCR` are modeled at `0xE000EF34`, `0xE000EF38`
   and `0xE000EF3C`; exception entry reserves or stacks the 17-word FP
@@ -1004,14 +1029,15 @@ FPv5-SP 访问不要求 CP11 —— 目标固件就是在 CP11 为 `0b00` 时执
   `FZ` 清零模式、`DN` 默认 NaN、`AHP`、`FPSCR.RMode` 除就近偶数之外的
   取值以及陷阱使能位；NaN 传播遵循 IEEE-754 静默 NaN 规则。
 - **使能与故障**：每条浮点编码先检查 CPACR。拒绝访问时走真实异常通路：
-  置 `CFSR.UFSR.NOCP`，异常号 6，按 CONTROL 在 MSP/PSP 上压标准栈帧，
+  置 `CFSR.UFSR.NOCP`；`SHCSR.USGFAULTENA = 1` 时进入异常号 6，否则以
+  `HFSR.FORCED` 升级为 HardFault（3）；按 CONTROL 在 MSP/PSP 上压标准栈帧，
   `EXC_RETURN` 为 0xFFFFFFF9 / 0xFFFFFFFD / 0xFFFFFFF1；压栈 PC 为
   引发故障的指令（进入前已回退 PC）。
 
   由于本模拟器直接从映像入口开始（不执行掩膜 ROM 中的 boot ROM），
   启动时复现 boot ROM 交付状态，使 CP10/CP11 保持使能。上电寄存器文件
   的 CPACR 仍为清零状态；把 CPACR 写 0 也会被完全遵守，因此 NOCP
-  通路可达且已被测试覆盖。
+  通路在使能与未使能 UsageFault 两种情形下都可达且已被测试覆盖。
 - **惰性 / 扩展异常帧**（详见下一节）：在 `0xE000EF34`、`0xE000EF38`、
   `0xE000EF3C` 建模 `FPCCR`、`FPCAR`、`FPDSCR`；异常进入按
   `FPCCR.ASPEN`/`LSPEN` 预留或立即压入 17 字浮点上下文，异常返回按需
@@ -1237,12 +1263,15 @@ to 1 instead of following the Cortex-M33 reset value of 0.
 
 ### Not implemented / 未实现清单
 
-These encodings are currently reported as **undefined instructions**
-(PC and opcode logged), never silently skipped. They are tracked so that
-firmware relying on them can be identified immediately.
+These encodings are currently reported as **undefined instructions** (PC and
+opcode logged) and, by default, escalate to HardFault; `set_strict_decode(true)`
+turns them into a host-visible halt with the opcode in the error. They are
+never silently skipped. They are tracked so that firmware relying on them can
+be identified immediately.
 
-以下编码当前按**未定义指令**上报（记录 PC 与 opcode），绝不静默跳过。
-列表用于快速定位依赖这些功能的固件。
+以下编码当前按**未定义指令**上报（记录 PC 与 opcode），默认升级为 HardFault；
+`set_strict_decode(true)` 会把它们变成宿主可见的停机，并在错误中携带操作码。
+绝不静默跳过。列表用于快速定位依赖这些功能的固件。
 
 1. Double-precision arithmetic and conversions (`VADD.F64` …, `VCVT.F64.F32`,
    `VCVT.F32.F64`) — the `D0-D15` view is storage only, and the encodings are
@@ -1411,7 +1440,7 @@ Handler，PSP）、`0xFFFFFFF9`（Thread MSP）、`0xFFFFFFFD`（Thread PSP）�
 异常进入总是让处理程序使用 MSP（`CONTROL.SPSEL = 0`）；bit2 记录被打断的 SPSEL，
 返回时恢复，因此原本使用 PSP 的线程或处理程序会继续使用 PSP。
 
-### PendSV / SysTick system exceptions / PendSV 与 SysTick 系统异常
+### System exceptions: NMI, SVCall, PendSV, SysTick / 系统异常
 
 Execution numbering and pending representation are kept separate from the NVIC:
 
@@ -1419,76 +1448,174 @@ Execution numbering and pending representation are kept separate from the NVIC:
   `IABR` and `IPR`. Bit `n` always means external interrupt `n`, whose exception
   number is `16 + n`. Software-pending bit 15 through `ISPR`/`STIR` therefore
   enters **exception 31**, never SysTick.
-- `Scb` (`scb.rs`) owns the two system-exception latches `ICSR.PENDSVSET` (14)
-  and `ICSR.PENDSTSET` (15) plus `SHPR2` (SVCall byte 3, stored) and `SHPR3`
-  (PendSV byte 2, SysTick byte 3).
+- `Scb` (`scb.rs`) owns four system-exception latches — `ICSR.NMIPENDSET` (2),
+  `SHCSR.SVCALLPENDED` (11), `ICSR.PENDSVSET` (14) and `ICSR.PENDSTSET` (15) —
+  plus `SHPR2` (SVCall byte 3) and `SHPR3` (PendSV byte 2, SysTick byte 3).
+- `SVC #imm` retires, pends exception 11, and the shared arbitration at the end
+  of the same `step` enters `VTOR + 0x2C` when the priority gate allows. The
+  handler recovers `imm` from the stacked return address: the frame holds the
+  address after the `SVC`, so the instruction at `stacked_pc - 2` is the `SVC`
+  itself. `SHCSR.SVCALLACT` / `SVCALLPENDED` mirror the live state. `PRIMASK`
+  does not delay SVCall (a synchronous supervisor call latched in `SHCSR`), but
+  `FAULTMASK` and `BASEPRI` do.
+- An `ICSR.NMIPENDSET` write of 1 pends NMI; a write of 0 is ignored, and only
+  taking exception 2 clears the latch. NMI enters `VTOR + 0x08` and cannot be
+  masked by `PRIMASK`, `FAULTMASK` or `BASEPRI`.
 - SysTick expiry (`SYST_CSR.TICKINT` plus a counter wrap) calls `pend_systick()`,
   which latches `PENDSTSET` and `SYST_CSR.COUNTFLAG`. Writing `PENDSTSET` from
   software has exactly the same effect (ARMv8-M B3.2.6).
 - Taking an exception clears its latch (one-shot); `PENDSVCLR` / `PENDSTCLR`
-  clear it from software. `VECTPENDING` reads the highest-priority pending
-  exception number (0 when none), `VECTACTIVE` mirrors `IPSR`, `RETTOBASE` is 1
-  while at most one exception is active, and `ISRPENDING` reports any NVIC line
-  even when disabled.
+  clear PendSV/SysTick from software, while NMI and SVCall have no software
+  clear. `VECTPENDING` reads the highest-priority pending exception number
+  (0 when none, including NMI = 2 and SVCall = 11), `VECTACTIVE` mirrors `IPSR`,
+  `RETTOBASE` is 1 while at most one exception is active, and `ISRPENDING`
+  reports any NVIC line even when disabled.
 
-Arbitration is one numeric-priority pass over both sources:
+Arbitration is one ranked pass over all sources (`faults::RANK_*`):
 
-1. External candidates come from `Nvic::find_highest_priority()` (enabled,
-   pending, not active). PendSV/SysTick candidates come from their latches.
-2. A numerically smaller priority wins; ties compare the **exception number**,
-   so PendSV (14) beats SysTick (15), and both beat every external interrupt
-   (16+). This matches the ARMv8-M rule that ties pick the lowest exception
-   number.
-3. `PRIMASK` and `FAULTMASK` block every configurable exception (SysTick and
-   PendSV included), `BASEPRI` blocks priorities numerically at or above its
-   value, and an active exception is only preempted by a **strictly** higher
-   priority. Sleeping cores use the same gate, so a wake-up never takes a masked
-   exception.
-4. `WFI`, `WFE` and `SLEEPONEXIT` treat a pending PendSV/SysTick latch as a wake
-   source exactly like an enabled NVIC line.
+1. NMI has fixed rank 0 and HardFault rank 1. NMI therefore preempts every
+   configurable exception **and** HardFault, matching ARMv8-M B1.5.4
+   (`Reset > NMI > HardFault`).
+2. External candidates come from `Nvic::find_highest_priority()` (enabled,
+   pending, not active); SVCall/PendSV/SysTick candidates come from their
+   latches. Configurable rank is `2 + priority`. A numerically smaller priority
+   wins; ties compare the **exception number**, so SVCall (11) beats PendSV (14),
+   which beats SysTick (15), and all three beat every external interrupt (16+).
+3. `FAULTMASK` blocks every configurable exception, `PRIMASK` blocks every
+   configurable exception except SVCall, `BASEPRI` blocks priorities numerically
+   at or above its value, and an active exception is only preempted by a
+   **strictly** higher priority. NMI and HardFault bypass all three masks.
+   Sleeping cores use the same gate, so a wake-up never takes a masked exception.
+4. `WFI`, `WFE` and `SLEEPONEXIT` treat any pending system-exception latch
+   (including NMI and SVCall) as a wake source exactly like an enabled NVIC line.
 
 Diagnostics: `system_exception_state()` (`systick=<state> pendsv=<state>`) is
-the stable string exposed by the core; `pend_pendsv()`/`pend_systick()` are the
-host entry points. In the full machine the `rp2350-periph` PPB stub replays
-`ICSR`/`SHPR2`/`SHPR3` writes into the core, so firmware pends PendSV and sets
-system priorities; delivering a peripheral-side SysTick expiry to the core needs
-the driver to forward `BootPeripherals::take_systick_pending()` to
-`pend_systick()` (CLI wiring, outside this crate).
+the stable string exposed by the core; `pend_nmi()`, `pend_svcall()`,
+`pend_pendsv()` and `pend_systick()` are the host entry points. In the full
+machine the `rp2350-periph` PPB stub replays `ICSR`/`SHPR2`/`SHPR3` writes into
+the core, so firmware pends NMI/PendSV and sets system priorities; delivering a
+peripheral-side SysTick expiry to the core needs the driver to forward
+`BootPeripherals::take_systick_pending()` to `pend_systick()` (CLI wiring,
+outside this crate). The PPB stub does **not** yet replay `SHCSR`, `CFSR`,
+`HFSR` or `AIRCR`, so firmware-side fault enables and `SYSRESETREQ` only take
+effect when a host writes them through `CpuCore::system_write` directly.
+
 执行编号与挂起表示与 NVIC 分开：
 
 - `Nvic` 只拥有外部中断线 `0..=255`：`ISPR`/`ICPR`、`ISER`/`ICER`、`IABR` 与
   `IPR`。位 `n` 永远是外部中断 `n`（异常号 `16 + n`）。因此通过 `ISPR`/`STIR`
   软件挂起位 15 进入的是**异常 31**，绝不是 SysTick。
-- `Scb`（`scb.rs`）拥有两个系统异常锁存 `ICSR.PENDSVSET`（14）与
-  `ICSR.PENDSTSET`（15），以及 `SHPR2`（第 3 字节 SVCall，仅存储）与 `SHPR3`
-  （第 2 字节 PendSV、第 3 字节 SysTick）。
+- `Scb`（`scb.rs`）拥有四个系统异常锁存——`ICSR.NMIPENDSET`（2）、
+  `SHCSR.SVCALLPENDED`（11）、`ICSR.PENDSVSET`（14）与 `ICSR.PENDSTSET`（15）
+  ——以及 `SHPR2`（第 3 字节 SVCall）与 `SHPR3`（第 2 字节 PendSV、第 3 字节
+  SysTick）。
+- `SVC #imm` 退役后挂起异常 11，同一步末尾的统一仲裁在优先级允许时进入
+  `VTOR + 0x2C`。处理程序从压栈返回地址取回 `imm`：栈帧保存 `SVC` 的后继地址，
+  因此 `stacked_pc - 2` 处的指令就是 `SVC` 本身。`SHCSR.SVCALLACT`/
+  `SVCALLPENDED` 反映实时状态。`PRIMASK` 不会延迟 SVCall（同步监管调用已锁存在
+  `SHCSR`），但 `FAULTMASK` 与 `BASEPRI` 会。
+- `ICSR.NMIPENDSET` 写 1 挂起 NMI；写 0 被忽略，只有取走异常 2 才清除锁存。NMI
+  从 `VTOR + 0x08` 进入，`PRIMASK`、`FAULTMASK`、`BASEPRI` 都无法屏蔽它。
 - SysTick 到期（`SYST_CSR.TICKINT` 且计数器回绕）调用 `pend_systick()`，置位
   `PENDSTSET` 与 `SYST_CSR.COUNTFLAG`。软件写 `PENDSTSET` 效果完全相同
   （ARMv8-M B3.2.6）。
-- 取走异常即清除锁存（一次性）；`PENDSVCLR`/`PENDSTCLR` 由软件清除。
-  `VECTPENDING` 读出最高优先级挂起异常的异常号（无挂起为 0），`VECTACTIVE`
+- 取走异常即清除锁存（一次性）；`PENDSVCLR`/`PENDSTCLR` 由软件清除
+  PendSV/SysTick，NMI 与 SVCall 没有软件清除位。`VECTPENDING` 读出最高优先级
+  挂起异常的异常号（无挂起为 0，含 NMI = 2 与 SVCall = 11），`VECTACTIVE`
   等于 `IPSR`，最多只有一个活跃异常时 `RETTOBASE` 为 1，`ISRPENDING` 报告任何
   NVIC 挂起线（即使未使能）。
 
-仲裁是一次数值优先级遍历：
+仲裁对所有来源做一次等级遍历（`faults::RANK_*`）：
 
-1. 外部候选来自 `Nvic::find_highest_priority()`（已使能、挂起、非活跃）；
-   PendSV/SysTick 候选来自各自锁存。
-2. 优先级数值更小者胜；并列时比较**异常号**，因此 PendSV（14）优先于
-   SysTick（15），两者都优先于任何外部中断（16+）。这与 ARMv8-M「并列取最小
-   异常号」的规则一致。
-3. `PRIMASK` 与 `FAULTMASK` 屏蔽所有可配置异常（含 SysTick 与 PendSV），
-   `BASEPRI` 屏蔽数值大于等于其值的优先级，活跃异常只能被**严格**更高优先级
-   抢占。睡眠核使用同一门控，因此唤醒绝不会取走被屏蔽的异常。
-4. `WFI`、`WFE` 与 `SLEEPONEXIT` 把 PendSV/SysTick 挂起锁存视作与已使能 NVIC 线
-   相同的唤醒源。
+1. NMI 固定等级 0、HardFault 等级 1。因此 NMI 抢占所有可配置异常**以及**
+   HardFault，符合 ARMv8-M B1.5.4（`Reset > NMI > HardFault`）。
+2. 外部候选来自 `Nvic::find_highest_priority()`（已使能、挂起、非活跃）；
+   SVCall/PendSV/SysTick 候选来自各自锁存。可配置等级为 `2 + 优先级`。优先级
+   数值更小者胜；并列时比较**异常号**，因此 SVCall（11）优先于 PendSV（14），
+   后者优先于 SysTick（15），三者都优先于任何外部中断（16+）。
+3. `FAULTMASK` 屏蔽所有可配置异常；`PRIMASK` 屏蔽除 SVCall 外的可配置异常；
+   `BASEPRI` 屏蔽数值大于等于其值的优先级；活跃异常只能被**严格**更高优先级
+   抢占。NMI 与 HardFault 绕过这三种屏蔽。睡眠核使用同一门控，因此唤醒绝不会
+   取走被屏蔽的异常。
+4. `WFI`、`WFE` 与 `SLEEPONEXIT` 把任何系统异常挂起锁存（含 NMI 与 SVCall）
+   视作与已使能 NVIC 线相同的唤醒源。
 
 诊断：`system_exception_state()`（`systick=<state> pendsv=<state>`）是核心暴露的
-稳定字符串；`pend_pendsv()`/`pend_systick()` 是宿主入口。完整机器中
-`rp2350-periph` 的 PPB 桩已把 `ICSR`/`SHPR2`/`SHPR3` 写入回放到核，因此固件可
-挂起 PendSV 并设置系统优先级；把外设侧 SysTick 到期投递到核仍需驱动把
-`BootPeripherals::take_systick_pending()` 转发到 `pend_systick()`（属 CLI 接线，
-不在本 crate 内）。
+稳定字符串；`pend_nmi()`、`pend_svcall()`、`pend_pendsv()`、`pend_systick()` 是
+宿主入口。完整机器中 `rp2350-periph` 的 PPB 桩已把 `ICSR`/`SHPR2`/`SHPR3` 写入
+回放到核，因此固件可挂起 NMI/PendSV 并设置系统优先级；把外设侧 SysTick 到期投递
+到核仍需驱动把 `BootPeripherals::take_systick_pending()` 转发到 `pend_systick()`
+（属 CLI 接线，不在本 crate 内）。PPB 桩**尚未**回放 `SHCSR`、`CFSR`、`HFSR`、
+`AIRCR`，因此固件侧写故障使能或 `SYSRESETREQ` 只有在宿主直接通过
+`CpuCore::system_write` 写入时才生效。
+
+### Fault escalation / 故障升级
+
+Every synchronous fault funnels through `CortexM33Core::finish_instruction` and
+`raise_sync_fault`, so the enabled-handler rule and the stacked return address
+are identical for all sources:
+
+| Source / 来源 | CFSR / HFSR | Handler / 处理程序 |
+|---------------|-------------|--------------------|
+| Undefined instruction / 未定义指令 | `UFSR.UNDEFINSTR` (16) | UsageFault 6 if `USGFAULTENA` **and** priority allows, else HardFault 3 + `HFSR.FORCED` |
+| Illegal `EXC_RETURN` / 非法返回 | `UFSR.INVSTATE` (17) | same / 同上 |
+| Coprocessor access denied / 协处理器拒绝 | `UFSR.NOCP` (19) | same / 同上 |
+| `SVC` / 监管调用 | — | SVCall 11 (pending in `SHCSR.SVCALLPENDED`) |
+| `BKPT` without debugger / 无调试器 | `HFSR.DEBUGEVT` (31) | HardFault 3 |
+| Frame crosses `MSPLIM`/`PSPLIM` | `UFSR.STKOF` (20) + `HFSR.FORCED` | HardFault 3 |
+| Bus error while stacking / 压栈总线错误 | `BFSR.STKERR` (12) + `HFSR.FORCED` | HardFault 3 |
+
+- Vectors: NMI `VTOR + 0x08`, HardFault `VTOR + 0x0C`, UsageFault `VTOR + 0x18`,
+  SVCall `VTOR + 0x2C`.
+- HardFault has the highest configurable level and ignores `PRIMASK`, `BASEPRI`
+  and `FAULTMASK`; only NMI outranks it (ARMv8-M B1.5.4).
+- A synchronous fault frame stacks the **faulting instruction** address (not its
+  successor), which is the ARM ARM rule for `UNDEFINSTR`/`INVSTATE`; `SVC` is the
+  exception and stacks its successor so the handler can read `imm` at
+  `stacked_pc - 2`. `MSPLIM`/`PSPLIM` overflow is detected before stacking; the
+  escalated HardFault frame deliberately skips the limit check so the handler is
+  still reachable (real hardware would lock up when the second frame also
+  overflows, which this model reports as a propagated bus error).
+- `set_strict_decode(true)` keeps the host diagnostic behaviour: an undefined
+  instruction returns `CoreError::UndefinedInstruction` and halts the core
+  instead of delivering HardFault. The default (`false`) is architectural.
+
+- 向量：NMI `VTOR + 0x08`、HardFault `VTOR + 0x0C`、UsageFault `VTOR + 0x18`、
+  SVCall `VTOR + 0x2C`。
+- HardFault 处于最高可配置层级，且忽略 `PRIMASK`、`BASEPRI`、`FAULTMASK`；
+  只有 NMI 高于它（ARMv8-M B1.5.4）。
+- 同步故障栈帧压入**故障指令**地址（不是后继地址），这是 ARM ARM 对
+  `UNDEFINSTR`/`INVSTATE` 的规则；`SVC` 是例外，压入后继地址，使处理程序能在
+  `stacked_pc - 2` 读到 `imm`。`MSPLIM`/`PSPLIM` 溢出在压栈前检测；升级后的
+  HardFault 帧刻意跳过上限检查，保证处理程序仍可到达（真实硬件在第二个帧也溢出
+  时会进入 lockup，本模型改为传播总线错误）。
+- `set_strict_decode(true)` 保留宿主诊断行为：未定义指令返回
+  `CoreError::UndefinedInstruction` 并停机，而不是投递 HardFault。默认（`false`）
+  为架构行为。
+
+### Fault and control registers / 故障与控制寄存器
+
+| Register | Address | Model / 建模 |
+|----------|---------|--------------|
+| `SHCSR` | `0xE000_ED24` | Writable `MEMFAULTENA`/`BUSFAULTENA`/`USGFAULTENA`; `MEMFAULTACT`/`BUSFAULTACT`/`USGFAULTACT`/`NMIACT`/`SVCALLACT`/`PENDSVACT`/`SYSTICKACT`/`HARDFAULTACT` are live views of the exception stack; `SVCALLPENDED` mirrors the SCB latch; `HARDFAULTPENDED` reads 0 (HardFault is always entered synchronously). |
+| `CFSR` | `0xE000_ED28` | MMFSR/BFSR/UFSR bits for `UNDEFINSTR`, `INVSTATE`, `INVPC`, `NOCP`, `STKOF`, `STKERR`, `UNSTKERR`, `IBUSERR`, `PRECISERR`, `IMPRECISERR`, `UNALIGNED`, `DIVBYZERO`; write-one-to-clear. |
+| `HFSR` | `0xE000_ED2C` | `FORCED` (30), `DEBUGEVT` (31), `VECTTBL` (1); write-one-to-clear. `VECTTBL` has no source yet. |
+| `AIRCR` | `0xE000_ED0C` | A write is accepted only with `VECTKEY = 0x05FA`; `PRIS` (14) is stored; `SYSRESETREQ` (2) latches a one-shot event read by `take_system_reset_request()`; `VECTRESET` (0) is latched for diagnostics (`vect_reset_requested()`); `VECTKEYSTAT` reads `0xFA05`, write-only request bits read 0. |
+| `SHPR1` | `0xE000_ED18` | **Not modelled**: MemManage/BusFault/UsageFault priorities report 0. |
+| `CCR` | `0xE000_ED14` | **Not modelled**: `UNALIGN_TRP`/`DIV_0_TRP`/`STKALIGN` behave as 0. |
+
+The table above is the complete modelled fault surface. **Still unmodelled /
+仍未建模**: TrustZone secure/non-secure state (there is one register file and one
+`SHCSR`; `SECUREFAULT*` bits are absent), MemManage/BusFault sources from MPU or
+data/instruction accesses (bus errors still surface as `CoreError` for the host
+and halt the core), `SHPR1` priorities, `CCR` traps, `HFSR.VECTTBL`, debug-monitor
+(`MONITORACT`) and lockup semantics, and `SHCSR.HARDFAULTPENDED`.
+
+上表是完整的故障建模范围。**仍未建模**：TrustZone 安全/非安全态（只有一套
+寄存器文件与一个 `SHCSR`，没有 `SECUREFAULT*` 位）、来自 MPU 或数据/取指访问的
+MemManage/BusFault 源（总线错误仍以 `CoreError` 上报宿主并停机）、`SHPR1`
+优先级、`CCR` 陷阱、`HFSR.VECTTBL`、调试监视器（`MONITORACT`）与 lockup 语义，
+以及 `SHCSR.HARDFAULTPENDED`。
 
 ---
 

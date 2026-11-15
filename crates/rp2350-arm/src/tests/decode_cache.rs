@@ -428,3 +428,22 @@ fn the_cache_fills_and_hits_within_the_hot_loop() {
     // loop keeps working; hit behaviour is covered by the differential tests.
     assert!(core.decode_cache_flushes() < 16);
 }
+
+#[test]
+fn pc_zero_falls_back_to_the_bus_with_the_cache_enabled() {
+    // PC=0 与译码缓存空槽位的 tag=0 相等；空槽位不是有效条目，因此缓存核心
+    // 必须像无缓存核心一样访问总线（此处地址 0 未映射 → BusError）。
+    // PC=0 equals an empty decode-cache slot's tag 0; an empty slot is not a
+    // valid entry, so the cached core must touch the bus exactly like the
+    // uncached core (address 0 is unmapped here → BusError).
+    let program = loop_program(&[0x2001, 0x2002]);
+    let (mut cached, mut cached_bus) = machine(&program, true);
+    let (mut plain, mut plain_bus) = machine(&program, false);
+    cached.registers.pc = 0;
+    plain.registers.pc = 0;
+    let a = cached.step(&mut cached_bus);
+    let b = plain.step(&mut plain_bus);
+    assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    assert!(a.is_err(), "address 0 is unmapped in this fixture");
+    assert_eq!(snapshot(&cached), snapshot(&plain));
+}

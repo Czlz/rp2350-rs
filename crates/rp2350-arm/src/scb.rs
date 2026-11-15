@@ -1,20 +1,23 @@
 //! System Control Block exception state (ARMv8-M)
 //! 系统控制块异常状态（ARMv8-M）
 //!
-//! ARMv8-M numbers the two software-triggered system exceptions separately from
-//! the external interrupt lines: `PendSV` is exception 14 and `SysTick` is
-//! exception 15, while external interrupt `n` is exception `16 + n`. Their
-//! pending bits live in `SCB_ICSR` (`PENDSVSET` / `PENDSVCLR` / `PENDSTSET` /
-//! `PENDSTCLR`) and their priorities live in `SCB_SHPR3` (PendSV in byte 2,
+//! ARMv8-M numbers the software-triggered system exceptions separately from
+//! the external interrupt lines: `NMI` is exception 2, `PendSV` is exception
+//! 14, `SVCall` is exception 11 and `SysTick` is exception 15, while external
+//! interrupt `n` is exception `16 + n`. Their pending bits live in `SCB_ICSR`
+//! (`NMIPENDSET` / `PENDSVSET` / `PENDSVCLR` / `PENDSTSET` / `PENDSTCLR`) or in
+//! `SHCSR.SVCALLPENDED` (modelled by [`crate::faults`]), and their priorities
+//! live in `SCB_SHPR2` (SVCall in byte 3) and `SCB_SHPR3` (PendSV in byte 2,
 //! SysTick in byte 3). This module keeps that state apart from [`crate::Nvic`],
 //! whose 256 pending bits are the external IRQ lines only, so a SysTick
 //! exception can never be mistaken for external IRQ 15.
-//! ARMv8-M 把两个软件触发的系统异常与外部中断线分开编号：`PendSV` 为异常 14、
-//! `SysTick` 为异常 15，而外部中断 `n` 为异常 `16 + n`。它们的挂起位位于
-//! `SCB_ICSR`（`PENDSVSET`/`PENDSVCLR`/`PENDSTSET`/`PENDSTCLR`），优先级位于
-//! `SCB_SHPR3`（PendSV 在第 2 字节、SysTick 在第 3 字节）。本模块把这些状态与
-//! [`crate::Nvic`] 的 256 个挂起位分开保存，后者只表示外部中断线，因此 SysTick
-//! 异常绝不会被误当作外部 IRQ 15。
+//! ARMv8-M 把软件触发的系统异常与外部中断线分开编号：`NMI` 为异常 2、`PendSV`
+//! 为异常 14、`SVCall` 为异常 11、`SysTick` 为异常 15，而外部中断 `n` 为异常
+//! `16 + n`。它们的挂起位位于 `SCB_ICSR`（`NMIPENDSET`/`PENDSVSET`/`PENDSVCLR`/
+//! `PENDSTSET`/`PENDSTCLR`）或 `SHCSR.SVCALLPENDED`（由 [`crate::faults`] 建模），
+//! 优先级位于 `SCB_SHPR2`（第 3 字节 SVCall）与 `SCB_SHPR3`（第 2 字节 PendSV、
+//! 第 3 字节 SysTick）。本模块把这些状态与 [`crate::Nvic`] 的 256 个挂起位分开
+//! 保存，后者只表示外部中断线，因此 SysTick 异常绝不会被误当作外部 IRQ 15。
 
 // SCB 寄存器使用 ARM 定义的首字母缩写词命名，文档标记反映硬件参考手册的命名约定。
 // SCB registers use ARM-defined acronyms; doc markup reflects the reference manual.
@@ -24,6 +27,10 @@ use crate::nvic::PRIORITY_BITS;
 
 /// `SCB_ICSR` bit definitions (ARMv8-M B3.2.6) / `SCB_ICSR` 位定义
 pub mod icsr {
+    /// NMI set-pending (write 1 to pend; reads back the pending state)
+    /// NMI 置挂起（写 1 挂起；读回挂起状态）
+    pub const NMIPENDSET: u32 = 1 << 31;
+
     /// PendSV set-pending (write 1 to pend; reads back the pending state)
     /// PendSV 置挂起（写 1 挂起；读回挂起状态）
     pub const PENDSVSET: u32 = 1 << 28;
@@ -72,8 +79,8 @@ const SHPR2_MODELED: u32 = 0xE000_0000;
 /// 单个优先级字节中实现的优先级位
 const PRIORITY_BYTE_MASK: u32 = 0xE0;
 
-/// System Control Block exception state for PendSV and SysTick
-/// PendSV 与 SysTick 的系统控制块异常状态
+/// System Control Block exception state for NMI, SVCall, PendSV and SysTick
+/// NMI、SVCall、PendSV 与 SysTick 的系统控制块异常状态
 ///
 /// Holds exactly the state that belongs to the system exceptions: their pending
 /// latches and the `SHPR2`/`SHPR3` priority bytes. Active state stays in the
@@ -82,6 +89,10 @@ const PRIORITY_BYTE_MASK: u32 = 0xE0;
 /// 由核心的异常栈保存，因为它与所有其它异常共享。
 #[derive(Debug, Clone)]
 pub struct Scb {
+    /// `ICSR.NMIPENDSET` latch / `ICSR.NMIPENDSET` 锁存
+    nmi_pending: bool,
+    /// `SHCSR.SVCALLPENDED` latch / `SHCSR.SVCALLPENDED` 锁存
+    svcall_pending: bool,
     /// `ICSR.PENDSVSET` latch / `ICSR.PENDSVSET` 锁存
     pendsv_pending: bool,
     /// `ICSR.PENDSTSET` latch / `ICSR.PENDSTSET` 锁存
@@ -99,11 +110,31 @@ impl Scb {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            nmi_pending: false,
+            svcall_pending: false,
             pendsv_pending: false,
             systick_pending: false,
             shpr2: 0,
             shpr3: 0,
         }
+    }
+
+    /// Whether NMI is pending / NMI 是否挂起
+    #[must_use]
+    pub fn nmi_pending(&self) -> bool {
+        self.nmi_pending
+    }
+
+    /// Whether SVCall is pending / SVCall 是否挂起
+    #[must_use]
+    pub fn svcall_pending(&self) -> bool {
+        self.svcall_pending
+    }
+
+    /// Set the SVCall pending latch, returning `true` on a 0-to-1 transition
+    /// 置位 SVCall 挂起锁存，0→1 跳变时返回 `true`
+    pub fn set_svcall_pending(&mut self) -> bool {
+        !std::mem::replace(&mut self.svcall_pending, true)
     }
 
     /// Whether PendSV is pending / PendSV 是否挂起
@@ -122,18 +153,21 @@ impl Scb {
     /// 是否有任何已建模的系统异常挂起
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        self.pendsv_pending || self.systick_pending
+        self.nmi_pending || self.svcall_pending || self.pendsv_pending || self.systick_pending
     }
 
     /// Whether `exception_number` is pending / `exception_number` 是否挂起
     ///
-    /// Only PendSV (14) and SysTick (15) have state here; every other number
-    /// reads as not pending. External IRQs live in [`crate::Nvic`].
-    /// 这里只保存 PendSV（14）与 SysTick（15）的状态；其它编号一律读为未挂起。
-    /// 外部中断位于 [`crate::Nvic`]。
+    /// Only NMI (2), SVCall (11), PendSV (14) and SysTick (15) have state here;
+    /// every other number reads as not pending. External IRQs live in
+    /// [`crate::Nvic`].
+    /// 这里只保存 NMI（2）、SVCall（11）、PendSV（14）与 SysTick（15）的状态；
+    /// 其它编号一律读为未挂起。外部中断位于 [`crate::Nvic`]。
     #[must_use]
     pub fn is_pending(&self, exception_number: u16) -> bool {
         match exception_number {
+            crate::exceptions::EXC_NMI => self.nmi_pending,
+            crate::exceptions::EXC_SVCALL => self.svcall_pending,
             crate::exceptions::EXC_PENDSV => self.pendsv_pending,
             crate::exceptions::EXC_SYSTICK => self.systick_pending,
             _ => false,
@@ -149,6 +183,8 @@ impl Scb {
     /// [`Self::is_pending`]。
     pub fn set_pending(&mut self, exception_number: u16) -> bool {
         match exception_number {
+            crate::exceptions::EXC_NMI => !std::mem::replace(&mut self.nmi_pending, true),
+            crate::exceptions::EXC_SVCALL => self.set_svcall_pending(),
             crate::exceptions::EXC_PENDSV => !std::mem::replace(&mut self.pendsv_pending, true),
             crate::exceptions::EXC_SYSTICK => !std::mem::replace(&mut self.systick_pending, true),
             _ => false,
@@ -158,6 +194,8 @@ impl Scb {
     /// Clear `exception_number` pending / 清除 `exception_number` 挂起
     pub fn clear_pending(&mut self, exception_number: u16) {
         match exception_number {
+            crate::exceptions::EXC_NMI => self.nmi_pending = false,
+            crate::exceptions::EXC_SVCALL => self.svcall_pending = false,
             crate::exceptions::EXC_PENDSV => self.pendsv_pending = false,
             crate::exceptions::EXC_SYSTICK => self.systick_pending = false,
             _ => {}
@@ -168,6 +206,12 @@ impl Scb {
     /// 把一个优先级字节解码为实现宽度的优先级值
     fn decode_priority(byte: u32) -> u8 {
         ((byte & PRIORITY_BYTE_MASK) >> (8 - PRIORITY_BITS)) as u8
+    }
+
+    /// Priority of SVCall (`SHPR2[31:24]`) / SVCall 优先级（`SHPR2[31:24]`）
+    #[must_use]
+    pub fn svcall_priority(&self) -> u8 {
+        Self::decode_priority((self.shpr2 >> 24) & 0xFF)
     }
 
     /// Priority of PendSV (`SHPR3[23:16]`) / PendSV 优先级（`SHPR3[23:16]`）
@@ -277,5 +321,34 @@ mod tests {
         let mut scb = Scb::new();
         scb.write_shpr2(0xFFFF_FFFF);
         assert_eq!(scb.read_shpr2(), 0xE000_0000);
+        assert_eq!(scb.svcall_priority(), 7);
+        scb.write_shpr2(0x4000_0000);
+        assert_eq!(scb.svcall_priority(), 2);
+    }
+
+    #[test]
+    fn nmi_and_svcall_latches_are_independent_system_exceptions() {
+        let mut scb = Scb::new();
+        assert!(!scb.nmi_pending());
+        assert!(!scb.svcall_pending());
+
+        assert!(scb.set_pending(crate::exceptions::EXC_NMI));
+        assert!(!scb.set_pending(crate::exceptions::EXC_NMI));
+        assert!(scb.nmi_pending());
+        assert!(scb.has_pending());
+
+        assert!(scb.set_svcall_pending());
+        assert!(!scb.set_svcall_pending());
+        assert!(scb.svcall_pending());
+        assert!(!scb.pendsv_pending());
+        assert!(!scb.systick_pending());
+
+        // 取走异常清除自己的锁存，绝不影响其它异常。
+        // Taking one exception clears its own latch only.
+        scb.clear_pending(crate::exceptions::EXC_NMI);
+        assert!(!scb.nmi_pending());
+        assert!(scb.svcall_pending());
+        scb.clear_pending(crate::exceptions::EXC_SVCALL);
+        assert!(!scb.has_pending());
     }
 }

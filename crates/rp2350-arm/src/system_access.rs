@@ -27,6 +27,17 @@ use super::{CortexM33Core, NVIC_BASE, SCB_CFSR, SCB_CPACR, SCB_VTOR, SYSTICK_BAS
 /// `SCB_ICSR` —— 挂起/活跃异常控制与状态
 const SCB_ICSR: u32 = 0xE000_ED04;
 
+/// `SCB_AIRCR` — VECTKEY / PRIS / SYSRESETREQ / VECTRESET
+/// `SCB_AIRCR` —— VECTKEY / PRIS / SYSRESETREQ / VECTRESET
+const SCB_AIRCR: u32 = 0xE000_ED0C;
+
+/// `SCB_SHCSR` — fault enables plus active/pending views
+/// `SCB_SHCSR` —— 故障使能与活跃/挂起视图
+const SCB_SHCSR: u32 = 0xE000_ED24;
+
+/// `SCB_HFSR` — HardFault status / `SCB_HFSR` —— HardFault 状态
+const SCB_HFSR: u32 = 0xE000_ED2C;
+
 /// `SCB_SHPR2` — SVCall priority in byte 3 / `SCB_SHPR2` —— 第 3 字节为 SVCall 优先级
 const SCB_SHPR2: u32 = 0xE000_ED1C;
 
@@ -108,11 +119,37 @@ impl CortexM33Core {
             Some(self.registers.cpacr)
         } else if addr == SCB_CFSR {
             if write {
-                // 简化为直接读写；真实 CFSR 为写 1 清零。
-                // Modeled as a plain read/write; the real CFSR is write-one-to-clear.
-                self.cfsr = value;
+                // CFSR 为写 1 清零；写入 0 不改变任何状态位。
+                // The real CFSR is write-one-to-clear; writing 0 changes nothing.
+                self.cfsr &= !value;
             }
             Some(self.cfsr)
+        } else if addr == SCB_HFSR {
+            // HFSR 为写 1 清零：FORCED/DEBUGEVT/VECTTBL 由故障路径置位。
+            // HFSR is write-one-to-clear; the fault paths set
+            // FORCED/DEBUGEVT/VECTTBL.
+            if write {
+                self.write_hfsr(value);
+            }
+            Some(self.hfsr())
+        } else if addr == SCB_SHCSR {
+            // SHCSR 只保存三个故障使能位；ACT/PENDED 为实时只读视图。
+            // SHCSR stores only the three fault enables; ACT/PENDED are live
+            // read-only views.
+            if write {
+                self.write_shcsr(value);
+            }
+            Some(self.shcsr())
+        } else if addr == SCB_AIRCR {
+            // AIRCR 写入必须携带 VECTKEY = 0x05FA；SYSRESETREQ/VECTRESET 锁存为
+            // 宿主事件，读侧 VECTKEYSTAT 恒为 0xFA05，只写位读 0。
+            // An AIRCR write must carry VECTKEY = 0x05FA; SYSRESETREQ/VECTRESET
+            // are latched as host events, VECTKEYSTAT reads 0xFA05 and the
+            // write-only bits read as zero.
+            if write {
+                self.write_aircr(value);
+            }
+            Some(self.aircr())
         } else if addr == scr::SCR {
             // SLEEPONEXIT/SLEEPDEEP/SEVONPEND 是唯一建模的位；其余保留位读 0。
             // SLEEPONEXIT/SLEEPDEEP/SEVONPEND are the only modeled bits; every
@@ -132,9 +169,9 @@ impl CortexM33Core {
             }
             Some(self.read_icsr())
         } else if addr == SCB_SHPR2 {
-            // SHPR2 第 3 字节为 SVCall 优先级（目前只存储，未投递 SVCall）。
-            // Byte 3 of SHPR2 is the SVCall priority (stored; SVCall delivery is
-            // not modelled yet).
+            // SHPR2 第 3 字节为 SVCall 优先级，参与异常 11 的仲裁。
+            // Byte 3 of SHPR2 is the SVCall priority and takes part in
+            // exception 11 arbitration.
             if write {
                 self.scb.write_shpr2(value);
             }

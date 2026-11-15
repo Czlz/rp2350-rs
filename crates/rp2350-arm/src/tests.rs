@@ -2,6 +2,7 @@
 //! Cortex-M33 核心集成与启动序列的单元测试
 
 mod decode_cache;
+mod faults;
 mod fp_lazy;
 mod irq_gate;
 mod scr;
@@ -9,6 +10,9 @@ mod sleep;
 mod systick;
 
 use super::*;
+
+/// `SCB_SHCSR` absolute address / `SCB_SHCSR` 绝对地址
+const SCB_SHCSR: u32 = 0xE000_ED24;
 
 #[test]
 fn new_core_is_in_reset() {
@@ -217,32 +221,54 @@ fn install_capture_logger() {
 }
 
 #[test]
-fn undefined_instruction_default_warns_once_and_continues() {
+fn undefined_instruction_default_enters_hardfault_and_warns_once() {
     install_capture_logger();
     captured_warnings().lock().unwrap().clear();
 
-    // Two copies of the undefined opcode 0xB800 at 0x80 and 0x82.
-    // 在 0x80 与 0x82 处放两条相同的未定义指令 0xB800。
-    let mut bus = boot_bus(0x2000_1000, 0x0000_0081);
-    let mut cycles = 0;
+    // 两条未定义指令 0xB800 位于 0x80/0x82；HardFault 处理程序位于 0x90。
+    // Two copies of the undefined opcode 0xB800 at 0x80/0x82; the HardFault
+    // handler lives at 0x90.
+    let mut bus = fpu_test_bus(0x0000_0081);
+    let mut cycles = 0u64;
+    bus.write_u32(0x0000_000C, 0x0000_0091, &mut cycles)
+        .unwrap();
     bus.write_u16(0x0000_0080, 0xB800, &mut cycles).unwrap();
     bus.write_u16(0x0000_0082, 0xB800, &mut cycles).unwrap();
+    bus.write_u16(0x0000_0090, 0x4770, &mut cycles).unwrap(); // BX LR
 
     let mut core = CortexM33Core::new(CpuId::Core0);
     core.boot(&mut bus).unwrap();
 
+    // 默认（非严格）行为：未定义指令升级为 HardFault（异常 3）。
+    // Default (non-strict) behaviour: the undefined instruction escalates to
+    // HardFault (exception 3).
     assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
-    assert_eq!(core.registers.pc, 0x0000_0082);
+    assert_eq!(core.registers.pc, 0x0000_0090);
+    assert_eq!(core.registers.xpsr & 0x1FF, 3);
+    assert_ne!(core.cfsr & crate::faults::cfsr::UNDEFINSTR, 0);
+    assert_ne!(core.hfsr() & crate::faults::hfsr::FORCED, 0);
+    // 压栈返回地址为故障指令本身。 / The stacked PC is the faulting instruction.
+    assert_eq!(bus.read_u32(0x2000_0FF8, &mut cycles).unwrap(), 0x0000_0080);
+
+    // 处理程序 BX LR 返回故障指令；第二次故障不得重复告警。
+    // BX LR returns to the faulting instruction; the second fault must not log
+    // the same opcode again.
     assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
-    assert_eq!(core.registers.pc, 0x0000_0084);
+    assert_eq!(core.registers.pc, 0x0000_0080);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.registers.pc, 0x0000_0090);
 
     let warnings = captured_warnings().lock().unwrap().clone();
+    // 其它并行测试也会写日志；按本测试的 PC 过滤，断言去重后只剩一条。
+    // Other tests running in parallel also log; filter by this test's PC so the
+    // deduplicated warning is exactly one entry.
     let undefined: Vec<&String> = warnings
         .iter()
-        .filter(|message| message.contains("undefined instruction"))
+        .filter(|message| {
+            message.contains("undefined instruction") && message.contains("0x00000080")
+        })
         .collect();
     assert_eq!(undefined.len(), 1, "warnings: {warnings:?}");
-    assert!(undefined[0].contains("0x00000080"));
     assert!(undefined[0].contains("0x0000B800"));
     assert!(undefined[0].contains("2 bytes"));
 }
@@ -305,6 +331,10 @@ fn fpu_access_without_cpacr_enters_usage_fault() {
 
     let mut core = CortexM33Core::new(CpuId::Core0);
     core.boot(&mut bus).unwrap();
+    // 使能 UsageFault，使 NOCP 进入异常 6；未使能时按 ARMv8-M 升级为 HardFault。
+    // Enable UsageFault so NOCP enters exception 6; without the enable ARMv8-M
+    // escalates it to HardFault.
+    core.system_write(SCB_SHCSR, crate::faults::shcsr::USGFAULTENA);
     // Deny FPU access explicitly, as firmware would when disabling the unit.
     // 像固件关闭浮点单元那样显式拒绝 FPU 访问。
     core.system_write(SCB_CPACR, 0);
@@ -333,6 +363,7 @@ fn fpu_usage_fault_from_psp_thread_stacks_on_psp() {
 
     let mut core = CortexM33Core::new(CpuId::Core0);
     core.boot(&mut bus).unwrap();
+    core.system_write(SCB_SHCSR, crate::faults::shcsr::USGFAULTENA);
     core.system_write(SCB_CPACR, 0);
     core.registers.control = 0x2;
     core.registers.psp = 0x2000_0800;

@@ -228,19 +228,26 @@ impl DecodeCache {
     ///
     /// Returns `None` for addresses outside the flash windows or for a miss.
     /// Only [`Self::store`] can create an entry, and it refuses addresses
-    /// outside the flash windows, so a tag match alone already proves the hit
-    /// came from flash — the window test and the validity flag cancel out.
-    /// 落在 Flash 窗口之外或未命中时返回 `None`。只有 [`Self::store`] 能创建条目，
-    /// 而它拒绝窗口外地址，因此标签相等本身即证明命中来自 Flash——窗口判定与有效位
-    /// 可以互相抵消。
+    /// outside the flash windows and empty kinds, so a tag match plus a
+    /// non-[`Kind::Empty`] kind proves the hit came from a stored flash
+    /// instruction. The `Empty` check is required because PC=0 equals the tag
+    /// of a never-filled slot.
+    /// 落在 Flash 窗口之外或未命中时返回 `None`。只有 [`Self::store`] 能创建
+    /// 条目，而它拒绝窗口外地址与空类别，因此标签相等且类别不是 [`Kind::Empty`]
+    /// 即证明命中来自已存储的 Flash 指令。`Empty` 检查是必需的，因为 PC=0 与
+    /// 从未填充的槽位标签相等。
     #[inline]
     pub fn lookup(&mut self, pc: u32) -> Option<Entry> {
         self.refresh(content_generation());
         let entry = self.entries[((pc >> 1) as usize) & DECODE_CACHE_MASK];
-        // 空条目标签为 0，而 0 不在任何 Flash 窗口内，因此无需额外有效位。
-        // Empty entries carry tag 0, which is outside both flash windows, so no
-        // separate valid bit is needed.
-        if entry.tag == pc {
+        // 空条目的标签为 0；地址 0 本身不在 Flash 窗口内，但 PC=0 仍会与空条目
+        // 的标签相等，因此必须显式排除 `Kind::Empty`，否则核心会在地址 0 上执行
+        // 一条虚构的 `word = 0` 指令而不访问总线。
+        // Empty entries carry tag 0. Address 0 is not inside a flash window, but
+        // PC=0 still matches that tag, so `Kind::Empty` must be rejected
+        // explicitly; otherwise the core would execute a phantom `word = 0`
+        // instruction at address 0 without touching the bus.
+        if entry.tag == pc && entry.kind != Kind::Empty {
             return Some(entry);
         }
         None
@@ -432,6 +439,20 @@ mod tests {
         let mut cache = DecodeCache::new();
         cache.store(decode16(0x2000_0010, 0x4770));
         assert!(cache.lookup(0x2000_0010).is_none());
+    }
+
+    #[test]
+    fn empty_slots_never_match_pc_zero() {
+        // PC=0 与空槽位的 tag=0 相等，但空槽位不是有效条目：核心必须回落到
+        // 总线取指（真实固件在 boot ROM 地址 0 上执行）。
+        // PC=0 matches an empty slot's tag 0, but an empty slot is not a valid
+        // entry: the core must fall back to a bus fetch (real firmware executes
+        // at boot-ROM address 0).
+        let mut cache = DecodeCache::new();
+        assert!(cache.lookup(0).is_none());
+        cache.store(decode16(FLASH_XIP_BASE, 0xBF00));
+        assert!(cache.lookup(0).is_none());
+        assert!(cache.lookup(FLASH_XIP_BASE).is_some());
     }
 
     #[test]
