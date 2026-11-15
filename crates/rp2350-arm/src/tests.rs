@@ -358,3 +358,192 @@ fn fpu_instruction_executes_when_cpacr_allows_it() {
     assert_eq!(core.cfsr, 0);
     assert_eq!(core.active_exceptions.len(), 0);
 }
+
+// === WFI / WFE / SEV 睡眠与事件语义 / Sleep and event semantics ===
+
+/// 代码 RAM 基地址 / Code RAM base
+const SLEEP_CODE_BASE: u32 = 0x0000_0100;
+/// 栈顶 / Stack top
+const SLEEP_STACK_TOP: u32 = 0x2000_1000;
+
+/// Build a bus with vectors at 0, code RAM at 0x100 and a stack region
+/// 构建带 0 处向量表、0x100 处代码 RAM 与栈区域的总线
+fn sleep_bus(entry: u32) -> rp2350_core::memory::SimpleBus {
+    let mut bus = rp2350_core::memory::SimpleBus::new();
+    bus.register_region(Box::new(rp2350_core::memory::RamRegion::new(
+        "code", 0, 0x800,
+    )))
+    .unwrap();
+    bus.register_region(Box::new(rp2350_core::memory::RamRegion::new(
+        "stack",
+        0x2000_0000,
+        0x1000,
+    )))
+    .unwrap();
+    let mut cycles = 0;
+    bus.write_u32(0x0000_0000, SLEEP_STACK_TOP, &mut cycles)
+        .unwrap();
+    bus.write_u32(0x0000_0004, entry, &mut cycles).unwrap();
+    bus
+}
+
+/// Write a halfword program at `base` / 在 `base` 处写入半字程序
+fn write_program(bus: &mut rp2350_core::memory::SimpleBus, base: u32, code: &[u16]) {
+    let mut cycles = 0;
+    for (index, halfword) in code.iter().enumerate() {
+        bus.write_u16(base + index as u32 * 2, *halfword, &mut cycles)
+            .unwrap();
+    }
+}
+
+/// Boot a core on `sleep_bus` and return it / 在 `sleep_bus` 上启动核心并返回
+fn booted_sleep_core(code: &[u16]) -> (CortexM33Core, rp2350_core::memory::SimpleBus) {
+    let mut bus = sleep_bus(SLEEP_CODE_BASE + 1);
+    write_program(&mut bus, SLEEP_CODE_BASE, code);
+    let mut cpu = CortexM33Core::new(CpuId::Core0);
+    cpu.boot(&mut bus).unwrap();
+    (cpu, bus)
+}
+
+/// WFE 编码 / WFE encoding
+const WFE: u16 = 0xBF20;
+/// WFI 编码 / WFI encoding
+const WFI: u16 = 0xBF30;
+/// SEV 编码 / SEV encoding
+const SEV: u16 = 0xBF40;
+/// SEVL 编码 / SEVL encoding
+const SEVL: u16 = 0xBF50;
+/// NOP 编码 / NOP encoding
+const NOP: u16 = 0xBF00;
+/// `b .` 编码 / `b .` encoding
+const SPIN: u16 = 0xE7FE;
+
+#[test]
+fn wfe_without_event_sleeps_and_advances_pc() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFE, NOP, SPIN]);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    // PC 已前移：WFE 本身已退休，只有后续指令被推迟。
+    // PC advanced: WFE itself retired; only later instructions are postponed.
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 2);
+    assert!(core.registers.waits_on_event());
+}
+
+#[test]
+fn sleeping_core_does_not_execute_until_woken() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFE, NOP, SPIN]);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 2);
+}
+
+#[test]
+fn wfe_resumes_after_event_and_executes_the_next_instruction() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFE, 0x2001, SPIN]);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    core.set_event();
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.read_register(0), 1);
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 4);
+    // 唤醒时事件被消费，第二次 WFE 会重新睡眠。
+    // Waking consumes the event, so a second WFE sleeps again.
+    assert!(!core.has_event());
+}
+
+#[test]
+fn wfi_ignores_the_event_register() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFI, SPIN]);
+    core.set_event();
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    assert!(!core.registers.waits_on_event());
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 2);
+}
+
+#[test]
+fn sev_then_wfe_does_not_sleep() {
+    let (mut core, mut bus) = booted_sleep_core(&[SEV, WFE, SPIN]);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert!(core.has_event());
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert!(!core.has_event());
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 4);
+}
+
+#[test]
+fn sev_latches_one_cross_core_signal() {
+    let (mut core, mut bus) = booted_sleep_core(&[SEV, SEV, SPIN]);
+    assert!(!core.take_sev_signal());
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert!(core.take_sev_signal());
+    assert!(!core.take_sev_signal());
+}
+
+#[test]
+fn sevl_sets_only_the_local_event() {
+    let (mut core, mut bus) = booted_sleep_core(&[SEVL, WFE, SPIN]);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert!(core.has_event());
+    // SEVL 不产生跨核信号，本核 WFE 直接继续。
+    // SEVL produces no cross-core signal; the local WFE simply continues.
+    assert!(!core.take_sev_signal());
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 4);
+}
+
+#[test]
+fn pending_enabled_irq_wakes_sleeping_core_before_the_next_instruction() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFI, NOP, SPIN]);
+    // IRQ 5 的处理程序位于 0x300。 / IRQ 5's handler lives at 0x300.
+    let mut cycles = 0;
+    bus.write_u32(0x0000_0054, 0x0000_0301, &mut cycles)
+        .unwrap();
+    bus.write_u16(0x0000_0300, SPIN, &mut cycles).unwrap();
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+
+    core.system_write(0xE000_E100, 1 << 5); // ISER0: enable IRQ 5
+    core.signal_interrupt(5);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    // 唤醒后直接进入异常，未执行 WFI 之后的 NOP。
+    // The exception is entered directly; the NOP after WFI never runs.
+    assert_eq!(core.pc(), 0x0000_0300);
+    assert_eq!(core.registers.lr, 0xFFFF_FFF9);
+    assert!(
+        core.active_exceptions
+            .contains(&(FIRST_EXTERNAL_EXCEPTION as u16 + 5))
+    );
+}
+
+#[test]
+fn pending_irq_at_wfi_entry_does_not_leave_the_core_asleep() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFI, NOP, SPIN]);
+    let mut cycles = 0;
+    bus.write_u32(0x0000_0054, 0x0000_0301, &mut cycles)
+        .unwrap();
+    bus.write_u16(0x0000_0300, SPIN, &mut cycles).unwrap();
+    core.system_write(0xE000_E100, 1 << 5);
+    core.signal_interrupt(5);
+
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.pc(), 0x0000_0300);
+}
+
+#[test]
+fn disabled_pending_irq_does_not_wake_a_sleeping_core() {
+    let (mut core, mut bus) = booted_sleep_core(&[WFI, NOP, SPIN]);
+    // 中断挂起但未使能：不是唤醒源。 / Pending but not enabled: not a wake source.
+    core.signal_interrupt(5);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Sleeping);
+    assert_eq!(core.pc(), SLEEP_CODE_BASE + 2);
+}
+
+#[test]
+fn running_core_does_not_sleep_on_an_event_alone() {
+    // 事件寄存器只影响 WFE；普通指令照常执行。
+    // The event register only affects WFE; normal instructions keep running.
+    let (mut core, mut bus) = booted_sleep_core(&[0x2001, SPIN]);
+    core.set_event();
+    assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
+    assert_eq!(core.read_register(0), 1);
+    assert!(core.has_event());
+}
