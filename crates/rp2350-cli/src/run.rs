@@ -1771,11 +1771,12 @@ fn deliver_irqs(
     usb: &Controller,
     irq_log: &mut Vec<String>,
 ) {
-    let mask = peripherals.irq_mask();
-    for irq in 0..64u16 {
-        if mask & (1u64 << irq) == 0 {
-            continue;
-        }
+    // 只遍历已断言的位置：`trailing_zeros` 逐位清除，顺序与 0..64 扫描一致。
+    // Walk asserted bits only; ascending order matches the 0..64 scan.
+    let mut mask = peripherals.irq_mask();
+    while mask != 0 {
+        let irq = mask.trailing_zeros() as u16;
+        mask &= mask - 1;
         core.signal_interrupt(irq);
         log_irq(irq_log, "", irq, core.pc());
     }
@@ -1789,11 +1790,10 @@ fn deliver_irqs(
     let Some(core1) = core1 else {
         return;
     };
-    let mask = peripherals.core1_irq_mask();
-    for irq in 0..64u16 {
-        if mask & (1u64 << irq) == 0 {
-            continue;
-        }
+    let mut mask = peripherals.core1_irq_mask();
+    while mask != 0 {
+        let irq = mask.trailing_zeros() as u16;
+        mask &= mask - 1;
         core1.signal_interrupt(irq);
         log_irq(irq_log, "core1 ", irq, core1.pc());
     }

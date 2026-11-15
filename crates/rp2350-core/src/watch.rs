@@ -35,6 +35,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 线程撤除自己的监视不得让本线程漏报。
 static READ_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Fast gate for the write channel / 写通道快速门控
+///
+/// Set when `RP2350_WATCH` / `RP2350_WATCHV` armed a write watch. Unset means
+/// both write hooks are no-ops: [`set_pc`] skips its thread-local store and
+/// [`check_write`] returns before touching thread-local storage, so a process
+/// that never set the variables pays one relaxed atomic load per store.
+/// 当 `RP2350_WATCH` / `RP2350_WATCHV` 安装了写监视时置位。未置位时两个写钩子
+/// 都是空操作：[`set_pc`] 跳过 thread-local 写入，[`check_write`] 在访问
+/// thread-local 之前返回，因此从未设置该变量的进程每次存储只付一次 relaxed
+/// 原子 load。
+static WRITE_ARMED: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
     /// Watch range `[start, end)` parsed from the environment / 从环境解析的监视区间
     static RANGE: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
@@ -63,27 +75,74 @@ pub fn init() {
             let parse = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16);
             if let (Ok(start), Ok(end)) = (parse(a), parse(b)) {
                 if start < end {
-                    RANGE.with(|r| r.set(Some((start, end))));
+                    set_write_watch(Some((start, end)));
                 }
             }
         }
     }
     if let Ok(spec) = std::env::var("RP2350_WATCHV") {
         if let Ok(value) = u32::from_str_radix(spec.trim().trim_start_matches("0x"), 16) {
-            VALUE.with(|v| v.set(Some(value)));
+            set_write_value(Some(value));
         }
     }
+}
+
+/// Arm or disarm the address-range write watch / 安装或撤除地址区间写监视
+///
+/// `Some((start, end))` reports every write whose address lies in
+/// `[start, end)`; `None` disarms it. The environment variable
+/// `RP2350_WATCH` is the command-line way to call this.
+/// `Some((start, end))` 上报地址落在 `[start, end)` 的每次写；`None` 撤除。
+/// 环境变量 `RP2350_WATCH` 是它在命令行上的入口。
+pub fn set_write_watch(range: Option<(u32, u32)>) {
+    RANGE.with(|r| r.set(range));
+    refresh_write_gate();
+}
+
+/// Arm or disarm the written-value write watch / 安装或撤除写值监视
+///
+/// `Some(value)` reports every write of `value`; `None` disarms it. The
+/// environment variable `RP2350_WATCHV` is the command-line way to call this.
+/// `Some(value)` 上报每次写入该值的写；`None` 撤除。环境变量 `RP2350_WATCHV`
+/// 是它在命令行上的入口。
+pub fn set_write_value(value: Option<u32>) {
+    VALUE.with(|v| v.set(value));
+    refresh_write_gate();
+}
+
+/// Refresh the write gate after a channel changed / 通道变化后刷新写门控
+fn refresh_write_gate() {
+    let armed = RANGE.with(Cell::get).is_some() || VALUE.with(Cell::get).is_some();
+    WRITE_ARMED.store(armed, Ordering::Relaxed);
+}
+
+/// Whether a write watch is armed / 是否已安装写监视
+///
+/// Callers that implement wide stores natively use this to decide between the
+/// fast path and the per-byte path, which reproduces the diagnostic exactly.
+/// 原生实现宽写入的调用方用它决定走快速路径还是逐字节路径，后者精确复现诊断输出。
+#[must_use]
+pub fn write_watch_armed() -> bool {
+    WRITE_ARMED.load(Ordering::Relaxed)
 }
 
 /// Record the program counter of the instruction about to execute
 /// 记录即将执行指令的程序计数器
 pub fn set_pc(pc: u32) {
+    // 未安装写监视时 PC 没有任何读者，跳过 thread-local 写入。
+    // With no write watch armed nothing reads the PC, so skip the store.
+    if !WRITE_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
     PC.with(|p| p.set(pc));
 }
 
 /// Report a write that falls inside the watch range, or matches the watch value
 /// 报告落入监视区间或匹配监视写值的写
 pub fn check_write(addr: u32, value: u32) {
+    if !WRITE_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
     let hit = RANGE.with(|r| {
         r.get()
             .is_some_and(|(start, end)| addr >= start && addr < end)
@@ -191,6 +250,44 @@ mod tests {
         set_read_watch(None);
         let _ = take_read_hit();
         READ_SUSPEND.with(|flag| flag.set(false));
+    }
+
+    /// Reset the environment-configured write channels between tests
+    /// 在测试之间重置由环境变量配置的写通道
+    fn reset_write() {
+        set_write_watch(None);
+        set_write_value(None);
+    }
+
+    #[test]
+    fn write_gate_is_closed_until_a_channel_is_armed() {
+        reset_write();
+        assert!(
+            !write_watch_armed(),
+            "no channel armed means the gate is off"
+        );
+        set_write_watch(Some((0x2000_0000, 0x2000_0010)));
+        assert!(write_watch_armed(), "an address range opens the gate");
+        set_write_watch(None);
+        assert!(!write_watch_armed(), "disarming closes it again");
+        set_write_value(Some(0x1234_5678));
+        assert!(write_watch_armed(), "a value watch opens the gate");
+        reset_write();
+        assert!(!write_watch_armed());
+    }
+
+    #[test]
+    fn pc_is_only_recorded_while_a_write_watch_is_armed() {
+        reset_write();
+        // 门控关闭时 set_pc 不得写入 thread-local。
+        // With the gate closed `set_pc` must not touch thread-local storage.
+        PC.with(|p| p.set(0xDEAD_BEEF));
+        set_pc(0x1111_2222);
+        assert_eq!(PC.with(Cell::get), 0xDEAD_BEEF);
+        set_write_watch(Some((0, 1)));
+        set_pc(0x1111_2222);
+        assert_eq!(PC.with(Cell::get), 0x1111_2222);
+        reset_write();
     }
 
     #[test]

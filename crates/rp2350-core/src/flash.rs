@@ -42,6 +42,7 @@ pub const FLASH_XIP_SIZE: usize = 16 * 1024 * 1024;
 pub struct FlashRegion {
     name: String,
     base: Address,
+    size: usize,
     data: Arc<RwLock<Vec<u8>>>,
 }
 
@@ -55,6 +56,7 @@ impl FlashRegion {
         Self {
             name: name.into(),
             base,
+            size,
             data: Arc::new(RwLock::new(vec![0; size])),
         }
     }
@@ -80,6 +82,7 @@ impl FlashRegion {
         Self {
             name: name.into(),
             base,
+            size: self.size,
             data: Arc::clone(&self.data),
         }
     }
@@ -142,13 +145,32 @@ impl FlashRegion {
 
     /// Translate an in-region address into a buffer offset / 将区域内地址转换为缓冲区偏移
     fn offset(&self, addr: Address) -> BusResult<usize> {
-        if !self.contains(addr) {
+        if addr < self.base || addr.wrapping_sub(self.base) as usize >= self.size {
             return Err(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
             });
         }
         Ok((addr - self.base) as usize)
+    }
+
+    /// Copy `N` bytes at `addr` into an array, or `None` when the span leaves
+    /// the region
+    /// 将 `addr` 处 `N` 字节复制进数组；跨度超出区域时返回 `None`
+    ///
+    /// One shared-store acquisition serves the whole access.
+    /// 整次访问只获取一次共享存储。
+    fn window<const N: usize>(&self, addr: Address) -> Option<[u8; N]> {
+        let offset = self.offset(addr).ok()?;
+        let end = offset.checked_add(N)?;
+        if end > self.size {
+            return None;
+        }
+        let data = self.read_store();
+        let slot = data.get(offset..end)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(slot);
+        Some(out)
     }
 
     /// Acquire the shared store for reading / 获取共享存储的读锁
@@ -172,7 +194,10 @@ impl MemoryRegion for FlashRegion {
     }
 
     fn size(&self) -> usize {
-        self.read_store().len()
+        // 长度在构造时固定且底层 `Vec` 从不扩容，因此无需加锁读取。
+        // The length is fixed at construction and the backing `Vec` never
+        // grows, so it can be read without taking the lock.
+        self.size
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
@@ -183,6 +208,41 @@ impl MemoryRegion for FlashRegion {
             addr,
             kind: BusErrorKind::DeviceError,
         })
+    }
+
+    /// A halfword fetch is one shared-store acquisition, not one per byte
+    /// 半字取指只获取一次共享存储，而不是每字节一次
+    ///
+    /// Instruction fetch is the hottest bus operation, and every acquisition
+    /// of the shared flash lock costs an interlocked read-modify-write on a
+    /// cache line that the CPU otherwise never dirties. Reaching past the end
+    /// of the region still falls back to the byte-wise default so per-byte
+    /// error and cycle accounting is unchanged.
+    /// 取指是最热的总线操作，而每次获取共享 Flash 锁都要在 CPU 平时不会写脏的
+    /// 缓存行上做一次互锁读-改-写。跨出区域末尾时仍退回逐字节默认实现，保持逐
+    /// 字节的错误与周期记账不变。
+    fn read_u16(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u16> {
+        let Some(bytes) = self.window::<2>(addr) else {
+            let lo = u16::from(self.read_u8(addr, cycles)?);
+            let hi = u16::from(self.read_u8(addr.wrapping_add(1), cycles)?);
+            return Ok(lo | (hi << 8));
+        };
+        *cycles += 2;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    /// A word read is one shared-store acquisition / 整字读取只获取一次共享存储
+    ///
+    /// See [`Self::read_u16`] for the out-of-range fallback.
+    /// 越界回退语义见 [`Self::read_u16`]。
+    fn read_u32(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u32> {
+        let Some(bytes) = self.window::<4>(addr) else {
+            let lo = u32::from(self.read_u16(addr, cycles)?);
+            let hi = u32::from(self.read_u16(addr.wrapping_add(2), cycles)?);
+            return Ok(lo | (hi << 16));
+        };
+        *cycles += 4;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn write_u8(&mut self, addr: Address, _value: u8, _cycles: &mut u64) -> BusResult<()> {
@@ -321,6 +381,40 @@ mod tests {
     use super::*;
     use crate::bus::AddressBus;
     use crate::memory::SimpleBus;
+
+    #[test]
+    fn wide_reads_match_the_byte_path_and_book_the_same_cycles() {
+        let mut flash = FlashRegion::new("flash", 0x1000_0000, 8);
+        let mut cycles = 0;
+        flash
+            .load_bytes(0x1000_0000, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66])
+            .unwrap();
+        assert_eq!(flash.read_u16(0x1000_0000, &mut cycles).unwrap(), 0x2211);
+        assert_eq!(
+            flash.read_u32(0x1000_0002, &mut cycles).unwrap(),
+            0x6655_4433
+        );
+        assert_eq!(cycles, 6, "one cycle per byte, like the default path");
+        // 末尾半字仍可读；越过末尾必须报 NoDevice。
+        // The last halfword is readable; one byte past the end must report
+        // NoDevice.
+        assert_eq!(flash.read_u16(0x1000_0006, &mut cycles).unwrap(), 0);
+        let err = flash.read_u16(0x1000_0007, &mut cycles).unwrap_err();
+        match err {
+            CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::NoDevice),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_and_alias_report_the_configured_length() {
+        let flash = FlashRegion::new("flash", FLASH_XIP_BASE, 0x1000);
+        assert_eq!(flash.size(), 0x1000);
+        assert_eq!(flash.end(), FLASH_XIP_BASE + 0x1000);
+        let alias = flash.alias("alias", FLASH_XIP_NOCACHE_BASE);
+        assert_eq!(alias.size(), 0x1000);
+        assert_eq!(alias.end(), FLASH_XIP_NOCACHE_BASE + 0x1000);
+    }
 
     #[test]
     fn guest_can_read_but_not_write() {

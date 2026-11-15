@@ -95,6 +95,29 @@ struct Resolved {
     op: Option<AliasOp>,
 }
 
+/// Number of router page-cache slots / 路由器页缓存槽数量
+///
+/// Each slot caches one child window for the 4 KiB page that last resolved into
+/// it, so a firmware polling one register pays a tag compare instead of a scan
+/// over every mounted device. The cache is direct-mapped and validated against
+/// the cached window span, so it can only ever return the device that really
+/// owns the address.
+/// 每个槽缓存最近解析到该槽的 4 KiB 页所属的子设备窗口，因此固件反复轮询同一
+/// 寄存器时只做一次标签比较，而不必遍历所有已挂载设备。缓存是直接映射的，并用
+/// 缓存的窗口跨度校验，因此只会返回真正拥有该地址的设备。
+pub const MMIO_PAGE_SLOTS: usize = 64;
+
+/// One cached child-window tag / 一个缓存的子设备窗口标签
+#[derive(Clone, Copy, Default)]
+struct PageSlot {
+    /// First address of the cached window / 缓存窗口起始地址
+    start: Address,
+    /// End address (exclusive) of the cached window / 缓存窗口结束地址（不含）
+    end: Address,
+    /// Child index plus one, zero means empty / 子设备下标加一，零表示空槽
+    tag: u16,
+}
+
 /// An address window owned by one MMIO device / 单个 MMIO 设备拥有的地址窗口
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MmioWindow {
@@ -394,6 +417,7 @@ pub struct MmioRouter {
     window: MmioWindow,
     regions: Vec<MmioRegion>,
     warned: BTreeSet<u32>,
+    pages: [PageSlot; MMIO_PAGE_SLOTS],
 }
 
 impl MmioRouter {
@@ -405,6 +429,7 @@ impl MmioRouter {
             window,
             regions: Vec::new(),
             warned: BTreeSet::new(),
+            pages: [PageSlot::default(); MMIO_PAGE_SLOTS],
         }
     }
 
@@ -465,6 +490,9 @@ impl MmioRouter {
             });
         }
         self.regions.push(MmioRegion::new(device));
+        // 新设备可能改变地址归属，页缓存必须整体失效。
+        // A new device can change ownership, so every page tag is dropped.
+        self.pages = [PageSlot::default(); MMIO_PAGE_SLOTS];
         Ok(child)
     }
 
@@ -473,6 +501,29 @@ impl MmioRouter {
         self.regions
             .iter()
             .position(|region| region.window().contains(addr))
+    }
+
+    /// Resolve `addr` through the page cache / 经页缓存解析地址
+    #[inline]
+    fn cached_child(&self, addr: Address) -> Option<usize> {
+        let slot = &self.pages[page_slot(addr)];
+        if addr >= slot.start && addr < slot.end {
+            return Some(usize::from(slot.tag - 1));
+        }
+        None
+    }
+
+    /// Remember `index` as the owner of the page containing `addr`
+    /// 记住 `index` 是包含 `addr` 的页的拥有者
+    #[inline]
+    fn fill_page(&mut self, addr: Address, index: usize, child: MmioWindow) {
+        if let Ok(tag) = u16::try_from(index + 1) {
+            self.pages[page_slot(addr)] = PageSlot {
+                start: child.base,
+                end: child.end(),
+                tag,
+            };
+        }
     }
 
     /// Resolve `addr` to a child, folding the atomic alias windows
@@ -485,8 +536,17 @@ impl MmioRouter {
     /// 每个块内 `+0x1000` 为 XOR、`+0x2000` 为 SET、`+0x3000` 为 CLR，作用于
     /// 低 12 位相同的寄存器。别名读返回底层值；别名写由调用方折叠成一次
     /// 读-改-写。子设备始终只看到折叠后的（非别名）地址。
-    fn resolve(&self, addr: Address) -> Option<Resolved> {
+    fn resolve(&mut self, addr: Address) -> Option<Resolved> {
+        if let Some(index) = self.cached_child(addr) {
+            return Some(Resolved {
+                index,
+                reg_addr: addr,
+                op: None,
+            });
+        }
         if let Some(index) = self.child_index(addr) {
+            let child = self.regions[index].window();
+            self.fill_page(addr, index, child);
             return Some(Resolved {
                 index,
                 reg_addr: addr,
@@ -681,8 +741,17 @@ pub fn mount_device(
     Ok(window)
 }
 
-/// Alias span of the block that owns `base` / `base` 所属块的别名跨度
+/// Page-cache slot for `addr` / `addr` 对应的页缓存槽
 ///
+/// Slots are indexed by the 4 KiB page number so one register poll and its
+/// neighbouring registers share a slot.
+/// 槽按 4 KiB 页号索引，因此同一寄存器的轮询与相邻寄存器共享一个槽。
+#[inline]
+fn page_slot(addr: Address) -> usize {
+    ((addr >> 12) as usize) & (MMIO_PAGE_SLOTS - 1)
+}
+
+/// Alias span of the block that owns `base` / `base` 所属块的别名跨度///
 /// The alias windows cover `block + 0x1000 .. block + 0x4000`, where the block
 /// base is `base` rounded down to [`MMIO_BLOCK_SIZE`].
 /// 别名窗口覆盖 `block + 0x1000 .. block + 0x4000`，块基址为 `base` 向下按
@@ -876,6 +945,89 @@ mod tests {
             router.read_u32(0x4000_3000, &mut cycles).unwrap(),
             0xA5A5_5A5A
         );
+    }
+
+    /// Router with three devices in three blocks / 三个块各挂一个设备的路由器
+    fn three_device_router() -> (MmioRouter, [u32; 3]) {
+        let bases = [0x4000_0000u32, 0x4001_0000, 0x4002_0000];
+        let mut router = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        for base in bases {
+            router.mount(dummy_at(base, 0x1000)).unwrap();
+        }
+        (router, bases)
+    }
+
+    #[test]
+    fn page_cache_keeps_three_devices_separate() {
+        let (mut router, bases) = three_device_router();
+        let mut cycles = 0;
+        for _ in 0..4 {
+            for (index, base) in bases.iter().enumerate() {
+                router
+                    .write_u32(*base, 0xA0 + index as u32, &mut cycles)
+                    .unwrap();
+            }
+        }
+        for (index, base) in bases.iter().enumerate() {
+            assert_eq!(
+                router.read_u32(*base, &mut cycles).unwrap(),
+                0xA0 + index as u32,
+                "device {index} must keep its own register"
+            );
+        }
+    }
+
+    #[test]
+    fn page_cache_keeps_alias_writes_on_the_right_device() {
+        let (mut router, bases) = three_device_router();
+        let mut cycles = 0;
+        for base in &bases {
+            router.write_u32(*base, 0x0F, &mut cycles).unwrap();
+            assert_eq!(router.read_u32(*base, &mut cycles).unwrap(), 0x0F);
+        }
+        // SET 别名必须折叠进第二个设备，而不是最近一次缓存的设备。
+        // The SET alias must fold into device 1, not the last cached device.
+        router
+            .write_u32(bases[1] + 0x2000, 0xF0, &mut cycles)
+            .unwrap();
+        assert_eq!(
+            router.read_u32(bases[1], &mut cycles).unwrap(),
+            0xFF,
+            "SET alias must reach device 1"
+        );
+        assert_eq!(router.read_u32(bases[0], &mut cycles).unwrap(), 0x0F);
+        assert_eq!(router.read_u32(bases[2], &mut cycles).unwrap(), 0x0F);
+    }
+
+    #[test]
+    fn page_cache_handles_two_devices_in_one_slot() {
+        // 0x4000_0000 与 0x4004_0000 的页号相差 64 页，映射到同一个缓存槽。
+        // Their page numbers differ by 64, so both map to the same cache slot.
+        let mut router = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        router.mount(dummy_at(0x4000_0000, 0x1000)).unwrap();
+        router.mount(dummy_at(0x4004_0000, 0x1000)).unwrap();
+        let mut cycles = 0;
+        for _ in 0..4 {
+            router.write_u32(0x4000_0000, 0x11, &mut cycles).unwrap();
+            router.write_u32(0x4004_0000, 0x22, &mut cycles).unwrap();
+        }
+        assert_eq!(router.read_u32(0x4000_0000, &mut cycles).unwrap(), 0x11);
+        assert_eq!(router.read_u32(0x4004_0000, &mut cycles).unwrap(), 0x22);
+    }
+
+    #[test]
+    fn page_cache_is_dropped_when_a_device_is_mounted() {
+        let mut router = MmioRouter::new("apb", MmioWindow::new(0x4000_0000, 0x10_0000));
+        router.mount(dummy_at(0x4000_0000, 0x1000)).unwrap();
+        let mut cycles = 0;
+        router.write_u32(0x4000_0000, 0x33, &mut cycles).unwrap();
+        assert_eq!(router.read_u32(0x4000_0000, &mut cycles).unwrap(), 0x33);
+        // 新设备挂载后缓存必须失效，否则 0x4001_0000 会落空。
+        // Mounting must invalidate the cache, otherwise 0x4001_0000 misses.
+        router.mount(dummy_at(0x4001_0000, 0x1000)).unwrap();
+        router.write_u32(0x4001_0000, 0x44, &mut cycles).unwrap();
+        assert_eq!(router.read_u32(0x4001_0000, &mut cycles).unwrap(), 0x44);
+        assert_eq!(router.read_u32(0x4000_0000, &mut cycles).unwrap(), 0x33);
     }
 
     #[test]

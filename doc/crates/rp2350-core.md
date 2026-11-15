@@ -76,10 +76,10 @@ diagnostic sees every word store.
 ### `SimpleBus` / `RamRegion`
 
 ```rust
-pub struct SimpleBus { /* regions: Vec<Box<dyn MemoryRegion>> */ }
+pub struct SimpleBus { /* regions: Vec<Box<dyn MemoryRegion>>, buckets: [RegionBucket; 256] */ }
 impl SimpleBus { pub fn new() -> Self; pub fn region_count(&self) -> usize; }
 // AddressBus impl: rejects overlapping regions (BusErrorKind::Overlap) and
-// routes accesses in registration order.
+// routes accesses through a region cache (see below).
 
 pub struct RamRegion { /* name, base, writable, data: Vec<u8> */ }
 impl RamRegion {
@@ -91,6 +91,39 @@ impl RamRegion {
 // ROM writes from the guest return BusErrorKind::AccessDenied.
 // 客户机写 ROM 返回 BusErrorKind::AccessDenied。
 ```
+
+#### Region cache / 区域缓存
+
+```text
+bucket = addr >> 24                        // 256 buckets, one per 16 MiB
+bucket[b] = { start, end, index }          // validated span + region index
+```
+
+Every instruction fetch and data access resolves an address to a region, so the
+lookup is the hottest operation in the interpreter. `SimpleBus` keeps a
+direct-mapped table of 256 buckets keyed by the top address byte; a hit costs a
+table load and two comparisons instead of a linear scan over dynamic objects.
+A bucket holds one span, so two regions inside the same 16 MiB bucket simply
+overwrite each other and the next lookup falls back to the scan — the cache can
+never change which region serves an address. `register_region` /
+`unregister_region` drop the whole table.
+
+`RamRegion` implements `read_u16` / `read_u32` / `write_u16` / `write_u32`
+natively: one bounds check and one slice copy instead of one `Vec::get` per
+byte. An access whose span leaves the buffer, a read-only region, and every
+store taken while a write watch is armed fall back to the byte-wise path, so
+per-byte error, cycle and diagnostic semantics are unchanged.
+
+每次取指与每次数据访问都要把地址解析到区域，因此该查找是解释器最热的操作。
+`SimpleBus` 按地址最高字节索引 256 个桶直接映射缓存：命中只需一次表读取加两次
+比较，而不是遍历动态对象。一个桶只保存一个跨度，同一 16 MiB 桶内的两个区域会
+互相覆盖，下一次查找自动回退到线性扫描，因此缓存绝不改变地址由哪个区域响应。
+`register_region` / `unregister_region` 会整体丢弃缓存表。
+
+`RamRegion` 原生实现 `read_u16`/`read_u32`/`write_u16`/`write_u32`：一次边界
+检查加一次切片拷贝，而不是每字节一次 `Vec::get`。跨度越界、只读区域，以及已
+安装写监视时的所有存储都回退到逐字节路径，因此逐字节的错误、周期与诊断语义
+完全不变。
 
 ### Flash XIP / Flash XIP 窗口
 
@@ -163,6 +196,7 @@ pub const MMIO_BLOCK_SIZE: u32 = 0x4000;
 pub const MMIO_ALIAS_XOR: u32 = 0x1000;
 pub const MMIO_ALIAS_SET: u32 = 0x2000;
 pub const MMIO_ALIAS_CLR: u32 = 0x3000;
+pub const MMIO_PAGE_SLOTS: usize = 64;                 // router page cache
 
 pub struct MmioWindow { pub base: Address, pub size: usize }
 // new(base, size) | end() | contains(addr) | offset(addr) -> Option<u32>
@@ -206,6 +240,27 @@ read-modify-write on the child, which never sees an alias offset.
 别名语义：每个 `MMIO_BLOCK_SIZE` 块内 `+0x1000` 为 XOR、`+0x2000` 为 SET、
 `+0x3000` 为 CLR，作用于低 12 位相同的寄存器。别名读返回底层值；别名写折叠成
 对子设备的一次读-改-写，子设备不会看到别名偏移。
+
+#### Device page cache / 设备页缓存
+
+```text
+slot  = (addr >> 12) & 63                 // 64 directly-mapped slots
+slot[s] = { start, end, index + 1 }       // validated child span, 0 = empty
+```
+
+`MmioRouter::resolve` used to scan every mounted child, which is what firmware
+polling one register pays on every access. Direct (non-alias) hits are now
+cached per 4 KiB page: a hit is one tag compare plus two range checks. The tag
+stores the child's window span, so a slot that is reused by another page can
+only miss and re-scan — it can never return the wrong device. Alias accesses
+still take the scan and are never cached, because they must fold an operation
+into the child. `mount` drops every slot.
+
+`MmioRouter::resolve` 原先要遍历所有已挂载子设备，固件轮询单个寄存器时每次访问
+都要付这个代价。现在直接（非别名）命中会按 4 KiB 页缓存：命中只需一次标签比较
+加两次范围检查。标签保存子设备的窗口跨度，因此被其他页复用的槽只会未命中并
+重新扫描，绝不会返回错误设备。别名访问仍走扫描且不进缓存，因为它们必须把操作
+折叠到子设备上。`mount` 会丢弃全部槽。
 
 ---
 
@@ -347,6 +402,9 @@ interpreted.
 
 ```rust
 pub fn init();                       // parse RP2350_WATCH / RP2350_WATCHV from env
+pub fn set_write_watch(range: Option<(u32, u32)>);   // arm/disarm the address range
+pub fn set_write_value(value: Option<u32>);          // arm/disarm the value watch
+pub fn write_watch_armed() -> bool;                  // gate query for native wide stores
 pub fn set_pc(pc: u32);              // refreshed once per instruction step
 pub fn check_write(addr: u32, value: u32);
 ```
@@ -359,6 +417,25 @@ no-op.
 `RP2350_WATCH=START-END`（十六进制）打印地址落入 `[START, END)` 的每次写及其
 PC；`RP2350_WATCHV=VALUE` 改为监视特定写值。输出到 stderr，格式为
 `[watch] pc=… addr=… value=…`。未设置变量时为空操作。
+
+#### Write gate / 写门控
+
+Arming either write channel sets a process-wide `AtomicBool`; `init()` leaves it
+clear when neither variable is present. `set_pc` and `check_write` return on one
+relaxed load while it is clear, so a normal run pays no thread-local access per
+store or per instruction. `RamRegion`'s native wide stores consult
+[`write_watch_armed`] and take the per-byte path while a watch is armed, which
+reproduces the diagnostic exactly. The gate is sticky for the same reason the
+read gate is: the watched range lives in thread-local storage, so one thread
+disarming its own watch must not make another thread skip its checks.
+
+任一条写通道安装后即置位一个进程级 `AtomicBool`；两个变量都不存在时 `init()`
+保持其清零。清零状态下 `set_pc` 与 `check_write` 只做一次 relaxed load 就返回，
+因此正常运行时每次存储与每条指令都不必访问 thread-local。`RamRegion` 的原生宽
+存储会查询 [`write_watch_armed`]，在监视安装期间改走逐字节路径，从而精确复现
+诊断输出。门控与读门控一样只置位不清零：监视区间位于 thread-local，一个线程
+撤除自己的监视不得让其他线程跳过检查。
+
 
 ---
 

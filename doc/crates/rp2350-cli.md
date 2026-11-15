@@ -763,6 +763,40 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
   for 1 000 000 consecutive steps (up to 4 warnings per run).
   当 PC 在同一个 32 字节窗口内连续停留 1 000 000 步时打印一次自旋告警
   （每次运行最多 4 条）。
+- `deliver_irqs` walks only the asserted bits of the mask
+  (`trailing_zeros` + `mask &= mask - 1`), in the same ascending order as the
+  former `0..64` scan, so IRQ log lines and delivery order are unchanged.
+  `deliver_irqs` 只遍历掩码中已断言的位（`trailing_zeros` + `mask &= mask - 1`），
+  顺序与原先的 `0..64` 扫描一致，因此 IRQ 日志行与投递顺序不变。
+
+#### Bus, MMIO and watch cost / 总线、MMIO 与监视开销
+
+`Machine` inherits its lookup costs from `rp2350-core`:
+
+- `SimpleBus` resolves addresses through a 256-bucket table keyed by `addr >> 24`
+  (see `doc/crates/rp2350-core.md`), so a fetch or store no longer scans the
+  region list;
+- `FlashRegion` caches its length in the struct (no lock in `size()`/`contains`)
+  and reads halfwords/words with a single shared-store acquisition;
+- `MmioRouter` caches direct child hits per 4 KiB page;
+- the `RP2350_WATCH` / `RP2350_WATCHV` write channel is behind a sticky
+  `AtomicBool`, so an unarmed run pays one relaxed load per store and nothing
+  per instruction for the PC record.
+
+None of these change what the guest observes, what `[run]`/`[tail]`/`[irq]`
+print, or when DMA/PIO batches and IRQ lines are pumped.
+`Machine` 的查找开销继承自 `rp2350-core`：
+
+- `SimpleBus` 按 `addr >> 24` 索引 256 个桶解析地址（见
+  `doc/crates/rp2350-core.md`），因此取指与存储不再遍历区域列表；
+- `FlashRegion` 在结构体里缓存长度（`size()`/`contains()` 不再加锁），并用一次
+  共享存储获取读取半字/整字；
+- `MmioRouter` 按 4 KiB 页缓存直接子设备命中；
+- `RP2350_WATCH` / `RP2350_WATCHV` 写通道位于一个只置位的 `AtomicBool` 之后，
+  未安装时每次存储只付一次 relaxed load，PC 记录每条指令零开销。
+
+以上都不改变客户机观察到的行为、`[run]`/`[tail]`/`[irq]` 的输出内容，或 DMA/PIO
+批次与中断线的泵送时机。
 
 ### Dual-core execution / 双核执行
 
