@@ -50,8 +50,10 @@ keyboard/gamepad input, audio output, and no crashes.
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
 | P0-1 ✅ | 解释器热路径优化：区域桶缓存、Flash/RAM 原生宽读写、写监视门控、MMIO 页缓存、IRQ 位遍历 | `rp2350-core` + `rp2350-cli` | **实测 9.72 s / 5.14 M steps/s（3.36 → 5.14，1.5×）**；300M 计数器逐字段不变；未达 6 s，瓶颈定量在 `rp2350-arm`（详见 [performance.md](performance.md)） |
-| P0-2 🚧 | 第二轮：`rp2350-arm` 取指/译码热路径、`Nvic` 位图优先级、Flash 取指锁摊销、`take_system_writes` 空转门控 | `rp2350-arm` + `rp2350-core` + `rp2350-cli` | emerald 50M 步 **≤6 s（≥8.3 M steps/s）**，拉伸 ≤4 s；300M 计数器逐字段不变 |
-| P0-3 | 目标评测：emerald 300M 步 wall time 记录到 `doc/performance.md`；给出 20/30/60 fps 可行性结论 | 主会话 | 数据 + 结论 |
+| P0-2 ✅ | 第二轮：`Nvic` 位图优先级（−43 %）、ROM 桩窗口过滤（−20 %）、通知门控（−14 %）、Flash 取指缓存、PPB 写世代门控、定长 `record_step` | `rp2350-arm` + `rp2350-core` + `rp2350-cli` | **实测 3.39 s / 14.8 M steps/s**（子会话最小 3.21 s / 15.6 M）；300M 计数器逐字段不变；累计 **4.6×** |
+| P0-3a 🚧 | 第三轮（`arm`+`core`）：数据访问快路径内联、取指/译码与异常检查合并、`core` 侧桶表内联 | `rp2350-arm` + `rp2350-core` | emerald 50M ≤2.6 s（≥19 M steps/s）；300M 计数器逐字段不变 |
+| P0-3b ⏳ | 第三轮（`cli`）：批量步进摊薄每步骨架、泵送事件门控、双核分线程评估 | `rp2350-cli` | emerald 50M ≤1.8 s（≥28 M steps/s） |
+| P0-3c ⏳ | 决策点：记录 20/30/60 fps 可行性；若 <30 fps，评估块级 JIT / 帧级并行作为 P0-4 | 主会话 | `doc/performance.md` 结论 |
 
 ### P1 画面 / Video
 
@@ -66,7 +68,7 @@ keyboard/gamepad input, audio output, and no crashes.
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
 | P2-1 ✅ | I2S 采样捕获：`AudioSink`/`AudioTap`，唯一接线点 `Pio::push_tx`（CPU 与 DMA 共用），`BootPeripherals::set_audio_tap` | `rp2350-periph` | periph 347 测试；CPU/DMA 两路径 + 端到端；未安装 tap 零开销 |
-| P2-2 🚧 | **宿主输出 crate（`cpal` 可选）** `rp2350-audio`（插件 ABI 只面向 virt-periph 引脚，拿不到 PIO 的 `AudioTap`，故改为宿主后端）：`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏 | `crates/rp2350-audio`（新） | 默认 feature 无声卡全绿（≥10 单测）；`shutdown` ≤2 s；无设备不 panic；`doc/crates/rp2350-audio.md` |
+| P2-2 ✅ | 宿主输出 crate `rp2350-audio`（`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏，最近邻重采样） | `crates/rp2350-audio`（新） | 12/13 测试（`--all-features` 实测 backend=cpal）；`shutdown` 毫秒级；无设备不 panic |
 
 ### P3 完善 / Polish
 
@@ -81,14 +83,14 @@ keyboard/gamepad input, audio output, and no crashes.
 并发上限 2（crate 不相交），每波完成后主会话复跑四道门禁 + FV-1/2/3 + emerald 300M 冒烟。
 
 1. **Wave 1 ✅**：P0-1（core+cli）‖ P2-1（periph）——均已验收提交
-2. **Wave 2 🚧**：P0-2（arm+core+cli）‖ P2-2（`rp2350-audio` 新 crate）
-3. **Wave 3**：P1-1（cli lib+play）‖ GAP-08b（cli）→ 冲突，改为 P1-1 ‖ GAP-11（periph DMA）
-4. **Wave 4**：P1-2（egui）‖ P3-2（cli 存档/复位）
-5. **Wave 5**：P1-3 + P3-1 + P3-3（主会话收口）
+2. **Wave 2 ✅**：P0-2（arm+core+cli）‖ P2-2（`rp2350-audio` 新 crate）——均已验收提交
+3. **Wave 3 🚧**：P0-3a（arm+core）‖ P1-1（cli lib + `play` worker + headless `--frames`）
+4. **Wave 4**：P0-3b（cli 批量步进）‖ P1-2（egui PlayView，消费 P1-1 的 `PlaySession` API）
+5. **Wave 5**：P1-3（示例 profile）+ P3-1（GAP-08b PSRAM 挂载）+ P3-3（soak）；P0-3c 决策点
 
 ## 4. 风险 / Risks
 
-- **性能**：P0-1 实测 5.14 M steps/s（1.5×）。P0-2 若仍达不到 ≥8.3 M steps/s，实时游玩只能以「低帧率 + 拉伸时间」演示；
+- **性能**：两轮后 14.8 M steps/s（累计 4.6×）。按每游戏帧 ≈2.5 M 步计算约 **6 fps**；30 fps 需 ≥75 M steps/s，60 fps 需 ≥150 M。P0-3a/b 之后若仍 <30 fps，实时游玩只能降级演示，需要 P0-3c 决策是否投入 JIT/帧级并行；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
 - **GUI 架构**：`Machine` 目前只在 `rp2350-cli` bin 内部；P1-1 的 lib 化是必要前置。
