@@ -28,7 +28,10 @@ use std::fmt;
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 
-use crate::exceptions::{EXC_HARDFAULT, EXC_NMI, EXC_PENDSV, EXC_SVCALL, EXC_SYSTICK};
+use crate::exceptions::{
+    EXC_BUSFAULT, EXC_HARDFAULT, EXC_MEMMANAGE, EXC_NMI, EXC_PENDSV, EXC_SVCALL, EXC_SYSTICK,
+    EXC_USAGE_FAULT,
+};
 use crate::faults::{RANK_CONFIGURABLE_BASE, RANK_HARDFAULT, RANK_NMI};
 use crate::scb::icsr;
 use crate::{CortexM33Core, FIRST_EXTERNAL_EXCEPTION, scr};
@@ -143,13 +146,12 @@ impl CortexM33Core {
     /// NMI and HardFault use the architecture's fixed ranks (0 and 1);
     /// configurable exceptions map to `2 + priority`, so a smaller rank always
     /// preempts a larger one. PendSV, SysTick and SVCall decode their
-    /// `SHPR2`/`SHPR3` bytes, external interrupts their NVIC `IPR` byte, and
-    /// the fault exceptions report configurable priority 0 until `SHPR1` is
-    /// modelled.
+    /// `SHPR2`/`SHPR3` bytes, MemManage/BusFault/UsageFault their `SHPR1` bytes
+    /// (byte 0/1/2), and external interrupts their NVIC `IPR` byte.
     /// NMI 与 HardFault 使用架构固定等级（0 与 1）；可配置异常映射为
     /// `2 + 优先级`，因此等级更小者总能抢占。PendSV、SysTick 与 SVCall 解码各自的
-    /// `SHPR2`/`SHPR3` 字节，外部中断解码 NVIC `IPR` 字节；`SHPR1` 尚未建模前，
-    /// 故障异常报告可配置优先级 0。
+    /// `SHPR2`/`SHPR3` 字节，MemManage/BusFault/UsageFault 解码 `SHPR1` 的
+    /// 第 0/1/2 字节，外部中断解码 NVIC `IPR` 字节。
     #[must_use]
     pub(crate) fn exception_priority(&self, exception_number: u16) -> u8 {
         match exception_number {
@@ -164,6 +166,9 @@ impl CortexM33Core {
     #[must_use]
     fn configurable_priority(&self, exception_number: u16) -> u8 {
         match exception_number {
+            EXC_MEMMANAGE => self.scb.memmanage_priority(),
+            EXC_BUSFAULT => self.scb.busfault_priority(),
+            EXC_USAGE_FAULT => self.scb.usagefault_priority(),
             EXC_SVCALL => self.scb.svcall_priority(),
             EXC_PENDSV => self.scb.pendsv_priority(),
             EXC_SYSTICK => self.scb.systick_priority(),

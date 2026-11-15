@@ -50,6 +50,12 @@ pub(crate) fn load_store_word_imm5(
     let rb = ((opcode >> 3) & 0x7) as usize;
     let rd = (opcode & 0x7) as usize;
     let addr = regs.r[rb].wrapping_add(imm5 << 2);
+    // 字传输在 CCR.UNALIGN_TRP 置位时必须自然对齐；捕获时不触碰内存。
+    // A word transfer must be naturally aligned when CCR.UNALIGN_TRP is set;
+    // a trapped access leaves memory untouched.
+    if regs.trap_unaligned(addr, 4) {
+        return Ok(StepResult::Ok);
+    }
     if store {
         // STR Rd, [Rb, #imm5*4]
         bus.write_u32(addr, regs.r[rd], cycles)?;

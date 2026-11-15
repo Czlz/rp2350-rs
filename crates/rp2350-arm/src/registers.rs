@@ -1,6 +1,7 @@
 //! Cortex-M33 register file (R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK)
 //! Cortex-M33 寄存器文件（R0-R15、MSP/PSP、XPSR、CONTROL、PRIMASK、BASEPRI、FAULTMASK）
 
+use crate::faults::ccr;
 use crate::fpu::{FpuRegisters, cpacr, fpexc};
 
 /// CONTROL.FPCA — floating-point context active / CONTROL.FPCA —— 浮点上下文活跃
@@ -81,6 +82,20 @@ pub struct CortexM33Registers {
     pub fpu: FpuRegisters,
     /// Coprocessor Access Control Register (CPACR) / 协处理器访问控制寄存器
     pub cpacr: u32,
+    /// Configuration and Control Register (SCB_CCR) / 配置与控制寄存器
+    ///
+    /// It lives next to CPACR because the load/store and divide executors need
+    /// the trap bits without access to the whole core. `STKALIGN` always reads
+    /// as one; see [`crate::faults::ccr`] for the bit meanings.
+    /// 它与 CPACR 放在一起，因为加载/存储与除法执行器需要陷阱位而无法访问整个核心。
+    /// `STKALIGN` 恒读 1；位含义见 [`crate::faults::ccr`]。
+    pub ccr: u32,
+    /// Address of an unaligned access trapped by `CCR.UNALIGN_TRP`
+    /// 被 `CCR.UNALIGN_TRP` 捕获的未对齐访问地址
+    pub(crate) pending_unaligned: Option<u32>,
+    /// A divide by zero was trapped by `CCR.DIV_0_TRP`
+    /// `CCR.DIV_0_TRP` 捕获到除零
+    pub(crate) pending_div0: bool,
     /// Exclusive monitor armed by this core's last exclusive load, as
     /// `(address, size in bytes)`
     /// 本核最近一次独占加载武装的独占监视器，形式为 `(地址, 字节尺寸)`
@@ -128,6 +143,9 @@ impl CortexM33Registers {
             psplim: 0,
             fpu: FpuRegisters::new(),
             cpacr: 0,
+            ccr: ccr::RESET,
+            pending_unaligned: None,
+            pending_div0: false,
             exclusive: None,
             pending_usage_fault: false,
             pending_invstate: false,
@@ -283,6 +301,54 @@ impl CortexM33Registers {
     /// 取出并清除待处理的 `INVSTATE` 故障标志
     pub(crate) fn take_invstate_fault(&mut self) -> bool {
         core::mem::take(&mut self.pending_invstate)
+    }
+
+    /// Trap an unaligned data access when `CCR.UNALIGN_TRP` is set
+    /// `CCR.UNALIGN_TRP` 置位时捕获未对齐数据访问
+    ///
+    /// Returns `true` when the access must be abandoned: the executor then
+    /// retires the instruction without touching memory, and the shared fault
+    /// tail raises `UFSR.UNALIGNED`. `alignment` is the natural access size in
+    /// bytes (1/2/4); byte accesses can never fail.
+    /// 返回 `true` 表示访问必须放弃：执行器不触碰内存就结束指令，由共享故障尾部
+    /// 触发 `UFSR.UNALIGNED`。`alignment` 为自然访问尺寸（1/2/4 字节）；字节访问
+    /// 永不失败。
+    #[inline]
+    pub(crate) fn trap_unaligned(&mut self, addr: u32, alignment: u32) -> bool {
+        debug_assert!(alignment.is_power_of_two());
+        if self.ccr & ccr::UNALIGN_TRP == 0 || addr & (alignment - 1) == 0 {
+            return false;
+        }
+        self.pending_unaligned = Some(addr);
+        true
+    }
+
+    /// Take and clear the trapped unaligned-access address
+    /// 取出并清除被捕获的未对齐访问地址
+    pub(crate) fn take_unaligned_fault(&mut self) -> Option<u32> {
+        self.pending_unaligned.take()
+    }
+
+    /// Trap a zero divisor when `CCR.DIV_0_TRP` is set
+    /// `CCR.DIV_0_TRP` 置位时捕获零除数
+    ///
+    /// Returns `true` when the divide must not write its destination; the
+    /// shared fault tail then raises `UFSR.DIVBYZERO`.
+    /// 返回 `true` 表示除法不得写目标寄存器；共享故障尾部随即触发
+    /// `UFSR.DIVBYZERO`。
+    #[inline]
+    pub(crate) fn trap_divide_by_zero(&mut self) -> bool {
+        if self.ccr & ccr::DIV_0_TRP == 0 {
+            return false;
+        }
+        self.pending_div0 = true;
+        true
+    }
+
+    /// Take and clear the pending divide-by-zero fault flag
+    /// 取出并清除待处理的除零故障标志
+    pub(crate) fn take_div0_fault(&mut self) -> bool {
+        core::mem::take(&mut self.pending_div0)
     }
 
     /// Arm this core's exclusive monitor for `addr` with byte size `size`

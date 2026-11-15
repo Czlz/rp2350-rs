@@ -70,6 +70,11 @@ fn transfer_for(op: u8) -> Option<Transfer> {
 /// are UNPREDICTABLE and decode as undefined.
 /// 加载写入 `Rt == 15` 时跳转到加载地址；存储到 `PC` 属 UNPREDICTABLE，
 /// 按未定义编码处理。
+///
+/// Returns `Ok(None)` when `CCR.UNALIGN_TRP` trapped the access: memory is left
+/// untouched and the shared fault tail raises `UFSR.UNALIGNED`.
+/// 当 `CCR.UNALIGN_TRP` 捕获访问时返回 `Ok(None)`：内存不被触碰，由共享故障尾部
+/// 触发 `UFSR.UNALIGNED`。
 fn access(
     instr: u32,
     regs: &mut CortexM33Registers,
@@ -77,7 +82,15 @@ fn access(
     cycles: &mut u64,
     transfer: Transfer,
     addr: u32,
-) -> Result<StepResult, CoreError> {
+) -> Result<Option<StepResult>, CoreError> {
+    let alignment = match transfer.width {
+        Width::Byte => 1,
+        Width::Half => 2,
+        Width::Word => 4,
+    };
+    if regs.trap_unaligned(addr, alignment) {
+        return Ok(None);
+    }
     let rt = ((instr >> 12) & 0xF) as u8;
     if transfer.load {
         let value = match transfer.width {
@@ -103,24 +116,24 @@ fn access(
             // LDR 写 PC 使用 LoadWritePC：EXC_RETURN 触发异常返回。
             // LDR to PC uses LoadWritePC: EXC_RETURN triggers a return.
             if crate::exceptions::write_pc(regs, value) {
-                Ok(StepResult::ExceptionReturn)
+                Ok(Some(StepResult::ExceptionReturn))
             } else {
-                Ok(StepResult::BranchTaken)
+                Ok(Some(StepResult::BranchTaken))
             }
         } else {
             regs.write(rt, value);
-            Ok(StepResult::Ok)
+            Ok(Some(StepResult::Ok))
         }
     } else {
         if rt == 15 {
-            return Ok(StepResult::Undefined);
+            return Ok(Some(StepResult::Undefined));
         }
         match transfer.width {
             Width::Byte => bus.write_u8(addr, regs.read(rt) as u8, cycles)?,
             Width::Half => bus.write_u16(addr, regs.read(rt) as u16, cycles)?,
             Width::Word => bus.write_u32(addr, regs.read(rt), cycles)?,
         }
-        Ok(StepResult::Ok)
+        Ok(Some(StepResult::Ok))
     }
 }
 
@@ -162,6 +175,9 @@ pub(super) fn execute_single(
             regs.read(rn).wrapping_add(imm12)
         };
         let result = access(instr, regs, bus, cycles, transfer, addr)?;
+        let Some(result) = result else {
+            return Ok(StepResult::Ok);
+        };
         *cycles += 1;
         return Ok(result);
     }
@@ -192,6 +208,9 @@ pub(super) fn execute_single(
             base
         };
         let result = access(instr, regs, bus, cycles, transfer, addr)?;
+        let Some(result) = result else {
+            return Ok(StepResult::Ok);
+        };
         if write_back {
             regs.write(rn, base.wrapping_add(delta));
         }
@@ -208,6 +227,9 @@ pub(super) fn execute_single(
         let imm12 = second & 0xFFF;
         let addr = (regs.pc & !3).wrapping_sub(imm12);
         let result = access(instr, regs, bus, cycles, transfer, addr)?;
+        let Some(result) = result else {
+            return Ok(StepResult::Ok);
+        };
         *cycles += 1;
         return Ok(result);
     }
@@ -222,6 +244,9 @@ pub(super) fn execute_single(
     let rm = (instr & 0xF) as u8;
     let addr = regs.read(rn).wrapping_add(regs.read(rm) << imm2);
     let result = access(instr, regs, bus, cycles, transfer, addr)?;
+    let Some(result) = result else {
+        return Ok(StepResult::Ok);
+    };
     *cycles += 1;
     Ok(result)
 }
@@ -322,6 +347,13 @@ pub(super) fn execute_dual(
     } else {
         base
     };
+
+    // LDRD/STRD 的寄存器对按两个连续字访问，CCR.UNALIGN_TRP 置位时要求字对齐。
+    // LDRD/STRD access a register pair as two consecutive words; with
+    // CCR.UNALIGN_TRP set the base must be word aligned.
+    if regs.trap_unaligned(addr, 4) {
+        return Ok(StepResult::Ok);
+    }
 
     if load {
         let first = bus.read_u32(addr, cycles)?;

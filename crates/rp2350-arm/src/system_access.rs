@@ -27,6 +27,14 @@ use super::{CortexM33Core, NVIC_BASE, SCB_CFSR, SCB_CPACR, SCB_VTOR, SYSTICK_BAS
 /// `SCB_ICSR` —— 挂起/活跃异常控制与状态
 const SCB_ICSR: u32 = 0xE000_ED04;
 
+/// `SCB_CCR` — unaligned/divide-by-zero traps and stored control bits
+/// `SCB_CCR` —— 未对齐/除零陷阱与存储的控制位
+const SCB_CCR: u32 = 0xE000_ED14;
+
+/// `SCB_SHPR1` — MemManage/BusFault/UsageFault priorities in bytes 0/1/2
+/// `SCB_SHPR1` —— 第 0/1/2 字节为 MemManage/BusFault/UsageFault 优先级
+const SCB_SHPR1: u32 = 0xE000_ED18;
+
 /// `SCB_AIRCR` — VECTKEY / PRIS / SYSRESETREQ / VECTRESET
 /// `SCB_AIRCR` —— VECTKEY / PRIS / SYSRESETREQ / VECTRESET
 const SCB_AIRCR: u32 = 0xE000_ED0C;
@@ -44,6 +52,12 @@ const SCB_SHPR2: u32 = 0xE000_ED1C;
 /// `SCB_SHPR3` — PendSV priority in byte 2, SysTick priority in byte 3
 /// `SCB_SHPR3` —— 第 2 字节 PendSV 优先级、第 3 字节 SysTick 优先级
 const SCB_SHPR3: u32 = 0xE000_ED20;
+
+/// `SCB_MMFAR` — MemManage fault address / `SCB_MMFAR` —— MemManage 故障地址
+const SCB_MMFAR: u32 = 0xE000_ED34;
+
+/// `SCB_BFAR` — BusFault fault address / `SCB_BFAR` —— BusFault 故障地址
+const SCB_BFAR: u32 = 0xE000_ED38;
 
 /// Software Trigger Interrupt Register (`SCB_STIR`) / 软件触发中断寄存器
 const SCB_STIR: u32 = 0xE000_EF00;
@@ -168,6 +182,15 @@ impl CortexM33Core {
                 self.write_icsr(value);
             }
             Some(self.read_icsr())
+        } else if addr == SCB_SHPR1 {
+            // SHPR1：第 0 字节 MemManage、第 1 字节 BusFault、第 2 字节 UsageFault，
+            // 三个故障异常的优先级参与异常进入与抢占仲裁。
+            // SHPR1: byte 0 MemManage, byte 1 BusFault, byte 2 UsageFault; the
+            // three fault priorities take part in entry and preemption.
+            if write {
+                self.scb.write_shpr1(value);
+            }
+            Some(self.scb.read_shpr1())
         } else if addr == SCB_SHPR2 {
             // SHPR2 第 3 字节为 SVCall 优先级，参与异常 11 的仲裁。
             // Byte 3 of SHPR2 is the SVCall priority and takes part in
@@ -192,6 +215,28 @@ impl CortexM33Core {
                 self.set_pending_irq(irq);
             }
             Some(0)
+        } else if addr == SCB_CCR {
+            // CCR：STKALIGN 只读 1，UNALIGN_TRP/DIV_0_TRP 控制陷阱，其余三位仅存储。
+            // CCR: STKALIGN reads as one, UNALIGN_TRP/DIV_0_TRP gate the traps
+            // and the remaining three bits are storage only.
+            if write {
+                self.write_ccr(value);
+            }
+            Some(self.ccr())
+        } else if addr == SCB_MMFAR {
+            // MMFAR 只保存地址字段；有效性由 CFSR.MMARVALID 表示。
+            // MMFAR stores only the address field; validity lives in CFSR.MMARVALID.
+            if write {
+                self.write_mmfar(value);
+            }
+            Some(self.mmfar())
+        } else if addr == SCB_BFAR {
+            // BFAR 只保存地址字段；有效性由 CFSR.BFARVALID 表示。
+            // BFAR stores only the address field; validity lives in CFSR.BFARVALID.
+            if write {
+                self.write_bfar(value);
+            }
+            Some(self.bfar())
         } else if let Some(value) = self.registers.fpu.system_access(addr, write, value) {
             // FPCCR / FPCAR / FPDSCR：LSPACT 只读，FPCAR 低 3 位保留，
             // FPDSCR 只保存 AHP/DN/FZ/RMode 字段。

@@ -87,6 +87,9 @@ pub mod cfsr {
     /// MemManage: data access violation (bit 1)
     /// MemManage：数据访问违例（位 1）
     pub const DACCVIOL: u32 = 1 << 1;
+    /// MemManage: `MMFAR` holds a valid fault address (bit 7)
+    /// MemManage：`MMFAR` 保存有效故障地址（位 7）
+    pub const MMARVALID: u32 = 1 << 7;
     /// BusFault: instruction bus error (bit 8)
     /// BusFault：取指总线错误（位 8）
     pub const IBUSERR: u32 = 1 << 8;
@@ -100,6 +103,9 @@ pub mod cfsr {
     pub const UNSTKERR: u32 = 1 << 11;
     /// BusFault: stacking error (bit 12) / BusFault：压栈错误（位 12）
     pub const STKERR: u32 = 1 << 12;
+    /// BusFault: `BFAR` holds a valid fault address (bit 15)
+    /// BusFault：`BFAR` 保存有效故障地址（位 15）
+    pub const BFARVALID: u32 = 1 << 15;
     /// UsageFault: undefined instruction (bit 16)
     /// UsageFault：未定义指令（位 16）
     pub const UNDEFINSTR: u32 = 1 << 16;
@@ -118,6 +124,44 @@ pub mod cfsr {
     /// UsageFault: divide by zero when `CCR.DIV_0_TRP` is set (bit 22)
     /// UsageFault：`CCR.DIV_0_TRP` 置位时的除零（位 22）
     pub const DIVBYZERO: u32 = 1 << 22;
+}
+
+/// `CCR` bit definitions (ARMv8-M B3.2.11) / `CCR` 位定义
+///
+/// `STKALIGN` is read-only one in ARMv8-M: every exception frame is placed on an
+/// 8-byte boundary and the stacked xPSR bit 9 records the 4-byte aligner. The
+/// other five bits are writable configuration: `UNALIGN_TRP`/`DIV_0_TRP` gate
+/// the architectural traps, while `NONBASETHRDENA`/`USERSETMPEND`/`BFHFNMIGN`
+/// are stored only because this model has no privilege, lazy-FP-on-bus-fault or
+/// `STIR` permission state to consult.
+/// ARMv8-M 中 `STKALIGN` 为只读 1：每个异常帧都放在 8 字节边界上，压栈 xPSR 的
+/// bit9 记录 4 字节对齐字。其余五位为可写配置：`UNALIGN_TRP`/`DIV_0_TRP` 控制
+/// 架构陷阱，而 `NONBASETHRDENA`/`USERSETMPEND`/`BFHFNMIGN` 仅作存储，因为本
+/// 模型没有特权级、总线故障惰性浮点或 `STIR` 权限状态可供查询。
+pub mod ccr {
+    /// `NONBASETHRDENA` (bit 0, storage only) / 非基线程返回（位 0，仅存储）
+    pub const NONBASETHRDENA: u32 = 1 << 0;
+    /// `USERSETMPEND` (bit 1, storage only) / 用户态可写 `STIR`（位 1，仅存储）
+    pub const USERSETMPEND: u32 = 1 << 1;
+    /// `UNALIGN_TRP` (bit 3): trap unaligned data accesses
+    /// `UNALIGN_TRP`（位 3）：捕获未对齐数据访问
+    pub const UNALIGN_TRP: u32 = 1 << 3;
+    /// `DIV_0_TRP` (bit 4): trap divide by zero in `SDIV`/`UDIV`
+    /// `DIV_0_TRP`（位 4）：捕获 `SDIV`/`UDIV` 的除零
+    pub const DIV_0_TRP: u32 = 1 << 4;
+    /// `BFHFNMIGN` (bit 8, storage only) / 忽略优先级 -1/-2 的总线故障（位 8，仅存储）
+    pub const BFHFNMIGN: u32 = 1 << 8;
+    /// `STKALIGN` (bit 9, read-only one) / 异常压栈对齐（位 9，只读 1）
+    pub const STKALIGN: u32 = 1 << 9;
+
+    /// Reset value: `STKALIGN` reads as one and every trap is disabled
+    /// 复位值：`STKALIGN` 读为 1，所有陷阱关闭
+    pub const RESET: u32 = STKALIGN;
+
+    /// Software-writable bits; `STKALIGN` is excluded because it is RAO/WI
+    /// 软件可写位；`STKALIGN` 因 RAO/WI 被排除
+    pub const WRITABLE_MASK: u32 =
+        NONBASETHRDENA | USERSETMPEND | UNALIGN_TRP | DIV_0_TRP | BFHFNMIGN;
 }
 
 /// `HFSR` bit definitions (ARMv8-M B3.2.13) / `HFSR` 位定义
@@ -174,6 +218,12 @@ pub struct FaultState {
     hfsr: u32,
     /// Stored `AIRCR` bits (`PRIS` only) / 保存的 `AIRCR` 位（仅 `PRIS`）
     aircr: u32,
+    /// `MMFAR` fault address field (validity lives in `CFSR.MMARVALID`)
+    /// `MMFAR` 故障地址字段（有效性由 `CFSR.MMARVALID` 表示）
+    mmfar: u32,
+    /// `BFAR` fault address field (validity lives in `CFSR.BFARVALID`)
+    /// `BFAR` 故障地址字段（有效性由 `CFSR.BFARVALID` 表示）
+    bfar: u32,
     /// Latched `AIRCR.SYSRESETREQ` / 锁存的 `AIRCR.SYSRESETREQ`
     system_reset_requested: bool,
     /// Latched `AIRCR.VECTRESET` (diagnostic) / 锁存的 `AIRCR.VECTRESET`（诊断）
@@ -189,6 +239,8 @@ impl FaultState {
             shcsr: 0,
             hfsr: 0,
             aircr: 0,
+            mmfar: 0,
+            bfar: 0,
             system_reset_requested: false,
             vect_reset_requested: false,
         }
@@ -241,6 +293,37 @@ impl FaultState {
     /// Clear `HFSR` bits (write-one-to-clear) / 清除 `HFSR` 位（写 1 清零）
     pub fn write_hfsr(&mut self, value: u32) {
         self.hfsr &= !value;
+    }
+
+    /// Read `MMFAR` / 读 `MMFAR`
+    ///
+    /// The address field is always readable; software must check
+    /// `CFSR.MMARVALID` before trusting it (ARMv8-M `MMFAR`).
+    /// 地址字段始终可读；软件必须先检查 `CFSR.MMARVALID` 才能信任它
+    /// （ARMv8-M `MMFAR`）。
+    #[must_use]
+    pub fn read_mmfar(&self) -> u32 {
+        self.mmfar
+    }
+
+    /// Write the `MMFAR` address field / 写入 `MMFAR` 地址字段
+    ///
+    /// `MMARVALID` lives in `CFSR`, so writing the address never changes the
+    /// validity flag.
+    /// `MMARVALID` 位于 `CFSR`，因此写地址不会改变有效标志。
+    pub fn write_mmfar(&mut self, value: u32) {
+        self.mmfar = value;
+    }
+
+    /// Read `BFAR` / 读 `BFAR`
+    #[must_use]
+    pub fn read_bfar(&self) -> u32 {
+        self.bfar
+    }
+
+    /// Write the `BFAR` address field / 写入 `BFAR` 地址字段
+    pub fn write_bfar(&mut self, value: u32) {
+        self.bfar = value;
     }
 
     /// Compose the `AIRCR` read value / 组合 `AIRCR` 读值
@@ -403,6 +486,64 @@ impl CortexM33Core {
         self.faults.vect_reset_requested()
     }
 
+    /// Read `CCR` / 读 `CCR`
+    ///
+    /// `STKALIGN` always reads as one (ARMv8-M makes it RAO/WI); the trap bits
+    /// reflect software writes.
+    /// `STKALIGN` 恒读 1（ARMv8-M 规定为 RAO/WI）；陷阱位反映软件写入。
+    #[must_use]
+    pub fn ccr(&self) -> u32 {
+        self.registers.ccr
+    }
+
+    /// Write the writable `CCR` bits / 写入 `CCR` 的可写位
+    ///
+    /// `STKALIGN` is read-only one, reserved bits read zero, and the three
+    /// "storage only" bits are kept for software read-back.
+    /// `STKALIGN` 只读为 1，保留位读 0，三个「仅存储」位为软件读回而保留。
+    pub fn write_ccr(&mut self, value: u32) {
+        self.registers.ccr = ccr::RESET | (value & ccr::WRITABLE_MASK);
+    }
+
+    /// Read `MMFAR` / 读 `MMFAR`
+    #[must_use]
+    pub fn mmfar(&self) -> u32 {
+        self.faults.read_mmfar()
+    }
+
+    /// Write the `MMFAR` address field / 写入 `MMFAR` 地址字段
+    pub fn write_mmfar(&mut self, value: u32) {
+        self.faults.write_mmfar(value);
+    }
+
+    /// Read `BFAR` / 读 `BFAR`
+    #[must_use]
+    pub fn bfar(&self) -> u32 {
+        self.faults.read_bfar()
+    }
+
+    /// Write the `BFAR` address field / 写入 `BFAR` 地址字段
+    pub fn write_bfar(&mut self, value: u32) {
+        self.faults.write_bfar(value);
+    }
+
+    /// Record the address of a trapped unaligned access in the `BFAR` field
+    /// 把被捕获的未对齐访问地址记入 `BFAR` 字段
+    ///
+    /// ARMv8-M reports unaligned accesses as UsageFault with `UFSR.UNALIGNED`
+    /// and does **not** define an address register for them: `MMFAR` is reserved
+    /// for MemManage and `BFARVALID` is only set for precise BusFaults. This
+    /// model still stores the trapped address in the `BFAR` address field for
+    /// host diagnostics, but leaves `CFSR.BFARVALID` clear so software sees the
+    /// architecturally correct validity.
+    /// ARMv8-M 把未对齐访问报告为带 `UFSR.UNALIGNED` 的 UsageFault，并**不**为其
+    /// 定义地址寄存器：`MMFAR` 专用于 MemManage，`BFARVALID` 只为精确 BusFault
+    /// 置位。本模型仍把被捕获地址存入 `BFAR` 地址字段供宿主诊断，但保持
+    /// `CFSR.BFARVALID` 清零，使软件看到架构正确的有效性。
+    pub(crate) fn record_unaligned_address(&mut self, addr: u32) {
+        self.faults.write_bfar(addr);
+    }
+
     /// Enter one exception through the stack-limit and stacking-error wrapper
     /// 通过栈上限与压栈错误包装进入一个异常
     ///
@@ -522,11 +663,16 @@ impl CortexM33Core {
             self.registers.msplim
         };
         let sp = self.registers.current_sp();
-        let frame = if self.registers.fp_context_active() {
+        let mut frame = if self.registers.fp_context_active() {
             EXCEPTION_STACK_FRAME_WITH_FP_SIZE
         } else {
             EXCEPTION_STACK_FRAME_SIZE
         };
+        // `CCR.STKALIGN` = 1：SP 未 8 字节对齐时还会多压一个 4 字节对齐字。
+        // `CCR.STKALIGN` = 1: an unaligned SP also adds a 4-byte aligner word.
+        if sp & 0x7 != 0 {
+            frame += 4;
+        }
         sp < limit || sp - limit < frame
     }
 
@@ -577,11 +723,15 @@ impl CortexM33Core {
     /// option and the architectural path cannot diverge: `NOCP` and illegal
     /// `EXC_RETURN` values are raised by the instruction executors, undefined
     /// encodings arrive as [`StepResult::Undefined`], and `BKPT` raises
-    /// `HFSR.DEBUGEVT`. A disabled or masked UsageFault handler escalates to
-    /// HardFault inside [`Self::raise_sync_fault`].
+    /// `HFSR.DEBUGEVT`. Trapped unaligned accesses and divide-by-zero operations
+    /// (`CCR.UNALIGN_TRP`/`DIV_0_TRP`) arrive as pending UsageFault reasons from
+    /// the load/store and divide executors. A disabled or masked UsageFault
+    /// handler escalates to HardFault inside [`Self::raise_sync_fault`].
     /// 所有同步故障都汇聚到这里，严格模式宿主选项与架构路径不会分叉：`NOCP` 与
     /// 非法 `EXC_RETURN` 由指令执行器触发，未定义编码以 [`StepResult::Undefined`]
-    /// 到达，`BKPT` 置位 `HFSR.DEBUGEVT`。未使能或被屏蔽的 UsageFault 处理程序在
+    /// 到达，`BKPT` 置位 `HFSR.DEBUGEVT`。被捕获的未对齐访问与除零
+    /// （`CCR.UNALIGN_TRP`/`DIV_0_TRP`）由加载/存储与除法执行器作为待处理
+    /// UsageFault 原因送达。未使能或被屏蔽的 UsageFault 处理程序在
     /// [`Self::raise_sync_fault`] 内升级为 HardFault。
     #[inline]
     pub(crate) fn finish_instruction(
@@ -593,6 +743,31 @@ impl CortexM33Core {
         width: u8,
         result: StepResult,
     ) -> Result<StepResult, CoreError> {
+        // 未对齐数据访问（CCR.UNALIGN_TRP=1）：UFSR.UNALIGNED，按 SHCSR 使能位
+        // 选择 UsageFault（6）或升级为 HardFault（3）。地址仅作诊断记入 BFAR，
+        // BFARVALID 保持清零（ARMv8-M 未为该故障定义地址寄存器）。
+        // An unaligned data access with CCR.UNALIGN_TRP=1: UFSR.UNALIGNED,
+        // routed by SHCSR.USGFAULTENA. The address is recorded in BFAR for
+        // diagnostics only, with BFARVALID left clear because ARMv8-M defines
+        // no fault-address register for this UsageFault.
+        if let Some(addr) = self.registers.take_unaligned_fault() {
+            self.record_unaligned_address(addr);
+            let entered =
+                self.raise_sync_fault(bus, cycles, EXC_USAGE_FAULT, cfsr::UNALIGNED, old_pc)?;
+            self.active_exceptions.push(entered);
+            return Ok(StepResult::Ok);
+        }
+
+        // 除零（CCR.DIV_0_TRP=1）：UFSR.DIVBYZERO，目标寄存器保持未写入。
+        // Divide by zero with CCR.DIV_0_TRP=1: UFSR.DIVBYZERO, with the
+        // destination register left unwritten.
+        if self.registers.take_div0_fault() {
+            let entered =
+                self.raise_sync_fault(bus, cycles, EXC_USAGE_FAULT, cfsr::DIVBYZERO, old_pc)?;
+            self.active_exceptions.push(entered);
+            return Ok(StepResult::Ok);
+        }
+
         // 同步用法故障（NOCP）：记录 CFSR.UFSR.NOCP，再由 SHCSR.USGFAULTENA
         // 决定进入 UsageFault（6）还是升级为 HardFault（3）。
         // Synchronous UsageFault (NOCP): record CFSR.UFSR.NOCP; SHCSR.USGFAULTENA

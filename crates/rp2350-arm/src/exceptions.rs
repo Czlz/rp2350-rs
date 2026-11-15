@@ -493,17 +493,15 @@ pub fn enter_exception(
     }
 
     let extended_frame = regs.fp_context_active();
-    // 扩展帧要求 FPCAR 8 字节对齐：SP 未对齐时先向下对齐，并在压栈 xPSR
-    // 的 bit 9 记录 4 字节对齐字，返回时再补回。
-    // An extended frame requires an 8-byte aligned FPCAR: an unaligned SP is
-    // rounded down and the 4-byte aligner is recorded in stacked xPSR bit 9 so
-    // the return path can restore the exact SP.
-    let (frame_top, stack_aligner) = if extended_frame {
-        let aligned = sp & !0x7;
-        (aligned, aligned != sp)
-    } else {
-        (sp, false)
-    };
+    // ARMv8-M 的 `CCR.STKALIGN` 恒为 1：所有异常帧都从 8 字节对齐处开始，SP 未
+    // 对齐时把 4 字节对齐字记录在压栈 xPSR 的 bit 9，返回时再补回。扩展帧的
+    // `FPCAR` 也必须 8 字节对齐，因此两种帧走同一对齐规则。
+    // ARMv8-M `CCR.STKALIGN` is always one: every exception frame starts on an
+    // 8-byte boundary, and a 4-byte aligner is recorded in stacked xPSR bit 9 so
+    // the return path can restore the exact SP. The extended frame's `FPCAR`
+    // also has to be 8-byte aligned, so both frame kinds share the rule.
+    let frame_top = sp & !0x7;
+    let stack_aligner = frame_top != sp;
     let frame_base = if extended_frame {
         // FPCAR points at S0 and must stay 8-byte aligned; the padding word
         // sits right above the 17-word context.

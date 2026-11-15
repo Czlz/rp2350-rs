@@ -479,6 +479,13 @@ pub fn execute_thumb16(
             let rb = ((opcode >> 3) & 0x7) as usize;
             let rd = (opcode & 0x7) as usize;
             let addr: u32 = regs.r[rb].wrapping_add(regs.r[ro]);
+            // 字/半字访问在 CCR.UNALIGN_TRP 置位时必须自然对齐（字节访问不需要）。
+            // Word/halfword accesses must be naturally aligned when
+            // CCR.UNALIGN_TRP is set; byte accesses never need a check.
+            let alignment = if op_a == 0b01 { 2 } else { 4 };
+            if op_a != 0b10 && op_a != 0b11 && regs.trap_unaligned(addr, alignment) {
+                return Ok(StepResult::Ok);
+            }
             match op_a {
                 0b00 => {
                     // STR Rd, [Rb, Ro] / 存储字
@@ -512,6 +519,14 @@ pub fn execute_thumb16(
             let rb = ((opcode >> 3) & 0x7) as usize;
             let rd = (opcode & 0x7) as usize;
             let addr: u32 = regs.r[rb].wrapping_add(regs.r[ro]);
+            let alignment = match op_b {
+                0b00 => 4,
+                0b01 | 0b11 => 2,
+                _ => 1,
+            };
+            if alignment > 1 && regs.trap_unaligned(addr, alignment) {
+                return Ok(StepResult::Ok);
+            }
             match op_b {
                 0b00 => {
                     // LDR Rd, [Rb, Ro] / 加载字
@@ -545,6 +560,9 @@ pub fn execute_thumb16(
             let rb = ((opcode >> 3) & 0x7) as usize;
             let rd = (opcode & 0x7) as usize;
             let addr = regs.r[rb].wrapping_add(imm5 << 1);
+            if regs.trap_unaligned(addr, 2) {
+                return Ok(StepResult::Ok);
+            }
             if op == 0 {
                 // STRH Rd, [Rb, #imm5*2] / 存储半字
                 bus.write_u16(addr, regs.r[rd] as u16, cycles)?;
@@ -561,6 +579,9 @@ pub fn execute_thumb16(
             let rd = ((opcode >> 8) & 0x7) as usize;
             let imm8 = (opcode & 0xFF) as u32;
             let addr = regs.sp.wrapping_add(imm8 << 2);
+            if regs.trap_unaligned(addr, 4) {
+                return Ok(StepResult::Ok);
+            }
             if op == 0 {
                 // STR Rd, [SP, #imm8*4] / 存储字
                 bus.write_u32(addr, regs.r[rd], cycles)?;
@@ -675,7 +696,14 @@ pub fn execute_thumb16(
                     let m = ((opcode >> 8) & 0x1) != 0;
                     let reg_list = (opcode & 0xFF) as u16;
                     let count = reg_list.count_ones() + u32::from(m);
-                    regs.write(13, regs.sp.wrapping_sub(count * 4));
+                    let new_sp = regs.sp.wrapping_sub(count * 4);
+                    // PUSH 按字写栈，CCR.UNALIGN_TRP 置位时新 SP 必须字对齐。
+                    // PUSH stores words; with CCR.UNALIGN_TRP set the new SP
+                    // must be word aligned.
+                    if regs.trap_unaligned(new_sp, 4) {
+                        return Ok(StepResult::Ok);
+                    }
+                    regs.write(13, new_sp);
                     let mut addr = regs.sp;
                     for i in 0..8u16 {
                         if (reg_list >> i) & 1 != 0 {
@@ -742,6 +770,12 @@ pub fn execute_thumb16(
                     let m = ((opcode >> 8) & 0x1) != 0;
                     let reg_list = (opcode & 0xFF) as u16;
                     let mut addr = regs.sp;
+                    // POP 从 SP 读字，CCR.UNALIGN_TRP 置位时 SP 必须字对齐。
+                    // POP reads words from SP; with CCR.UNALIGN_TRP set the SP
+                    // must be word aligned.
+                    if regs.trap_unaligned(addr, 4) {
+                        return Ok(StepResult::Ok);
+                    }
                     for i in 0..8u16 {
                         if (reg_list >> i) & 1 != 0 {
                             regs.r[i as usize] = bus.read_u32(addr, cycles)?;
@@ -792,6 +826,9 @@ pub fn execute_thumb16(
             let rb = ((opcode >> 8) & 0x7) as usize;
             let reg_list = (opcode & 0xFF) as u16;
             let mut addr = regs.r[rb];
+            if regs.trap_unaligned(addr, 4) {
+                return Ok(StepResult::Ok);
+            }
             for i in 0..8u16 {
                 if (reg_list >> i) & 1 != 0 {
                     bus.write_u32(addr, regs.r[i as usize], cycles)?;
@@ -811,6 +848,9 @@ pub fn execute_thumb16(
             let rb = ((opcode >> 8) & 0x7) as usize;
             let reg_list = (opcode & 0xFF) as u16;
             let mut addr = regs.r[rb];
+            if regs.trap_unaligned(addr, 4) {
+                return Ok(StepResult::Ok);
+            }
             for i in 0..8u16 {
                 if (reg_list >> i) & 1 != 0 {
                     regs.r[i as usize] = bus.read_u32(addr, cycles)?;

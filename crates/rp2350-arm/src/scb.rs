@@ -71,6 +71,12 @@ pub mod icsr {
 /// each byte read as zero. / 只有实现的优先级位可写，每个字节的保留低位读 0。
 const SHPR3_MODELED: u32 = 0xE0E0_0000;
 
+/// Bytes of `SHPR1` that this model stores (MemManage byte 0, BusFault byte 1,
+/// UsageFault byte 2)
+/// 本模型保存的 `SHPR1` 字节（MemManage 第 0 字节、BusFault 第 1 字节、
+/// UsageFault 第 2 字节）
+const SHPR1_MODELED: u32 = 0x00E0_E0E0;
+
 /// Bytes of `SHPR2` that this model stores (SVCall byte 3)
 /// 本模型保存的 `SHPR2` 字节（SVCall 第 3 字节）
 const SHPR2_MODELED: u32 = 0xE000_0000;
@@ -83,10 +89,10 @@ const PRIORITY_BYTE_MASK: u32 = 0xE0;
 /// NMI、SVCall、PendSV 与 SysTick 的系统控制块异常状态
 ///
 /// Holds exactly the state that belongs to the system exceptions: their pending
-/// latches and the `SHPR2`/`SHPR3` priority bytes. Active state stays in the
-/// core's exception stack because it is shared with every other exception.
-/// 只保存系统异常自己的状态：挂起锁存与 `SHPR2`/`SHPR3` 优先级字节。活跃状态
-/// 由核心的异常栈保存，因为它与所有其它异常共享。
+/// latches and the `SHPR1`/`SHPR2`/`SHPR3` priority bytes. Active state stays in
+/// the core's exception stack because it is shared with every other exception.
+/// 只保存系统异常自己的状态：挂起锁存与 `SHPR1`/`SHPR2`/`SHPR3` 优先级字节。活跃
+/// 状态由核心的异常栈保存，因为它与所有其它异常共享。
 #[derive(Debug, Clone)]
 pub struct Scb {
     /// `ICSR.NMIPENDSET` latch / `ICSR.NMIPENDSET` 锁存
@@ -99,6 +105,9 @@ pub struct Scb {
     systick_pending: bool,
     /// `SHPR2` (SVCall priority in byte 3) / `SHPR2`（第 3 字节为 SVCall 优先级）
     shpr2: u32,
+    /// `SHPR1` (MemManage byte 0, BusFault byte 1, UsageFault byte 2)
+    /// `SHPR1`（第 0 字节 MemManage、第 1 字节 BusFault、第 2 字节 UsageFault）
+    shpr1: u32,
     /// `SHPR3` (PendSV in byte 2, SysTick in byte 3)
     /// `SHPR3`（第 2 字节 PendSV、第 3 字节 SysTick）
     shpr3: u32,
@@ -115,6 +124,7 @@ impl Scb {
             pendsv_pending: false,
             systick_pending: false,
             shpr2: 0,
+            shpr1: 0,
             shpr3: 0,
         }
     }
@@ -214,6 +224,24 @@ impl Scb {
         Self::decode_priority((self.shpr2 >> 24) & 0xFF)
     }
 
+    /// Priority of MemManage (`SHPR1[7:0]`) / MemManage 优先级（`SHPR1[7:0]`）
+    #[must_use]
+    pub fn memmanage_priority(&self) -> u8 {
+        Self::decode_priority(self.shpr1 & 0xFF)
+    }
+
+    /// Priority of BusFault (`SHPR1[15:8]`) / BusFault 优先级（`SHPR1[15:8]`）
+    #[must_use]
+    pub fn busfault_priority(&self) -> u8 {
+        Self::decode_priority((self.shpr1 >> 8) & 0xFF)
+    }
+
+    /// Priority of UsageFault (`SHPR1[23:16]`) / UsageFault 优先级（`SHPR1[23:16]`）
+    #[must_use]
+    pub fn usagefault_priority(&self) -> u8 {
+        Self::decode_priority((self.shpr1 >> 16) & 0xFF)
+    }
+
     /// Priority of PendSV (`SHPR3[23:16]`) / PendSV 优先级（`SHPR3[23:16]`）
     #[must_use]
     pub fn pendsv_priority(&self) -> u8 {
@@ -238,6 +266,22 @@ impl Scb {
     /// Write `SHPR2` / 写 `SHPR2`
     pub fn write_shpr2(&mut self, value: u32) {
         self.shpr2 = value & SHPR2_MODELED;
+    }
+
+    /// Read `SHPR1` / 读 `SHPR1`
+    ///
+    /// Byte 0 is MemManage, byte 1 BusFault and byte 2 UsageFault; byte 3 is
+    /// reserved and reads zero.
+    /// 第 0 字节 MemManage、第 1 字节 BusFault、第 2 字节 UsageFault；第 3 字节
+    /// 保留并读 0。
+    #[must_use]
+    pub fn read_shpr1(&self) -> u32 {
+        self.shpr1
+    }
+
+    /// Write `SHPR1` / 写 `SHPR1`
+    pub fn write_shpr1(&mut self, value: u32) {
+        self.shpr1 = value & SHPR1_MODELED;
     }
 
     /// Read `SHPR3` / 读 `SHPR3`

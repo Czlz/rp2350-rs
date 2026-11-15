@@ -100,6 +100,13 @@ pub(super) fn execute_register_list(
         base
     };
 
+    // LDM/STM 按字访问，CCR.UNALIGN_TRP 置位时基址必须字对齐；捕获时不得写回。
+    // LDM/STM access words; with CCR.UNALIGN_TRP set the base must be word
+    // aligned, and a trapped access must not write back the base.
+    if regs.trap_unaligned(start, 4) {
+        return Ok(StepResult::Ok);
+    }
+
     let mut addr = start;
     let mut loaded_pc = None;
     for index in 0..16u8 {
@@ -163,6 +170,10 @@ pub(super) fn execute_exclusive(
     let offset = (instr & 0xFF) << 2;
     let addr = regs.read(rn).wrapping_add(offset);
     let size = TransferSize::Word.bytes();
+
+    if regs.trap_unaligned(addr, 4) {
+        return Ok(StepResult::Ok);
+    }
 
     if load {
         let value = bus.read_u32(addr, cycles)?;
@@ -230,6 +241,20 @@ pub(super) fn execute_acquire_release(
     }
 
     let addr = regs.read(rn);
+
+    // 字节访问永不未对齐；半字/字/双字在 CCR.UNALIGN_TRP 置位时必须自然对齐。
+    // Byte accesses can never be unaligned; halfword/word/doubleword accesses
+    // must be naturally aligned when CCR.UNALIGN_TRP is set.
+    let alignment = if size == TransferSize::Byte {
+        1
+    } else if size == TransferSize::Half {
+        2
+    } else {
+        4
+    };
+    if regs.trap_unaligned(addr, alignment) {
+        return Ok(StepResult::Ok);
+    }
 
     if load {
         if double {

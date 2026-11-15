@@ -233,6 +233,14 @@ pub(super) fn execute(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
                 return StepResult::Undefined;
             }
             let divisor = regs.read(rm) as i32;
+            // CCR.DIV_0_TRP：除数为零时进入 UFSR.DIVBYZERO，且不写目标寄存器。
+            // 未置位时保持 ARM 规定的结果：除零为 0，INT_MIN / -1 为 INT_MIN。
+            // CCR.DIV_0_TRP: a zero divisor raises UFSR.DIVBYZERO and leaves the
+            // destination unwritten. With the bit clear the ARM results hold:
+            // zero for divide-by-zero and INT_MIN for INT_MIN / -1.
+            if divisor == 0 && regs.trap_divide_by_zero() {
+                return StepResult::Ok;
+            }
             let result = (regs.read(rn) as i32)
                 .checked_div(divisor)
                 .unwrap_or(if divisor == 0 { 0 } else { i32::MIN });
@@ -244,6 +252,9 @@ pub(super) fn execute(instr: u32, regs: &mut CortexM33Registers) -> StepResult {
                 return StepResult::Undefined;
             }
             let divisor = regs.read(rm);
+            if divisor == 0 && regs.trap_divide_by_zero() {
+                return StepResult::Ok;
+            }
             let result = regs.read(rn).checked_div(divisor).unwrap_or(0);
             regs.write(rd, result);
             StepResult::Ok
