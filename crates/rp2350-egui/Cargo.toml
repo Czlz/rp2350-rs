@@ -19,6 +19,7 @@ tracing-subscriber = { workspace = true }
 rp2350-core = { workspace = true }
 rp2350-cpu = { workspace = true }
 rp2350-arm = { workspace = true }
+rp2350-cli = { workspace = true }
 rp2350-virt-periph = { workspace = true, features = ["gui"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

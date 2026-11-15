@@ -8,8 +8,10 @@
 > （`panels.rs` 的快照类型与格式化函数 + `app.rs` 的渲染函数）、`canvas.rs` 的
 > 画布数据模型/几何层、`canvas_view.rs` 的 egui 绘制与拖拽交互，以及设备调色板
 > （`palette.rs`）与文本持久化（`canvas_io.rs`）。应用顶部标签栏可在「虚拟实验室」
-> 与「寄存器与外设」之间切换；虚拟实验室标签页带保存/加载工具栏。下文的 HSTX
-> 视频解码面板、内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
+> 「游戏」与「寄存器与外设」之间切换；虚拟实验室标签页带保存/加载工具栏，游戏
+> 标签页（`play_view.rs`）实时显示 RGB565 帧并映射键盘，已通过
+> `play_view/cli_source.rs` 接到真实 `PlaySession`（`main.rs` 默认挂载）。
+> 下文的 HSTX 视频解码面板、内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
 >
 > **Status** (EN): skeleton — `EmuApp` (`app.rs`), the register panel
 > (`panels.rs`: `RegisterPanel`, `RegisterSnapshot`), the read-only DMA/HSTX/PIO
@@ -17,10 +19,12 @@
 > `app.rs`), the canvas data model/geometry layer (`canvas.rs`), the egui painter
 > + drag interaction (`canvas_view.rs`), the built-in device palette
 > (`palette.rs`) and canvas text persistence (`canvas_io.rs`) are implemented. A
-> top tab bar switches between the Virtual Lab and the register/peripheral
-> panels, and the Virtual Lab tab carries a save/load toolbar. The HSTX video
-> decoder panel and the memory/GPIO/terminal/debugger panels below remain target
-> designs.
+> top tab bar switches between the Virtual Lab, the Play tab and the
+> register/peripheral panels; the Virtual Lab tab carries a save/load toolbar and
+> the Play tab (`play_view.rs`) shows live RGB565 frames with keyboard input,
+> wired to the real `PlaySession` through `play_view/cli_source.rs` and attached
+> by `main.rs` by default. The HSTX video decoder panel and the
+> memory/GPIO/terminal/debugger panels below remain target designs.
 
 ---
 
@@ -29,13 +33,16 @@
 ```
 rp2350-egui/
 └── src/
-    ├── lib.rs            # module declarations + re-export EmuApp, CanvasState
+    ├── lib.rs            # module declarations + re-export EmuApp, CanvasState, PlayView, CliPlayStarter
     ├── app.rs            # EmuApp — eframe::App + tab bar + save/load toolbar (已落地 / landed)
     ├── panels.rs         # RegisterPanel / RegisterSnapshot / XpsrFlags (已落地 / landed)
     ├── canvas.rs         # Virtual Lab 数据模型与几何（已落地 / landed）
     ├── canvas_view.rs    # Virtual Lab egui 绘制、输入与调色板侧栏（已落地 / landed）
     ├── palette.rs        # 内置设备调色板模板（已落地 / landed）
     ├── canvas_io.rs      # 画布文本格式 to_text/from_text（已落地 / landed）
+    ├── play_view.rs      # 游戏标签页：帧纹理、缩放、键盘映射（已落地 / landed）
+    ├── play_view/cli_source.rs # PlaySession → PlaySource 适配器（已接线 / wired）
+    ├── play_view/tests.rs # 游戏标签页测试（仅 test 构建 / test-only）
     ├── canvas_tests.rs   # 调色板/持久化测试（仅 test 构建 / test-only）
     └── main.rs           # binary entry / 二进制入口
 
@@ -71,6 +78,8 @@ Planned target layout (Phase 3, not yet created / 规划中的目标结构，尚
 pub enum ActiveView {
     /// Virtual Lab wiring canvas (default) / 虚拟实验室连线画布（默认）
     VirtualLab,
+    /// Play tab: live game picture and keyboard / 游戏标签页：实时画面与键盘
+    Play,
     /// Register and peripheral panels / 寄存器与外设面板
     Panels,
 }
@@ -95,6 +104,9 @@ pub struct EmuApp {
     /// Result of the last save/load shown in the toolbar
     /// 工具栏中显示的最近一次保存/加载结果
     canvas_status: String,
+    /// Play tab model (worker, texture, toolbar fields), preserved across tabs
+    /// 游戏标签页模型（worker、纹理、工具栏字段），切换标签页时保留
+    play: PlayView,
     /// Active top-level view / 当前顶层视图
     view: ActiveView,
 }
@@ -108,6 +120,11 @@ impl EmuApp {
     /// Attach a read-only peripheral snapshot source (DMA/HSTX/PIO)
     /// 挂载只读外设快照来源（DMA/HSTX/PIO）
     pub fn with_peripheral_source(self, source: Box<dyn PeripheralSource>) -> Self;
+    /// Play tab accessors / 游戏标签页访问器
+    pub fn play(&self) -> &PlayView;
+    pub fn play_mut(&mut self) -> &mut PlayView;
+    /// Attach the play worker factory (host side) / 挂载游玩 worker 工厂（宿主侧）
+    pub fn with_play_starter(self, starter: Box<dyn PlayStarter>) -> Self;
     /// Canvas model accessors / 画布模型访问器
     pub fn canvas(&self) -> &CanvasState;
     pub fn canvas_mut(&mut self) -> &mut CanvasState;
@@ -124,15 +141,18 @@ impl EmuApp {
 }
 
 impl eframe::App for EmuApp {
-    /// Heading + tab bar + active view (`VirtualLab` or `Panels`)
+    /// Heading + tab bar + active view (`VirtualLab`, `Play` or `Panels`)
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame);
 }
 ```
 
 Tab switching only changes the `view` field: `CanvasState` (nodes, wires, pan,
-zoom, selection) is owned by `EmuApp` and survives switching back and forth.
-切换标签页只改 `view` 字段：`CanvasState`（节点、连线、平移、缩放、选中项）
-由 `EmuApp` 持有，来回切换不会丢失。
+zoom, selection) and `PlayView` (worker, texture, toolbar text) are owned by
+`EmuApp` and survive switching back and forth. A running play worker keeps
+stepping in the background because the session lives in its own thread.
+切换标签页只改 `view` 字段：`CanvasState`（节点、连线、平移、缩放、选中项）与
+`PlayView`（worker、纹理、工具栏文本）由 `EmuApp` 持有，来回切换不会丢失。正在
+运行的游玩 worker 会继续在后台推进，因为会话位于自己的线程中。
 
 **目标设计 / Target design（规划中 / planned，Phase 3）**：扩展为
 `chip: Arc<Mutex<RP2350Chip>>` + `gdb_server` 句柄 + `plugin_host` + 左侧外设/
@@ -203,11 +223,245 @@ that switching tabs preserves the canvas nodes and wires.
 
 ---
 
+## PlayView / 游戏标签页
+
+「Play / 游戏」标签页（`play_view.rs`）把后台游玩 worker 发布的 RGB565 帧实时显示
+出来，并把键盘映射成 GBA 按键位图。它是 GUI 中**唯一**会写仿真器的视图（写的是
+按键掩码），其余面板仍然只读。
+
+The "Play" tab (`play_view.rs`) shows the RGB565 frames published by the
+background play worker and maps the keyboard onto the GBA button bitmap. It is
+the only GUI view that writes to the simulator (a button mask); every other panel
+stays read-only.
+
+### Wiring model / 接线模型
+
+依赖方向为 **`rp2350-egui → rp2350-cli`**：旧的 `rp2350-cli → rp2350-egui` 依赖已删除
+（CLI 源码从未使用它，却造成包循环），因此本 crate 现在可以在
+`play_view/cli_source.rs` 里提供真实适配器 `CliPlaySource` / `CliPlayStarter`。视图本身
+仍只与两个 trait 交互，测试与其它宿主依然可以注入假 worker。
+
+The dependency points **`rp2350-egui → rp2350-cli`**: the stale
+`rp2350-cli → rp2350-egui` edge (never used by CLI source, but a package cycle) is
+gone, so this crate ships the real adapter `CliPlaySource` / `CliPlayStarter` in
+`play_view/cli_source.rs`. The view still talks only to the two traits, so tests
+and alternate hosts can keep injecting a fake worker.
+
+```rust
+/// Running play worker as seen by the GUI / GUI 视角的运行中 worker
+pub trait PlaySource {
+    fn latest_frame(&self) -> Option<Arc<PlayFrame>>;
+    fn set_buttons(&self, mask: u16);
+    fn stats(&self) -> PlayStats;
+    fn is_running(&self) -> bool;
+    fn button_pins(&self) -> u16;
+    fn shutdown(self: Box<Self>) -> PlayStats;
+}
+
+/// Factory that boots a PlaySource from a PlayRequest
+/// 用 PlayRequest 启动 PlaySource 的工厂
+pub trait PlayStarter {
+    fn start(&self, request: PlayRequest) -> Result<Box<dyn PlaySource>, String>;
+}
+```
+
+宿主侧适配现在就在本 crate 内（`play_view/cli_source.rs`，不再需要 CLI 的 `gui` 子命令）：
+
+```rust
+/// 由运行中的 CLI 游玩会话支撑的来源 / source backed by a live CLI session
+pub struct CliPlaySource { session: PlaySession, cached: Mutex<Option<Arc<PlayFrame>>> }
+
+impl PlaySource for CliPlaySource {
+    fn latest_frame(&self) -> Option<Arc<PlayFrame>> { /* 按 index 缓存转换结果 */ }
+    fn set_buttons(&self, mask: u16) { self.session.set_buttons(mask); }
+    fn stats(&self) -> PlayStats { /* frames/steps/fps/steps_per_second + replaced */ }
+    fn is_running(&self) -> bool { self.session.is_running() }
+    fn button_pins(&self) -> u16 { self.session.button_pins() }
+    fn shutdown(self: Box<Self>) -> PlayStats { /* 先取 replaced，再 shutdown */ }
+}
+
+pub struct CliPlayStarter;
+
+impl PlayStarter for CliPlayStarter {
+    fn start(&self, request: PlayRequest) -> Result<Box<dyn PlaySource>, String> {
+        let frame = FrameSpec::parse(request.frame.trim())?;
+        let config = PlayConfig {
+            frame,
+            steps_per_frame: request.steps_per_frame,
+            max_frames: None,
+            button_pins: request.button_pins,
+            audio: request.audio,
+            trace_steps: 0,
+        };
+        let options = MachineOptions { arch: None, max_cycles: u64::MAX, strict_decode: false };
+        PlaySession::start(request.image, options, config)
+            .map(|session| Box::new(CliPlaySource::new(session)) as Box<dyn PlaySource>)
+    }
+}
+```
+
+`arch: None` 让 UF2 家族 / ELF 自行选核，`max_cycles = u64::MAX` 表示交互式游玩没有
+指令预算上限（用 Stop 结束，而不是因预算停机）。`latest_frame()` 把 CLI 的
+`Arc<Frame>` 转成 GUI 的 `PlayFrame`，并按帧序号缓存，因此 UI 重绘快于游戏帧率时不会
+重复拷贝像素缓冲。
+
+`arch: None` lets the UF2 family / ELF pick the core and `max_cycles = u64::MAX`
+means an interactive game has no instruction budget (Stop ends it, not a budget
+halt). `latest_frame()` converts the CLI `Arc<Frame>` into the GUI `PlayFrame` and
+caches it by index, so repaints faster than the guest never re-copy the pixels.
+
+原生入口 `main.rs` 挂载现成适配器，因此 `cargo run -p rp2350-egui` 的「游戏」标签页
+可以直接读固件并出画面；`EmuApp::sample()` 与 `EmuApp::default()` 保持不变：
+
+```rust
+EmuApp::sample()
+    .with_play_starter(Box::new(CliPlayStarter))
+    .run()
+```
+
+The native entry point attaches the ready-made starter, so the Play tab of
+`cargo run -p rp2350-egui` can read firmware and show frames immediately;
+`EmuApp::sample()` and `EmuApp::default()` stay unchanged.
+
+未挂载 starter 的 `PlayView::default()` 仍然可用（测试与 `EmuApp::sample()` 依赖这一点）：
+工具栏、占位画面与状态栏照常渲染，「Start / 启动」把
+`no play source attached / 未挂载游玩来源` 写进状态行，不 panic。
+
+A `PlayView::default()` without a starter still works (tests and `EmuApp::sample()`
+rely on it): the toolbar, the placeholder picture and the status bar still render;
+"Start" writes `no play source attached` into the status line instead of
+panicking.
+
+### Toolbar and fields / 工具栏与字段
+
+| 字段 / Field | 默认值 / Default | 说明 / Notes |
+|--------------|------------------|--------------|
+| `file` | `DEFAULT_FIRMWARE` = `E:\Source\mcu\pico\rp2350\gba\pokeemerald-rp2350\rp2350\hw\build_emerald\emerald.uf2` | 启动时 `std::fs::read`；读失败写状态行 |
+| `fb` | `0x20063DF4:240x160` | `ADDR:WxH[:STRIDE]`，由宿主用 `FrameSpec::parse` 解析 |
+| `steps_per_frame` | `2500000` | 必须是正整数，否则写状态行 |
+| `audio` | `false` | 传给 `PlayConfig::audio`（当前仅捕获，无播放后端） |
+| `status` | `idle / 空闲` | `running` / `stopped` / `start failed` / `cannot read firmware` |
+
+按键位（`GP0..GP9`，按下 = 低电平，固件内部上拉）：
+
+| 键 / Key | 按键 / Button | 引脚 / Pin | 掩码位 / Bit |
+|----------|---------------|-----------|--------------|
+| `Z` | A | GP0 | `0x001` |
+| `X` | B | GP1 | `0x002` |
+| `Backspace` | Select | GP2 | `0x004` |
+| `Enter` | Start | GP3 | `0x008` |
+| `→` | Right | GP4 | `0x010` |
+| `←` | Left | GP5 | `0x020` |
+| `↑` | Up | GP6 | `0x040` |
+| `↓` | Down | GP7 | `0x080` |
+| `S` | R | GP8 | `0x100` |
+| `A` | L | GP9 | `0x200` |
+
+键盘只在「画面区域」拥有焦点时生效：点击画面获得焦点（蓝色描边，提示文字消失），
+点击别处释放；为 `false` 时不写掩码。映射是纯函数
+（`KeyState::from_pressed` / `KeyState::from_input` / `mask_from_keys`），可无窗口测试。
+
+Keys only apply while the picture region owns focus: click the picture to focus it
+(blue outline, hint disappears) and click elsewhere to release it; with no focus
+the mask is not written. Mapping is pure (`KeyState`, `mask_from_keys`).
+
+### Texture and scaling / 纹理与缩放
+
+- 每帧轮询 `latest_frame()`；只有 `frame.index != last_frame` 时才把 RGB565 转成
+  `egui::ColorImage` 并写入纹理（`TextureHandle::set`，首帧用
+  `ctx.load_texture`），所以 UI 刷新率高于游戏帧率时不会重复上传。
+- RGB565 → `Color32`：`(r << 3) | (r >> 2)`、`(g << 2) | (g >> 4)`、`(b << 3) | (b >> 2)`，
+  满量程正好到 255；短帧用黑色补齐（不会 panic）。
+- 采样用 `TextureOptions::NEAREST`，画面保持锐利。
+- 缩放：`fit_size(available, w, h)` 取 `min(avail/w, avail/h)`，≥ 1 时向下取整为**整数倍**
+  （240×160 在 1280×720 里按 4× → 960×640，在 320×240 里按 1× → 240×160），
+  < 1 时保留小数倍率缩小（80×60 窗口 → 80×53.3），始终居中、保持 3:2。
+- 极小窗口（80×60）只裁剪不 panic：画面可用尺寸钳制到 ≥ 1 px，零尺寸时跳过绘制。
+
+### Status bar / 状态栏
+
+```
+frame=<index> steps=<..> fps=<..> steps/s=<..> replaced=<..> · running|stopped
+buttons / 按键: A|Right
+```
+
+`halted` 存在时追加 ` · halted / 停机: <原因>`（例如指令预算耗尽、非法指令）。
+`replaced` 是「未被 GUI 取走即被替换」的帧数；它持续增长说明 UI 或渲染跟不上 worker
+（当前 worker 约 8 fps）。
+
+### 帧率说明 / Frame rate
+
+worker 每帧执行 `steps_per_frame` 步后发布一帧，因此帧率 ≈ `steps/s / steps_per_frame`。
+当前实测约 **8 fps**（20.6 M steps/s，每帧 2.5 M 步），远低于 GBA 的 60 fps；画面
+能看，但动作偏慢。提高办法见 [`doc/playability-plan.md`](../playability-plan.md)
+的 P0（解释器热路径），或降低 `steps_per_frame`（画面更快但游戏内时间更慢）。
+
+The worker publishes one frame per `steps_per_frame` guest steps, so the frame
+rate is ≈ `steps/s / steps_per_frame`. The measured rate is about **8 fps**
+(20.6 M steps/s at 2.5 M steps/frame), far below the GBA's 60 fps: the picture is
+readable but slow. See the P0 rows of the playability plan for the way forward.
+
+### Limits / 限制
+
+- **无音频输出接线**：`audio` 只打开 worker 的 I2S 捕获（`AudioTap`），GUI 没有播放
+  后端，也不消费采样；`rp2350-audio` 尚未接入本视图。
+- **无存档 / 无复位**：不能保存进度，也不能从 GUI 复位客户机；只能停止后重启。
+- **无手柄 / 无按键重绑**：键位写死为上表，不支持 gamepad 或自定义映射。
+- **无暂停 / 单步 / 截图**：只有 Start 与 Stop；帧率与步数由 `steps_per_frame` 决定。
+- 依赖宿主挂载 `PlayStarter`：`PlayView::default()` 仍无 starter（便于测试注入假实现），
+  但原生入口 `main.rs` 已默认挂载 `CliPlayStarter`，所以 `cargo run -p rp2350-egui`
+  的「游戏」标签页可直接出画面。
+- The starter is still injectable (`PlayView::default()` has none, for tests and
+  alternate hosts), but the native `main.rs` attaches `CliPlayStarter` by default,
+  so the standalone `rp2350-egui` binary shows real frames. There is still no audio
+  output wiring (capture only), no save states, no reset, no gamepad or rebinding,
+  and no pause/step/screenshot.
+
+### Tests / 测试
+
+`play_view/tests.rs`（`#[cfg(test)] mod tests`，独立文件以免挤占行数预算）：
+
+- RGB565 三原色 / 黑 / 白，5 位与 6 位通道的高位复制（`0x8410` → `#84/82/84` 等）；
+- `color_image` 尺寸、行优先顺序与短输入黑填充；
+- 键盘掩码：无键为空、单键逐位对应 GP0..GP9、组合键（`Z`+`S` → A|R）、全键 = `0x3FF`；
+- `KeyState::from_input` 通过 `RawInput` 事件读出 `↑`+`X` → UP|B；
+- `fit_size`：1280×720 → 4×（960×640）、320×240 → 1×（240×160）、80×60 → 小数
+  缩小且保持 3:2、零尺寸/零帧返回 `Vec2::ZERO`；
+- `format_stats` 的进度行与 `halted` 后缀、`describe_mask` 的按键名；
+- 无会话时只渲染「未运行」占位且不 panic；
+- 80×60 / 320×240 / 1280×720 三种尺寸无窗口渲染 `ui()`；
+- 同一帧不重复上传（`uploads` 计数与 `last_frame`）；
+- 未获焦点不写掩码、获焦点后 `Z` → `0x001` 送达假来源；
+- 启动错误路径：读文件失败、未挂载 starter、非法 `steps_per_frame`、starter 返回
+  `Err` 都只写状态行；成功路径把 `PlayRequest`（映像、帧缓冲、步数、音频、引脚）
+  交给 starter，`stop()` 调用一次 `shutdown`；
+- **真实适配器**（`CliPlaySource` / `CliPlayStarter`，用合成 UF2 启动真正的
+  `PlaySession`）：首帧发布后 `latest_frame()` 有值、`button_pins() == 0x3FF`、
+  `shutdown()` 后 `is_running() == false`；`set_buttons` 透传（读回一致）；统计中
+  `frames`/`steps` 单调递增且 `steps_per_second > 0`；同一帧重复轮询返回同一个
+  `Arc`（像素不重复拷贝）；非法帧文本 / 未知映像 / 零步数返回 `Err` 而不 panic；
+- 端到端：`PlayView` 挂载 `CliPlayStarter` + 临时 UF2 文件启动后，无头渲染循环
+  能上传至少一帧，`stop()` 后状态为 `stopped / 已停止`；
+- 应用层：`ActiveView::Play` 在 760×600 与 80×60 下渲染，切到其它标签再切回后
+  状态保持。
+
+English: RGB565 primaries plus bit replication, `color_image` padding and order,
+empty/single/combined key masks with the GP0..GP9 layout, live `KeyState::from_input`,
+integer/fractional `fit_size` cases, `format_stats`/`describe_mask`, idle
+placeholder rendering, headless 80×60 / 320×240 / 1280×720 rendering, upload
+deduplication per frame index, focus-gated mask delivery, every start/stop error
+path, the real `PlaySession` adapter (first frame, mask round-trip, monotonic
+statistics, cached `Arc`, bad frame text / unknown image / zero steps rejected),
+the end-to-end `CliPlayStarter` + headless render path, and the app-level Play tab
+that keeps its state across tab switches.
+
+---
+
 ## Window Layout / 窗口布局
 
-Current implementation: a heading, a two-tab bar (Virtual Lab / Panels), and the
-active view below it. The richer layout below is the target design.
-当前实现：标题、两个标签页（虚拟实验室 / 寄存器与外设）以及下方的当前视图。
+Current implementation: a heading, a three-tab bar (Virtual Lab / Play / Panels),
+and the active view below it. The richer layout below is the target design.
+当前实现：标题、三个标签页（虚拟实验室 / 游戏 / 寄存器与外设）以及下方的当前视图。
 下面更丰富的布局是目标设计。
 
 ```

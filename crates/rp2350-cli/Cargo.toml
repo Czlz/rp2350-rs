@@ -34,5 +34,4 @@ rp2350-usb-host = { workspace = true }
 rp2350-virt-periph = { workspace = true }
 rp2350-gdb = { workspace = true }
 rp2350-mcp = { workspace = true }
-rp2350-egui = { workspace = true }
 rp2350-ffi = { workspace = true }

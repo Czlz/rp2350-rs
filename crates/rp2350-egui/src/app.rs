@@ -30,6 +30,7 @@ use crate::panels::{
     format_dma_count, format_hstx_fifo, format_hstx_row, format_hstx_scanline, format_pio_block,
     format_pio_row,
 };
+use crate::play_view::{PlayStarter, PlayView};
 
 /// Top-level view selected by the tab bar / 标签栏选中的顶层视图
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +38,8 @@ pub enum ActiveView {
     /// Virtual Lab wiring canvas / 虚拟实验室连线画布
     #[default]
     VirtualLab,
+    /// Play tab: live game picture and keyboard input / 游戏标签页：实时画面与键盘输入
+    Play,
     /// Register and peripheral panels / 寄存器与外设面板
     Panels,
 }
@@ -89,6 +92,9 @@ pub struct EmuApp {
     /// Result of the last save/load shown in the toolbar
     /// 工具栏中显示的最近一次保存/加载结果
     pub(crate) canvas_status: String,
+    /// Play tab: live frames, keyboard and status bar, preserved across tabs
+    /// 游戏标签页：实时画面、键盘与状态栏，切换标签页时保留
+    play: PlayView,
     /// Active top-level view / 当前顶层视图
     view: ActiveView,
 }
@@ -105,6 +111,7 @@ impl EmuApp {
             canvas: CanvasState::sample(),
             canvas_snapshot: String::new(),
             canvas_status: String::from("snapshot: none / 快照：无"),
+            play: PlayView::default(),
             view: ActiveView::default(),
         }
     }
@@ -124,6 +131,31 @@ impl EmuApp {
     #[must_use]
     pub fn active_view(&self) -> ActiveView {
         self.view
+    }
+
+    /// Play tab model, for host integration and tests / 游戏标签页模型，供宿主集成与测试
+    #[must_use]
+    pub fn play(&self) -> &PlayView {
+        &self.play
+    }
+
+    /// Mutable Play tab model / 可变游戏标签页模型
+    pub fn play_mut(&mut self) -> &mut PlayView {
+        &mut self.play
+    }
+
+    /// Attach the play worker factory / 挂载游玩 worker 工厂
+    ///
+    /// The native entry point passes [`CliPlayStarter`](crate::CliPlayStarter),
+    /// which boots `rp2350_cli::play::PlaySession`; tests and alternate hosts can
+    /// inject any other [`PlayStarter`].
+    /// 原生入口传入 [`CliPlayStarter`](crate::CliPlayStarter)（启动
+    /// `rp2350_cli::play::PlaySession`）；测试与其它宿主可注入任意
+    /// [`PlayStarter`]。
+    #[must_use]
+    pub fn with_play_starter(mut self, starter: Box<dyn PlayStarter>) -> Self {
+        self.play.set_starter(starter);
+        self
     }
 
     /// Switch the active top-level view / 切换当前顶层视图
@@ -279,6 +311,7 @@ impl EmuApp {
                 ActiveView::VirtualLab,
                 "Virtual Lab / 虚拟实验室",
             );
+            ui.selectable_value(&mut self.view, ActiveView::Play, "Play / 游戏");
             ui.selectable_value(&mut self.view, ActiveView::Panels, "Panels / 寄存器与外设");
         });
         ui.separator();
@@ -291,6 +324,7 @@ impl EmuApp {
                 self.show_canvas_toolbar(ui);
                 self.canvas.show(ui);
             }
+            ActiveView::Play => self.play.ui(ui),
             ActiveView::Panels => self.show_panels(ui),
         }
     }
@@ -635,6 +669,25 @@ mod tests {
         app.set_active_view(ActiveView::VirtualLab);
         assert_eq!(app.canvas().nodes.len(), nodes);
         assert_eq!(app.canvas().wires.len(), wires);
+        render_view(&mut app, egui::vec2(760.0, 600.0));
+    }
+
+    #[test]
+    fn play_tab_renders_headlessly_and_keeps_its_state() {
+        let mut app = EmuApp::sample();
+        app.set_active_view(ActiveView::Play);
+        assert_eq!(app.active_view(), ActiveView::Play);
+        render_view(&mut app, egui::vec2(760.0, 600.0));
+        render_view(&mut app, egui::vec2(80.0, 60.0));
+        assert_eq!(app.play().status(), "idle / 空闲");
+        assert!(!app.play().is_running());
+
+        // 切走再切回不重建 PlayView：状态与控件文本保持。
+        // Switching away and back keeps the same PlayView and its state.
+        app.set_active_view(ActiveView::Panels);
+        render_view(&mut app, egui::vec2(760.0, 600.0));
+        app.set_active_view(ActiveView::Play);
+        assert_eq!(app.play().status(), "idle / 空闲");
         render_view(&mut app, egui::vec2(760.0, 600.0));
     }
 }

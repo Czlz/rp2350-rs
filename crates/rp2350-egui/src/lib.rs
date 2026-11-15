@@ -31,6 +31,7 @@ pub mod canvas_io;
 mod canvas_view;
 pub mod palette;
 pub mod panels;
+pub mod play_view;
 
 #[cfg(test)]
 mod canvas_tests;
@@ -39,3 +40,7 @@ pub use app::EmuApp;
 pub use canvas::CanvasState;
 pub use canvas_io::CanvasParseError;
 pub use palette::DevicePalette;
+pub use play_view::{
+    CliPlaySource, CliPlayStarter, PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats,
+    PlayView,
+};

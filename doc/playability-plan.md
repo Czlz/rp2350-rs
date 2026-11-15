@@ -60,7 +60,7 @@ keyboard/gamepad input, audio output, and no crashes.
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
 | P1-1 ✅ | `play` worker：独占线程运行 `Machine`，按墙钟节拍推进；发布 RGB565 帧（单槽最新帧/三缓冲语义）；接收按钮掩码；`--frames N` 无 GUI 测试模式 | `rp2350-cli`（新增 lib target + `play.rs`） | **实测 6.1–7.0 fps / 15.3–17.5 M steps/s**（emerald，`--steps-per-frame 2500000 --frames 20`，两次运行，退出码 0，20 帧记录 + 汇总）；按钮掩码单测（按下→低 / 松开→高 / 只动配置引脚）；`cargo test -p rp2350-cli` 126 passed / 1 ignored（新增 16 项 `play` 测试 + 1 项 CLI 解析） |
-| P1-2 🚧 | egui PlayView：纹理上传 + 保持 3:2 缩放 + 键盘映射（Z/X/Enter/Backspace/方向键/S/A）+ 启动/停止/状态栏；标签页「游戏」 | `rp2350-egui` | 80×60/320×240/1280×720 无头渲染；键盘→掩码单测；`cargo test -p rp2350-egui` 全绿 |
+| P1-2 ✅ | egui PlayView：纹理上传（新帧才上传）+ 保持 3:2 缩放（≥1 时整数倍、<1 时小数）+ 键盘映射（方向键/Z/X/Enter/Backspace/S/A）+ 启动/停止/音频开关/状态栏；标签页「游戏」；`PlaySource`/`PlayStarter` 抽象保留，并在 `play_view/cli_source.rs` 提供真实适配器 `CliPlaySource`/`CliPlayStarter`（包装 `rp2350_cli::play::PlaySession`），`main.rs` 默认挂载 | `rp2350-egui`（依赖 `rp2350-cli`） | 80×60/320×240/1280×720 无头渲染；键盘→掩码单测（GP0..GP9 逐位）；真实 `PlaySession` 适配器测试 5 项（首帧发布与掩码透传、统计单调、帧缓存复用、启动失败路径、`CliPlayStarter` 端到端无头出帧）；`cargo test -p rp2350-egui` **80 passed**；`clippy -D warnings -W pedantic` 零警告；依赖方向 `cargo tree -p rp2350-egui --depth 1` 含 `rp2350-cli`、`cargo tree -p rp2350-cli --depth 1` 不含 `rp2350-egui` |
 | P1-3 | 示例配置：`example/gba/profile.toml`（固件路径、帧缓冲/格式、按钮引脚、音频 SM）与 `README` 游玩步骤 | `example/gba` + 主会话 | 一条命令启动示例；文档含按键表 |
 
 ### P2 音频 / Audio
@@ -85,7 +85,7 @@ keyboard/gamepad input, audio output, and no crashes.
 1. **Wave 1 ✅**：P0-1（core+cli）‖ P2-1（periph）——均已验收提交
 2. **Wave 2 ✅**：P0-2（arm+core+cli）‖ P2-2（`rp2350-audio` 新 crate）——均已验收提交
 3. **Wave 3 ✅**：P0-3a（arm+core）‖ P1-1（cli lib + `play` worker + headless `--frames`）
-4. **Wave 4 🚧**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2（egui PlayView）
+4. **Wave 4 🚧**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2 ✅（egui PlayView 已接线到真实 `PlaySession`）
 5. **Wave 5**：P1-3（示例 profile）+ P3-1（GAP-08b PSRAM 挂载）+ P3-3（soak）；P0-3c 决策点
 
 ## 4. 风险 / Risks
@@ -93,7 +93,13 @@ keyboard/gamepad input, audio output, and no crashes.
 - **性能**：三轮后 20.1 M steps/s（累计 6.8×），`play` 实测 **8.3 fps**；30 fps 需 ≥75 M steps/s，60 fps 需 ≥150 M。P0-3b 之后若仍 <30 fps，实时游玩只能降级演示，需要 P0-3c 决策是否投入 JIT/帧级并行；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
-- **GUI 架构**：`rp2350-cli` 已提供 lib target（`rp2350_cli::run::Machine` +
-  `rp2350_cli::play::PlaySession`），P1-2 的 egui PlayView 直接依赖即可。
+- **GUI 架构**：`rp2350-cli` 提供 lib target（`rp2350_cli::run::Machine` +
+  `rp2350_cli::play::PlaySession`）。依赖方向已修正为 **egui → CLI**：删除了
+  `rp2350-cli` 中从未被源码使用的 `rp2350-egui` 依赖（它曾造成包循环），
+  `rp2350-egui` 直接依赖 `rp2350-cli`，在 `play_view/cli_source.rs` 提供
+  `CliPlaySource` / `CliPlayStarter`，`main.rs` 默认挂载。`PlaySource` +
+  `PlayStarter` 抽象保留，仅用于测试注入与其它宿主。证据：
+  `cargo tree -p rp2350-egui --depth 1` 含 `rp2350-cli`，
+  `cargo tree -p rp2350-cli --depth 1` 不含 `rp2350-egui`。
 - **音频**：`cpal` 在无声卡/CI 环境会失败；插件必须可选、可静默。
 - **示例耦合**：帧缓冲地址与按钮引脚属于示例配置，必须放 `example/gba/`，不写死进模拟器。
