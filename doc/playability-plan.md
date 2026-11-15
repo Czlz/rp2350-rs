@@ -49,8 +49,8 @@ keyboard/gamepad input, audio output, and no crashes.
 
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
-| P0-1 | 解释器热路径优化：总线区域缓存、写监视/PC 记录门控、外设泵送节流、去掉每步 `Vec`/格式化、`step` 内联与错误路径冷分离 | `rp2350-core` + `rp2350-cli` | emerald 50M 步 ≤6 s（≥8.3 M steps/s），行为与计数器不变；四道门禁 + FV-1/2/3 |
-| P0-2 | 第二轮：MMIO 路由缓存、PIO/DMA 泵送成本、双核步进批量化、`--release` 代码布局 | 同上 | emerald 50M 步 ≤2 s（≥25 M steps/s） |
+| P0-1 ✅ | 解释器热路径优化：区域桶缓存、Flash/RAM 原生宽读写、写监视门控、MMIO 页缓存、IRQ 位遍历 | `rp2350-core` + `rp2350-cli` | **实测 9.72 s / 5.14 M steps/s（3.36 → 5.14，1.5×）**；300M 计数器逐字段不变；未达 6 s，瓶颈定量在 `rp2350-arm`（详见 [performance.md](performance.md)） |
+| P0-2 🚧 | 第二轮：`rp2350-arm` 取指/译码热路径、`Nvic` 位图优先级、Flash 取指锁摊销、`take_system_writes` 空转门控 | `rp2350-arm` + `rp2350-core` + `rp2350-cli` | emerald 50M 步 **≤6 s（≥8.3 M steps/s）**，拉伸 ≤4 s；300M 计数器逐字段不变 |
 | P0-3 | 目标评测：emerald 300M 步 wall time 记录到 `doc/performance.md`；给出 20/30/60 fps 可行性结论 | 主会话 | 数据 + 结论 |
 
 ### P1 画面 / Video
@@ -65,8 +65,8 @@ keyboard/gamepad input, audio output, and no crashes.
 
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
-| P2-1 | I2S 采样捕获：PIO TX FIFO 推送（CPU 与 DMA 两条路径）进入 `AudioSink` 环形缓冲；`take_audio_samples()`（已提供捕获口 `AudioTap`/`BootPeripherals::set_audio_tap`） | `rp2350-periph` | 32 个字 → 64 个 i16；复位清空；DMA/CPU 两条路径都有测试 |
-| P2-2 | 音频播放插件：`plugins/i2s-audio`（或 `rp2350-virt-periph` 内建可选 `cpal`）把 `AudioSink` 样本按 13440 Hz 立体声播放；缺失设备时静默降级 | `plugins/` + `rp2350-virt-periph` | 插件加载测试；无设备不 panic；文档 |
+| P2-1 ✅ | I2S 采样捕获：`AudioSink`/`AudioTap`，唯一接线点 `Pio::push_tx`（CPU 与 DMA 共用），`BootPeripherals::set_audio_tap` | `rp2350-periph` | periph 347 测试；CPU/DMA 两路径 + 端到端；未安装 tap 零开销 |
+| P2-2 🚧 | **宿主输出 crate** `rp2350-audio`（插件 ABI 只面向 virt-periph 引脚，拿不到 PIO 的 `AudioTap`，故改为宿主后端）：`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏 | `crates/rp2350-audio`（新） | 默认 feature 无声卡全绿；`shutdown` ≤2 s；无设备不 panic；文档 |
 
 ### P3 完善 / Polish
 
@@ -80,15 +80,15 @@ keyboard/gamepad input, audio output, and no crashes.
 
 并发上限 2（crate 不相交），每波完成后主会话复跑四道门禁 + FV-1/2/3 + emerald 300M 冒烟。
 
-1. **Wave 1**：P0-1（core+cli）‖ P2-1（periph）
-2. **Wave 2**：P0-2（core+cli）‖ P2-2（plugins+virt-periph）
+1. **Wave 1 ✅**：P0-1（core+cli）‖ P2-1（periph）——均已验收提交
+2. **Wave 2 🚧**：P0-2（arm+core+cli）‖ P2-2（`rp2350-audio` 新 crate）
 3. **Wave 3**：P1-1（cli lib+play）‖ GAP-08b（cli）→ 冲突，改为 P1-1 ‖ GAP-11（periph DMA）
 4. **Wave 4**：P1-2（egui）‖ P3-2（cli 存档/复位）
 5. **Wave 5**：P1-3 + P3-1 + P3-3（主会话收口）
 
 ## 4. 风险 / Risks
 
-- **性能**：若 P0-1/P0-2 达不到 ≥25 M steps/s，则实时游玩只能以「低帧率 + 拉伸时间」演示；
+- **性能**：P0-1 实测 5.14 M steps/s（1.5×）。P0-2 若仍达不到 ≥8.3 M steps/s，实时游玩只能以「低帧率 + 拉伸时间」演示；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
 - **GUI 架构**：`Machine` 目前只在 `rp2350-cli` bin 内部；P1-1 的 lib 化是必要前置。
