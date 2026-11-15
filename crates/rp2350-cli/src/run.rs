@@ -2234,7 +2234,7 @@ fn load_image(
 /// 用于 boot ROM 陷阱与轨迹步（原 `run` 循环每步都泵送）。无轨迹的热路径分开
 /// 调用两半：系统写入立即生效，中断线保持节流。
 fn pump(
-    core: &mut dyn CpuCore,
+    core: &mut CoreHandle,
     core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
@@ -2253,23 +2253,37 @@ fn replay_system_writes(core: &mut dyn CpuCore, peripherals: &BootPeripherals) {
     }
 }
 
-/// Deliver asserted interrupt lines to both cores / 向两个核心投递已断言的中断线
+/// Deliver asserted interrupt lines and pending system exceptions
+/// 投递已断言的中断线与已挂起的系统异常
 ///
 /// Every shared line reaches both NVICs and each core's enables decide whether
 /// it is taken; `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` are per-core endpoints and are
 /// taken from [`BootPeripherals::core1_irq_mask`] for core 1. This is what lets
-/// core 1 run HSTX's `DMA_IRQ_0` handler.
+/// core 1 run HSTX's `DMA_IRQ_0` handler. `SysTick` is forwarded separately
+/// through [`systick::forward_systick_pending`]: its counter lives in the
+/// peripheral PPB, so the machine hands the one-shot expiry latch to the ARM
+/// core's system exception 15 instead of an NVIC line.
 /// 所有共享线同时送达两个 NVIC，由各核心的使能位决定是否响应；
 /// `SIO_IRQ_FIFO` / `SIO_IRQ_BELL` 是按核端点，core1 使用
 /// [`BootPeripherals::core1_irq_mask`]。这正是 core1 能运行 HSTX
-/// `DMA_IRQ_0` 处理程序的原因。
+/// `DMA_IRQ_0` 处理程序的原因。`SysTick` 走独立的
+/// [`systick::forward_systick_pending`]：计数器属于外设侧 PPB，机器把一次性到期
+/// 锁存交给 ARM 核心的系统异常 15，而不是 NVIC 中断线。
 fn deliver_irqs(
-    core: &mut dyn CpuCore,
+    core: &mut CoreHandle,
     core1: Option<&mut CortexM33Core>,
     peripherals: &BootPeripherals,
     usb: &Controller,
     irq_log: &mut Vec<String>,
 ) {
+    // SysTick 的计数与 COUNTFLAG 归外设 `SysTickCounter`（唯一真相源），这里只把
+    // 一次性到期锁存转发给核的系统异常 15（`SCB_ICSR.PENDSTSET`），由核经
+    // `VTOR + 0x3C` 投递；每次泵送最多转发一次。
+    // The peripheral `SysTickCounter` owns counting and COUNTFLAG (the single
+    // source of truth); this forwards its one-shot expiry latch to the core's
+    // system exception 15 (`SCB_ICSR.PENDSTSET`), which vectors through
+    // `VTOR + 0x3C`. At most one forward happens per pump.
+    systick::forward_systick_pending(core, peripherals, irq_log);
     // 只遍历已断言的位置：`trailing_zeros` 逐位清除，顺序与 0..64 扫描一致。
     // Walk asserted bits only; ascending order matches the 0..64 scan.
     let mut mask = peripherals.irq_mask();
@@ -2279,20 +2293,6 @@ fn deliver_irqs(
         core.signal_interrupt(irq);
         log_irq(irq_log, "", irq, core.pc());
     }
-    // SysTick 的计时与 COUNTFLAG 由外设侧计数器负责（见
-    // `BootPeripherals::systick`），但**不**在此处向 NVIC 投递：`rp2350-arm`
-    // 目前把所有 NVIC 挂起位按「外部中断 n = 异常 16+n」映射，挂起 15 会进入
-    // 异常 31 而不是 SysTick 的异常 15。在 rp2350-arm 增加内部异常投递之前，
-    // 这里保持不投递，避免把错误向量送进客户机；计时与状态仍可通过
-    // `BootPeripherals::take_systick_pending` 观察。
-    // SysTick timing/COUNTFLAG live in the peripheral counter (see
-    // `BootPeripherals::systick`), but it is **not** delivered to the NVIC here:
-    // `rp2350-arm` currently maps every NVIC pending bit as "external IRQ n =
-    // exception 16+n", so pending 15 would enter exception 31 instead of the
-    // SysTick exception 15. Until rp2350-arm gains internal-exception delivery,
-    // no delivery is attempted, which keeps a wrong vector out of the guest;
-    // timing and status remain observable through
-    // `BootPeripherals::take_systick_pending`.
     // USB 控制器把 INTR & INTE 聚合到 INTS；固件清 INTS 后条件自然撤销。
     // The USB controller aggregates INTR & INTE into INTS; the condition
     // disappears when firmware clears INTS.
@@ -2326,5 +2326,8 @@ mod batch;
 mod psram_tests;
 #[cfg(test)]
 mod sleep_tests;
+mod systick;
+#[cfg(test)]
+mod systick_tests;
 #[cfg(test)]
 mod tests;

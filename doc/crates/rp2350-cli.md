@@ -79,9 +79,22 @@ rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
 | `--arch` | auto | Override the detected architecture / 覆盖检测到的架构 |
 | `--max-cycles` | `20_000_000` | Instruction budget / 指令预算 |
 | `--trace-steps` | `16` | Boot-trace steps printed / 打印的启动轨迹步数 |
-| `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
+| `--strict-decode` | off | Halt on undefined instructions instead of delivering HardFault / 未定义指令停机，而不是投递 HardFault |
 | `--psram` | off (unmapped) | Mount an external PSRAM window at `0x1100_0000`; see “PSRAM window and size syntax” below / 在 `0x1100_0000` 挂载外部 PSRAM 窗口，见下文「PSRAM 窗口与大小语法」 |
 | `--dump` | none | `ADDR:LEN:PATH` memory dump written when the run stops (repeatable, decimal or `0x` hex) / 停机时写入的内存导出，可重复，支持十进制或 `0x` 十六进制 |
+
+Without `--strict-decode` an undefined Arm instruction follows the architecture:
+`CFSR.UFSR.UNDEFINSTR` is set and the core enters HardFault (or UsageFault when
+firmware enabled `SHCSR.USGFAULTENA`) at `VTOR + 0x0C`; the handler's return
+address is the undefined instruction itself, so firmware can fix it up. The
+flag is a host diagnostic that turns the same event into an immediate halt with
+`undefined instruction at PC ...` in the error, which is the recommended mode
+when bringing up a new image.
+不带 `--strict-decode` 时，未定义 ARM 指令遵循架构：置位
+`CFSR.UFSR.UNDEFINSTR`，核心从 `VTOR + 0x0C` 进入 HardFault（固件使能
+`SHCSR.USGFAULTENA` 时为 UsageFault）；处理程序的返回地址就是未定义指令本身，
+固件可自行修正。该开关是宿主诊断选项，把同一事件变为立即停机，并在错误中打印
+`undefined instruction at PC ...`，适合新映像的启动调试。
 
 `run` prints the image summary, core description and boot vectors, executes
 the first `trace_steps` steps as `[trace]` lines, then runs to halt or budget
@@ -144,7 +157,7 @@ rp2350 repl --file <FIRMWARE> [--exec "CODE" | --stdio] [--max-cycles N]
 | `--max-cycles` | `300_000_000` | Total simulated instruction budget; `0` means unlimited for `repl` / 总指令预算；`repl` 中 `0` 表示不限制 |
 | `--enum-cycles` | `100_000_000` | Budget before USB enumeration must finish / USB 枚举需在此预算内完成 |
 | `--no-soft-reset` | off | Skip the Ctrl-D soft reset on entry (ignored by `--stdio`) / 进入时跳过 Ctrl-D 软复位（`--stdio` 下忽略） |
-| `--strict-decode` | off | Halt on undefined instructions / 未定义指令即停机 |
+| `--strict-decode` | off | Halt on undefined instructions instead of delivering HardFault / 未定义指令停机，而不是投递 HardFault |
 | `--arch` | from UF2 family | Override the core architecture / 覆盖核心架构（`riscv` 为别名） |
 | `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`） |
 
@@ -329,7 +342,7 @@ profile 文件或命令行；两者都没有时命令直接失败并指出缺失
 | `--audio-rate` / `--audio-channels` / `--audio-capacity` | `48000` / `2` / `48000` | Generic sink metadata (samples retained) / 通用 sink 元数据（保留样本数） |
 | `--trace-steps` | `0` | Leading steps of the first frame printed as `[trace]` lines / 第一帧开头打印的 `[trace]` 步数 |
 | `--max-cycles` | `u64::MAX` | Total instruction budget; `u64::MAX` = unlimited / 总指令预算，`u64::MAX` 表示不限制 |
-| `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions / 架构覆盖 / 未定义指令即停机 |
+| `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions instead of HardFault / 架构覆盖 / 未定义指令停机，而不是投递 HardFault |
 | `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`; a profile may set `psram = 8M` instead) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`；profile 也可用 `psram = 8M`） |
 
 #### Profile format / profile 格式
@@ -1322,11 +1335,32 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   `halt_reason`，也不停止 core0。
 - **Per-core register state / 每核寄存器状态**：the SIO view is switched to
   `Core1` around core 1's instruction, and PPB system writes (VTOR, CPACR,
-  NVIC, SysTick) are replayed into the core that executed them, so the two
-  cores keep independent vector tables, FPU enable state and NVIC enable masks.
+  NVIC, `ICSR`, `SHPR2`/`SHPR3`, `SCR`, `STIR`) are replayed into the core that
+  executed them, so the two cores keep independent vector tables, FPU enable
+  state and NVIC enable masks. SysTick is the exception: `SYST_CSR`/`SYST_RVR`/
+  `SYST_CVR` stay in the peripheral `SysTickCounter`, which follows the live
+  clock tree and is never replayed into a core.
   core1 指令前后把 SIO 视图切到 `Core1`，PPB 系统写入（VTOR、CPACR、NVIC、
-  SysTick）回放到实际执行它的核心，因此两核各自保有独立的向量表、FPU 使能与
-  NVIC 使能掩码。
+  `ICSR`、`SHPR2`/`SHPR3`、`SCR`、`STIR`）回放到实际执行它的核心，因此两核各自
+  保有独立的向量表、FPU 使能与 NVIC 使能掩码。SysTick 是例外：
+  `SYST_CSR`/`SYST_RVR`/`SYST_CVR` 留在外设 `SysTickCounter` 中，跟随实时时钟树，
+  永不回放到核。
+- **SysTick forwarding / SysTick 转发**：the peripheral `SysTickCounter` is the
+  single source of truth for counting, `COUNTFLAG`, the live clock source
+  (`CLKSOURCE=1` → `clk_sys`, `CLKSOURCE=0` → `clk_ref/2`) and the one-shot
+  expiry latch. Every IRQ pump calls `BootPeripherals::take_systick_pending()`
+  at most once and forwards a `true` result to `CortexM33Core::pend_systick()`;
+  the core then enters system exception 15 at `VTOR + 0x3C`. The forward is
+  logged as `[irq] core0 systick at PC=…`. A machine never replays the SysTick
+  registers, so the core-side counter stays disabled and nothing double-counts;
+  that self-count path only serves `rp2350-arm` unit tests without a PPB.
+  **SysTick 转发**：外设 `SysTickCounter` 是计数、`COUNTFLAG`、实时时钟源
+  （`CLKSOURCE=1` → `clk_sys`，`CLKSOURCE=0` → `clk_ref/2`）与一次性到期锁存的
+  唯一真相源。每次中断泵送最多调用一次 `BootPeripherals::take_systick_pending()`，
+  结果为 `true` 时转发给 `CortexM33Core::pend_systick()`，核随后进入
+  `VTOR + 0x3C` 的系统异常 15。转发记录为 `[irq] core0 systick at PC=…`。
+  机器从不回放 SysTick 寄存器，因此核内计数器保持关闭、不会双计时；该自计数
+  路径只服务于没有 PPB 的 `rp2350-arm` 单测。
 - **IRQ routing / 中断路由**：every shared `IrqAssert` line is delivered to both
   NVICs (each core's enables decide whether it is taken), except
   `SIO_IRQ_FIFO`/`SIO_IRQ_BELL`, which are per-core endpoints fed by
@@ -1351,21 +1385,21 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   `LDREX`/`STREX` exclusive monitor with `CLREX`.
   **已建模**：SIO 硬件自旋锁（`SPINLOCK0..31` 位于 `0x100+4n`，读即取/写即放，
   `SPINLOCK_ST` 为真实位图）与每核 `LDREX`/`STREX` 独占监视器 + `CLREX`。
-- **Not modelled / 未建模项**：DMA arbitration between cores, `SLEEPDEEP`/
-  `SCR.SLEEPONEXIT` power-down entry, and SysTick exception delivery (SysTick
-  pending marks external IRQ 15 instead of entering exception 15). Core-1
+- **Not modelled / 未建模项**：DMA arbitration between cores and `SLEEPDEEP`/
+  `SCR.SLEEPONEXIT` power-down entry. Core-1
   writable registers: GDB exposes core 1 as thread 2 with read-only
   PC/SP, while per-core stepping is available through `Machine::step_cores`.
   Core 1 has no
   modelled mask ROM: a launch jumps straight to `entry`, reproducing the post-ROM
   state, and only the trap stubs (`rom_table_lookup` at `0x74`, the ROM function
-  table) are dispatched.
-  **未建模项**：双核之间的 DMA 仲裁、`SLEEPDEEP`/`SCR.SLEEPONEXIT` 掉电进入，
-  以及 SysTick 异常投递（SysTick 挂起目前只标记外部 IRQ 15，而不是进入异常 15）。
+  table) are dispatched. SysTick is no longer in this list: the machine forwards
+  the peripheral latch to exception 15 (see the forwarding entry above).
+  **未建模项**：双核之间的 DMA 仲裁、`SLEEPDEEP`/`SCR.SLEEPONEXIT` 掉电进入。
   core1 可写寄存器：GDB 把 core1 暴露为线程 2（PC/SP 只读），而按核步进已可通过
   `Machine::step_cores` 使用。core1 不建模掩膜 ROM：启动直接跳到
   `entry` 并复现 post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与
-  ROM 函数表）。
+  ROM 函数表）。SysTick 已不在未建模列表中：机器把外设锁存转发为异常 15
+  （见上面的转发条目）。
 
 ### Sleep scheduling and diagnostics / 睡眠调度与诊断
 

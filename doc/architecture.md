@@ -365,9 +365,17 @@ CLK_RTC: RP2350 无该分频器，RTC 直接使用 LPOSC
   时钟树/时基；PIO 的一个宿主 tick 是一个 `clk_sys` 周期，`CLKDIV`（16.8 定点）
   在其上分频，写入 `SMx_CLKDIV` 立即重启分频器；DMA pacing 按真实经过周期记账。
 - 消费者与时钟对照见 [`crates/rp2350-periph.md`](crates/rp2350-periph.md) 的
-  「Unified time base and consumers」表。已知缺口：`rp2350-arm` 只把 NVIC 挂起位
-  映射为外部异常 `16+n`，SysTick（异常 15）的**投递**仍需 `rp2350-arm` 任务；
-  外设侧计数、`COUNTFLAG` 与一次性锁存已建模。
+  「Unified time base and consumers」表。SysTick 的唯一真相源是外设侧
+  `SysTickCounter`：`SYST_CSR`/`SYST_RVR`/`SYST_CVR`、`COUNTFLAG`、实时时钟源与
+  一次性到期锁存都在外设侧；CLI 每次中断泵送最多取走一次
+  `BootPeripherals::take_systick_pending()` 并转发给
+  `CortexM33Core::pend_systick()`，由核按系统异常 15（向量 `VTOR + 0x3C`）投递。
+  机器运行时不回放 SysTick 寄存器，核内自计数路径只服务于没有外设的单元测试，
+  因此不存在双计时。The peripheral `SysTickCounter` is the single source of
+  truth (registers, `COUNTFLAG`, clock source and the one-shot expiry latch);
+  the CLI forwards at most one latch per IRQ pump to `pend_systick()` and the
+  core delivers system exception 15. SysTick registers are never replayed into
+  the core, so nothing ticks twice.
 - 精度测试：12 MHz + 125/5/2 = 150 MHz、252 MHz 超频（126/6/1）、`CLK_SYS` 切
   `REF` + DIV 3 = 4 MHz、`CLK_PERI` = PLL_SYS/2 = 75 MHz、`CLK_USB` 48 MHz、
   非法分频 0 Hz、`generation` 递增规则、总线级 252 MHz 与 `CLK_SYS_SELECTED`
@@ -410,18 +418,31 @@ CLK_RTC: RP2350 无该分频器，RTC 直接使用 LPOSC
 
 ### Interrupt Wiring / 中断接线
 
-中断线不插桩到指令执行路径，而由驱动在两个位置搬运状态：
+中断线不插桩到指令执行路径，而由驱动在三个位置搬运状态：
 
-1. **NVIC/SysTick/VTOR 写回放**：PPB 桩把落在 `0xE000_ED08`（VTOR）、
-   `0xE000_E010..=0xE000_E01F`（SysTick）与 `0xE000_E100..=0xE000_E4FF`
+1. **NVIC/VTOR 写回放**：PPB 桩把落在 `0xE000_ED08`（VTOR）、`SCB_ICSR`、
+   `SHPR2`/`SHPR3`、`SCR`、`STIR`、`CPACR` 与 `0xE000_E100..=0xE000_E4FF`
    （NVIC）的写记录到共享日志；驱动调用 `CpuCore::system_write` 回放到核。
+   SysTick 寄存器（`0xE000_E010..=0xE000_E01F`）**不回放**：外设侧
+   `SysTickCounter` 跟随实时时钟树，是计数与 `COUNTFLAG` 的唯一真相源。
 2. **外设中断线轮询**：外设把断言状态写入共享 `IrqAssert`（64 位掩码），
    驱动读取 `BootPeripherals::irq_mask()` 并对每条断言的线调用
    `CpuCore::signal_interrupt`。
+3. **SysTick 到期转发**：外设计数器的一次性到期锁存由
+   `BootPeripherals::take_systick_pending()` 取走，驱动每次泵送最多转发一次给
+   `CortexM33Core::pend_systick()`；核按系统异常 15（向量 `VTOR + 0x3C`）
+   投递，并用 `[irq] core0 systick at PC=…` 记录该次转发。
 
 核侧在每次 `step` 后检查 `PRIMASK` 与 NVIC 的使能/挂起/活跃状态，满足条件
-即按 `16 + irq` 进入异常。活跃中断不会被再次选中，避免同一电平在异常返回
-前自我抢占。
+即按 `16 + irq` 进入外部异常；SysTick（15）与 PendSV（14）是系统异常，
+`rp2350-arm` 按（优先级，异常号）统一仲裁。活跃中断不会被再次选中，避免同一
+电平在异常返回前自我抢占。
+
+External IRQ lines are polled into each NVIC, while the peripheral SysTick
+counter is the single owner of `SYST_CSR`/`COUNTFLAG` and its one-shot expiry
+latch. The driver forwards that latch to `CortexM33Core::pend_systick()`, which
+enters system exception 15 at `VTOR + 0x3C`; SysTick registers are never
+replayed into the core, so the core-side counter cannot double-count.
 
 ---
 
