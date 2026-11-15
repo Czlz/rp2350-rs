@@ -91,6 +91,21 @@ impl WiringTable {
             .map(|e| e.gpio_pin)
     }
 
+    /// Clone every wiring entry belonging to one device
+    /// 克隆某个设备的全部接线条目
+    ///
+    /// Used by hot reload to snapshot wiring before the old device instance is
+    /// dropped and to re-apply it to the replacement instance. 热重载在释放旧设备
+    /// 实例前用其快照接线，再重新应用到替换后的实例。
+    #[must_use]
+    pub fn entries_for_device(&self, device_id: &str) -> Vec<WiringEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.device_id == device_id)
+            .cloned()
+            .collect()
+    }
+
     /// Return all entries / 返回所有条目
     #[must_use]
     pub fn all(&self) -> &[WiringEntry] {

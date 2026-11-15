@@ -115,13 +115,25 @@ impl DeviceManager {
     /// 从动态库加载设备插件并注册
     ///
     /// The library is kept alive for as long as the device remains registered.
-    /// 只要设备保持注册状态，库就会保持存活。
+    /// The registry ID is supplied by the host; the plugin's own metadata ID is
+    /// **not** used here (only [`DeviceManager::scan_and_load`] and
+    /// [`DeviceManager::reload`] derive it from metadata). Loading the same path
+    /// twice under two different IDs therefore creates two independent
+    /// instances; loading it twice under the same ID fails before the library is
+    /// touched.
+    /// 库在设备注册期间保持存活。注册 ID 由宿主给出，这里**不**使用插件自身的
+    /// 元数据 ID（只有 [`DeviceManager::scan_and_load`] 与
+    /// [`DeviceManager::reload`] 会从元数据推导）。因此同一路径用两个不同 ID
+    /// 加载会得到两个独立实例；用同一 ID 加载两次会在触碰库之前失败。
     ///
     /// # Errors
     ///
     /// Returns [`DeviceError::AlreadyExists`] for a duplicate ID and
-    /// [`DeviceError::PluginLoadFailed`] when the library cannot be loaded.
-    /// 重复 ID 返回 [`DeviceError::AlreadyExists`]，库无法加载时返回
+    /// [`DeviceError::PluginLoadFailed`] when the path is missing, is a
+    /// directory, is empty, is not a loadable library, lacks an ABI symbol, or
+    /// reports an incompatible ABI version.
+    /// 重复 ID 返回 [`DeviceError::AlreadyExists`]；路径不存在、是目录、为空、
+    /// 不是可加载库、缺少 ABI 符号或 ABI 版本不兼容时返回
     /// [`DeviceError::PluginLoadFailed`]。
     pub fn load_plugin(&mut self, id: DeviceId, path: impl AsRef<Path>) -> Result<(), DeviceError> {
         if self.devices.contains_key(&id) {
@@ -368,6 +380,21 @@ impl DeviceManager {
     #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.len()
+    }
+
+    /// Iterate over every registered device as `(id, plugin)`
+    /// 遍历所有已注册设备 `(id, plugin)`
+    ///
+    /// Iteration order is unspecified (`HashMap`); sort by ID when a stable
+    /// order is required. The iterator borrows the manager, so the host must not
+    /// call [`DeviceManager::reload`] concurrently (reload is synchronous and
+    /// unloads libraries).
+    /// 迭代顺序不确定（`HashMap`）；需要稳定顺序时请按 ID 排序。迭代器借用管理器，
+    /// 因此宿主不得并发调用 [`DeviceManager::reload`]（热重载是同步操作并会卸载库）。
+    pub fn devices(&self) -> impl Iterator<Item = (&DeviceId, &dyn DevicePlugin)> + '_ {
+        self.devices
+            .iter()
+            .map(|(id, managed)| (id, managed.plugin.as_ref()))
     }
 }
 

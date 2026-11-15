@@ -20,6 +20,7 @@ use crate::DeviceManager;
 use crate::error::DeviceError;
 use crate::loader::{LoadedPlugin, PluginLoader};
 use crate::manager::{DeviceId, ManagedDevice, device_id_for};
+use crate::wiring::WiringEntry;
 
 /// Change report returned by [`crate::DeviceManager::reload`]
 /// [`crate::DeviceManager::reload`] 返回的变更报告
@@ -45,6 +46,16 @@ pub struct ReloadReport {
     pub removed: Vec<String>,
     /// Libraries unloaded and loaded again after a change / 变化后卸载并重新加载的库
     pub reloaded: Vec<String>,
+    /// Reloaded libraries whose wiring was re-applied to the new instance
+    /// 接线已成功重新应用到新实例的重载库
+    pub rewired: Vec<String>,
+    /// Reloaded libraries whose wiring was dropped, with the reason
+    /// 接线被清除的重载库及原因
+    ///
+    /// The reason is bilingual and names the port that changed or disappeared.
+    /// The wiring table never keeps entries that point at a stale port.
+    /// 原因为双语文本，指出变化或消失的端口；接线表不会保留指向过期端口的条目。
+    pub unwired: Vec<(String, String)>,
     /// Libraries that failed to load, with the error message / 加载失败的库及错误信息
     pub failed: Vec<(String, String)>,
 }
@@ -56,13 +67,20 @@ impl ReloadReport {
         self.added.is_empty()
             && self.removed.is_empty()
             && self.reloaded.is_empty()
+            && self.rewired.is_empty()
+            && self.unwired.is_empty()
             && self.failed.is_empty()
     }
 
     /// Total number of reported entries / 报告条目总数
     #[must_use]
     pub fn change_count(&self) -> usize {
-        self.added.len() + self.removed.len() + self.reloaded.len() + self.failed.len()
+        self.added.len()
+            + self.removed.len()
+            + self.reloaded.len()
+            + self.rewired.len()
+            + self.unwired.len()
+            + self.failed.len()
     }
 
     /// Render one human-readable line per entry plus a summary line
@@ -77,16 +95,24 @@ impl ReloadReport {
                 .iter()
                 .map(|path| format!("[reload] ~ {path}")),
         );
+        lines.extend(self.rewired.iter().map(|path| format!("[reload] = {path}")));
+        lines.extend(
+            self.unwired
+                .iter()
+                .map(|(path, reason)| format!("[reload] x {path}: {reason}")),
+        );
         lines.extend(
             self.failed
                 .iter()
                 .map(|(path, error)| format!("[reload] ! {path}: {error}")),
         );
         lines.push(format!(
-            "[reload] summary: added={} removed={} reloaded={} failed={}",
+            "[reload] summary: added={} removed={} reloaded={} rewired={} unwired={} failed={}",
             self.added.len(),
             self.removed.len(),
             self.reloaded.len(),
+            self.rewired.len(),
+            self.unwired.len(),
             self.failed.len()
         ));
         lines
@@ -172,19 +198,36 @@ impl DeviceManager {
     /// [`DeviceManager::load_plugin`] 记录的库比较：
     ///
     /// - **removed** — the file disappeared: the device instance is shut down
-    ///   and dropped, then its library is unloaded.
+    ///   and dropped, its wiring entries are removed, then its library is
+    ///   unloaded.
     /// - **reloaded** — same path, different size or modification time: the old
     ///   instance is dropped, the old library unloaded (mandatory on Windows,
-    ///   where loaded DLLs are locked), and the library loaded again.
+    ///   where loaded DLLs are locked), and the library loaded again. Wiring is
+    ///   captured before the drop and re-applied when the new instance exposes
+    ///   the same port indices and names (`rewired`).
+    /// - **rewired** — the replacement kept the port table, so every existing
+    ///   wiring entry (device, port index → GPIO pin) stays valid.
+    /// - **unwired** — the replacement changed a port index/name (or its device
+    ///   ID): all wiring of that device is dropped and the reason is recorded;
+    ///   the wiring table never references a port that no longer exists.
     /// - **added** — a new library: loaded and registered.
     /// - **failed** — a library that could not be loaded; the error is kept in
-    ///   [`ReloadReport::failed`] and the rest of the manager keeps working.
-    /// - **removed / 已移除** — 文件已消失：先关闭并释放设备实例，再卸载库。
+    ///   [`ReloadReport::failed`] and the rest of the manager keeps working. A
+    ///   failed *replacement* leaves no device behind (the old library must be
+    ///   unloaded before the file can be reopened on Windows).
+    /// - **removed / 已移除** — 文件已消失：先关闭并释放设备实例、清除其接线，
+    ///   再卸载库。
     /// - **reloaded / 已重载** — 路径相同但大小或修改时间变化：先释放旧实例、
-    ///   卸载旧库（Windows 上必须如此，已加载 DLL 会被锁定），再重新加载。
+    ///   卸载旧库（Windows 上必须如此，已加载 DLL 会被锁定），再重新加载。释放
+    ///   前会快照接线，新实例端口索引与名称一致时重新应用（`rewired`）。
+    /// - **rewired / 接线保留** — 替换实例保持相同端口表，原有接线条目
+    ///   （设备、端口索引 → GPIO 引脚）继续有效。
+    /// - **unwired / 接线清除** — 替换实例的端口索引/名称（或设备 ID）变化：
+    ///   该设备的全部接线被清除并记录原因；接线表不会引用已不存在的端口。
     /// - **added / 新增** — 新库：加载并注册。
-    /// - **failed / 失败** — 加载失败：错误记入 [`ReloadReport::failed`]，
-    ///   管理器其余部分继续可用。
+    /// - **failed / 失败** — 加载失败：错误记入 [`ReloadReport::failed`]，管理器
+    ///   其余部分继续可用。替换失败时不会保留旧设备（Windows 上必须先卸载旧库
+    ///   才能重新打开同一文件）。
     ///
     /// Unchanged libraries keep their existing instance and registration order.
     /// Devices registered in-process ([`DeviceManager::register`]) and devices
@@ -227,7 +270,21 @@ impl DeviceManager {
                 continue;
             }
             let file_name = source.file_name().unwrap_or_default().to_os_string();
-            previous.insert(dir_key.join(file_name), (id.clone(), managed.fingerprint));
+            let key = dir_key.join(file_name);
+            // 同一文件可能被多个宿主 ID 加载；热重载按文件跟踪，固定选择字典序
+            // 最小的 ID，避免 HashMap 迭代顺序导致行为不确定。
+            // One file may back several host IDs; reload tracks files and picks the
+            // smallest ID so the outcome never depends on HashMap order.
+            match previous.get_mut(&key) {
+                Some(slot) => {
+                    if id < &slot.0 {
+                        *slot = (id.clone(), managed.fingerprint);
+                    }
+                }
+                None => {
+                    previous.insert(key, (id.clone(), managed.fingerprint));
+                }
+            }
         }
 
         // 1) 先卸载消失的库，确保 Windows 上的文件锁被释放。
@@ -239,8 +296,8 @@ impl DeviceManager {
             }
         }
 
-        // 2) 已变化的库：释放旧实例 → 卸载旧库 → 重新加载。
-        // Changed libraries: drop the old instance, unload, then load again.
+        // 2) 已变化的库：快照接线 → 释放旧实例 → 卸载旧库 → 重新加载。
+        // Changed libraries: snapshot wiring, drop the old instance, unload, load again.
         for (key, (path, fingerprint)) in &current {
             let Some((old_id, old_fingerprint)) = previous.get(key) else {
                 continue;
@@ -252,9 +309,32 @@ impl DeviceManager {
             if !changed {
                 continue;
             }
+            let wiring = self.wiring.entries_for_device(old_id);
             self.drop_device_instance(old_id);
             match self.insert_loaded(path, Some(*fingerprint)) {
-                Ok(_id) => report.reloaded.push(render_path(key)),
+                Ok(new_id) => {
+                    report.reloaded.push(render_path(key));
+                    if wiring.is_empty() {
+                        continue;
+                    }
+                    let restored = if new_id == *old_id {
+                        self.restore_wiring(&new_id, &wiring)
+                    } else {
+                        Err(format!(
+                            "device id changed from '{old_id}' to '{new_id}' / \
+                             设备 ID 由 '{old_id}' 变为 '{new_id}'"
+                        ))
+                    };
+                    match restored {
+                        Ok(()) => report.rewired.push(render_path(key)),
+                        Err(reason) => {
+                            // 端口表不兼容时清空该设备的全部接线，保证 devices/wiring 一致。
+                            // Drop every entry so devices and wiring stay consistent.
+                            self.wiring.remove_device(&new_id);
+                            report.unwired.push((render_path(key), reason));
+                        }
+                    }
+                }
                 Err(error) => report.failed.push((render_path(key), error.to_string())),
             }
         }
@@ -279,6 +359,49 @@ impl DeviceManager {
             );
         }
         report
+    }
+
+    /// Re-apply captured wiring entries to a freshly loaded device
+    /// 将快照中的接线条目重新应用到刚加载的设备
+    ///
+    /// An error is returned when the replacement no longer exposes the same
+    /// `(port_index, port_name)` pair; the caller then removes every entry of
+    /// that device so the wiring table never points at a stale port.
+    /// 替换实例不再提供相同的 `(端口索引, 端口名)` 时返回错误；调用方随后删除该
+    /// 设备的全部条目，确保接线表不会指向过期端口。
+    fn restore_wiring(&mut self, id: &DeviceId, entries: &[WiringEntry]) -> Result<(), String> {
+        for entry in entries {
+            {
+                let Some(managed) = self.devices.get(id) else {
+                    return Err("device vanished after reload / 重载后设备消失".to_string());
+                };
+                let ports = managed.plugin.ports();
+                match ports.get(entry.port_index) {
+                    Some(port) if port.name == entry.port_name => {}
+                    Some(port) => {
+                        return Err(format!(
+                            "port {} changed from '{}' to '{}' / 端口 {} 由 '{}' 变为 '{}'",
+                            entry.port_index,
+                            entry.port_name,
+                            port.name,
+                            entry.port_index,
+                            entry.port_name,
+                            port.name
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "port {} ('{}') no longer exists in the reloaded plugin / \
+                             重载后的插件不再提供端口 {}（'{}'）",
+                            entry.port_index, entry.port_name, entry.port_index, entry.port_name
+                        ));
+                    }
+                }
+            }
+            self.wiring
+                .wire(id, &entry.port_name, entry.port_index, entry.gpio_pin);
+        }
+        Ok(())
     }
 
     /// Load one library and register it under its reported device ID
@@ -343,324 +466,33 @@ impl DeviceManager {
             None => false,
         }
     }
+
+    /// Test-only: point an existing device at a library path and fingerprint
+    /// 仅测试用：将已有设备指向某个库路径与指纹
+    ///
+    /// Lets tests model "the file behind this device was replaced / deleted"
+    /// without writing to a loaded DLL, which Windows locks. Returns `false` for
+    /// unknown IDs. 让测试无需写入已加载 DLL（Windows 会锁定）即可模拟“设备背后的
+    /// 文件被替换/删除”；ID 不存在时返回 `false`。
+    #[cfg(test)]
+    pub(crate) fn set_source_for_test(
+        &mut self,
+        id: &str,
+        path: PathBuf,
+        fingerprint: Option<Fingerprint>,
+    ) -> bool {
+        match self.devices.get_mut(id) {
+            Some(managed) => {
+                managed.source_path = Some(path);
+                managed.fingerprint = fingerprint;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Render a path for a reload report / 将路径渲染为热重载报告文本
 fn render_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::DeviceManager;
-    use crate::device::{DevicePlugin, DevicePort};
-    use rp2350_plugin::RpPlugin;
-    use rp2350_plugin::error::PluginError;
-    use rp2350_plugin::metadata::PluginMetadata;
-
-    /// Minimal in-process device proving reload leaves it untouched
-    /// 最小进程内设备，用于验证热重载不会影响它
-    struct StubLed {
-        metadata: PluginMetadata,
-        ports: Vec<DevicePort>,
-        level: bool,
-    }
-
-    impl RpPlugin for StubLed {
-        fn metadata(&self) -> &PluginMetadata {
-            &self.metadata
-        }
-        fn init(&mut self, _ctx: &mut dyn rp2350_plugin::PluginContext) -> Result<(), PluginError> {
-            Ok(())
-        }
-        fn tick(&mut self, _ctx: &mut dyn rp2350_plugin::PluginContext, _cycles: u64) {}
-        fn shutdown(&mut self) {}
-        fn state_snapshot(&self) -> serde_json::Value {
-            serde_json::json!({ "level": self.level })
-        }
-    }
-
-    impl DevicePlugin for StubLed {
-        fn ports(&self) -> &[DevicePort] {
-            &self.ports
-        }
-        fn ports_mut(&mut self) -> &mut [DevicePort] {
-            &mut self.ports
-        }
-        fn on_gpio_change(&mut self, _port_index: usize, level: bool) {
-            self.level = level;
-        }
-    }
-
-    fn stub_led() -> StubLed {
-        StubLed {
-            metadata: PluginMetadata::builder()
-                .id("reload.stub")
-                .name("Reload Stub")
-                .version("0.1.0")
-                .description("stub")
-                .author("test")
-                .abi_version(1)
-                .min_host_version("0.1.0")
-                .has_ui(false)
-                .tags(vec!["test".into()])
-                .build(),
-            ports: vec![DevicePort::input("LED", "LED input")],
-            level: false,
-        }
-    }
-
-    /// Fresh temporary directory for reload tests / 热重载测试的临时目录
-    fn temp_dir(tag: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("rp2350-reload-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        path
-    }
-
-    /// Platform library extension used to name fake libraries
-    /// 用于伪造库文件的平台库扩展名
-    fn platform_ext() -> &'static str {
-        crate::loader::PluginLoader::platform_extensions()[0]
-    }
-
-    /// Locate the built LED plugin library in the workspace target directory
-    /// 在工作区 target 目录中定位已构建的 LED 插件库
-    fn locate_led_plugin() -> Option<PathBuf> {
-        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        let name = if cfg!(target_os = "windows") {
-            "rp2350_led_plugin.dll"
-        } else if cfg!(target_os = "macos") {
-            "librp2350_led_plugin.dylib"
-        } else {
-            "librp2350_led_plugin.so"
-        };
-        ["debug", "release", "debug/deps"]
-            .into_iter()
-            .map(|profile| target.join(profile).join(name))
-            .find(|path| path.is_file())
-    }
-
-    #[test]
-    fn reload_empty_directory_reports_nothing() {
-        let dir = temp_dir("empty");
-        let mut dm = DeviceManager::new();
-        let report = dm.reload(&dir);
-        assert!(report.is_empty(), "{report:?}");
-        assert_eq!(report.change_count(), 0);
-        assert_eq!(dm.device_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_missing_directory_reports_nothing() {
-        let dir = temp_dir("missing");
-        let mut dm = DeviceManager::new();
-        let report = dm.reload(&dir.join("absent"));
-        assert!(report.is_empty(), "{report:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_ignores_non_library_files() {
-        let dir = temp_dir("nonlib");
-        std::fs::write(dir.join("notes.txt"), b"hello").expect("write notes");
-        std::fs::write(dir.join("readme.md"), b"# doc").expect("write readme");
-        let mut dm = DeviceManager::new();
-        let report = dm.reload(&dir);
-        assert!(report.is_empty(), "{report:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_records_corrupt_library_as_failed() {
-        let dir = temp_dir("corrupt");
-        let bad = dir.join(format!("broken.{}", platform_ext()));
-        std::fs::write(&bad, b"this is not a dynamic library").expect("write fake library");
-        let mut dm = DeviceManager::new();
-        let report = dm.reload(&dir);
-        assert_eq!(report.added, Vec::<String>::new(), "{report:?}");
-        assert_eq!(report.failed.len(), 1, "{report:?}");
-        assert!(report.failed[0].0.contains("broken."), "{report:?}");
-        assert!(!report.failed[0].1.is_empty(), "{report:?}");
-        assert_eq!(dm.device_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_failure_keeps_other_devices_intact() {
-        let dir = temp_dir("failure");
-        std::fs::write(dir.join(format!("broken.{}", platform_ext())), b"garbage")
-            .expect("write fake library");
-        let mut dm = DeviceManager::new();
-        dm.register("reload.stub".into(), Box::new(stub_led()))
-            .expect("register stub");
-        let report = dm.reload(&dir);
-        assert_eq!(report.failed.len(), 1, "{report:?}");
-        assert_eq!(dm.device_count(), 1);
-        let devices = dm.mcp_list_devices();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0]["id"], "reload.stub");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_retries_failed_library_after_fingerprint_change() {
-        let dir = temp_dir("retry");
-        let bad = dir.join(format!("broken.{}", platform_ext()));
-        std::fs::write(&bad, b"garbage").expect("write fake library");
-        let mut dm = DeviceManager::new();
-        assert_eq!(dm.reload(&dir).failed.len(), 1);
-        // 文件内容变化后重载仍失败，但必须再次尝试并记录，而不是静默跳过。
-        // After the content changes the reload still fails, but it must retry.
-        std::fs::write(&bad, b"garbage with different length").expect("rewrite fake library");
-        let report = dm.reload(&dir);
-        assert_eq!(report.failed.len(), 1, "{report:?}");
-        assert_eq!(report.reloaded, Vec::<String>::new(), "{report:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn fingerprint_detects_length_change() {
-        let dir = temp_dir("fp-len");
-        let file = dir.join("lib.bin");
-        std::fs::write(&file, b"1234").expect("write file");
-        let first = Fingerprint::read(&file).expect("first fingerprint");
-        std::fs::write(&file, b"12345678").expect("rewrite file");
-        let second = Fingerprint::read(&file).expect("second fingerprint");
-        assert!(second.differs_from(&first));
-        assert!(!second.differs_from(&second));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn fingerprint_without_mtime_counts_as_changed() {
-        let unknown = Fingerprint {
-            len: 42,
-            modified: None,
-        };
-        assert!(unknown.differs_from(&unknown));
-        let known = Fingerprint {
-            len: 42,
-            modified: Some(SystemTime::now()),
-        };
-        assert!(known.differs_from(&unknown));
-    }
-
-    #[test]
-    fn scan_with_fingerprints_reports_sorted_libraries() {
-        let dir = temp_dir("scan-fp");
-        let ext = platform_ext();
-        let first = dir.join(format!("a.{ext}"));
-        let second = dir.join(format!("b.{ext}"));
-        std::fs::write(&first, b"aa").expect("write a");
-        std::fs::write(&second, b"bb").expect("write b");
-        std::fs::write(dir.join("ignored.txt"), b"txt").expect("write txt");
-        let found = scan_with_fingerprints(&dir);
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].0, first);
-        assert_eq!(found[1].0, second);
-        assert_eq!(found[0].1.len, 2);
-        assert_eq!(
-            scan_with_fingerprints(dir.join("absent")),
-            Vec::<(PathBuf, Fingerprint)>::new()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_report_renders_entries_and_summary() {
-        let report = ReloadReport {
-            added: vec!["a.dll".into()],
-            removed: vec!["b.dll".into()],
-            reloaded: vec!["c.dll".into()],
-            failed: vec![("d.dll".into(), "boom".into())],
-        };
-        let lines = report.render_lines();
-        assert_eq!(lines[0], "[reload] + a.dll");
-        assert_eq!(lines[1], "[reload] - b.dll");
-        assert_eq!(lines[2], "[reload] ~ c.dll");
-        assert_eq!(lines[3], "[reload] ! d.dll: boom");
-        assert_eq!(
-            lines[4],
-            "[reload] summary: added=1 removed=1 reloaded=1 failed=1"
-        );
-        assert_eq!(report.change_count(), 4);
-        assert!(!report.is_empty());
-    }
-
-    #[test]
-    fn reload_reloads_changed_library_in_place() {
-        let Some(source) = locate_led_plugin() else {
-            eprintln!("SKIP: LED plugin not built / 未构建 LED 插件，跳过");
-            return;
-        };
-        let dir = temp_dir("changed");
-        std::fs::copy(&source, dir.join(source.file_name().expect("file name")))
-            .expect("copy plugin");
-        let mut dm = DeviceManager::new();
-        assert_eq!(dm.scan_and_load(&dir).len(), 1);
-
-        // 注入"已过期"的指纹来模拟文件变化：Windows 上无法写已加载的 DLL。
-        // Inject a stale fingerprint to simulate a change: loaded DLLs are locked
-        // on Windows, so the file itself cannot be rewritten by the test.
-        let stale = Fingerprint {
-            len: 0,
-            modified: None,
-        };
-        assert!(dm.set_fingerprint_for_test("com.rp2350-rs.led", stale));
-
-        let report = dm.reload(&dir);
-        assert_eq!(report.reloaded.len(), 1, "{report:?}");
-        assert_eq!(report.failed, Vec::<(String, String)>::new(), "{report:?}");
-        assert_eq!(dm.device_count(), 1);
-        assert_eq!(dm.mcp_list_devices()[0]["id"], "com.rp2350-rs.led");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_adds_library_copied_after_scan() {
-        let Some(source) = locate_led_plugin() else {
-            eprintln!("SKIP: LED plugin not built / 未构建 LED 插件，跳过");
-            return;
-        };
-        let dir = temp_dir("added");
-        let mut dm = DeviceManager::new();
-        assert_eq!(dm.scan_and_load(&dir), Vec::<(String, PathBuf)>::new());
-        std::fs::copy(&source, dir.join(source.file_name().expect("file name")))
-            .expect("copy plugin");
-        let report = dm.reload(&dir);
-        assert_eq!(report.added.len(), 1, "{report:?}");
-        assert_eq!(dm.device_count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reload_removes_deleted_library_from_mcp_list() {
-        let Some(source) = locate_led_plugin() else {
-            eprintln!("SKIP: LED plugin not built / 未构建 LED 插件，跳过");
-            return;
-        };
-        let dir = temp_dir("removed");
-        let library = dir.join(source.file_name().expect("file name"));
-        std::fs::copy(&source, &library).expect("copy plugin");
-        let mut dm = DeviceManager::new();
-        assert_eq!(dm.scan_and_load(&dir).len(), 1);
-
-        // Windows 会锁定已加载的 DLL，删除失败时无法验证 removed 路径。
-        // Windows locks loaded DLLs; without a successful delete this cannot run.
-        if std::fs::remove_file(&library).is_err() {
-            eprintln!("SKIP: loaded library cannot be deleted / 已加载库无法删除，跳过");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-
-        let report = dm.reload(&dir);
-        assert_eq!(report.removed.len(), 1, "{report:?}");
-        assert_eq!(dm.device_count(), 0);
-        assert_eq!(dm.mcp_list_devices(), Vec::<serde_json::Value>::new());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

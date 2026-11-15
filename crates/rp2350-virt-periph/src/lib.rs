@@ -18,6 +18,9 @@ pub mod manager;
 pub mod reload;
 pub mod wiring;
 
+#[cfg(test)]
+mod tests;
+
 pub use config::ConfigSchema;
 pub use device::{DevicePlugin, DevicePort};
 pub use error::DeviceError;

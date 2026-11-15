@@ -358,20 +358,31 @@ pub extern "C" fn rp2350_device_plugin_create() -> *mut dyn DevicePlugin {
 DeviceManager::load_plugin(id, path)     // 单个库文件加载（内部走 PluginLoader::load_device）
      │
      ├── id 已注册 → DeviceError::AlreadyExists
-     ├── PluginLoader::load_device(path)
-     │     ├── SafeLibrary::load(path)                        // dlopen / LoadLibrary
-     │     ├── find_symbol("rp2350_plugin_version") → 必须等于 ABI_VERSION (1)
-     │     ├── find_symbol("rp2350_plugin_is_device") → 非 1 拒绝（仅设备插件）
-     │     ├── find_symbol("rp2350_device_plugin_create") → 调用工厂
-     │     ├── 工厂返回空指针 → DeviceError::PluginLoadFailed
-     │     └── Box::from_raw(create()) → LoadedPlugin { library, plugin }
-     └── ManagedDevice { plugin, source_path, library } 注册进 DeviceManager
-              （库与设备实例一同保持存活，vtable 位于库内）
+     ├── PluginLoader::load(path)                             // 输入校验 + dlopen / LoadLibrary
+     │     ├── 不存在 / 目录 / 0 字节 → PluginLoadFailed（含路径）
+     │     └── 随机字节 / 截断 ELF / 非 cdylib → PluginLoadFailed（含路径）
+     ├── find_symbol("rp2350_plugin_version") → 必须等于 ABI_VERSION (1)
+     ├── find_symbol("rp2350_plugin_is_device") → 非 1 拒绝（仅设备插件）
+     ├── find_symbol("rp2350_device_plugin_create") → 调用工厂
+     ├── 工厂返回空指针 → DeviceError::PluginLoadFailed
+     └── Box::from_raw(create()) → LoadedPlugin { plugin, library }
+              （plugin 先声明：trait 对象先于库释放，vtable 始终有效）
 
-目录扫描（当前仅加载库本体，不实例化设备）：
-     PluginLoader::scan()           → 搜索路径中匹配 .dll / .so / .dylib（默认路径 "plugins"）
-     PluginLoader::scan_and_load()  → Vec<(PathBuf, SafeLibrary)>
-     └── DeviceManager 级别的自动实例化 + 注册接入为规划项
+目录扫描（实例化并注册）：
+     DeviceManager::scan_and_load(dir)
+       ├── scan_with_fingerprints(dir) → 按平台扩展名 + 路径排序
+       └── 每个库：load_device → id = metadata().id || 文件名主干
+             ├── 重复 ID → log::warn! + 跳过（库被关闭）
+             └── 其它错误 → log::warn! + 跳过（坏库不中断扫描）
+
+热重载：
+     DeviceManager::reload(dir) → ReloadReport
+       ├── removed  文件消失：shutdown → 清除接线 → 卸载库
+       ├── reloaded 指纹变化：快照接线 → 释放旧实例/库 → 重新加载
+       │     ├── 端口索引/名称一致 → rewired（接线保留）
+       │     └── 端口表或设备 ID 变化 → unwired（接线清除 + 原因）
+       ├── added    新库 → 加载并注册（失败记入 failed）
+       └── failed   加载失败：只影响该库，其余设备继续工作
 
 卸载：
      DeviceManager::unregister(id) → shutdown() → 移除接线 →
@@ -383,6 +394,30 @@ GUI mode / GUI 模式：
 Headless/MCP mode / 无头与 MCP 模式：
      state_snapshot() → 由 mcp_query_all() 汇总进 MCP 响应；完全不依赖 egui
 ```
+
+> **Loader guarantees and limits / 加载器保证与限制**
+>
+> - 所有非法输入（路径不存在、目录、空文件、随机字节、截断文件、缺符号、
+>   ABI 不匹配、工厂返回空指针）都返回 `DeviceError::PluginLoadFailed`，消息
+>   包含路径与双语原因，不 panic、不泄漏库句柄。
+> - 只有「版本号 + 三个导出符号存在性」可校验；相同 `ABI_VERSION` 但不同编译器
+>   构建的库仍可能布局不兼容，必须使用同一工具链。
+> - **跨 `cdylib` 的 panic 无法捕获**：插件 panic 会穿过 `extern "C"` 帧终止
+>   进程，因此插件自身必须不 panic，错误应返回 `PluginError`。
+> - 工厂返回非空但无效的裸指针无法校验，宿主按可信代码处理（固有 ABI 限制）。
+>
+> - Every invalid input (missing path, directory, empty file, random bytes,
+>   truncated file, missing symbol, ABI mismatch, null factory) returns
+>   `DeviceError::PluginLoadFailed` with the path and a bilingual reason; no
+>   panic, no leaked library handle.
+> - Only the version number and the presence of the three exports can be
+>   validated; same-`ABI_VERSION` libraries built by different compilers may
+>   still be layout-incompatible, so one toolchain is required.
+> - **Panics cannot be caught across the `cdylib` boundary**: a panicking plugin
+>   unwinds through an `extern "C"` frame and aborts the process. Plugins must
+>   not panic and should return `PluginError` instead.
+> - A non-null invalid raw pointer from the factory cannot be validated; the host
+>   trusts plugins as trusted code (inherent ABI limit).
 
 ---
 
