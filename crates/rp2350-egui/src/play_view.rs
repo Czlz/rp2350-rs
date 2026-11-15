@@ -38,6 +38,15 @@
 //! `rp2350_audio::AudioOutput`（见 [`audio`]）。音频线程严格在会话丢弃**之前**
 //! join，因此绝不会读取已释放的 tap。
 //!
+//! **Reset / 复位** rebuilds the session from the current fields without
+//! touching the text inputs: the old worker is shut down (its audio thread is
+//! joined first), the host output is re-created and the new session restarts at
+//! frame 1. It is also the host-side answer to a guest `AIRCR.SYSRESETREQ`,
+//! which stops the play worker with `halted=system reset requested`.
+//! **复位**按当前字段重建会话且不改动输入框：先关闭旧 worker（先 join 音频线程）、
+//! 重建宿主输出，新会话从第 1 帧开始。它也是 GUI 对客户机 `AIRCR.SYSRESETREQ`
+//! 的宿主响应（该请求会让 play worker 以 `halted=system reset requested` 停止）。
+//!
 //! Pixel math, key mapping and fitting are free functions so they can be tested
 //! without a window; [`PlayView::ui`] only wires them together.
 //! 像素换算、按键映射与缩放都是自由函数，无需窗口即可测试；[`PlayView::ui`] 只
@@ -55,6 +64,9 @@ pub mod cli_source;
 pub mod fields;
 #[cfg(test)]
 mod params_tests;
+mod reset;
+#[cfg(test)]
+mod reset_tests;
 #[cfg(test)]
 mod tests;
 pub mod types;
@@ -344,6 +356,8 @@ pub struct PlayView {
     focused: bool,
     /// Number of texture uploads (diagnostics and tests) / 纹理上传次数（诊断与测试）
     uploads: u64,
+    /// Successful resets since creation / 创建以来成功复位的次数
+    reset_count: u32,
 }
 
 impl Default for PlayView {
@@ -362,6 +376,7 @@ impl Default for PlayView {
             focus_hint: true,
             focused: false,
             uploads: 0,
+            reset_count: 0,
         }
     }
 }
@@ -504,57 +519,6 @@ impl PlayView {
         self.status.push_str(SILENT_NOTICE);
     }
 
-    /// Boot a worker from the toolbar fields / 用工具栏字段启动 worker
-    ///
-    /// Validates the text fields ([`PlayFields::inputs`]), reads the firmware
-    /// file, then hands the request to the attached starter. Every failure is
-    /// written to the toolbar status: this method never panics and never blocks
-    /// the UI thread on the guest.
-    /// 先校验文本字段（[`PlayFields::inputs`]）、读取固件文件，再把请求交给已挂载的
-    /// 工厂。所有失败都写入工具栏状态：本方法不 panic，也不会在 UI 线程上阻塞等待
-    /// 客户机。
-    pub fn start(&mut self) {
-        let inputs = match self.fields.inputs() {
-            Ok(inputs) => inputs,
-            Err(message) => {
-                self.status = message;
-                return;
-            }
-        };
-        let image = match std::fs::read(&inputs.firmware) {
-            Ok(image) => image,
-            Err(error) => {
-                self.status = format!("cannot read firmware / 无法读取固件: {error}");
-                return;
-            }
-        };
-        let Some(starter) = self.starter.as_ref() else {
-            "no play source attached / 未挂载游玩来源（宿主需实现 PlayStarter）"
-                .clone_into(&mut self.status);
-            return;
-        };
-        let request = PlayRequest {
-            image,
-            frame: inputs.frame.clone(),
-            steps_per_frame: inputs.steps_per_frame,
-            audio: inputs.audio,
-            button_pins: inputs.buttons,
-        };
-        match starter.start(request) {
-            Ok(session) => {
-                // 状态行先就位，`attach` 里的音频静默提示才不会被覆盖。
-                // Set the status line first so the audio notice from `attach`
-                // is not overwritten.
-                self.status = format!(
-                    "running / 运行中 · {} · steps/frame / 每帧步数 {}",
-                    inputs.frame, inputs.steps_per_frame
-                );
-                self.attach(session);
-            }
-            Err(message) => self.status = format!("start failed / 启动失败: {message}"),
-        }
-    }
-
     /// Load the profile named by the toolbar into the fields
     /// 载入工具栏指定的 profile 到各字段
     ///
@@ -683,6 +647,20 @@ impl PlayView {
         if load_profile {
             self.load_profile();
         }
+        self.controls(ui);
+        ui.horizontal(|ui| {
+            ui.label(self.status.as_str());
+        });
+    }
+
+    /// Start/Stop/Reset row plus the input-lock hint / 启动/停止/复位行与参数锁定提示
+    ///
+    /// Start and Stop stay clickable while a worker runs; Reset additionally
+    /// requires something to rebuild ([`PlayView::can_reset`]), so it is greyed
+    /// out on an idle view and after a normal Stop.
+    /// worker 运行中 Start 与 Stop 仍可点击；Reset 还要求有可重建的会话
+    /// （[`PlayView::can_reset`]），因此在空闲视图与正常 Stop 之后置灰。
+    fn controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Start / 启动").clicked() {
                 self.start();
@@ -690,12 +668,15 @@ impl PlayView {
             if ui.button("Stop / 停止").clicked() {
                 self.stop();
             }
-            if running {
+            if ui
+                .add_enabled(self.can_reset(), egui::Button::new("Reset / 复位"))
+                .clicked()
+            {
+                self.reset();
+            }
+            if self.is_running() {
                 ui.label("inputs locked / 参数已锁定");
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label(self.status.as_str());
         });
     }
 

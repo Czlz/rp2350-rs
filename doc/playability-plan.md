@@ -95,7 +95,7 @@ UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 
 | ID | 任务 | 归属 | 验收 |
 |----|------|------|------|
 | P3-1 ✅ | GAP-08b：CLI 挂载 PSRAM 窗口（`run`/`repl`/`play`/`gdb`） | `rp2350-cli` | `--psram SIZE`（字节/`K`/`M`/`MiB`）+ profile `psram` 键；未给出时不注册（`0x1100_0000` 仍 `NoDevice`），启动错误走 `anyhow`（超限只警告一次）；`cargo test -p rp2350-cli` 115 + 86 绿，FV-1/2/3 `stdout: 42`，emerald 300M 冒烟计数器不变 |
-| P3-2 | 存档/复位：`monitor reset` 在 GUI 可用；flash 存档路径可配置 | cli + egui | 手动冒烟 |
+| P3-2 🚧 | 存档/复位：**GUI 复位已就绪**——PlayView 工具栏 `Reset / 复位`（有可重建会话时可用，含客户机 `AIRCR.SYSRESETREQ` 停机后）按当前字段先关闭并 join 旧会话与音频线程，再重建 `PlaySession`；`reset count` 递增、帧序号从 1 重新开始、音频输出重建，失败只写状态行不 panic。**存档仍待定**：`monitor reset` 的 flash 存档路径与状态保存/恢复未实现 | egui（复位）+ cli（存档，待定） | `cargo test -p rp2350-egui` **106 green**（+6 复位测试：可用性/两次 starter 透传/计数与帧号/音频 join/失败路径/80×60 真实指针点击）；复位不保存客户机状态（文档已写明） |
 | P3-3 | 稳定性：2 小时游玩 soak（headless，模拟时间 ≥30 分钟），内存/句柄不增长 | 主会话 | 日志 + 结论 |
 
 ## 3. 波次与并发 / Waves

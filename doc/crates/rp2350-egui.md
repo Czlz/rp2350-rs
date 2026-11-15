@@ -45,7 +45,9 @@ rp2350-egui/
     ├── play_view/fields.rs # 工具栏文本字段 → 数值 + profile 载入（已落地 / landed）
     ├── play_view/cli_source.rs # PlaySession → PlaySource 适配器（已接线 / wired）
     ├── play_view/audio.rs # 宿主音频输出接线：AudioOutput 启动/状态行（rp2350-audio）
+    ├── play_view/reset.rs # 启动/复位生命周期：字段 → PlayRequest、Reset 语义（已落地 / landed）
     ├── play_view/tests.rs # 游戏标签页测试（仅 test 构建 / test-only）
+    ├── play_view/reset_tests.rs # 复位测试（仅 test 构建 / test-only）
     ├── play_view/params_tests.rs # 字段与 profile 测试（仅 test 构建 / test-only）
     ├── canvas_tests.rs   # 调色板/持久化测试（仅 test 构建 / test-only）
     └── main.rs           # binary entry / 二进制入口
@@ -377,8 +379,9 @@ appears once the fields are complete.
 
 ### Toolbar and fields / 工具栏与字段
 
-工具栏分四行输入 + 一行 Start/Stop + 一行状态。worker 运行中输入区整体置灰
-（会话只在启动时读取参数），Start 与 Stop 仍可点击。
+工具栏分四行输入 + 一行 Start/Stop/Reset + 一行状态。worker 运行中输入区整体置灰
+（会话只在启动时读取参数），Start 与 Stop 仍可点击；`Reset / 复位` 只在有可重建的
+会话时可用（运行中，或客户机请求 `AIRCR.SYSRESETREQ` 后停机，见下节）。
 
 | 字段 / Field | 默认值 / Default | 说明 / Notes |
 |--------------|------------------|--------------|
@@ -393,7 +396,7 @@ appears once the fields are complete.
 | `audio_rate` | `48000` | 写入音频 sink 的采样率（宿主属性，故有通用默认） |
 | `audio_channels` | `2` | 写入音频 sink 的声道数 |
 | `audio_capacity` | `48000` | sink 保留的样本数（48 kHz 下 1 秒） |
-| `status` | `idle / 空闲` | `running` / `stopped` / `start failed` / `profile loaded` / `profile failed` |
+| `status` | `idle / 空闲` | `running` / `stopped` / `reset` / `start failed` / `reset failed` / `profile loaded` / `profile failed` |
 
 字段的解析与校验集中在 `play_view/fields.rs`（`PlayFields::inputs`）：
 
@@ -477,8 +480,9 @@ the mask is not written. Mapping is pure (`KeyState`, `mask_from_keys`).
 
 1. `start()`：状态行先写 `running`，再启动宿主输出；后端探测最多 1 s，返回后
    `backend()` 立即有效。
-2. `stop()` / `Drop`：**先** `AudioOutput::shutdown()`（join 音频线程），**再**
-   `PlaySession::shutdown()`，因此输出线程绝不会读取已释放会话的 tap。
+2. `stop()` / `reset()` / `Drop`：**先** `AudioOutput::shutdown()`（join 音频线程），**再**
+   `PlaySession::shutdown()`，因此输出线程绝不会读取已释放会话的 tap；`reset()` 在
+   新会话挂载后立刻重建输出（见下节「Reset / 复位」）。
 3. 运行中全部输入框（含「Audio / 音频」复选框）置灰并显示
    `inputs locked / 参数已锁定`：音频按会话固定，`PlayView::set_audio()` 在运行中
    调用也会被忽略。
@@ -504,14 +508,66 @@ capacity keep generic sink defaults) the GUI really plays sound:
 `PlaySource::audio_source()` hands out the worker's `AudioTap` (installed on that
 block/state machine when `PlayConfig.audio = Some(..)`) and `PlayView` starts a
 bounded host worker with `rp2350_audio::AudioOutput::start(tap, 96_000)`. The audio
-thread is always joined **before** the session (`stop()` and `Drop` alike), and
-every input (the checkbox included) is greyed out while a session runs. With
+thread is always joined **before** the session (`stop()`, `reset()` and `Drop`
+alike), and `reset()` re-creates it for the new session; every input (the
+checkbox included) is greyed out while a session runs. With
 `audio = false` the worker never touches a PIO FIFO, `audio_source()` returns
 `None` and the status bar stays `audio=off underruns=0`. Real `cpal` output is
 opt-in through `--features audio-playback`; without the feature or without a
 device the null backend consumes samples silently, `start()` still succeeds, the
 status bar shows `audio=null` and the one-time notice
 `无声卡，静默运行 / no sound card, silent` is appended to the status line.
+
+### Reset / 复位
+
+`Reset / 复位` 是**宿主侧重启**：用当前工具栏字段（含 profile 载入后的值）重建整个
+会话，语义等价于「Stop + Start」，但一次点击完成且保留字段。按钮可用性由
+`PlayView::can_reset()` 决定：
+
+- **运行中可用**；
+- **客户机请求 `AIRCR.SYSRESETREQ` 后仍可用**：`play` worker 检测到该请求后以
+  `halted=system reset requested (AIRCR.SYSRESETREQ)` 停止（见
+  [`doc/crates/rp2350-cli.md`](rp2350-cli.md)），状态栏显示 `halted / 停机: …`；
+  这是需要宿主动作的**请求**而不是终态，因此 GUI 允许用户按当前字段重建（与 `run`
+  自动重启 3 次的策略不同，GUI 不自动重启、也没有次数上限，完全由用户触发）；
+- **空闲或正常 Stop 后置灰**：没有可重建的会话，`reset()` 只写
+  `reset unavailable / 无法复位：没有可重建的会话`。
+
+点击后的固定顺序（`play_view/reset.rs` 的 `PlayView::reset`）：
+
+1. 校验字段并重读固件（`PlayFields::inputs` → `std::fs::read`）；失败只写状态行，
+   **不杀正在运行的会话**（笔误不该中断游戏）；
+2. `AudioOutput::shutdown()`（join 音频线程）；
+3. 旧 `PlaySource::shutdown()`（`PlaySession` 在 shutdown/drop 时 join worker 线程）；
+4. `PlayStarter::start(request)` 以相同字段启动新 worker；失败写
+   `reset failed / 复位失败: <原因>`，此时旧会话已停止、不留下半启动状态；
+5. 成功：`reset count` 递增，状态行
+   `reset / 已复位 · reset count=N · <帧缓冲> · steps/frame …`，随后 `attach()` 清零
+   帧序号/统计/纹理并从**第 1 帧**重新开始，勾选音频时重新创建 `AudioOutput`
+   （新 sink、underrun 计数从 0 开始）。
+
+边界语义：
+
+- **不重置输入框**：字段、profile 路径与音频接线与 Stop/Start 一样保留；运行中输入区
+  仍然置灰，因此正常操作下重建用的就是启动时那套参数。
+- **不保存状态**：复位不是存档。客户机 RAM、外设寄存器、时钟树与 PIO 状态全部从
+  固件映像冷重建，进度、按钮按下状态（掩码清零）与音频队列都会丢失，无法从复位点
+  恢复；它也不是给客户机的软复位线，只是宿主侧重启。
+- 状态栏的 `frame=` 来自新会话，`fps`/`steps` 在新帧到达后即切换为新会话的统计。
+
+`Reset / 复位` is a **host-side restart** from the current toolbar fields, the
+same as "Stop + Start" in one click. It is enabled while a worker runs and while
+a worker stopped on a guest `AIRCR.SYSRESETREQ` (that halt is a request for host
+action), and greyed out on an idle view or after a normal Stop. The order is
+fixed: validate fields and re-read the firmware (a validation error leaves the
+running session alive), shut down the host audio output, shut down and join the
+old worker, then boot a new one with the same fields. Success increments
+`reset count`, writes `reset / 已复位 · reset count=N · …`, resets the frame
+counter to 1 and re-creates the audio output; a starter error writes
+`reset failed / 复位失败: …` with no session left behind. Reset never touches
+the text fields, and it is **not** a save state: guest RAM, peripherals, clocks
+and PIO state are rebuilt from the image, so progress and the button mask are
+lost and nothing can resume from the reset point.
 
 ### Status bar / 状态栏
 
@@ -552,10 +608,11 @@ but slow. See the P0 rows of the playability plan for the way forward.
 - **音频 sink 元数据是宿主默认值**：`audio_rate`/`audio_channels`/`audio_capacity`
   默认 48 kHz/2 声道/48 000 样本，可改；实际重采样与设备格式仍由 `rp2350-audio`
   决定（最近邻重采样），GUI 不提供音量、静音或设备选择。
-- **无存档 / 无复位**：不能保存进度，也不能从 GUI 复位客户机；只能停止后重启。
+- **无存档**：不能保存进度；`Reset / 复位` 只是按当前字段的宿主侧重启（见上节），
+  不是存档恢复，复位后无法回到之前的状态。
 - **无手柄 / 无按键重绑**：键盘→GP 的映射是固定前端约定（下表），但 `buttons` 掩码
   决定哪些引脚真的被驱动，因此换固件时改掩码即可。
-- **无暂停 / 单步 / 截图**：只有 Start 与 Stop；帧率与步数由 `steps_per_frame` 决定。
+- **无暂停 / 单步 / 截图**：只有 Start、Stop 与 Reset；帧率与步数由 `steps_per_frame` 决定。
 - 依赖宿主挂载 `PlayStarter`：`PlayView::default()` 仍无 starter（便于测试注入假实现），
   但原生入口 `main.rs` 已默认挂载 `CliPlayStarter`，所以 `cargo run -p rp2350-egui`
   的「游戏」标签页可直接出画面（仍需填入固件与帧缓冲）。
@@ -569,7 +626,8 @@ but slow. See the P0 rows of the playability plan for the way forward.
   fixed frontend convention, but the `buttons` mask decides which pins are really
   driven. The starter is still injectable (`PlayView::default()` has none, for
   tests and alternate hosts), and the native `main.rs` attaches `CliPlayStarter`.
-  There are still no save states, no reset, no gamepad, no pause/step/screenshot.
+  There are still no save states, no gamepad, no pause/step/screenshot; `Reset`
+  rebuilds the session from the current fields but cannot resume prior progress.
 
 ### Tests / 测试
 
@@ -636,6 +694,34 @@ for the real starter, through `audio_source()`/`AudioFormat`), the audio field
 validation messages, the `example/gba/profile.conf` round-trip which is skipped
 when the file is absent, the `profile line N` rejection that leaves fields
 untouched, `format_frame` round-trips, and the out-of-range PIO block rejection.
+
+`play_view/reset_tests.rs`（复位按钮，`#[cfg(test)] mod reset_tests`）：
+
+- **可用性**：空闲视图 `can_reset() == false`（Reset 只写 `reset unavailable`，不调用
+  starter）；运行中为 `true`；客户机 `SYSRESETREQ` 停机后仍为 `true`；正常 Stop 后回到
+  `false`；并断言 GUI 匹配前缀 `system reset requested` 与
+  `rp2350_cli::run::SYSTEM_RESET_MESSAGE` 不漂移；
+- **重建**：Reset 让 starter 被调用两次（旧会话 shutdown 一次 + 新会话 start），两次
+  `PlayRequest` 完全相等（映像、帧缓冲、步数、按键掩码、音频接线），文本字段不变；
+- **新会话计数**：`reset count` 从 0 → 1 → 2，状态行含 `reset / 已复位` 与
+  `reset count=N`；Reset 后 `last_frame == 0`、统计清零、纹理释放，新会话重新发布
+  `index=1` 的帧后状态行为 `frame=1 steps=200 fps=60.00`；
+- **音频生命周期**：勾选音频启动后旧 `AudioOutput` 的 `SilentSource` drop 标志为真
+  （旧线程已 join），Reset 后创建第二个输出且仍在播放，Stop 再 join 第二个；
+- **失败路径**：starter 第二次返回 `Err` → 状态行 `reset failed / 复位失败: machine
+  boot failed`、`is_running() == false`、旧会话 shutdown 一次、`reset count` 不增、
+  再次 Reset 只写 `reset unavailable`，不 panic；
+- **80×60 无头渲染**：整页在 80×60 下渲染两遍不 panic；再单独渲染
+  Start/Stop/Reset 行，用真实指针按下/抬起点击第三个控件（Reset），`reset count`
+  变为 1 且新会话运行。
+
+English: the reset suite pins availability (idle, running, system-reset halt, normal
+stop, plus the `SYSTEM_RESET_MESSAGE` prefix drift check), the two starter calls
+with an identical `PlayRequest` and untouched fields, the monotonic `reset count`
+with frame numbering restarting at 1 and the new session's `fps`/`steps` in the
+status bar, the old audio output being joined before the new one is created, the
+starter-error path (old session stopped, no panic, no count), and a headless
+80×60 render plus a real pointer click on the Reset control.
 
 ---
 
