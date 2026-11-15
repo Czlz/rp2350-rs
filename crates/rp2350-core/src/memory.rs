@@ -78,6 +78,21 @@ impl RamRegion {
         }
         Ok((addr - self.base) as usize)
     }
+
+    /// Read one byte and account for one bus cycle, without watchpoint hooks
+    /// 读取一个字节并记一次总线周期，不触发监视点钩子
+    ///
+    /// The wide accessors below build on this helper so a halfword or word read
+    /// records exactly one read-watch hit instead of one per byte.
+    /// 下面的宽访问器基于此函数，使半字/字读只记录一次读监视命中而不是每字节一次。
+    fn read_byte(&self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
+        *cycles += 1;
+        let offset = self.offset(addr)?;
+        self.data.get(offset).copied().ok_or(CoreError::BusError {
+            addr,
+            kind: BusErrorKind::DeviceError,
+        })
+    }
 }
 
 impl MemoryRegion for RamRegion {
@@ -94,12 +109,30 @@ impl MemoryRegion for RamRegion {
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
-        *cycles += 1;
-        let offset = self.offset(addr)?;
-        self.data.get(offset).copied().ok_or(CoreError::BusError {
-            addr,
-            kind: BusErrorKind::DeviceError,
-        })
+        let value = self.read_byte(addr, cycles)?;
+        // 诊断钩子：未安装读监视时只多一次原子 load。
+        // Diagnostic hook: an unarmed read watch costs one atomic load.
+        crate::watch::check_read(addr, 1);
+        Ok(value)
+    }
+
+    fn read_u16(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u16> {
+        // 字节与周期开销与默认实现一致，但只记录一次宽度为 2 的命中。
+        // Same bytes and cycle cost as the default, but one width-2 hit only.
+        let lo = u16::from(self.read_byte(addr, cycles)?);
+        let hi = u16::from(self.read_byte(addr.wrapping_add(1), cycles)?);
+        crate::watch::check_read(addr, 2);
+        Ok(lo | (hi << 8))
+    }
+
+    fn read_u32(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u32> {
+        let mut value = 0u32;
+        for index in 0..4u32 {
+            let byte = u32::from(self.read_byte(addr.wrapping_add(index), cycles)?);
+            value |= byte << (index * 8);
+        }
+        crate::watch::check_read(addr, 4);
+        Ok(value)
     }
 
     fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
@@ -199,6 +232,28 @@ mod tests {
         let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
         let mut cycles = 0;
         assert!(ram.read_u8(0x2000_0010, &mut cycles).is_err());
+    }
+
+    #[test]
+    fn read_watch_records_one_hit_per_access_with_its_width() {
+        let mut ram = RamRegion::new("ram", 0x2000_0000, 16);
+        let mut cycles = 0;
+        crate::watch::set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+
+        ram.read_u8(0x2000_0001, &mut cycles).unwrap();
+        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0001, 1)));
+        ram.read_u16(0x2000_0002, &mut cycles).unwrap();
+        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0002, 2)));
+        ram.read_u32(0x2000_0004, &mut cycles).unwrap();
+        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0004, 4)));
+        // 未取走前有新的读命中时只保留最新一次。
+        // A newer hit replaces an unconsumed one.
+        ram.read_u8(0x2000_0000, &mut cycles).unwrap();
+        ram.read_u8(0x2000_0003, &mut cycles).unwrap();
+        assert_eq!(crate::watch::take_read_hit(), Some((0x2000_0003, 1)));
+
+        crate::watch::set_read_watch(None);
+        assert_eq!(cycles, 9, "byte cycles must match the default path");
     }
 
     #[test]

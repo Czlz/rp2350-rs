@@ -249,18 +249,30 @@ packets go through `Machine::bus` byte accesses. Breakpoints are PC comparisons
 request so an accidental infinite loop cannot block the server. Write
 watchpoints (`watch`, RSP `Z2`) are sampled after every executed instruction:
 `MachineTarget` keeps a byte snapshot per watchpoint and stops with
-`T05watch:<addr>;` as soon as any covered byte changes. Only SRAM
+`T05watch:<addr>;` as soon as any covered byte changes. Read watchpoints
+(`rwatch`, `Z3`) use the core's runtime read hook and stop with
+`T05rwatch:<addr>;`; access watchpoints (`awatch`, `Z4`) stop with
+`T05awatch:<addr>;` on either path. Only SRAM
 (`0x2000_0000..0x2008_2000`) is accepted — peripheral/USB windows are rejected
 with `E01` because sampling them would pop FIFOs or advance device state.
+`monitor` commands reach the adapter through `qRcmd`: `monitor reset` rebuilds
+PC/SP from the boot vectors, `monitor info` prints core 0/1 state, step count and
+DMA/HSTX summaries, `monitor halt` makes the next `c`/`s` stop with SIGINT, and
+unknown commands are logged and answered with `OK`.
 `gdb` 读取 ELF、构建与 `run` 相同的 `Machine`，打印映像摘要、核心描述与启动
 向量，然后把机器交给 `GdbServer`/`MachineTarget` 并阻塞在 `serve`。适配器把
 GDB 寄存器号 `0..=15` 转发到核心寄存器组、`16` 转发到 XPSR；内存包通过
 `Machine::bus` 的字节访问完成。断点按 PC 比较（不写入 `BKPT`），单次
 `Continue` 最多执行 1 000 000 条指令，避免意外死循环阻塞服务器。写监视点
 （`watch`，RSP `Z2`）在每条指令执行后采样：`MachineTarget` 为每个监视点保存
-字节快照，任一被覆盖字节变化即返回 `T05watch:<addr>;` 停止。仅接受 SRAM
-（`0x2000_0000..0x2008_2000`）；外设/USB 窗口会以 `E01` 拒绝，因为采样它们会
-弹出 FIFO 或推进设备状态。
+字节快照，任一被覆盖字节变化即返回 `T05watch:<addr>;` 停止。读监视点
+（`rwatch`，`Z3`）使用核心的运行期读钩子，命中返回 `T05rwatch:<addr>;`；访问
+监视点（`awatch`，`Z4`）在读或写任一路径命中时返回 `T05awatch:<addr>;`。仅接受
+SRAM（`0x2000_0000..0x2008_2000`）；外设/USB 窗口会以 `E01` 拒绝，因为采样它们
+会弹出 FIFO 或推进设备状态。`monitor` 命令经 `qRcmd` 到达适配器：`monitor reset`
+按启动向量重建 PC/SP，`monitor info` 打印 core0/core1 状态、步数与 DMA/HSTX
+摘要，`monitor halt` 使随后的 `c`/`s` 立即以 SIGINT 停止，未识别命令记录日志并
+回复 `OK`。
 
 ```bash
 cargo run -p rp2350-cli -- gdb --file firmware.elf --port 3333
@@ -272,6 +284,13 @@ arm-none-eabi-gdb firmware.elf
 (gdb) info registers
 (gdb) watch counter        # 写监视点：仅 SRAM 变量
 (gdb) continue             # 命中：T05watch:20000000;
+(gdb) rwatch *(unsigned int*)0x20081FF0   # 读监视点 Z3
+(gdb) continue             # 命中：T05rwatch:20081ff0;
+(gdb) awatch *(unsigned int*)0x20081FF0   # 访问监视点 Z4（读写均触发）
+(gdb) continue             # 命中：T05awatch:20081ff0;
+(gdb) monitor info         # core0/core1、步数、DMA/HSTX 摘要
+(gdb) monitor halt         # 之后的 c/s 立即停止（SIGINT）
+(gdb) monitor reset        # PC/SP 回到启动向量
 (gdb) delete               # 移除监视点后不再触发
 (gdb) continue
 ```
@@ -280,16 +299,27 @@ arm-none-eabi-gdb firmware.elf
 
 - `resume` 通过 `Machine::step` 执行，因此 boot ROM 陷阱、中断泵送、PPB 系统
   写入回放与外设时基都保持有效；`StopReply` 的 `Breakpoint`/`SingleStep`/
-  `Watchpoint`/`Fault`/`Sleeping`/`Halted`/`Reset`/`InstructionLimit` 映射为
-  对应 GDB 信号（`S05` / `T05watch:<addr>;` / `S0b` / `S02`）。
+  `Watchpoint`/`ReadWatch`/`AccessWatch`/`Fault`/`Sleeping`/`Halted`/`Reset`/
+  `InstructionLimit` 映射为对应 GDB 信号（`S05` / `T05watch:<addr>;` /
+  `T05rwatch:<addr>;` / `T05awatch:<addr>;` / `S0b` / `S02`）。
   `resume` uses `Machine::step`, so boot ROM traps, interrupt pumping, PPB
   replay and the peripheral timebase stay active; stop reasons map to GDB
-  signals (`S05` / `T05watch:<addr>;` / `S0b` / `S02`).
+  signals (`S05` / `T05watch:<addr>;` / `T05rwatch:<addr>;` /
+  `T05awatch:<addr>;` / `S0b` / `S02`).
 - 写监视点比较的是**值变化**而非“发生写入”：写入相同字节不会停止。快照读取
   使用局部周期计数器，不推进 `Machine::steps` 或外设时基。
   Watchpoints compare **values**, not the act of writing: storing identical
   bytes does not stop. Snapshot reads use a local cycle counter and never
   advance `Machine::steps` or the peripheral timebase.
+- 读监视点是**访问即命中**：每步执行后先查 `watch::take_read_hit()`（读/访问
+  监视点），再查写快照（写/访问监视点），因此 `awatch` 在读与写两条路径上都会
+  命中。宿主自身的读取（GDB `m` 包与写监视点快照）被 `watch::without_read_watch`
+  抑制，`resume` 开始时会丢弃停止期间遗留的命中。
+  Read watchpoints fire **on access**: after each step the adapter checks
+  `watch::take_read_hit()` (read/access) before the write snapshots
+  (write/access), so `awatch` stops on both paths. Host-side reads (GDB `m`
+  packets and write-watchpoint snapshots) are wrapped in
+  `watch::without_read_watch`, and `resume` discards hits recorded while stopped.
 - 机器自身预算固定为 `u64::MAX`，停机时机完全由 GDB 的 `c`/`s` 与断点决定；
   `--max-cycles` 未暴露。
   The machine budget is pinned to `u64::MAX`; stopping is driven only by GDB
@@ -313,19 +343,30 @@ arm-none-eabi-gdb firmware.elf
   `p10`/`P10`（寄存器 16）会回复 `E01`。
   No `--arch` override: ELF boots as Cortex-M33. RISC-V has no XPSR, so
   `p10`/`P10` (register 16) replies `E01`.
-- 监视点仅支持**写**监视点（`watch` / `Z2`）：`rwatch`（`Z3`）与 `awatch`
-  （`Z4`）返回空包，GDB 会报告不支持。仅接受 SRAM（`0x2000_0000`–
-  `0x2008_2000`）地址；外设、USB、PPB 与 Flash 窗口返回 `E01`。不使用 DWT
-  数据断点寄存器，检测由模拟器在每条指令后比较快照完成。
-  Only **write** watchpoints are supported (`watch` / `Z2`); `rwatch` (`Z3`) and
-  `awatch` (`Z4`) return an empty packet, which GDB reports as unsupported.
-  Only SRAM (`0x2000_0000`–`0x2008_2000`) is accepted; peripheral, USB, PPB and
-  flash windows reply `E01`. No DWT data-breakpoint registers are used: the
-  simulator compares snapshots after each instruction.
-- 单客户端串行、无 TLS、无 `target.xml`（`qXfer:features:read`）、无多核
-  `vCont`、无 `qRcmd` monitor 命令；细节见 `doc/crates/rp2350-gdb.md`。
-  Single sequential client, no TLS, no `target.xml`, no multi-core `vCont`, no
-  `qRcmd` monitor commands; see `doc/crates/rp2350-gdb.md`.
+- 监视点覆盖写（`watch` / `Z2`）、读（`rwatch` / `Z3`）与访问（`awatch` / `Z4`）
+  三类，仅接受 SRAM（`0x2000_0000`–`0x2008_2000`）地址；外设、USB、PPB 与
+  Flash 窗口返回 `E01`。不使用 DWT 数据断点寄存器：写在每条指令后比较快照，
+  读由核心的 `watch::check_read` 钩子记录。核心层只支持一个合并后的读区间，且
+  取指与 core1 落在此区间内的读同样算命中；未安装过读监视的进程每次 SRAM 读只多
+  一次 relaxed 原子 load（门控只置位不复位，之后为一次 thread-local 判断）。
+  Watchpoints cover write (`watch` / `Z2`), read (`rwatch` / `Z3`) and access
+  (`awatch` / `Z4`), and only SRAM (`0x2000_0000`–`0x2008_2000`) addresses;
+  peripheral, USB, PPB and flash windows reply `E01`. No DWT data-breakpoint
+  registers are used: writes compare a snapshot after each instruction and reads
+  are recorded by the core `watch::check_read` hook. The core supports one merged
+  read span, and instruction fetches or core-1 reads inside it also count as
+  hits; a process that never armed a read watch pays one extra relaxed atomic
+  load per SRAM read (the gate is sticky, then it becomes a thread-local check).
+- `monitor` 最小集合：`reset`（按启动向量重建 PC/SP）、`info`（core0/core1 状态、
+  步数、DMA/HSTX 摘要）、`halt`（下一次 `c`/`s` 立即以 SIGINT 停止，`reset`
+  解除）。未识别命令记录 `log::info!` 并回复 `OK`，不会中断会话。
+  Minimal `monitor` set: `reset` (rebuild PC/SP from the boot vectors), `info`
+  (core 0/1 state, step count, DMA/HSTX summaries) and `halt` (the next `c`/`s`
+  stops immediately with SIGINT; `reset` clears it). Unknown commands are logged
+  with `log::info!` and answered with `OK`, so the session never breaks.
+- 单客户端串行、无 TLS、无多核 `vCont`；细节见 `doc/crates/rp2350-gdb.md`。
+  Single sequential client, no TLS, no multi-core `vCont`; see
+  `doc/crates/rp2350-gdb.md`.
 - 不做 Flash 编程：Flash 窗口对客户机写保护，`M`/`load` 写 Flash 会以 `E01`
   失败；SRAM 与已映射的可写 MMIO 可正常写入。
   No flash programming: the flash window rejects guest writes, so `M`/`load`

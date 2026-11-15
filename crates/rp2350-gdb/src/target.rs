@@ -70,6 +70,22 @@ pub enum ResumeMode {
     Step,
 }
 
+/// Kind of watchpoint requested by the debugger / 调试器请求的监视点类型
+///
+/// `Write` maps to RSP `Z2` (`watch`), `Read` to `Z3` (`rwatch`), and `Access`
+/// to `Z4` (`awatch`) which fires on both reads and writes.
+/// `Write` 对应 RSP `Z2`（`watch`），`Read` 对应 `Z3`（`rwatch`），`Access` 对应
+/// `Z4`（`awatch`，读写均触发）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchKind {
+    /// Write watchpoint (`Z2`, GDB `watch`) / 写监视点（`Z2`，GDB `watch`）
+    Write,
+    /// Read watchpoint (`Z3`, GDB `rwatch`) / 读监视点（`Z3`，GDB `rwatch`）
+    Read,
+    /// Access watchpoint (`Z4`, GDB `awatch`) / 访问监视点（`Z4`，GDB `awatch`）
+    Access,
+}
+
 /// Why the target stopped executing / 目标停止执行的原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -89,6 +105,10 @@ pub enum StopReason {
     InstructionLimit,
     /// A write watchpoint observed a value change / 写监视点观察到值变化
     Watchpoint,
+    /// A read watchpoint observed an access / 读监视点观察到访问
+    ReadWatch,
+    /// An access watchpoint observed a read or write / 访问监视点观察到读或写
+    AccessWatch,
 }
 
 impl StopReason {
@@ -110,7 +130,9 @@ impl StopReason {
             | Self::Sleeping
             | Self::Reset
             | Self::InstructionLimit
-            | Self::Watchpoint => 5,
+            | Self::Watchpoint
+            | Self::ReadWatch
+            | Self::AccessWatch => 5,
         }
     }
 }
@@ -295,15 +317,82 @@ pub trait GdbTarget: Send {
         Err(GdbError::Unsupported("write watchpoints"))
     }
 
+    /// Add a read watchpoint covering `length` bytes at `address`
+    /// 在 `address` 处添加覆盖 `length` 字节的读监视点
+    ///
+    /// # Errors
+    /// The default implementation reports [`GdbError::Unsupported`] so existing
+    /// targets (such as `CortexM33Target`) need no changes; the RSP layer then
+    /// answers `Z3` with `E01` and GDB reports the watchpoint as unsupported.
+    /// 默认实现返回 [`GdbError::Unsupported`]，现有目标（如 `CortexM33Target`）
+    /// 无需修改；RSP 层随后对 `Z3` 回复 `E01`，GDB 会报告该监视点不受支持。
+    fn set_read_watchpoint(&mut self, _address: u32, _length: usize) -> Result<(), GdbError> {
+        Err(GdbError::Unsupported("read watchpoints"))
+    }
+
+    /// Remove the read watchpoint at `address` / 移除 `address` 处的读监视点
+    ///
+    /// # Errors
+    /// Defaults to [`GdbError::Unsupported`], mirroring
+    /// [`Self::set_read_watchpoint`]. / 与 [`Self::set_read_watchpoint`] 一致，
+    /// 默认返回 [`GdbError::Unsupported`]。
+    fn clear_read_watchpoint(&mut self, _address: u32, _length: usize) -> Result<(), GdbError> {
+        Err(GdbError::Unsupported("read watchpoints"))
+    }
+
+    /// Add an access watchpoint covering `length` bytes at `address`
+    /// 在 `address` 处添加覆盖 `length` 字节的访问监视点
+    ///
+    /// An access watchpoint fires on reads *and* writes. It is a separate hook
+    /// rather than a read plus a write watch so a target can arm one combined
+    /// comparator and report [`StopReason::AccessWatch`].
+    /// 访问监视点在读与写上都会触发。它独立于读/写监视点，使目标可以安装一个
+    /// 组合比较器并上报 [`StopReason::AccessWatch`]。
+    ///
+    /// # Errors
+    /// Defaults to [`GdbError::Unsupported`]; see [`Self::set_read_watchpoint`].
+    /// 默认返回 [`GdbError::Unsupported`]；参见 [`Self::set_read_watchpoint`]。
+    fn set_access_watchpoint(&mut self, _address: u32, _length: usize) -> Result<(), GdbError> {
+        Err(GdbError::Unsupported("access watchpoints"))
+    }
+
+    /// Remove the access watchpoint at `address` / 移除 `address` 处的访问监视点
+    ///
+    /// # Errors
+    /// Defaults to [`GdbError::Unsupported`], mirroring
+    /// [`Self::set_access_watchpoint`]. / 与 [`Self::set_access_watchpoint`]
+    /// 一致，默认返回 [`GdbError::Unsupported`]。
+    fn clear_access_watchpoint(&mut self, _address: u32, _length: usize) -> Result<(), GdbError> {
+        Err(GdbError::Unsupported("access watchpoints"))
+    }
+
     /// Address of the watchpoint that caused the latest stop
     /// 最近一次停止所命中的监视点地址
     ///
-    /// The RSP layer appends `watch:<address>;` to a `T05` stop reply when this
-    /// returns `Some`. / 返回 `Some` 时 RSP 层会在 `T05` 停止回复后追加
-    /// `watch:<address>;`。
+    /// Used for all three kinds: the RSP layer appends `watch:<address>;` for
+    /// [`StopReason::Watchpoint`], `rwatch:<address>;` for
+    /// [`StopReason::ReadWatch`], and `awatch:<address>;` for
+    /// [`StopReason::AccessWatch`]. / 三种类型共用：RSP 层对
+    /// [`StopReason::Watchpoint`] 追加 `watch:<地址>;`，对
+    /// [`StopReason::ReadWatch`] 追加 `rwatch:<地址>;`，对
+    /// [`StopReason::AccessWatch`] 追加 `awatch:<地址>;`。
     #[must_use]
     fn watchpoint_hit(&self) -> Option<u32> {
         None
+    }
+
+    /// Execute one `monitor` command and return human-readable output
+    /// 执行一条 `monitor` 命令并返回可读输出
+    ///
+    /// The RSP layer decodes `qRcmd,<hex>` into a UTF-8 command string, calls
+    /// this hook, and hex-encodes the returned text. The default returns an
+    /// empty string, which the RSP layer maps to `OK` (success, no output), so
+    /// targets without monitor support accept the command silently.
+    /// RSP 层把 `qRcmd,<hex>` 解码为 UTF-8 命令字符串后调用本钩子，并把返回文本
+    /// 编码为十六进制。默认返回空串，RSP 层将其映射为 `OK`（成功且无输出），
+    /// 因此不支持 monitor 的目标会静默接受命令。
+    fn monitor_command(&mut self, _command: &str) -> String {
+        String::new()
     }
 
     /// Resume execution according to `mode` / 按 `mode` 恢复执行
@@ -339,6 +428,8 @@ mod tests {
     #[test]
     fn watchpoint_stops_report_sigtrap() {
         assert_eq!(StopReason::Watchpoint.signal(), 5);
+        assert_eq!(StopReason::ReadWatch.signal(), 5);
+        assert_eq!(StopReason::AccessWatch.signal(), 5);
         assert_eq!(
             StopReply {
                 reason: StopReason::Watchpoint,
@@ -347,6 +438,12 @@ mod tests {
             .signal(),
             5
         );
+    }
+
+    #[test]
+    fn watch_kinds_are_ordered_by_rsp_number() {
+        assert!(WatchKind::Write < WatchKind::Read);
+        assert!(WatchKind::Read < WatchKind::Access);
     }
 
     #[test]

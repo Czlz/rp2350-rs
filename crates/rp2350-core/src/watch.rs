@@ -1,15 +1,39 @@
-//! Optional memory-write watchpoint for debugging / 可选的写监视点（调试用）
+//! Optional memory watchpoints for debugging / 可选的内存监视点（调试用）
 //!
-//! Enabled by the `RP2350_WATCH=START-END` environment variable (hex). When
-//! set, every SRAM write whose address falls in `[START, END)` is printed
-//! together with the program counter of the instruction performing it. This is
-//! a throwaway diagnostic for locating a store that corrupts guest memory; it
-//! does nothing unless the variable is present.
-//! 由环境变量 `RP2350_WATCH=START-END`（十六进制）启用。启用后，地址落入
-//! `[START, END)` 区间的每次 SRAM 写都会连同执行它的指令 PC 一起打印。这是
-//! 定位污染客户机内存的存储指令的一次性诊断；未设置变量时完全空操作。
+//! Two independent channels live here.
+//!
+//! 1. An environment-variable diagnostic: `RP2350_WATCH=START-END` (hex) prints
+//!    every SRAM write in `[START, END)` with the program counter of the
+//!    instruction that performed it; `RP2350_WATCHV=VALUE` watches a written
+//!    value instead. Both do nothing unless the variables are present.
+//! 2. A runtime read watch armed by the GDB server: [`set_read_watch`] installs
+//!    one `[start, end)` range, [`check_read`] records the latest hit, and
+//!    [`take_read_hit`] consumes it once. When no range is armed the read path
+//!    pays a single relaxed atomic load.
+//!
+//! 本模块包含两条互不影响的通道：
+//!
+//! 1. 环境变量诊断：`RP2350_WATCH=START-END`（十六进制）打印 `[START, END)`
+//!    区间内每次 SRAM 写及其指令 PC；`RP2350_WATCHV=VALUE` 改为监视特定写值。
+//!    未设置变量时完全空操作。
+//! 2. GDB 服务器安装的运行期读监视：[`set_read_watch`] 安装一个 `[start, end)`
+//!    区间，[`check_read`] 记录最近一次命中，[`take_read_hit`] 一次性取走。未安装
+//!    区间时读路径只多一次 relaxed 原子 load。
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Fast gate: set once a runtime read watch has ever been armed
+/// 快速门控：一旦安装过运行期读监视就置位
+///
+/// Checked before any thread-local access so a process that never armed a read
+/// watch pays one relaxed atomic load per read. The gate is **sticky**: it is
+/// never cleared, because the range itself lives in thread-local storage and a
+/// different thread disarming its own watch must not make this thread miss
+/// hits. / 在任何 thread-local 访问之前检查，因此从未安装读监视的进程每次读只付
+/// 一次 relaxed 原子 load。门控**只置位不复位**：区间本身位于 thread-local，另一
+/// 线程撤除自己的监视不得让本线程漏报。
+static READ_ARMED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Watch range `[start, end)` parsed from the environment / 从环境解析的监视区间
@@ -19,6 +43,12 @@ thread_local! {
     /// Current program counter, refreshed once per instruction step
     /// 当前程序计数器，每条指令单步刷新一次
     static PC: Cell<u32> = const { Cell::new(0) };
+    /// Runtime read-watch range installed by the debugger / 调试器安装的运行期读监视区间
+    static READ_RANGE: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+    /// Latest recorded read hit `(address, width)` / 最近一次读命中 `(地址, 宽度)`
+    static READ_HIT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+    /// Host-side suppression flag for snapshot sampling / 宿主采样时的抑制标记
+    static READ_SUSPEND: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Install the watch range from `RP2350_WATCH`, if present
@@ -61,5 +91,177 @@ pub fn check_write(addr: u32, value: u32) {
     if hit {
         let pc = PC.with(Cell::get);
         eprintln!("[watch] pc={pc:#010X} addr={addr:#010X} value={value:#010X}");
+    }
+}
+
+/// Arm or disarm the runtime read watch / 安装或撤除运行期读监视
+///
+/// `Some((start, end))` watches reads whose address lies in `[start, end)`;
+/// `None` disarms the watch and costs one relaxed atomic load per read again.
+/// A pending hit is kept until [`take_read_hit`] consumes it.
+/// `Some((start, end))` 监视地址落入 `[start, end)` 的读；`None` 撤除监视，读操作
+/// 恢复为一次 relaxed 原子 load 的开销。未取走的命中会保留到 [`take_read_hit`]。
+pub fn set_read_watch(range: Option<(u32, u32)>) {
+    READ_RANGE.with(|r| r.set(range));
+    if range.is_none() {
+        // 撤除时丢弃未取走的命中，避免重新安装后上报陈旧访问。
+        // Drop an unconsumed hit on disarm so a later re-arm cannot report it.
+        READ_HIT.with(|hit| hit.set(None));
+    }
+    // 门控只置位：区间按线程存放，撤除本方监视不能影响其他线程的判定。
+    // Publish the range before raising the gate; the sticky flag is never
+    // cleared because the range lives per thread.
+    if range.is_some() {
+        READ_ARMED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Record a read of `width` bytes at `addr` when it falls inside the armed range
+/// 当地址落在已安装区间内时记录一次宽度为 `width` 字节的读
+///
+/// Only the latest hit is kept: a halfword or word read that the bus lowers to
+/// several byte accesses still produces one recorded hit, because the wider
+/// accessors call this exactly once. / 只保留最新一次命中：总线把半字/字读拆成
+/// 多次字节访问时也只记录一次，因为宽访问器只调用本函数一次。
+pub fn check_read(addr: u32, width: u32) {
+    if !READ_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    if READ_SUSPEND.with(Cell::get) {
+        return;
+    }
+    let inside = READ_RANGE.with(|r| {
+        r.get()
+            .is_some_and(|(start, end)| addr >= start && addr < end)
+    });
+    if inside {
+        READ_HIT.with(|hit| hit.set(Some((addr, width))));
+    }
+}
+
+/// Take the pending read hit, if any / 取走待处理的读命中
+///
+/// The hit is cleared, so every recorded access is reported exactly once.
+/// 命中会被清除，因此每次记录的访问只上报一次。
+#[must_use]
+pub fn take_read_hit() -> Option<(u32, u32)> {
+    if !READ_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    READ_HIT.with(|hit| hit.replace(None))
+}
+
+/// Run `body` without recording read hits / 在禁止记录读命中的情况下运行 `body`
+///
+/// The debugger's own memory reads (watchpoint snapshots and GDB `m` packets)
+/// must not trigger a read watch; they wrap their bus accesses in this helper.
+/// Restores the previous flag on drop, including when `body` panics.
+/// 调试器自身的内存读（监视点快照与 GDB `m` 包）不得触发读监视，它们把总线访问
+/// 包在本辅助函数里。标志在 `Drop` 时恢复，`body` panic 也不例外。
+pub fn without_read_watch<R>(body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0 {
+                READ_SUSPEND.with(|flag| flag.set(previous));
+            }
+        }
+    }
+
+    // 只有已安装读监视时才需要动抑制标记，避免给普通执行增加开销。
+    // Only touch the flag when a read watch is armed, keeping plain execution free.
+    let guard = if READ_ARMED.load(Ordering::Relaxed) {
+        Restore(Some(READ_SUSPEND.with(|flag| flag.replace(true))))
+    } else {
+        Restore(None)
+    };
+    let result = body();
+    drop(guard);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reset the runtime read watch state between tests
+    /// 在测试之间重置运行期读监视状态
+    fn reset() {
+        set_read_watch(None);
+        let _ = take_read_hit();
+        READ_SUSPEND.with(|flag| flag.set(false));
+    }
+
+    #[test]
+    fn reads_are_ignored_without_an_armed_watch() {
+        reset();
+        check_read(0x2000_0000, 4);
+        assert_eq!(take_read_hit(), None);
+    }
+
+    #[test]
+    fn armed_watch_records_reads_inside_the_range() {
+        reset();
+        set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+        check_read(0x2000_0004, 4);
+        assert_eq!(take_read_hit(), Some((0x2000_0004, 4)));
+        set_read_watch(None);
+    }
+
+    #[test]
+    fn armed_watch_ignores_reads_outside_the_range() {
+        reset();
+        set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+        check_read(0x2000_0010, 1);
+        check_read(0x1FFF_FFFF, 1);
+        assert_eq!(take_read_hit(), None);
+        set_read_watch(None);
+    }
+
+    #[test]
+    fn take_read_hit_returns_each_hit_once() {
+        reset();
+        set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+        check_read(0x2000_0000, 2);
+        assert_eq!(take_read_hit(), Some((0x2000_0000, 2)));
+        assert_eq!(take_read_hit(), None);
+        set_read_watch(None);
+    }
+
+    #[test]
+    fn latest_hit_and_width_are_reported() {
+        reset();
+        set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+        check_read(0x2000_0000, 1);
+        check_read(0x2000_0008, 4);
+        assert_eq!(take_read_hit(), Some((0x2000_0008, 4)));
+        set_read_watch(None);
+    }
+
+    #[test]
+    fn suspended_reads_are_not_recorded() {
+        reset();
+        set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+        without_read_watch(|| check_read(0x2000_0004, 4));
+        assert_eq!(take_read_hit(), None);
+        check_read(0x2000_0004, 4);
+        assert_eq!(take_read_hit(), Some((0x2000_0004, 4)));
+        set_read_watch(None);
+    }
+
+    #[test]
+    fn disarming_clears_pending_hits_from_reporting() {
+        reset();
+        set_read_watch(Some((0x2000_0000, 0x2000_0010)));
+        check_read(0x2000_0004, 4);
+        set_read_watch(None);
+        // 撤除后 `take_read_hit` 返回 `None`，旧命中不再上报；门控保持置位只是
+        // 让其他线程仍能自行判定各自区间。
+        // After disarming `take_read_hit` returns `None`; the sticky gate only
+        // lets other threads keep evaluating their own range.
+        assert_eq!(take_read_hit(), None);
+        check_read(0x2000_0004, 4);
+        assert_eq!(take_read_hit(), None);
     }
 }

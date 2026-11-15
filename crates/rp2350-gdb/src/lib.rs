@@ -29,7 +29,7 @@ pub use rsp::{
     unescape_binary,
 };
 pub use server::GdbServer;
-pub use target::{GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus};
+pub use target::{GdbError, GdbTarget, ResumeMode, StopReason, StopReply, TargetStatus, WatchKind};
 pub use target_xml::{ANNEX as TARGET_XML_ANNEX, ANNEX_ERROR as TARGET_XML_ERROR, TARGET_XML};
 
 // 协议测试放在 lib.rs，使 rsp.rs 的实现保持在单文件 500 行代码上限内；

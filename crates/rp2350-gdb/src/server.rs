@@ -187,6 +187,26 @@ impl GdbTarget for Box<dyn GdbTarget + Send> {
         (**self).clear_watchpoint(address, length)
     }
 
+    fn set_read_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        (**self).set_read_watchpoint(address, length)
+    }
+
+    fn clear_read_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        (**self).clear_read_watchpoint(address, length)
+    }
+
+    fn set_access_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        (**self).set_access_watchpoint(address, length)
+    }
+
+    fn clear_access_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError> {
+        (**self).clear_access_watchpoint(address, length)
+    }
+
+    fn monitor_command(&mut self, command: &str) -> String {
+        (**self).monitor_command(command)
+    }
+
     fn watchpoint_hit(&self) -> Option<u32> {
         (**self).watchpoint_hit()
     }

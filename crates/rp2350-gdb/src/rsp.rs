@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason};
+use crate::target::{GdbError, GdbTarget, ResumeMode, StopReason, WatchKind};
 use crate::target_xml::{ANNEX, ANNEX_ERROR};
 
 /// Positive acknowledgement byte sent by GDB / GDB 发送的肯定应答字节
@@ -243,9 +243,9 @@ pub struct Session<T: GdbTarget> {
     target: T,
     /// Whether GDB requested no-acknowledgement mode / GDB 是否请求了无应答模式
     no_ack_mode: bool,
-    /// Write watchpoints requested by GDB, keyed by `(address, length)`
-    /// GDB 请求的写监视点，以 `(地址, 长度)` 为键
-    watchpoints: BTreeSet<(u32, usize)>,
+    /// Watchpoints requested by GDB, keyed by `(address, length, kind)`
+    /// GDB 请求的监视点，以 `(地址, 长度, 类型)` 为键
+    watchpoints: BTreeSet<(u32, usize, WatchKind)>,
 }
 
 impl<T: GdbTarget> Session<T> {
@@ -347,9 +347,36 @@ impl<T: GdbTarget> Session<T> {
             }),
             b'Q' => Ok(self.handle_extended(payload)),
             b'v' => self.handle_v(payload),
-            b'q' => Ok(self.query_reply(payload)),
+            b'q' => self.handle_query(payload),
             _ => Ok(String::new()),
         }
+    }
+
+    /// Route `q...` packets, including `qRcmd` monitor commands
+    /// 路由 `q...` 包，包括 `qRcmd` monitor 命令
+    fn handle_query(&mut self, payload: &str) -> Result<String, Error> {
+        // `qRcmd,<hex>` carries a monitor command: the payload is the hex
+        // encoding of a UTF-8 string and the reply is the hex encoding of the
+        // text to print. An empty reply payload is not allowed here, so a
+        // command without output becomes `OK`.
+        // `qRcmd,<hex>` 承载 monitor 命令：载荷是 UTF-8 字符串的十六进制编码，
+        // 回复是要打印文本的十六进制编码。此处不允许空回复载荷，因此无输出的命令
+        // 回复 `OK`。
+        if let Some(args) = payload.strip_prefix("qRcmd,") {
+            return self.monitor(args);
+        }
+        Ok(self.query_reply(payload))
+    }
+
+    /// Decode and run one `qRcmd` monitor command / 解码并执行一条 `qRcmd` monitor 命令
+    fn monitor(&mut self, args: &str) -> Result<String, Error> {
+        let bytes = decode_hex(args)?;
+        let command = String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
+        let output = self.target.monitor_command(command.trim());
+        if output.is_empty() {
+            return Ok("OK".to_string());
+        }
+        Ok(encode_hex(output.as_bytes()))
     }
 
     /// Read every register as little-endian 32-bit hex (`g`)
@@ -427,10 +454,9 @@ impl<T: GdbTarget> Session<T> {
         Ok("OK".to_string())
     }
 
-    /// Insert or remove an instruction breakpoint (`Z0`/`Z1`) or a write
-    /// watchpoint (`Z2`/`z2`); read/access watchpoints reply empty
-    /// 插入或移除指令断点（`Z0`/`Z1`）或写监视点（`Z2`/`z2`）；读/访问监视点
-    /// 返回空包
+    /// Insert or remove an instruction breakpoint (`Z0`/`Z1`) or a watchpoint
+    /// (`Z2`/`Z3`/`Z4`, write/read/access)
+    /// 插入或移除指令断点（`Z0`/`Z1`）或监视点（`Z2`/`Z3`/`Z4`，写/读/访问）
     fn change_breakpoint(&mut self, args: &str, insert: bool) -> Result<String, Error> {
         let (kind, rest) = args.split_once(',').ok_or(Error::InvalidArgument)?;
         let (address, size) = rest.split_once(',').ok_or(Error::InvalidArgument)?;
@@ -445,29 +471,30 @@ impl<T: GdbTarget> Session<T> {
                 }
                 Ok("OK".to_string())
             }
-            "2" => self.change_watchpoint(address, size, insert),
-            // `Z3`/`Z4` (read/access watchpoints) are not implemented; an empty
-            // packet tells GDB that the request type is unsupported, while an
-            // `OK` would falsely claim that the watchpoint is armed.
-            // `Z3`/`Z4`（读/访问监视点）未实现；空包告知 GDB 该请求类型不受支持，
-            // 而回复 `OK` 会错误地声称监视点已生效。
-            "3" | "4" => Ok(String::new()),
+            // `Z2` = write (`watch`), `Z3` = read (`rwatch`), `Z4` = access
+            // (`awatch`): identical syntax and width validation.
+            // `Z2` = 写（`watch`），`Z3` = 读（`rwatch`），`Z4` = 访问（`awatch`）：
+            // 语法与宽度校验完全一致。
+            "2" => self.change_watchpoint(address, size, WatchKind::Write, insert),
+            "3" => self.change_watchpoint(address, size, WatchKind::Read, insert),
+            "4" => self.change_watchpoint(address, size, WatchKind::Access, insert),
             _ => Err(Error::InvalidArgument),
         }
     }
 
-    /// Insert or remove a write watchpoint (`Z2`/`z2`)
-    /// 插入或移除写监视点（`Z2`/`z2`）
+    /// Insert or remove one watchpoint of `kind` / 插入或移除一个指定类型的监视点
     ///
-    /// Re-inserting or re-removing the same `(address, length)` is idempotent:
-    /// the session remembers armed watchpoints and only forwards the first
-    /// insert and the last remove to the target.
-    /// 对同一 `(地址, 长度)` 重复插入或删除是幂等的：会话记住已生效的监视点，只把
-    /// 首次插入与最后一次删除转发给目标。
+    /// Re-inserting or re-removing the same `(address, length, kind)` is
+    /// idempotent: the session remembers armed watchpoints and only forwards the
+    /// first insert and the last remove to the target. The same address may be
+    /// armed independently as a write, read and access watchpoint.
+    /// 对同一 `(地址, 长度, 类型)` 重复插入或删除是幂等的：会话记住已生效的监视点，
+    /// 只把首次插入与最后一次删除转发给目标。同一地址可分别安装写、读与访问监视点。
     fn change_watchpoint(
         &mut self,
         address: u32,
         size: usize,
+        kind: WatchKind,
         insert: bool,
     ) -> Result<String, Error> {
         // GDB encodes the watchpoint width in bytes; only the hardware-supported
@@ -476,14 +503,22 @@ impl<T: GdbTarget> Session<T> {
         if !matches!(size, 1 | 2 | 4 | 8) {
             return Ok(String::new());
         }
-        let entry = (address, size);
+        let entry = (address, size, kind);
         if insert {
             if !self.watchpoints.contains(&entry) {
-                self.target.set_watchpoint(address, size)?;
+                match kind {
+                    WatchKind::Write => self.target.set_watchpoint(address, size)?,
+                    WatchKind::Read => self.target.set_read_watchpoint(address, size)?,
+                    WatchKind::Access => self.target.set_access_watchpoint(address, size)?,
+                }
                 self.watchpoints.insert(entry);
             }
         } else if self.watchpoints.contains(&entry) {
-            self.target.clear_watchpoint(address, size)?;
+            match kind {
+                WatchKind::Write => self.target.clear_watchpoint(address, size)?,
+                WatchKind::Read => self.target.clear_read_watchpoint(address, size)?,
+                WatchKind::Access => self.target.clear_access_watchpoint(address, size)?,
+            }
             self.watchpoints.remove(&entry);
         }
         Ok("OK".to_string())
@@ -493,13 +528,16 @@ impl<T: GdbTarget> Session<T> {
     /// 继续或单步执行并格式化停止回复（`c`/`s`/`vCont`）
     fn resume(&mut self, mode: ResumeMode) -> Result<String, Error> {
         let reply = self.target.resume(mode)?;
-        if reply.reason == StopReason::Watchpoint {
-            let Some(address) = self.target.watchpoint_hit() else {
-                return Ok(format!("T{:02x}", reply.signal()));
-            };
-            return Ok(format!("T{:02x}watch:{address:x};", reply.signal()));
-        }
-        Ok(format!("S{:02x}", reply.signal()))
+        let keyword = match reply.reason {
+            StopReason::Watchpoint => "watch",
+            StopReason::ReadWatch => "rwatch",
+            StopReason::AccessWatch => "awatch",
+            _ => return Ok(format!("S{:02x}", reply.signal())),
+        };
+        let Some(address) = self.target.watchpoint_hit() else {
+            return Ok(format!("T{:02x}", reply.signal()));
+        };
+        Ok(format!("T{:02x}{keyword}:{address:x};", reply.signal()))
     }
 
     /// Handle `Q...` extension packets / 处理 `Q...` 扩展包

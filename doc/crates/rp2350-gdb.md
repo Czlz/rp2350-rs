@@ -38,9 +38,14 @@ pub trait GdbTarget: Send {
     fn clear_breakpoint(&mut self, address: u32) -> Result<(), GdbError>;
     fn has_breakpoint(&self, address: u32) -> bool;
     fn supports_watchpoints(&self) -> bool;                    // default: false
-    fn set_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;
+    fn set_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;   // Z2
     fn clear_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;
+    fn set_read_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;  // Z3
+    fn clear_read_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;
+    fn set_access_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>; // Z4
+    fn clear_access_watchpoint(&mut self, address: u32, length: usize) -> Result<(), GdbError>;
     fn watchpoint_hit(&self) -> Option<u32>;                   // default: None
+    fn monitor_command(&mut self, command: &str) -> String;    // default: empty (= OK)
     fn resume(&mut self, mode: ResumeMode) -> Result<StopReply, GdbError>;
     fn status(&self) -> TargetStatus;
 }
@@ -48,21 +53,31 @@ pub trait GdbTarget: Send {
 
 支持类型 / Supporting types：
 - `ResumeMode`：`Continue` / `Step`
+- `WatchKind`：`Write`（`Z2`）/ `Read`（`Z3`）/ `Access`（`Z4`）
 - `StopReply { reason: StopReason, pc: u32 }`；`signal()` 返回 GDB 信号号
 - `StopReason`：`Breakpoint`、`SingleStep`、`Fault`、`Sleeping`、`Halted`、
-  `Reset`、`InstructionLimit`、`Watchpoint`（均为 SIGTRAP，`Watchpoint` 输出
-  `T05`）
+  `Reset`、`InstructionLimit`、`Watchpoint`（`T05watch:`）、`ReadWatch`
+  （`T05rwatch:`）、`AccessWatch`（`T05awatch:`）；前三类监视点均为 SIGTRAP
 - `TargetStatus { state, stop_reason, pc, total_cycles }`
 - `GdbError`：`InvalidRegister`、`Bus(CoreError)`、`AddressOutOfRange`、
   `Unsupported(&'static str)`
 
 监视点钩子默认返回 `GdbError::Unsupported` 且 `supports_watchpoints()` 为
 `false`，因此未实现监视点的目标（如 `CortexM33Target`）无需改动，RSP 层也不会
-向 GDB 声明该能力。
+向 GDB 声明该能力；`Z3`/`Z4` 在只实现写监视点的目标上同样以 `E01` 干净失败。
+`monitor_command` 默认返回空串，RSP 层把它映射为 `OK`（成功且无输出）。
 The watchpoint hooks default to `GdbError::Unsupported` with
 `supports_watchpoints() == false`, so targets without watchpoint support (such as
 `CortexM33Target`) need no changes and the RSP layer never advertises the
-capability for them.
+capability for them; `Z3`/`Z4` fail cleanly with `E01` on a write-only target.
+`monitor_command` defaults to an empty string, which the RSP layer maps to `OK`
+(success, no output).
+
+> 注意：`server.rs` 为 `Box<dyn GdbTarget + Send>` 提供了转发实现。新增 trait
+> 方法时必须同步转发，否则 TCP 服务会静默回落到默认实现（监视点/monitor 失效）。
+> Note: `server.rs` implements `GdbTarget` for `Box<dyn GdbTarget + Send>` by
+> forwarding. Every new trait method must be forwarded there too, or the TCP
+> server silently falls back to the default implementation.
 
 `target_description()` 默认返回静态 ARMv8-M `target.xml`（见下文）；寄存器文件
 不同的目标可返回 `None`，此时 `qXfer:features:read` 回复 `E00`。
@@ -139,7 +154,7 @@ impl<T: GdbTarget> RspSession<T> {
 
 | Packet | Reply / 回复 | Notes |
 |--------|--------------|-------|
-| `qSupported[:features]` | `PacketSize=fff;qXfer:features:read+;QStartNoAckMode+;vContSupported+;hwbreak+[;watchpoint+]` | 特性协商；`watchpoint+` 仅在目标支持写监视点时追加；声明 `qXfer:features:read` 后 GDB 会主动读取 `target.xml` |
+| `qSupported[:features]` | `PacketSize=fff;qXfer:features:read+;QStartNoAckMode+;vContSupported+;hwbreak+[;watchpoint+]` | 特性协商；`watchpoint+` 仅在目标支持监视点时追加（写/读/访问三类共用，不区分）；声明 `qXfer:features:read` 后 GDB 会主动读取 `target.xml` |
 | `?` | `S05` | 附加查询（SIGTRAP） |
 | `g` | 每寄存器 4 字节小端 hex | 寄存器批量读 |
 | `G<hex>` | `OK` | 批量写；长度须为 4 的倍数且不超出寄存器数 |
@@ -151,8 +166,10 @@ impl<T: GdbTarget> RspSession<T> {
 | `s` / `S<sig>` | `S<sig>` | `GdbTarget::resume(Step)` |
 | `Z0,addr,kind` / `z0,addr,kind` | `OK` | 软件断点（kind 校验，忽略值） |
 | `Z1,addr,kind` / `z1,addr,kind` | `OK` | 硬件断点（复用目标的断点模型） |
-| `Z2,addr,kind` / `z2,addr,kind` | `OK` | 写监视点；`kind` 为字节数（1/2/4/8）。重复插入/删除幂等，仅在首次插入与最后一次删除时调用目标 |
-| `Z3`/`Z4`（读/访问监视点） | 空包 | 未实现：不回 `OK`，GDB 可据此回退 |
+| `Z2,addr,kind` / `z2,addr,kind` | `OK` | 写监视点（`watch`）；`kind` 为字节数（1/2/4/8） |
+| `Z3,addr,kind` / `z3,addr,kind` | `OK`（目标不支持时 `E01`） | 读监视点（`rwatch`）；同样的宽度校验与幂等语义 |
+| `Z4,addr,kind` / `z4,addr,kind` | `OK`（目标不支持时 `E01`） | 访问监视点（`awatch`），读写均触发 |
+| `qRcmd,<hex>` | `<hex 输出>` / `OK` | monitor 命令：`hex` 是 UTF-8 命令的十六进制；目标返回文本按 hex 回复，空文本回复 `OK` |
 | `D` | `OK` | detach |
 | `k` | 无回复 | 传输层应随后关闭连接 |
 | `qC` | `QC1` | 单核阶段固定线程 1 |
@@ -165,13 +182,28 @@ impl<T: GdbTarget> RspSession<T> {
 | `qXfer:features:read:<其他 annex>:...` | `E00` | 未提供的 annex；参数非法同样 `E00` |
 | 未知 / 不支持的 `q`、`Q`、`v` | 空包 `""` | 符合 RSP 探测约定 |
 
-写监视点命中时停止回复为 `T05watch:<hex-addr>;`；目标无法给出命中地址时退化为
-合法 `T05`。`Z2` 的 `kind` 不是 1/2/4/8 或目标未实现监视点时不会误报成功：
-前者返回空包，后者回复 `E01`。
-A write-watchpoint stop is reported as `T05watch:<hex-addr>;`; when the target
-cannot name the hit address it degrades to a valid `T05`. `Z2` never claims
-success falsely: unsupported widths return an empty packet, and targets that
-implement no watchpoints answer `E01`.
+写监视点命中时停止回复为 `T05watch:<hex-addr>;`，读监视点为
+`T05rwatch:<hex-addr>;`，访问监视点为 `T05awatch:<hex-addr>;`；目标无法给出
+命中地址时三者都退化为合法 `T05`。`Z2`/`Z3`/`Z4` 的 `kind` 不是 1/2/4/8 时返回
+空包且不转发给目标；目标未实现对应类型时回复 `E01`。同一地址可同时安装写、读、
+访问三种监视点，会话按 `(addr, kind)` 分别记账，重复插入/删除幂等。
+A write-watchpoint stop is reported as `T05watch:<hex-addr>;`, a read watchpoint
+as `T05rwatch:<hex-addr>;`, and an access watchpoint as
+`T05awatch:<hex-addr>;`; all three degrade to a valid `T05` when the target
+cannot name the hit address. A `kind` other than 1/2/4/8 returns an empty packet
+and is never forwarded; an unimplemented kind replies `E01`. The same address can
+carry a write, a read and an access watchpoint at once — the session books them
+per `(addr, kind)`, and repeated inserts/removes are idempotent.
+
+`qRcmd,<hex>` 是 monitor 通道：载荷是命令文本的十六进制（如 `info` 为
+`696e666f`），回复是目标输出文本的十六进制；目标返回空串时回复 `OK`。非法十六
+进制或非 UTF-8 载荷回复 `E01`，会话保持可用。未识别的命令由目标记录
+`log::info!` 并返回空串，因此 GDB 不会因拼写错误报错。
+`qRcmd,<hex>` is the monitor channel: the payload is the hex-encoded command text
+(`info` is `696e666f`) and the reply is the hex-encoded target output; an empty
+target string becomes `OK`. Malformed hex or non-UTF-8 payloads reply `E01` while
+the session stays usable. Unknown commands are logged with `log::info!` and
+return an empty string, so a typo never makes GDB error out.
 
 错误映射：目标错误（非法寄存器、总线错误、地址越界）与非法参数均回复
 `E01`，会话保持可用；未知命令返回空包。
@@ -348,11 +380,19 @@ survives because one `Session` is shared for the whole `serve` call.
 - 无 TLS、无 multiprocess。
 - `qXfer:features:read` 仅提供静态 `target.xml`；无动态 XML 生成，无 FPU/DWT/ETM
   寄存器，也未声明 `msp`/`psp`/`control`（目标无法按编号读取）。
-- 仅写监视点（`Z2`/`z2`）：读监视点 `rwatch`（`Z3`）与访问监视点 `awatch`
-  （`Z4`）未实现并返回空包；库层 `CortexM33Target` 未实现监视点，只有 CLI
-  `MachineTarget` 提供（且仅限 SRAM）。不使用 DWT 数据断点寄存器。
+- 监视点由目标适配器实现：`MachineTarget` 支持写（`Z2`）、读（`Z3`）与访问
+  （`Z4`）三类，且仅接受 SRAM；库层 `CortexM33Target` 仍未实现监视点。不使用
+  DWT 数据断点寄存器。
+- 核心层读监视只支持**一个** `[start, end)` 区间：多个读/访问监视点被合并成一个
+  跨度，命中后再匹配回具体条目。
+- 读监视覆盖 SRAM 区的所有读，包括取指与 core1 的读（地址落在区间内时）；宿主侧
+  读取（GDB `m` 包与写监视点快照）被显式抑制，不会自我触发。
+- 性能：未安装过读监视的进程每次 SRAM 读只多一次 relaxed 原子 load；安装后每次读
+  多一次 thread-local 判断。门控只置位不复位（区间按线程存放），因此不会出现另一
+  线程撤除监视导致本线程漏报；写监视点仍按指令采样。
 - `vCont` 仅单动作单线程；多核动作列表返回空包。
-- 无 `qRcmd` monitor 命令、无 `qfThreadInfo` / `qsThreadInfo`。
+- `qRcmd` monitor 命令由目标定义；库层默认全部返回 `OK`（无输出）。无
+  `qfThreadInfo` / `qsThreadInfo`。
 - `stop()` 只清标志，不能中断阻塞中的 `accept`（需要连接一次才退出）。
 
 - The CLI `gdb` subcommand is wired (`--file <ELF>`, default port 3333); there
@@ -364,14 +404,26 @@ survives because one `Session` is shared for the whole `serve` call.
 - `qXfer:features:read` serves only the static `target.xml`; there is no dynamic
   XML generation, no FPU/DWT/ETM registers, and no `msp`/`psp`/`control`
   (the target cannot read them by number).
-- Write watchpoints only (`Z2`/`z2`): read watchpoints (`Z3`) and access
-  watchpoints (`Z4`) are unimplemented and answer with an empty packet. The
-  library `CortexM33Target` implements no watchpoints; only the CLI
-  `MachineTarget` does, and only for SRAM. No DWT data-breakpoint registers are
+- Watchpoints are implemented by target adapters: `MachineTarget` supports write
+  (`Z2`), read (`Z3`) and access (`Z4`) and only for SRAM; the library
+  `CortexM33Target` still implements none. No DWT data-breakpoint registers are
   used.
+- The core read watch covers exactly **one** `[start, end)` range: several
+  read/access watchpoints are merged into a single span and matched back to the
+  concrete entry on a hit.
+- The read watch sees every SRAM read, including instruction fetches and core-1
+  reads whose address falls inside the range. Host-side reads (GDB `m` packets
+  and write-watchpoint snapshots) are explicitly suppressed and never
+  self-trigger.
+- Performance: a process that never armed a read watch pays one extra relaxed
+  atomic load per SRAM read; once armed, every read pays one thread-local check.
+  The gate is sticky (the range lives per thread), so another thread disarming
+  its watch can never make this thread miss hits. Write watchpoints keep
+  sampling once per instruction.
 - `vCont` is single-action single-thread only; multi-core action lists return
   an empty packet.
-- No `qRcmd` monitor commands or thread-list queries.
+- `qRcmd` monitor commands are defined by the target; the library default
+  answers everything with `OK` (no output). No `qfThreadInfo` / `qsThreadInfo`.
 - `stop()` only clears a flag; it cannot interrupt a blocked `accept` (one
   connection is needed before `serve` returns).
 
@@ -417,7 +469,14 @@ arm-none-eabi-gdb
 (gdb) target remote :3333
 (gdb) info registers
 (gdb) stepi
-(gdb) watch counter          # 写监视点（CLI 适配器仅支持 SRAM）
+(gdb) watch counter          # 写监视点 Z2（CLI 适配器仅支持 SRAM）
 (gdb) continue               # 命中后返回 T05watch:<addr>;
+(gdb) rwatch *(unsigned int*)0x20081FF0   # 读监视点 Z3
+(gdb) continue               # 命中后返回 T05rwatch:20081ff0;
+(gdb) awatch *(unsigned int*)0x20081FF0   # 访问监视点 Z4（读写均触发）
+(gdb) continue               # 命中后返回 T05awatch:20081ff0;
+(gdb) monitor info           # qRcmd：core0/core1/步数/DMA/HSTX 摘要
+(gdb) monitor halt           # 之后的 c/s 立即以 SIGINT 停止
+(gdb) monitor reset          # 恢复启动向量的 PC/SP
 (gdb) detach
 ```
