@@ -33,6 +33,15 @@
 > 状态标记：✅ 完成（P1 范围） · 🚧 部分完成 · ⏳ 未开始。
 > Status markers: ✅ done for P1 scope · 🚧 partial · ⏳ not started.
 
+> **P2 可玩性（当前阶段）/ Playability (current phase)**
+>
+> 目标：人类可以在模拟器里正常游玩 `emerald.uf2`（实时画面 + 键盘输入 + 音频）。
+> 计划、硬指标与波次见 [playability-plan.md](playability-plan.md)；新缺口 GAP-13…GAP-17
+> 已加入 skill 的 GAP 表。**一级阻塞是性能**：当前 3.0 M steps/s，实时需 ≥50 M steps/s。
+> Goal: a human can play `emerald.uf2` in real time (video + keyboard + audio). See
+> [playability-plan.md](playability-plan.md); the new gaps GAP-13…GAP-17 are in the skill's
+> GAP table. **Performance is the primary blocker**: 3.0 M steps/s now vs ≥50 M needed.
+
 > **P1 任务队列 / Task queue（主会话拆分，子会话实现）**
 >
 > 规则见 `.trae/rules/project.md` 的「角色边界」与「子会话使用规则」：主会话只做分析、
