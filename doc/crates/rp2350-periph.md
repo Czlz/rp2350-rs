@@ -985,6 +985,90 @@ assert_eq!(moved, 64);
 
 ---
 
+## TIMER / 定时器
+
+RP2350 exposes two identical timer blocks. Both share **one** 64-bit
+microsecond counter driven by the simulation timebase (`Timebase`, advanced from
+executed cycles at 150 MHz); `ALARM0..3`, `ARMED`, `INTR`, `INTE`, `INTF` and
+`INTS` are per block.
+RP2350 提供两个相同的定时器块。它们共享**同一个** 64 位微秒计数器（由仿真时基
+`Timebase` 按 150 MHz 的已执行周期推进）；`ALARM0..3`、`ARMED`、`INTR`、
+`INTE`、`INTF`、`INTS` 均按块独立。
+
+| Block | Base | Alarm lines |
+| --- | --- | --- |
+| TIMER0 | `0x400B_0000` | `TIMER0_IRQ_0..3` = `0..=3` |
+| TIMER1 | `0x400B_8000` | `TIMER1_IRQ_0..3` = `4..=7` |
+
+### Register offsets / 寄存器偏移
+
+| Offset | Register | Model |
+| --- | --- | --- |
+| `0x00` | `TIMEHW` | write-only, reads as 0 / 只写，读回 0 |
+| `0x04` | `TIMELW` | write-only, reads as 0 / 只写，读回 0 |
+| `0x08` | `TIMEHR` | high 32 bits of the counter / 计数器高 32 位 |
+| `0x0C` | `TIMELR` | low 32 bits of the counter / 计数器低 32 位 |
+| `0x10..=0x1C` | `ALARM0..3` | 32-bit deadline, low half of the counter / 32 位截止值，计数器低半部 |
+| `0x20` | `ARMED` | bit `n` set while `ALARMn` is armed / `ALARMn` 武装期间置位 |
+| `0x24` | `TIMERAWH` | unlatched high half / 非锁存高半部 |
+| `0x28` | `TIMERAWL` | unlatched low half / 非锁存低半部 |
+| `0x30` | `DBGPAUSE` | storage / 存储 |
+| `0x34` | `PAUSE` | storage / 存储 |
+| `0x36` | `LOCKED` | 16-bit storage, kept apart from `PAUSE` / 16 位存储，与 `PAUSE` 分开保存 |
+| `0x38` | `SOURCE` | storage / 存储 |
+| `0x3C` | `INTR` | raw status, **write-one-to-clear** / 原始状态，**写 1 清零** |
+| `0x40` | `INTE` | per-alarm enable / 逐 alarm 使能 |
+| `0x44` | `INTF` | **plain read/write force bits** / **普通读写强制位** |
+| `0x48` | `INTS` | masked status / 屏蔽后的状态 |
+
+### Interrupt semantics / 中断语义
+
+```text
+INTS = (INTR | INTF) & INTE
+```
+
+* `INTR` reports latched alarm hits. Firmware acknowledges by writing a one to
+  the bit; writing a zero leaves it unchanged. / `INTR` 报告锁存的 alarm 命中，
+  固件向对应位写 1 确认，写 0 不变。
+* `INTF` is a force register, not write-one-to-clear. pico-sdk's alarm pool
+  raises an interrupt with `hw_set_bits(&timer->intf, 1u << n)` and drops it
+  with `hw_clear_bits`; the model stores those bits verbatim, so a forced bit
+  keeps `INTS` asserted even after `INTR` is acknowledged. / `INTF` 是强制位
+  寄存器，不是写 1 清零。pico-sdk 的 alarm pool 用
+  `hw_set_bits(&timer->intf, 1u << n)` 触发中断、用 `hw_clear_bits` 撤销；
+  模型按普通读写保存这些位，因此即使 `INTR` 已被确认，强制位仍让 `INTS` 保持
+  断言。
+* `INTS` bit `n` drives the line `TIMERx_IRQ_n`; a disabled bit (`INTE` = 0)
+  never asserts, even when forced. / `INTS` 第 `n` 位驱动 `TIMERx_IRQ_n`；
+  未使能的位（`INTE` 为 0）即使被强制也不会断言。
+
+### Alarm auto-disarm / alarm 自动解除武装
+
+Writing a non-zero deadline arms alarm `n` (`ARMED.n = 1`); writing zero
+disarms it. When the low 32 bits of the counter reach the deadline (signed
+wrap-around comparison, the same rule pico-sdk uses), the model latches
+`INTR.n = 1` and clears `ARMED.n`, so each arming delivers exactly one interrupt
+until firmware acknowledges `INTR` and programs the next deadline. A disarmed
+alarm never re-fires on its own.
+写入非零截止值会武装 alarm `n`（`ARMED.n = 1`），写 0 则解除武装。当计数器低
+32 位到达截止值（按有符号回绕比较，与 pico-sdk 相同），模型锁存 `INTR.n = 1`
+并清掉 `ARMED.n`，因此每次武装只投递一次中断，直到固件确认 `INTR` 并写入下一个
+截止值。已解除武装的 alarm 不会自行再次触发。
+
+### Handles / 句柄
+
+`BootPeripherals::mount` installs both blocks into the APB router and exposes
+`timer()` / `timer1()`. Both handles share state with the bus devices;
+`refresh()` samples the counters and republishes the eight alarm lines, and
+`BootPeripherals::advance` / `irq_mask` do that on every pump so a `WFI`
+waiting on a future deadline wakes on time.
+`BootPeripherals::mount` 把两个块安装到 APB 路由器，并暴露 `timer()` /
+`timer1()`。两个句柄与总线设备共享状态；`refresh()` 采样计数器并重新发布八条
+alarm 线，`BootPeripherals::advance` / `irq_mask` 在每次泵送时执行该操作，使
+等待未来截止值的 `WFI` 按时唤醒。
+
+---
+
 ## XIP (QMI + Flash + PSRAM backend)
 
 ```rust

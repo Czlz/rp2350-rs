@@ -69,6 +69,8 @@ mod dma_tests;
 mod hstx_tests;
 #[cfg(test)]
 mod sio_spinlock_tests;
+#[cfg(test)]
+mod timer_tests;
 
 use rp2350_core::mmio::MmioRegion;
 

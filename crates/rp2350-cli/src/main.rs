@@ -16,7 +16,6 @@ mod mcp_serve;
 mod perfbench;
 mod repl;
 mod run;
-mod sleep;
 #[cfg(test)]
 mod test_support;
 

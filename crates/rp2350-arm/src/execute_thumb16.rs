@@ -898,38 +898,14 @@ pub fn execute_thumb16(
                     let firstcond = ((opcode >> 4) & 0xF) as u8;
                     let mask = (opcode & 0xF) as u8;
                     if mask == 0 {
-                        // 提示语义：WFE 只在事件寄存器清零时睡眠；WFI 总是睡眠；
-                        // SEV 置本核事件并锁存跨核信号；SEVL 只置本核事件。
-                        // NOP/YIELD 与手册保留的 hint 编码按 NOP 执行。
-                        // Hint semantics: WFE sleeps only while the event register is
-                        // clear; WFI always sleeps; SEV sets the local event and
-                        // latches the cross-core signal; SEVL only sets the local
-                        // event. NOP/YIELD and the reserved hint encodings are NOPs.
                         return Ok(match firstcond {
-                            0x2 => {
-                                if regs.take_event() {
-                                    regs.set_wait_on_event(false);
-                                    StepResult::Ok
-                                } else {
-                                    regs.set_wait_on_event(true);
-                                    StepResult::Sleep
-                                }
-                            }
-                            // WFI 与事件寄存器无关，ARM 规定总是进入等待。
-                            // WFI ignores the event register and always waits.
-                            0x3 => {
-                                regs.set_wait_on_event(false);
-                                StepResult::Sleep
-                            }
-                            0x4 => {
-                                regs.set_event();
-                                regs.set_sev_signal();
-                                StepResult::Ok
-                            }
-                            0x5 => {
-                                regs.set_event();
-                                StepResult::Ok
-                            }
+                            // WFE / WFI：显式进入等待状态，不能顺带跳过下一条。
+                            // WFE / WFI: a real wait state, never a silent skip.
+                            0x2 | 0x3 => StepResult::Sleep,
+                            // NOP / YIELD / SEV / SEVL 以及手册保留的 hint 编码
+                            // （0x6..=0xF）均按 NOP 执行。
+                            // NOP / YIELD / SEV / SEVL, plus the reserved hint
+                            // encodings (0x6..=0xF), all execute as NOP.
                             _ => StepResult::Ok,
                         });
                     }

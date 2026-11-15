@@ -203,37 +203,11 @@ fn execute_msr_or_misc(instr: u32, regs: &mut CortexM33Registers) -> StepResult 
             }
             _ => StepResult::Undefined,
         },
-        // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4), SEVL (5).
-        // WFE consumes a pending event instead of sleeping, WFI always waits,
-        // SEV sets the local event and latches the cross-core signal, and SEVL
-        // sets only the local event.
-        // 提示指令：NOP（0）、YIELD（1）、WFE（2）、WFI（3）、SEV（4）、SEVL（5）。
-        // WFE 消费已置位的事件而不睡眠，WFI 总是等待，SEV 置本核事件并锁存跨核
-        // 信号，SEVL 只置本核事件。
+        // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4).
+        // 提示指令：NOP（0）、YIELD（1）、WFE（2）、WFI（3）、SEV（4）。
         0xA => match instr & 0xF {
-            0x0 | 0x1 => StepResult::Ok,
-            0x2 => {
-                if regs.take_event() {
-                    regs.set_wait_on_event(false);
-                    StepResult::Ok
-                } else {
-                    regs.set_wait_on_event(true);
-                    StepResult::Sleep
-                }
-            }
-            0x3 => {
-                regs.set_wait_on_event(false);
-                StepResult::Sleep
-            }
-            0x4 => {
-                regs.set_event();
-                regs.set_sev_signal();
-                StepResult::Ok
-            }
-            0x5 => {
-                regs.set_event();
-                StepResult::Ok
-            }
+            0x0 | 0x1 | 0x4 => StepResult::Ok,
+            0x2 | 0x3 => StepResult::Sleep,
             _ => StepResult::Undefined,
         },
         _ => StepResult::Undefined,

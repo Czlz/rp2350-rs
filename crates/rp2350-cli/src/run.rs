@@ -24,11 +24,6 @@ use rp2350_periph::{BootPeripherals, Core1Launch};
 use rp2350_riscv::Hazard3Core;
 use rp2350_usb::{Controller, USBCTRL_IRQ};
 
-use crate::sleep::{
-    AlarmWake, SLEEP_HALT_AFTER_US, SLEEP_HARD_LIMIT_US, SLEEPING_REASON, SleepStats,
-    TIMER0_ALARM0, TIMER0_ARMED, TIMER0_BASE, TIMER0_FORCE, TIMER0_TIMERAWL,
-};
-
 /// SRAM base address / SRAM 基地址
 const SRAM_BASE: u32 = 0x2000_0000;
 
@@ -43,17 +38,6 @@ pub const DEFAULT_RUN_MAX_CYCLES: u64 = 20_000_000;
 
 /// Instructions between interrupt polls / 中断轮询间隔（指令数）
 const PUMP_INTERVAL: u64 = 64;
-
-/// Simulated ticks advanced per sleep step / 每个睡眠步推进的模拟节拍数
-///
-/// A parked core has nothing to do but wait, so the driver advances simulated
-/// time one pump batch at a time instead of one tick at a time. Wake conditions
-/// are re-checked at every pump, so the extra wake-up latency is bounded by one
-/// batch (64 cycles ≈ 0.43 µs at 150 MHz).
-/// 停摆核心除了等待无事可做，因此驱动器按一个泵送批次而不是单节拍推进模拟时间。
-/// 唤醒条件在每个泵送点重新检查，额外唤醒延迟不超过一个批次（150 MHz 下 64 周期
-/// ≈ 0.43 µs）。
-const SLEEP_BATCH_TICKS: u64 = PUMP_INTERVAL;
 
 /// Instructions between simulated-time advances / 推进模拟时间的指令间隔
 const ADVANCE_INTERVAL: u64 = 10_000;
@@ -88,16 +72,6 @@ const TAIL_TRACE_STEPS: usize = 32;
 /// Reason reported when the instruction budget runs out
 /// 指令预算耗尽时报告的原因
 const BUDGET_REASON: &str = "instruction budget exhausted / 指令预算耗尽";
-
-/// Simulated ticks of source-less sleep before `run` halts
-/// `run` 在无唤醒源睡眠这么多模拟节拍后停机
-const SLEEP_HALT_TICKS: u64 =
-    SLEEP_HALT_AFTER_US * rp2350_periph::boot::DEFAULT_CYCLES_PER_US as u64;
-
-/// Simulated ticks of total sleep before `run` halts unconditionally
-/// `run` 在睡眠累计这么多模拟节拍后无条件停机
-const SLEEP_HARD_LIMIT_TICKS: u64 =
-    SLEEP_HARD_LIMIT_US * rp2350_periph::boot::DEFAULT_CYCLES_PER_US as u64;
 
 /// CPU architecture selection for `run` / `run` 的 CPU 架构选择
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,53 +211,11 @@ macro_rules! core_dispatch {
     };
 }
 
-impl CoreHandle {
-    /// Set the event register of an Arm core / 置位 Arm 核心的事件寄存器
-    ///
-    /// RISC-V has no `WFE` wait, so the call is a no-op there.
-    /// RISC-V 没有 `WFE` 等待，因此该调用在 RISC-V 上为空操作。
-    fn set_event(&mut self) {
-        if let CoreHandle::Arm(core) = self {
-            core.set_event();
-        }
-    }
-
-    /// Take a latched `SEV` signal; RISC-V never produces one
-    /// 取出锁存的 `SEV` 信号；RISC-V 不产生该信号
-    fn take_sev_signal(&mut self) -> bool {
-        match self {
-            CoreHandle::Arm(core) => core.take_sev_signal(),
-            CoreHandle::RiscV(_) => false,
-        }
-    }
-
-    /// Report whether an enabled interrupt is pending
-    /// 报告是否有已使能且挂起的中断
-    fn has_pending_interrupt(&self) -> bool {
-        match self {
-            CoreHandle::Arm(core) => core.has_pending_interrupt(),
-            CoreHandle::RiscV(_) => false,
-        }
-    }
-
-    /// Report whether the event register is set / 报告事件寄存器是否置位
-    fn has_event(&self) -> bool {
-        match self {
-            CoreHandle::Arm(core) => core.has_event(),
-            CoreHandle::RiscV(_) => false,
-        }
-    }
-
-    /// Report whether the core is parked in `Sleeping` / 报告核心是否处于睡眠
-    fn is_sleeping(&self) -> bool {
-        self.state() == CpuState::Sleeping
-    }
-}
-
 impl CpuCore for CoreHandle {
     fn cpu_id(&self) -> CpuId {
         core_dispatch!(self, cpu_id)
     }
+
     fn arch(&self) -> rp2350_cpu::CpuArch {
         core_dispatch!(self, arch)
     }
@@ -409,11 +341,6 @@ pub struct Machine {
     dma_pumped: u64,
     /// Steps at the last PIO pump / 上次 PIO 泵送时的步数
     pio_pumped: u64,
-    /// Idle ticks attributed to sleeping cores / 记入睡眠核心的空闲节拍
-    sleep: SleepStats,
-    /// Fired `TIMER0` alarms already bridged to the NVIC
-    /// 已桥接到 NVIC 的 `TIMER0` alarm
-    alarm_wake: AlarmWake,
     /// Cumulative DMA data units moved by the host pump / 宿主泵送累计搬运的 DMA 数据单元数
     dma_transfers: u64,
     /// Cumulative HSTX output words drained by the host pump / 宿主泵送累计排空的 HSTX 输出字数
@@ -567,8 +494,6 @@ impl Machine {
             pumped: 0,
             dma_pumped: 0,
             pio_pumped: 0,
-            sleep: SleepStats::new(),
-            alarm_wake: AlarmWake::new(),
             dma_transfers: 0,
             hstx_words: 0,
             halt: None,
@@ -624,27 +549,10 @@ impl Machine {
         self.steps
     }
 
-    /// Simulated clock: retired instructions plus sleep ticks
-    /// 模拟时钟：退休指令数加睡眠节拍数
-    ///
-    /// Sleeping cores still consume simulated time, so every pump cadence and
-    /// the USB enumeration deadline must use this clock instead of [`Self::steps`].
-    /// 睡眠核心同样消耗模拟时间，因此所有泵送节拍与 USB 枚举期限都必须使用该
-    /// 时钟，而不是 [`Self::steps`]。
-    fn clock(&self) -> u64 {
-        self.steps.saturating_add(self.sleep.ticks())
-    }
-
-    /// Ticks spent asleep / 睡眠消耗的节拍数
-    #[must_use]
-    pub fn sleep_steps(&self) -> u64 {
-        self.sleep.ticks()
-    }
-
     /// Current simulated cycle count / 当前模拟周期数
     #[must_use]
     pub fn now_cycles(&self) -> u64 {
-        self.clock()
+        self.steps
     }
 
     /// Cumulative DMA data units moved by the host pump
@@ -727,10 +635,10 @@ impl Machine {
     /// Elapsed simulated microseconds / 已模拟的微秒数
     #[must_use]
     pub fn time_us(&self) -> u64 {
-        // 外设时基按 10_000 步批量推进，诊断时把尚未推进的节拍也算进来。
-        // The peripheral timebase advances in 10_000-tick batches; include the
-        // not-yet-advanced ticks so diagnostics report the current time.
-        let pending = self.clock().saturating_sub(self.advanced);
+        // 外设时基按 10_000 步批量推进，诊断时把尚未推进的步数也算进来。
+        // The peripheral timebase advances in 10_000-step batches; include the
+        // not-yet-advanced steps so diagnostics report the current time.
+        let pending = self.steps.saturating_sub(self.advanced);
         let pending_us = pending / u64::from(rp2350_periph::boot::DEFAULT_CYCLES_PER_US);
         self.peripherals.time_us().saturating_add(pending_us)
     }
@@ -1002,24 +910,19 @@ impl Machine {
         self.execute_step(Some(index))
     }
 
-    /// Advance the guest by at most `cycles` ticks
-    /// 最多推进 `cycles` 个节拍
+    /// Advance the guest by at most `cycles` instructions
+    /// 最多推进 `cycles` 条指令
     ///
     /// This is the callback used by [`rp2350_usb_host::CdcLink`]: it runs the
     /// same boot-ROM dispatch, interrupt pump, timebase advance and UART
     /// collection as the `run` path, and stops at the machine budget.
-    /// A sleeping core spends its ticks on [`SleepStats`] instead of retiring
-    /// instructions, so a `WFI` wait still advances time and can be woken by a
-    /// peripheral or USB interrupt without stalling the host bridge.
     /// 这是 [`rp2350_usb_host::CdcLink`] 使用的回调：执行与 `run` 路径相同的
     /// boot ROM 分发、中断泵送、时基推进与 UART 收集，并在机器预算处停止。
-    /// 睡眠核心把节拍记到 [`SleepStats`] 而不是退休指令，因此 `WFI` 等待仍会
-    /// 推进时间并被外设或 USB 中断唤醒，不会卡住主机桥。
     pub fn run_cycles(&mut self, cycles: u64) {
-        let target = self.clock().saturating_add(cycles);
-        while self.clock() < target && self.halt.is_none() && !self.budget_exhausted() {
+        let target = self.steps.saturating_add(cycles).min(self.budget);
+        while self.steps < target && self.halt.is_none() {
             match self.step() {
-                Ok(CpuState::Running | CpuState::Sleeping) => {}
+                Ok(CpuState::Running) => {}
                 Ok(_) => break,
                 Err(error) => {
                     if self.halt.is_none() {
@@ -1044,23 +947,7 @@ impl Machine {
 
     fn execute_step(&mut self, trace: Option<usize>) -> Result<CpuState> {
         let state = self.execute_core0_step(trace)?;
-        // core0 的 SEV 必须在 core1 本步执行之前送达，core1 的 WFE 才能在同一个
-        // 节拍内继续执行。
-        // Core0's SEV must reach core1 before core1 runs this tick so core1's
-        // WFE can resume within the same tick.
-        if self.core.take_sev_signal() {
-            if let Some(core1) = self.core1.as_mut() {
-                core1.set_event();
-            }
-        }
         self.step_core1();
-        if self
-            .core1
-            .as_mut()
-            .is_some_and(CortexM33Core::take_sev_signal)
-        {
-            self.core.set_event();
-        }
         Ok(state)
     }
 
@@ -1099,12 +986,7 @@ impl Machine {
         let Some(core1) = self.core1.as_mut() else {
             return;
         };
-        // 睡眠中的 core1 仍要推进一次：`step` 内部会检查唤醒条件，否则对端的
-        // SEV 与挂起中断永远无法让它继续。
-        // A sleeping core1 is still stepped once: `step` checks the wake
-        // conditions internally, otherwise a peer SEV or a pending interrupt
-        // could never resume it.
-        if !matches!(core1.state(), CpuState::Running | CpuState::Sleeping) {
+        if core1.state() != CpuState::Running {
             return;
         }
         self.peripherals.sio().select_core(CpuId::Core1);
@@ -1135,10 +1017,7 @@ impl Machine {
             core1.system_write(addr, value);
         }
         match result {
-            // 睡眠不是故障：不记录 core1 停机原因，下个节拍照常唤醒检查。
-            // Sleeping is not a fault: no core-1 halt reason is recorded, and
-            // the wake conditions are checked again next tick.
-            Ok(CpuState::Running | CpuState::Sleeping) => {}
+            Ok(CpuState::Running) => {}
             Ok(state) => {
                 self.core1_halt = Some(format!("core1 entered state {state:?}"));
             }
@@ -1182,15 +1061,9 @@ impl Machine {
         if self.halt.is_some() || self.budget_exhausted() {
             return Ok(CpuState::Halted);
         }
-        // 睡眠中的 core0 只是等待唤醒：不记录 PC 轨迹，也不分发 boot ROM 陷阱。
-        // A sleeping core0 is only waiting for a wakeup: no PC history entry and
-        // no boot ROM trap dispatch.
-        let was_sleeping = self.core.is_sleeping();
         let pc = self.core.pc();
-        if !was_sleeping {
-            self.record_step(pc);
-        }
-        if !was_sleeping && self.bootrom_applicable && self.bootrom.handles(pc) {
+        self.record_step(pc);
+        if self.bootrom_applicable && self.bootrom.handles(pc) {
             if let Some(index) = trace {
                 self.notices
                     .push(format!("[trace] {index:03} PC={pc:#010X} bootrom-trap"));
@@ -1222,12 +1095,10 @@ impl Machine {
             }
         }
         if let Some(index) = trace {
-            if !was_sleeping {
-                let mut cycles = 0u64;
-                let opcode = self.bus.read_u16(pc, &mut cycles).unwrap_or(0xFFFF);
-                self.notices
-                    .push(format!("[trace] {index:03} PC={pc:#010X} op={opcode:#06X}"));
-            }
+            let mut cycles = 0u64;
+            let opcode = self.bus.read_u16(pc, &mut cycles).unwrap_or(0xFFFF);
+            self.notices
+                .push(format!("[trace] {index:03} PC={pc:#010X} op={opcode:#06X}"));
         }
         match self.core.step(&mut self.bus) {
             Ok(CpuState::Running) => {
@@ -1255,30 +1126,6 @@ impl Machine {
                     self.after_running_step();
                 }
                 Ok(CpuState::Running)
-            }
-            Ok(CpuState::Sleeping) => {
-                if was_sleeping {
-                    // 空闲等待按泵送批次推进模拟时间：每个批次检查一次唤醒条件、
-                    // 泵送一次外设，100 ms 级等待在宿主机上仍然廉价。
-                    // Idle waits advance simulated time one pump batch at a time:
-                    // each batch checks the wake conditions and pumps once, which
-                    // keeps 100 ms-scale waits cheap on the host.
-                    self.sleep.advance(SLEEP_BATCH_TICKS);
-                    // 睡眠节拍不退休指令，但继续推进时间与外设。
-                    // A sleep batch retires no instruction but keeps time and
-                    // peripherals moving.
-                    self.sleep_step();
-                } else {
-                    // WFI/WFE 本身已退休：计入指令预算并走普通步的泵送路径。
-                    // The WFI/WFE itself retired: charge the instruction budget
-                    // and take the normal-step pump path.
-                    self.steps += 1;
-                    self.record_sync_trap();
-                    self.pump_dma_batch();
-                    self.pump_pio_batch();
-                    self.after_running_step();
-                }
-                Ok(CpuState::Sleeping)
             }
             Ok(state) => {
                 self.halt = Some(format!("core entered state {state:?}"));
@@ -1351,7 +1198,7 @@ impl Machine {
         // 64-step batch replay makes the core raise a spurious NOCP UsageFault.
         // IRQ lines stay throttled to avoid re-asserting a level IRQ each step.
         replay_system_writes(&mut self.core, &self.peripherals);
-        if self.clock() - self.pumped >= PUMP_INTERVAL {
+        if self.steps - self.pumped >= PUMP_INTERVAL {
             self.peripherals.service_core1_peer();
             deliver_irqs(
                 &mut self.core,
@@ -1360,209 +1207,11 @@ impl Machine {
                 &self.usb,
                 &mut self.irqs,
             );
-            self.pumped = self.clock();
+            self.pumped = self.steps;
         }
-        if self.clock() - self.advanced >= ADVANCE_INTERVAL {
+        if self.steps - self.advanced >= ADVANCE_INTERVAL {
             self.advance_timebase();
         }
-    }
-
-    /// Handle one step of a sleeping core 0 / 处理 core0 的一个睡眠节拍
-    ///
-    /// No instruction retires, so the instruction budget does not move, but
-    /// simulated time, the peripheral timebase, DMA/PIO progress and interrupt
-    /// lines must keep going: a `WFI` waiting for a future timer alarm or a USB
-    /// interrupt only wakes because those advance.
-    /// 不退休指令，因此指令预算不变；但模拟时间、外设时基、DMA/PIO 进度与中断线
-    /// 必须继续推进：等待**未来**定时器 alarm 或 USB 中断的 `WFI` 正是靠它们才会
-    /// 唤醒。
-    fn sleep_step(&mut self) {
-        // 调用方已把本批次的模拟节拍计入 `SleepStats`。
-        // The caller already charged this batch to `SleepStats`.
-        if self.clock() - self.pumped >= PUMP_INTERVAL {
-            self.peripherals.service_core1_peer();
-            // 先桥接已到期的 TIMER0 alarm：外设模型尚未在正确偏移上断言 alarm 中断。
-            // Bridge fired TIMER0 alarms first: the peripheral model does not yet
-            // assert the alarm lines at the corrected register offsets.
-            self.pump_timer_alarms();
-            deliver_irqs(
-                &mut self.core,
-                self.core1.as_mut(),
-                &self.peripherals,
-                &self.usb,
-                &mut self.irqs,
-            );
-            self.pumped = self.clock();
-            self.pump_dma_batch();
-            self.pump_pio_batch();
-        }
-        if self.clock() - self.advanced >= ADVANCE_INTERVAL {
-            self.advance_timebase();
-        }
-    }
-
-    /// Deliver a fired `TIMER0` alarm to the cores that enabled its NVIC line
-    /// 把已到期的 `TIMER0` alarm 投递给使能了对应 NVIC 线的核心
-    ///
-    /// The guest enables the alarm IRQ through the NVIC (`irq_set_enabled`) and
-    /// through `TIMER0.INTE`; the peripheral model still exposes `INTE` at the
-    /// RP2040-era offset, so its own line assertion never happens for pico-sdk's
-    /// alarm pool. This bridge observes the guest-visible `ALARM0..3`,
-    /// `TIMERAWL` and forced bits and raises the NVIC pending bit exactly once
-    /// per deadline, which wakes a sleeping `WFE` the way the real interrupt
-    /// would. The timer's own line is still delivered by `deliver_irqs`, so the
-    /// bridge becomes a no-op once the peripheral model is corrected.
-    /// 客户机通过 NVIC（`irq_set_enabled`）与 `TIMER0.INTE` 使能 alarm 中断；外设
-    /// 模型仍在 RP2040 时代的偏移上暴露 `INTE`，因此不会为 pico-sdk 的 alarm pool
-    /// 断言自己的中断线。本桥接观察客户机可见的 `ALARM0..3`、`TIMERAWL` 与强制位，
-    /// 每个截止时间只置一次 NVIC 挂起位，从而像真实中断一样唤醒睡眠中的 `WFE`。
-    /// 定时器自身的断言行仍由 `deliver_irqs` 投递，因此外设模型修正后本桥接自动
-    /// 退化为空操作。
-    fn pump_timer_alarms(&mut self) {
-        let mut cycles = 0u64;
-        let Ok(now) = self
-            .bus
-            .read_u32(TIMER0_BASE + TIMER0_TIMERAWL, &mut cycles)
-        else {
-            return;
-        };
-        let mut alarms = [0u32; 4];
-        for (index, slot) in alarms.iter_mut().enumerate() {
-            let addr = TIMER0_BASE + TIMER0_ALARM0 + index as u32 * 4;
-            *slot = self.bus.read_u32(addr, &mut cycles).unwrap_or(0);
-        }
-        let forced = self
-            .bus
-            .read_u32(TIMER0_BASE + TIMER0_FORCE, &mut cycles)
-            .unwrap_or(0);
-        let due = self.alarm_wake.observe(now, alarms, forced);
-        for index in 0..4u16 {
-            if due & (1 << index) == 0 {
-                continue;
-            }
-            let irq = rp2350_periph::map::TIMER0_IRQ_0 + index;
-            if nvic_irq_enabled(&mut self.core, irq) {
-                self.core.signal_interrupt(irq);
-                log_irq(&mut self.irqs, "", irq, self.core.pc());
-            }
-            if let Some(core1) = self.core1.as_mut() {
-                if nvic_irq_enabled(core1, irq) {
-                    core1.signal_interrupt(irq);
-                }
-            }
-        }
-    }
-
-    /// Stop a `run` whose cores cannot wake without help
-    /// 结束一个核心无法自行唤醒的 `run`
-    ///
-    /// Core 0 sleeping is normal: the machine keeps advancing simulated time so
-    /// a future timer alarm, DMA/SIO completion or USB interrupt can wake it.
-    /// The run only ends once the sleep has lasted [`SLEEP_HALT_AFTER_US`] of
-    /// simulated time with **no** wake source at all (no pending exception or
-    /// event, no runnable peer core, no pending core-1 launch/hard reset, no
-    /// asserted peripheral/USB line and no armed or forced `TIMER0` alarm), or
-    /// once total sleep reaches [`SLEEP_HARD_LIMIT_US`]. `repl`/GDB never call
-    /// this: they advance time through [`Self::run_cycles`].
-    /// core0 睡眠是正常状态：机器继续推进模拟时间，使未来的定时器 alarm、DMA/SIO
-    /// 完成或 USB 中断可以唤醒它。只有睡眠持续 [`SLEEP_HALT_AFTER_US`] 的模拟时间
-    /// 且**完全**没有唤醒源（无挂起异常或事件、无可运行对端核心、无待处理 core1
-    /// 启动/硬复位、无已断言的外设/USB 线、也无已武装或强制触发的 `TIMER0`
-    /// alarm），或睡眠累计达到 [`SLEEP_HARD_LIMIT_US`] 时，`run` 才结束。
-    /// `repl`/GDB 从不调用它：它们通过 [`Self::run_cycles`] 推进时间。
-    pub fn halt_if_sleeping(&mut self) -> bool {
-        if !self.core.is_sleeping() {
-            return false;
-        }
-        if self.halt.is_some() {
-            return true;
-        }
-        // 至少给机器一个泵送周期：中断线与启动握手都在泵送点生效。
-        // Give the machine at least one pump period: lines and launch handshakes
-        // take effect at the pump.
-        if self.sleep.ticks() < PUMP_INTERVAL {
-            return false;
-        }
-        // 唤醒源只在泵送点变化，因此按泵送节拍评估，避免每节拍读定时器寄存器。
-        // Wake sources only change at the pump, so evaluate them at the pump
-        // cadence instead of reading timer registers on every tick.
-        if self.sleep.ticks() % PUMP_INTERVAL == 0 && self.has_wake_source() {
-            self.sleep.note_wake_source();
-            return false;
-        }
-        // 没有任何唤醒源：再等一段模拟时间，让固件自身的超时有机会产生中断。
-        // No wake source at all: wait a while longer so the firmware's own
-        // timeouts can still fire a peripheral interrupt.
-        if self.sleep.idle_ticks() < SLEEP_HALT_TICKS && self.sleep.ticks() < SLEEP_HARD_LIMIT_TICKS
-        {
-            return false;
-        }
-        self.halt = Some(SLEEPING_REASON.to_owned());
-        self.finalize();
-        true
-    }
-
-    /// Report whether anything left in the machine could still wake core 0
-    /// 报告机器中是否还有任何能唤醒 core0 的来源
-    fn has_wake_source(&mut self) -> bool {
-        if self.core.has_pending_interrupt() || self.core.has_event() {
-            return true;
-        }
-        // 仍在运行的对端核心可以推送 SIO 门铃；带唤醒条件的睡眠核心也会自行恢复。
-        // A peer core that is still running can push an SIO doorbell, and a
-        // sleeping core with a wake condition resumes on its own.
-        let core1_wakeable = self
-            .core1
-            .as_ref()
-            .is_some_and(|core1| match core1.state() {
-                CpuState::Running => true,
-                CpuState::Sleeping => core1.has_pending_interrupt() || core1.has_event(),
-                _ => false,
-            });
-        if core1_wakeable {
-            return true;
-        }
-        // 启动/复位握手与已断言的中断线都会在下一次泵送时产生唤醒。
-        // The launch/reset handshakes and any asserted line produce a wakeup at
-        // the next pump.
-        if self.peripherals.core1_launch_pending()
-            || self.peripherals.core1_reset_pending()
-            || self.peripherals.irq_mask() != 0
-            || self.usb.irq_asserted()
-        {
-            return true;
-        }
-        // 未来的 TIMER0 alarm（已武装或已被 alarm pool 强制）同样是唤醒源。
-        // A future TIMER0 alarm — armed, or forced by the alarm pool — is a wake
-        // source as well.
-        self.timer_wakeup_pending()
-    }
-
-    /// Report whether `TIMER0` has an armed alarm or a forced request
-    /// 报告 `TIMER0` 是否有已武装的 alarm 或强制请求
-    fn timer_wakeup_pending(&mut self) -> bool {
-        let mut cycles = 0u64;
-        let now = self
-            .bus
-            .read_u32(TIMER0_BASE + TIMER0_TIMERAWL, &mut cycles)
-            .unwrap_or(0);
-        let armed = self
-            .bus
-            .read_u32(TIMER0_BASE + TIMER0_ARMED, &mut cycles)
-            .unwrap_or(0);
-        let forced = self
-            .bus
-            .read_u32(TIMER0_BASE + TIMER0_FORCE, &mut cycles)
-            .unwrap_or(0);
-        if armed != 0 || forced != 0 {
-            return true;
-        }
-        let mut alarms = [0u32; 4];
-        for (index, slot) in alarms.iter_mut().enumerate() {
-            let addr = TIMER0_BASE + TIMER0_ALARM0 + index as u32 * 4;
-            *slot = self.bus.read_u32(addr, &mut cycles).unwrap_or(0);
-        }
-        AlarmWake::has_future_wakeup(now, alarms, forced)
     }
 
     /// Run one throttled DMA batch before interrupt delivery
@@ -1583,13 +1232,13 @@ impl Machine {
     /// `PIOx_TXy`/`PIOx_RXy` 的 `TREQ_SEL` 只会在所选 FIFO 有空间或有数据时推进。
     /// 空闲路径只做一次 `busy_mask` 探测，不访问总线与 PIO 块。
     fn pump_dma_batch(&mut self) {
-        if self.clock() - self.dma_pumped < PUMP_INTERVAL {
+        if self.steps - self.dma_pumped < PUMP_INTERVAL {
             return;
         }
         // 先记节流点：即使当前空闲，下一次检查也推迟一整批，避免每步加锁。
         // Record the throttle point first: even when idle, the next probe waits
         // a full batch instead of locking on every step.
-        self.dma_pumped = self.clock();
+        self.dma_pumped = self.steps;
         // HSTX advances independently of DMA: drain the host queue every batch,
         // advance the expander by one batch of cycles and publish its FIFO-room
         // DREQ before arbitration.
@@ -1626,11 +1275,11 @@ impl Machine {
     /// 每批只花三次加锁、不做状态机工作，且只在 `IRQ` 标志变化时重新发布中断线。
     /// 块在中断投递之前推进，因此本批次置位的标志会在同一批次送达 CPU。
     fn pump_pio_batch(&mut self) {
-        if self.clock() - self.pio_pumped < PUMP_INTERVAL {
+        if self.steps - self.pio_pumped < PUMP_INTERVAL {
             return;
         }
-        let elapsed = self.clock() - self.pio_pumped;
-        self.pio_pumped = self.clock();
+        let elapsed = self.steps - self.pio_pumped;
+        self.pio_pumped = self.steps;
         // 空闲快速路径：三个块都没有使能状态机时只做一次掩码探测就返回。
         // Idle fast path: with no enabled state machine in any of the three
         // blocks, one mask probe is the whole batch.
@@ -1649,9 +1298,9 @@ impl Machine {
     }
 
     fn advance_timebase(&mut self) {
-        if self.clock() > self.advanced {
-            self.peripherals.advance(self.clock() - self.advanced);
-            self.advanced = self.clock();
+        if self.steps > self.advanced {
+            self.peripherals.advance(self.steps - self.advanced);
+            self.advanced = self.steps;
             self.uart.extend(self.peripherals.take_uart_output());
         }
     }
@@ -1702,12 +1351,6 @@ pub fn run(options: &RunOptions) -> Result<()> {
     while machine.halt_reason().is_none() && !machine.budget_exhausted() {
         machine.step()?;
         drain_notices(&mut machine, &mut stdout)?;
-        // 睡眠不消耗指令预算：若 core0 已无唤醒源，直接以睡眠原因结束，
-        // 而不是空转把预算耗光。
-        // Sleeping does not consume the instruction budget: with no wake source
-        // left for core0, end the run with the sleeping reason instead of
-        // spinning until the budget is exhausted.
-        machine.halt_if_sleeping();
     }
     machine.finalize();
 
@@ -1718,7 +1361,13 @@ pub fn run(options: &RunOptions) -> Result<()> {
     for (step, pc, opcode) in machine.recent_steps() {
         writeln!(stdout, "[tail] {step:06} PC={pc:#010X} op={opcode:#06X}")?;
     }
-    writeln!(stdout, "{}", executed_summary(&machine))?;
+    writeln!(
+        stdout,
+        "[run] executed {steps} steps, {us} us simulated, final PC={pc:#010X}",
+        steps = machine.steps(),
+        us = machine.time_us(),
+        pc = machine.pc()
+    )?;
     print_post_mortem(&mut machine, &mut stdout)?;
     write_dumps(&mut machine, &options.dumps)?;
     for dump in &options.dumps {
@@ -1732,23 +1381,6 @@ pub fn run(options: &RunOptions) -> Result<()> {
     }
     stdout.flush()?;
     Ok(())
-}
-
-/// Format the final `[run] executed ...` diagnostics line
-/// 格式化最终的 `[run] executed ...` 诊断行
-///
-/// `sleep=` is separate from `steps` because a sleeping core advances simulated
-/// time without retiring instructions or consuming the instruction budget.
-/// `sleep=` 与 `steps` 分开，因为睡眠核心推进模拟时间但不退休指令，也不消耗
-/// 指令预算。
-fn executed_summary(machine: &Machine) -> String {
-    format!(
-        "[run] executed {steps} steps, sleep={sleep}, {us} us simulated, final PC={pc:#010X}",
-        steps = machine.steps(),
-        sleep = machine.sleep_steps(),
-        us = machine.time_us(),
-        pc = machine.pc()
-    )
 }
 
 /// Print the peripheral, register and UART diagnostics of a stopped machine
@@ -2027,17 +1659,6 @@ fn replay_system_writes(core: &mut dyn CpuCore, peripherals: &BootPeripherals) {
     for (addr, value) in peripherals.take_system_writes() {
         core.system_write(addr, value);
     }
-}
-
-/// Read one enable bit from a core's NVIC / 从核心的 NVIC 读取一条使能位
-///
-/// Used by the sleep-side `TIMER0` alarm bridge to only raise lines the guest
-/// actually enabled.
-/// 供睡眠侧的 `TIMER0` alarm 桥接使用，只对客户机真正使能的线置挂起位。
-fn nvic_irq_enabled(core: &mut dyn CpuCore, irq: u16) -> bool {
-    let addr = 0xE000_E100 + u32::from(irq / 32) * 4;
-    core.system_read(addr)
-        .is_some_and(|bits| bits & (1 << (irq % 32)) != 0)
 }
 
 /// Deliver asserted interrupt lines to both cores / 向两个核心投递已断言的中断线
@@ -3080,10 +2701,6 @@ mod tests {
         let mut machine = Machine::new(&bytes, &options).expect("machine");
         while machine.halt_reason().is_none() && !machine.budget_exhausted() {
             machine.step().expect("step");
-            // 若 core0 进入 WFI/WFE 且无唤醒源，立即以睡眠原因结束，避免测试挂起。
-            // End with the sleeping reason if core0 idles with no wake source,
-            // so the test fails loudly instead of hanging.
-            machine.halt_if_sleeping();
         }
         machine.finalize();
 
@@ -3113,241 +2730,5 @@ mod tests {
             hstx.unknown_commands()
         );
         assert!(machine.dma_transfers() > 0);
-    }
-
-    // ---- WFI / WFE / SEV sleep semantics ------------------------------------
-
-    /// Core-0 scratch code region inside SRAM / SRAM 中的 core0 暂存代码区
-    const CORE0_CODE: u32 = SRAM_BASE + 0x6000;
-
-    /// Core-0 stack top used by in-SRAM boots / in-SRAM 启动使用的 core0 栈顶
-    const CORE0_STACK: u32 = SRAM_BASE + 0xE000;
-
-    /// Thumb `wfe` / Thumb `wfe`
-    const WFE: u16 = 0xBF20;
-
-    /// Thumb `wfi` / Thumb `wfi`
-    const WFI: u16 = 0xBF30;
-
-    /// Thumb `sev` / Thumb `sev`
-    const SEV: u16 = 0xBF40;
-
-    /// Thumb `nop` / Thumb `nop`
-    const NOP: u16 = 0xBF00;
-
-    /// Boot core 0 at an SRAM program so a test can use WFE/WFI
-    /// 让 core0 从 SRAM 程序启动，便于测试使用 WFE/WFI
-    fn boot_core0_in_sram(machine: &mut Machine, code: &[u16]) {
-        boot_core0_in_sram_at(machine, code, FLASH_XIP_BASE);
-    }
-
-    /// Boot core 0 at an SRAM program with an explicit vector table base
-    /// 让 core0 从 SRAM 程序启动，并指定向量表基址
-    fn boot_core0_in_sram_at(machine: &mut Machine, code: &[u16], vtor: u32) {
-        bind_halfwords(machine, CORE0_CODE, code);
-        if let CoreHandle::Arm(core) = &mut machine.core {
-            core.boot_at(CORE0_STACK, CORE0_CODE | 1, vtor);
-        }
-        // 机器构造时向 PPB 排队的 FLASH VTOR 会在首步回放进核；再排一次写，
-        // 使回放顺序最终把核的 VTOR 指向测试向量表。
-        // The FLASH VTOR queued by machine construction is replayed into the core
-        // on the first step; queue a second write so the replay ends on the test
-        // vector table.
-        let mut cycles = 0u64;
-        machine
-            .bus
-            .write_u32(0xE000_ED08, vtor, &mut cycles)
-            .expect("seed VTOR");
-    }
-
-    #[test]
-    fn wfi_ends_run_with_a_sleeping_halt_reason() {
-        let mut machine = machine_with_budget(1_000);
-        boot_core0_in_sram(&mut machine, &[WFI, SPIN_PROGRAM[0]]);
-        machine.step().expect("wfi step");
-        assert_eq!(machine.cpu_state(), CpuState::Sleeping);
-        // 一个泵送周期内不判定停机：中断线可能正好在泵送点到达。
-        // No halt verdict within one pump period: a line may arrive at the pump.
-        machine.step().expect("sleep tick");
-        assert!(!machine.halt_if_sleeping());
-        // 无任何唤醒源：推进满 100 ms 模拟时间后才以睡眠原因结束。
-        // With no wake source at all, the run ends after 100 ms of simulated time.
-        let mut ticks = 0u64;
-        while !machine.halt_if_sleeping() {
-            assert!(ticks < SLEEP_HALT_TICKS + PUMP_INTERVAL * 2, "halt verdict");
-            machine.step().expect("sleep tick");
-            ticks += 1;
-        }
-        assert_eq!(machine.halt_reason(), Some(SLEEPING_REASON));
-        assert_eq!(machine.steps(), 1, "only WFI retires / 只有 WFI 退休");
-        assert!(
-            machine.sleep_steps() >= SLEEP_HALT_TICKS,
-            "sleep={} / 睡眠节拍不足",
-            machine.sleep_steps()
-        );
-        assert!(
-            !machine.budget_exhausted(),
-            "sleep must not burn the budget"
-        );
-        // 100 ms 的模拟时间已经推进，指令数仍为 1。
-        // 100 ms of simulated time passed while one instruction retired.
-        assert!(machine.time_us() >= SLEEP_HALT_AFTER_US);
-        let summary = executed_summary(&machine);
-        assert!(summary.contains("[run] executed 1 steps"), "{summary}");
-        assert!(summary.contains("sleep="), "{summary}");
-    }
-
-    #[test]
-    fn a_future_timer_alarm_wakes_a_sleeping_core() {
-        let mut machine = machine_with_budget(1_000_000);
-        // 向量表放在 SRAM，IRQ 0 的处理程序是一条自循环。
-        // Keep the vector table in SRAM; IRQ 0's handler is a self loop.
-        write_word(&mut machine, SRAM_BASE + 64, (CORE0_CODE + 0x40) | 1);
-        boot_core0_in_sram_at(&mut machine, &[WFI, SPIN_PROGRAM[0]], SRAM_BASE);
-        bind_halfwords(&mut machine, CORE0_CODE + 0x40, &SPIN_PROGRAM);
-        // 10 ms alarm + NVIC IRQ 0 使能：未来到期的 alarm 必须唤醒 WFE。
-        // A 10 ms alarm with NVIC IRQ 0 enabled must wake the WFE when it fires.
-        write_word(&mut machine, TIMER0_BASE + TIMER0_ALARM0, 10_000);
-        machine.core.system_write(0xE000_E100, 1);
-
-        machine.step().expect("wfi step");
-        assert_eq!(machine.cpu_state(), CpuState::Sleeping);
-        let mut probe = 0u64;
-        assert_eq!(
-            machine.bus.read_u32(SRAM_BASE + 64, &mut probe).unwrap(),
-            (CORE0_CODE + 0x40) | 1,
-            "IRQ 0 vector"
-        );
-        assert_eq!(machine.core.system_read(0xE000_ED08), Some(SRAM_BASE));
-        // 2 ms 内不应唤醒。 / No wakeup within 2 ms.
-        machine.run_cycles(300_000);
-        assert_eq!(machine.cpu_state(), CpuState::Sleeping);
-        assert!(
-            !machine.halt_if_sleeping(),
-            "a future alarm is a wake source"
-        );
-        assert_eq!(machine.steps(), 1);
-
-        // alarm 到期后由睡眠桥接投递 IRQ 0，核心进入处理程序并继续退休指令。
-        // When the alarm expires the sleep bridge delivers IRQ 0, the core enters
-        // the handler and keeps retiring instructions.
-        machine.run_cycles(2_000_000);
-        assert_eq!(
-            machine.cpu_state(),
-            CpuState::Running,
-            "halt={:?} steps={} sleep={}",
-            machine.halt_reason(),
-            machine.steps(),
-            machine.sleep_steps()
-        );
-        assert!(
-            machine.steps() > 1,
-            "steps={} / 指令数没有增长",
-            machine.steps()
-        );
-        assert!(machine.sleep_steps() > 0);
-        assert_eq!(machine.halt_reason(), None);
-        assert!(!machine.halt_if_sleeping());
-    }
-
-    #[test]
-    fn sleeping_core0_keeps_irq_pumping_and_the_timebase() {
-        let mut machine = machine_with_budget(1_000);
-        boot_core0_in_sram(&mut machine, &[WFI, SPIN_PROGRAM[0]]);
-        machine.run_cycles(ADVANCE_INTERVAL + 1);
-        // repl 路径遇睡眠仍推进时基与外设，不会卡死。
-        // The repl path keeps advancing time and peripherals while asleep.
-        assert_eq!(machine.halt_reason(), None);
-        assert!(machine.pumped >= PUMP_INTERVAL, "IRQ pump must run");
-        assert!(
-            machine.advanced >= ADVANCE_INTERVAL,
-            "timebase must advance"
-        );
-        assert!(machine.now_cycles() > machine.steps());
-    }
-
-    #[test]
-    fn run_cycles_advances_the_clock_while_sleeping() {
-        let mut machine = machine_with_budget(1_000);
-        boot_core0_in_sram(&mut machine, &[WFI, SPIN_PROGRAM[0]]);
-        machine.run_cycles(500);
-        assert_eq!(machine.halt_reason(), None, "repl must not stop on sleep");
-        assert_eq!(machine.steps(), 1);
-        // 空闲等待按泵送批次推进，允许一个批次的过冲。
-        // Idle waits advance one pump batch at a time, so allow one batch of
-        // overshoot.
-        assert!(machine.sleep_steps() > 0);
-        assert!(
-            machine.now_cycles() >= 500 && machine.now_cycles() < 500 + SLEEP_BATCH_TICKS,
-            "clock={}",
-            machine.now_cycles()
-        );
-        assert!(machine.time_us() > 0);
-        assert!(!machine.budget_exhausted());
-    }
-
-    #[test]
-    fn core1_sleeping_does_not_stop_core0_or_report_a_fault() {
-        let mut machine = machine_with_budget(1_000);
-        bind_halfwords(&mut machine, CORE1_CODE, &[WFE, 0x2001, SPIN_PROGRAM[0]]);
-        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
-        machine.step().expect("launch step");
-        assert_eq!(machine.core1_state(), Some(CpuState::Sleeping));
-
-        let steps = machine.steps();
-        machine.step().expect("sleeping core1 step");
-        assert_eq!(machine.cpu_state(), CpuState::Running);
-        assert!(machine.steps() > steps, "core0 keeps retiring instructions");
-        assert_eq!(machine.core1_state(), Some(CpuState::Sleeping));
-        assert_eq!(machine.core1_halt_reason(), None);
-        assert!(!machine.halt_if_sleeping());
-    }
-
-    #[test]
-    fn sev_from_core0_wakes_core1_wfe() {
-        let mut machine = machine_with_budget(1_000);
-        boot_core0_in_sram(&mut machine, &[NOP, SEV, SPIN_PROGRAM[0]]);
-        bind_halfwords(&mut machine, CORE1_CODE, &[WFE, 0x2001, SPIN_PROGRAM[0]]);
-        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
-        machine.step().expect("launch step");
-        assert_eq!(machine.core1_state(), Some(CpuState::Sleeping));
-
-        machine.step().expect("sev step");
-        // core0 的 SEV 经驱动器转发，core1 的 WFE 在同一节拍继续。
-        // Core0's SEV is forwarded by the driver, so core1's WFE resumes in
-        // the same tick.
-        assert_eq!(machine.core1_state(), Some(CpuState::Running));
-        assert_eq!(machine.core1_register(0), Some(1));
-    }
-
-    #[test]
-    fn sev_from_core1_wakes_core0_wfe() {
-        let mut machine = machine_with_budget(1_000);
-        boot_core0_in_sram(&mut machine, &[WFE, 0x2001, SPIN_PROGRAM[0]]);
-        bind_halfwords(&mut machine, CORE1_CODE, &[SEV, SPIN_PROGRAM[0]]);
-        push_launch(&mut machine, CORE1_VTOR, CORE1_STACK, CORE1_CODE | 1);
-        machine.step().expect("launch step");
-        assert_eq!(machine.cpu_state(), CpuState::Sleeping);
-
-        machine.step().expect("wake step");
-        assert_eq!(machine.cpu_state(), CpuState::Running);
-        assert_eq!(machine.register(0), 1);
-    }
-
-    #[test]
-    fn halt_if_sleeping_waits_for_a_pending_interrupt() {
-        let mut machine = machine_with_budget(1_000);
-        boot_core0_in_sram(&mut machine, &[WFI, SPIN_PROGRAM[0]]);
-        machine.step().expect("wfi step");
-        assert_eq!(machine.cpu_state(), CpuState::Sleeping);
-        machine.run_cycles(PUMP_INTERVAL);
-
-        // 已使能且挂起的中断是唤醒源，run 不得就此结束。
-        // An enabled pending interrupt is a wake source, so `run` must continue.
-        machine.core.system_write(0xE000_E100, 1 << 5);
-        machine.core.signal_interrupt(5);
-        assert!(!machine.halt_if_sleeping());
-        machine.step().expect("wake step");
-        assert_eq!(machine.cpu_state(), CpuState::Running);
     }
 }

@@ -301,89 +301,6 @@ pub enum StepResult {
 - **Load/Store**: `LDR`, `STR`, `LDRH`, `STRH`, `LDRB`, `STRB`, `LDMIA`, `STMIA`, `PUSH`, `POP`
 - **Miscellaneous**: `NOP`, `BKPT`, `SVC`, `CPS`, `IT`, `CBZ`, `CBNZ`, `REV`
 
-## Sleep and events (`WFI` / `WFE` / `SEV`)
-## 睡眠与事件（`WFI` / `WFE` / `SEV`）
-
-### Event register / 事件寄存器
-
-Every core owns one event bit in `CortexM33Registers` (reset value `false`); it
-is never shared between the two cores.
-每个核心在 `CortexM33Registers` 中拥有独立的事件位（复位为 `false`），两个
-核心之间绝不共享。
-
-| Instruction | Effect / 作用 |
-|-------------|---------------|
-| `SEV` | Sets the local event bit **and** latches a cross-core signal (`take_sev_signal`). Returns `Ok`. / 置本核事件位，并锁存一个跨核信号（`take_sev_signal`）。返回 `Ok`。 |
-| `SEVL` | Sets only the local event bit. Returns `Ok`. / 仅置本核事件位。返回 `Ok`。 |
-| `WFE` | Event bit set → clear it and continue (`Ok`); otherwise decode returns `Sleep`. / 事件位已置 → 清除并继续（`Ok`）；否则解码返回 `Sleep`。 |
-| `WFI` | Always returns `Sleep`; the event bit is irrelevant (ARMv8-M). / 总是返回 `Sleep`，与事件位无关（ARMv8-M）。 |
-
-`CortexM33Core` public entry points / `CortexM33Core` 公共入口：
-
-```rust
-impl CortexM33Core {
-    pub fn set_event(&mut self);           // peer SEV / 对端 SEV
-    pub fn has_event(&self) -> bool;
-    pub fn clear_event(&mut self);
-    pub fn take_sev_signal(&mut self) -> bool;  // true at most once / 最多一次 true
-    pub fn has_pending_interrupt(&self) -> bool; // enabled+pending, PRIMASK ignored
-}
-```
-
-The decoder stores the wait kind (`WFE` vs `WFI`) so a late event wakes a `WFE`
-but never a `WFI`.
-
-解码器记住等待类型（`WFE` 或 `WFI`），因此后到的事件可以唤醒 `WFE`，但绝不会
-唤醒 `WFI`。
-
-### `Sleep` and wake-up / 睡眠与唤醒
-
-`step_instruction` turns a `Sleep` result into `self.state = CpuState::Sleeping`
-**after** the hint retired, so `PC` already points past `WFI`/`WFE`. If a wake
-condition was already present, the instruction completes immediately and the
-core stays `Running`; a pending enabled exception is then taken in the same
-step instead of after one more instruction.
-
-`step_instruction` 在提示指令退休**之后**把 `Sleep` 结果转成
-`self.state = CpuState::Sleeping`，因此 `PC` 已指向 `WFI`/`WFE` 之后。若唤醒
-条件已满足，该指令立即完成、核心保持 `Running`，并且挂起的已使能异常会在同一次
-`step` 中进入，而不是再执行一条指令之后。
-
-`step()` / `run_cycles()` first consult `try_wake()` while sleeping:
-`step()` / `run_cycles()` 在睡眠时先调用 `try_wake()`：
-
-1. an enabled pending exception in the NVIC (`find_highest_priority`), or
-2. the event bit when the wait came from `WFE` (the event is consumed).
-
-If neither holds, no instruction executes and the core keeps reporting
-`CpuState::Sleeping` (the driver decides whether time should advance). Wake-ups
-themselves do not consume the instruction budget.
-
-两者都不满足时不执行指令，核心持续报告 `CpuState::Sleeping`（由驱动决定是否推进
-时间）。唤醒本身不消耗指令预算。
-
-### Cross-core `SEV` / 跨核 `SEV`
-
-The core does not know about its peer. The driver forwards
-`core.take_sev_signal()` to the other core's `set_event()`, which is what makes a
-`SEV`/`WFE` pair work across cores without shared state.
-
-核心不知道对端存在。驱动器把 `core.take_sev_signal()` 转发到另一核心的
-`set_event()`，跨核 `SEV`/`WFE` 配对因此无需共享状态即可工作。
-
-### Limitations / 剩余限制
-
-- No clock gating, no low-power state and no wake-up latency: a sleeping core is
-  simply not stepped, and simulated time only advances when the driver says so.
-  没有时钟门控、低功耗状态与唤醒延迟：睡眠核心只是不被推进，模拟时间仅在驱动
-  要求时前进。
-- `SEVONPEND` is not modelled: only *enabled* pending exceptions wake a wait.
-  `SEVONPEND` 未建模：只有**已使能**且挂起的中断才能唤醒等待。
-- `DualCoreM33` (the scaffold) still treats `Sleeping` as "not running" and does
-  not wake core1; the CLI `Machine` implements the wake-up policy instead.
-  `DualCoreM33`（脚手架）仍把 `Sleeping` 视为「未运行」，也不会唤醒 core1；
-  唤醒策略由 CLI `Machine` 实现。
-
 ## Thumb-32 Decoder / Thumb-32 解码器
 
 The Thumb-32 decoder is fully implemented (see `execute_thumb32`): 60+ ALU,
@@ -588,7 +505,7 @@ thread — cannot observe each other's exclusive accesses: `LDREX` on core0
 followed by `STREX` on core1 fails, as the hardware requires, and `CLREX` on
 one core leaves the other armed. Sharing one monitor through thread-local
 state was a real correctness bug, and `CLREX` used to fall through the barrier
-group as an undefined instruction. `CpuCore::reset`
+group as an undefined instruction (startup firmware logged it). `CpuCore::reset`
 and `boot_at` rebuild the register file, so the monitor starts disarmed exactly
 like a hardware reset.
 

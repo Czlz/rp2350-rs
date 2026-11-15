@@ -83,6 +83,14 @@ pub const PWM1_BASE: Address = 0x400A_9000;
 /// TIMER0 base / TIMER0 基地址
 pub const TIMER0_BASE: Address = 0x400B_0000;
 
+/// TIMER1 base / TIMER1 基地址
+///
+/// TIMER1 has the same register layout as TIMER0, shares the same 64-bit
+/// microsecond counter, and owns its own alarm and interrupt registers.
+/// TIMER1 与 TIMER0 寄存器布局相同、共享同一个 64 位微秒计数器，但拥有自己的
+/// alarm 与中断寄存器。
+pub const TIMER1_BASE: Address = 0x400B_8000;
+
 /// HSTX control register block base (APB) / HSTX 控制寄存器块基地址（APB）
 ///
 /// The control window holds `CSR`, `BIT0..BIT7`, `EXPAND_SHIFT` and
@@ -210,6 +218,21 @@ pub const PPB_WINDOW_SIZE: usize = 0x0010_0000;
 
 /// TIMER0 alarm 0 interrupt line / TIMER0 闹钟 0 中断线
 pub const TIMER0_IRQ_0: u16 = 0;
+
+/// TIMER1 alarm 0 interrupt line / TIMER1 闹钟 0 中断线
+///
+/// RP2350 numbers the TIMER1 lines `4..=7`, immediately after TIMER0's `0..=3`.
+/// RP2350 把 TIMER1 的四条线编号为 `4..=7`，紧接 TIMER0 的 `0..=3`。
+pub const TIMER1_IRQ_0: u16 = 4;
+
+/// TIMER1 alarm 1 interrupt line / TIMER1 闹钟 1 中断线
+pub const TIMER1_IRQ_1: u16 = 5;
+
+/// TIMER1 alarm 2 interrupt line / TIMER1 闹钟 2 中断线
+pub const TIMER1_IRQ_2: u16 = 6;
+
+/// TIMER1 alarm 3 interrupt line / TIMER1 闹钟 3 中断线
+pub const TIMER1_IRQ_3: u16 = 7;
 
 /// USBCTRL interrupt line (RP2350 `intctrl.h`) / USBCTRL 中断线（RP2350 `intctrl.h`）
 pub const USBCTRL_IRQ: u16 = 14;

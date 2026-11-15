@@ -460,6 +460,10 @@ pub fn enter_exception(
     // IT state was saved in the stacked xPSR.
     // 处理程序开始时没有活跃的 IT 块；被打断线程的 IT 状态已保存在栈中 xPSR。
     *it = ITBlockState::new();
+    // IPSR 记录当前异常号（外部中断为 16 + n），固件通过 MRS IPSR 判断中断源。
+    // IPSR holds the active exception number (16 + n for external interrupts);
+    // firmware reads it with MRS IPSR to identify the interrupt source.
+    regs.xpsr = (regs.xpsr & !0x1FF) | (exception_number & 0x1FF);
     regs.xpsr = (regs.xpsr | 0x0100_0000) & !XPSR_IT_MASK;
 
     // Update SP based on mode

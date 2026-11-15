@@ -44,23 +44,13 @@ exhaustion. The report ends with the halt reason, a 32-step `[tail]` PC
 history, the simulated time, up to 8 logged IRQ deliveries, and any buffered
 UART0 output. Arm machines also print one `[run] core1 state=… pc=… sp=…
 launches=…` line (plus `[run] core1 halt: …` if core 1 stopped) after the
-DMA/HSTX counters. The `[run] executed … steps, sleep=<ticks>, … us simulated`
-line keeps idle sleep ticks separate from retired instructions.
+DMA/HSTX counters.
 `run` 打印映像摘要、核心描述与启动向量，先按 `[trace]` 行执行前
 `trace_steps` 步，然后运行至停机或预算耗尽。报告以停机原因、32 步 `[tail]`
 PC 轨迹、模拟时间、最多 8 条已记录的中断投递以及缓冲的 UART0 输出收尾。
 Arm 机器还会在 DMA/HSTX 计数之后打印一行
 `[run] core1 state=… pc=… sp=… launches=…`（core1 停机时另有
-`[run] core1 halt: …`）。`[run] executed … steps, sleep=<节拍数>, … us
-simulated` 行把空闲睡眠节拍与退休指令分开统计。
-
-Halt reasons / 停机原因:
-
-| Reason / 原因 | Meaning / 含义 |
-|---------------|----------------|
-| `instruction budget exhausted` | `--max-cycles` reached / 到达 `--max-cycles` |
-| `bootrom halt: …` / `core entered state …` | Guest-side stop / 客户机侧停机 |
-| `sleeping (no pending interrupt)` | Core 0 slept 100 ms of simulated time with no wake source at any pump; see [Sleep handling](#sleep-handling--睡眠处理) / core0 睡眠 100 ms 模拟时间且每个泵送点都无唤醒源 |
+`[run] core1 halt: …`）。
 
 The diagnostic block is `[run] dma=<units> busy=<mask>`, then
 `[run] hstx words=<expanded> underruns=<episodes> fifo=<level> enabled=<bool>
@@ -690,121 +680,21 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
 
 ### Execution loop details / 执行循环细节
 
-- Retired instructions and sleep ticks form one simulated clock:
-  `now_cycles = steps + sleep_steps`. `steps` (and the instruction budget) only
-  count retired instructions; a sleeping core advances `sleep_steps` instead.
-  The peripheral timebase advances in 10 000-tick batches and `time_us` includes
-  the not-yet-advanced ticks.
-  退休指令与睡眠节拍组成同一个模拟时钟：`now_cycles = steps + sleep_steps`。
-  `steps`（以及指令预算）只统计退休指令；睡眠核心改为推进 `sleep_steps`。
-  外设时基按 10 000 节拍批量推进，`time_us` 会把尚未推进的节拍也计入。
+- Steps double as cycles: `steps == now_cycles`, and the peripheral timebase
+  advances in 10 000-step batches (`time_us` includes pending steps).
+  步数同时充当周期：`steps == now_cycles`；外设时基按 10 000 步批量推进
+  （`time_us` 会把未推进的步数也计入）。
 - System-control writes (e.g. CPACR) captured from the private peripheral
   bus are replayed into the core **before the next instruction**; IRQ lines
-  are pumped every 64 ticks and USB's `USBCTRL_IRQ` whenever
+  are pumped every 64 steps and USB's `USBCTRL_IRQ` whenever
   `controller.irq_asserted()`.
   从私有外设总线捕获的系统控制写入（如 CPACR）会在**下一条指令前**回放进
-  核心；中断线每 64 节拍泵送一次，`controller.irq_asserted()` 成立时投递
+  核心；中断线每 64 步泵送一次，`controller.irq_asserted()` 成立时投递
   `USBCTRL_IRQ`。
 - A tight spin warning prints when the PC stays within one 32-byte window
   for 1 000 000 consecutive steps (up to 4 warnings per run).
   当 PC 在同一个 32 字节窗口内连续停留 1 000 000 步时打印一次自旋告警
   （每次运行最多 4 条）。
-
-### Sleep handling / 睡眠处理
-
-`WFI`/`WFE` make the core report `CpuState::Sleeping`; the machine then stops
-retiring instructions on that core but keeps the machine alive.
-`WFI`/`WFE` 让核心报告 `CpuState::Sleeping`；机器随后在该核心上停止退休指令，
-但整台机器继续运行。
-
-- **No budget cost / 不消耗预算**：a sleep tick never increments `steps`, so a
-  firmware that idles cannot exhaust the instruction budget. Ticks are recorded
-  in `SleepStats` and shown as `sleep=<ticks>` on the
-  `[run] executed … steps, sleep=… , … us simulated` line. Idle waits advance
-  simulated time one pump batch (`SLEEP_BATCH_TICKS` = 64 ticks ≈ 0.43 µs) at a
-  time, so a 100 ms-scale wait stays cheap on the host; the extra wake-up
-  latency is bounded by one batch.
-  睡眠节拍不会增加 `steps`，空闲固件因此不会耗尽指令预算。节拍记入
-  `SleepStats`，并在 `[run] executed … steps, sleep=… , … us simulated` 行显示。
-  空闲等待按一个泵送批次（`SLEEP_BATCH_TICKS` = 64 节拍 ≈ 0.43 µs）推进模拟
-  时间，因此 100 ms 级等待在宿主机上仍很廉价；额外唤醒延迟不超过一个批次。
-- **Time and peripherals keep moving / 时间与外设继续推进**：every batch replays
-  PPB writes, services the core-1 peer, delivers IRQ lines, pumps DMA/PIO and
-  bridges fired `TIMER0` alarms into the NVIC; the 10 000-tick advance updates
-  the peripheral timebase. A *future* timer alarm, DMA/SIO completion or USB
-  interrupt therefore still arrives and wakes the core.
-  每个批次都会回放 PPB 写入、服务 core1 对端、投递中断线、泵送 DMA/PIO，并把
-  已到期的 `TIMER0` alarm 桥接到 NVIC；每 10 000 节拍推进外设时基。因此**未来**
-  到期的定时器 alarm、DMA/SIO 完成或 USB 中断仍会到达并唤醒核心。
-- **Cross-core `SEV` / 跨核 `SEV`**：after each core step the machine forwards
-  `take_sev_signal()` from one core to the other's `set_event()`. A `SEV` on
-  core 0 is delivered *before* core 1 runs that tick, so core 1's `WFE` resumes
-  in the same tick.
-  每核步进后，机器把一核的 `take_sev_signal()` 转发到另一核的 `set_event()`。
-  core0 的 `SEV` 在 core1 当拍执行**之前**送达，因此 core1 的 `WFE` 在同一拍
-  继续执行。
-- **`run` idle halt / `run` 空闲停机**：sleeping is normal and never ends the run
-  by itself. `Machine::halt_if_sleeping` only reports
-  `sleeping (no pending interrupt)` after **100 ms of simulated time**
-  (`SLEEP_HALT_AFTER_US`) in which no wake source existed at any pump: no pending
-  exception or event, no runnable core 1, no pending core-1 launch/hard reset, no
-  asserted peripheral/USB line and no armed or forced `TIMER0` alarm. A hard
-  limit of **10 s** of total sleep (`SLEEP_HARD_LIMIT_US`) also ends the run, so
-  a heartbeat that never arrives cannot spin forever.
-  睡眠是正常状态，本身绝不结束运行。`Machine::halt_if_sleeping` 只有在**100 ms
-  模拟时间**（`SLEEP_HALT_AFTER_US`）内每个泵送点都没有任何唤醒源时才报告
-  `sleeping (no pending interrupt)`：无挂起异常或事件、无可运行 core1、无待处理
-  core1 启动/硬复位、无已断言的外设/USB 线、也无已武装或强制触发的 `TIMER0`
-  alarm。睡眠累计达到 **10 s**（`SLEEP_HARD_LIMIT_US`）的硬上限同样会结束运行，
-  永不到来的心跳因此不会无限空转。
-- **`repl` / GDB / `perfbench` / `repl`、GDB、`perfbench`**：`run_cycles` never
-  sets that halt. It advances `cycles` simulated ticks (instructions *or* sleep
-  ticks) and keeps time moving, so the USB host bridge can still deliver traffic
-  to an idle guest. `repl --exec` stdout stays exactly the guest output (e.g.
-  `42`); sleep accounting only appears on host diagnostics.
-  `run_cycles` 从不设置该停机。它推进 `cycles` 个模拟节拍（指令**或**睡眠节拍）
-  并保持时间流动，USB 主机桥因此仍能把流量送达空闲的客户机。
-  `repl --exec` 的 stdout 仍只有客户机输出（例如 `42`）；睡眠记账只出现在宿主
-  诊断中。
-
-Known blocker / 已知卡点:
-
-- `emerald.uf2` calls `sleep_ms(1500)` during boot. pico-sdk implements it with the
-  default alarm pool: it only queues a software alarm and *forces* the timer IRQ
-  (`hw_set_bits(&TIMER0->intf, 1 << 3)`) so the pool handler can program the
-  hardware alarm, then waits in `WFE` until `TIMER0_IRQ_3` fires. The
-  `rp2350-periph` `Timer0` model still exposes `INTR`/`INTE`/`INTF`/`INTS` at
-  `0x38`/`0x3C`/`0x40`/`0x44` (RP2350: `0x3C`/`0x40`/`0x44`/`0x48`), treats
-  `INTF` as write-one-to-clear instead of a force mask and never auto-disarms a
-  fired alarm. The `+0x2000` SET alias *is* decoded by `rp2350-core`, but it
-  folds onto those wrong offsets, so the forced line never asserts. The sleep
-  driver cannot see the forced request through the guest-visible registers
-  either (offset `0x44` reads the computed `INTS`), so `run` correctly reports
-  `sleeping (no pending interrupt)` after the 100 ms source-less window at
-  ~105 k steps (`sleep=15000000`, `hstx words=0`).
-  With a local probe patch that only fixed those timer offsets plus the
-  force/auto-disarm semantics, the same image left `sleep_ms` and entered
-  `alarm_pool_irq_handler` at `PC=0x1000AB6C` — i.e. the sleep semantics wake on
-  a future alarm as intended. Completing that `rp2350-periph` timer task (offsets,
-  `INTF` force mask, auto-disarm, and the `TIMER1` instance at `0x400B_8000` that
-  the handler also probes) is what unblocks emerald; the sleep semantics must not
-  be relaxed to work around it.
-  `emerald.uf2` 启动时调用 `sleep_ms(1500)`。pico-sdk 用默认 alarm pool 实现：
-  它只把软件 alarm 入队，并**强制**定时器中断（`hw_set_bits(&TIMER0->intf,
-  1 << 3)`）让 pool 处理程序去编程硬件 alarm，然后在 `WFE` 中等待
-  `TIMER0_IRQ_3`。`rp2350-periph` 的 `Timer0` 模型仍把
-  `INTR`/`INTE`/`INTF`/`INTS` 放在 `0x38`/`0x3C`/`0x40`/`0x44`（RP2350 为
-  `0x3C`/`0x40`/`0x44`/`0x48`），把 `INTF` 当作写 1 清零而不是强制掩码，且到期
-  alarm 不会自动撤防。`+0x2000` SET 别名**由 `rp2350-core` 解码**，但会落到这些
-  错误偏移上，因此强制中断线永不断言。睡眠驱动器也无法从客户机可见寄存器观察到
-  该强制请求（偏移 `0x44` 读到的是计算出的 `INTS`），因此 `run` 在 100 ms 无唤醒
-  源窗口后正确报告 `sleeping (no pending interrupt)`（约 10.5 万步，
-  `sleep=15000000`、`hstx words=0`）。
-  用只修正这些定时器偏移加强制/自动撤防语义的本地探针补丁后，同一映像离开了
-  `sleep_ms` 并进入 `alarm_pool_irq_handler`（`PC=0x1000AB6C`）——说明睡眠语义
-  确实会因未来 alarm 而唤醒。完成该 `rp2350-periph` 定时器任务（偏移、`INTF`
-  强制掩码、自动撤防，以及处理程序还会探测的 `0x400B_8000` 处 `TIMER1` 实例）
-  才能解除 emerald 的卡点；不得为绕过它而放宽睡眠语义。
 
 ### Dual-core execution / 双核执行
 
@@ -876,21 +766,16 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   一帧 `0`（`multicore_reset_core1()` 等待的确认），除非已记录新的启动信息。
 - **Not modelled / 未建模项**：SIO hardware spinlocks (`SPINLOCKn` registers are
   unmapped and `SPINLOCK_ST` always reads free), exclusive/`LDREX`/`STREX`
-  monitors, DMA arbitration between cores, clock gating / low-power states and
-  `SEVONPEND` (a disabled pending interrupt never wakes a `WFI`/`WFE` here),
-  core-1 debug attachment and a multi-core GDB `vCont`/thread model. `WFI` /
-  `WFE` / `SEV` **are** modelled as scheduling points — see
-  [Sleep handling](#sleep-handling--睡眠处理). Core 1 has no modelled mask ROM: a
-  launch jumps straight to `entry`, reproducing the post-ROM state, and only the
-  trap stubs (`rom_table_lookup` at `0x74`, the ROM function table) are
-  dispatched.
+  monitors, DMA arbitration between cores, `WFI`/`WFE`/`SEV` as scheduling
+  points (they are no-ops), core-1 debug attachment and a multi-core GDB
+  `vCont`/thread model. Core 1 has no modelled mask ROM: a launch jumps straight
+  to `entry`, reproducing the post-ROM state, and only the trap stubs
+  (`rom_table_lookup` at `0x74`, the ROM function table) are dispatched.
   **未建模项**：SIO 硬件自旋锁（`SPINLOCKn` 寄存器未映射，`SPINLOCK_ST` 恒读
-  空闲）、独占访问/`LDREX`/`STREX` 监视器、双核之间的 DMA 仲裁、时钟门控与
-  低功耗状态、`SEVONPEND`（未使能的挂起中断在本实现中不会唤醒
-  `WFI`/`WFE`）、core1 调试接入与多核 GDB `vCont`/线程模型。`WFI`/`WFE`/`SEV`
-  **已**作为调度点建模——见[睡眠处理](#sleep-handling--睡眠处理)。core1 不建模
-  掩膜 ROM：启动直接跳到 `entry` 并复现 post-ROM 状态，仅分发陷阱桩
-  （`0x74` 的 `rom_table_lookup` 与 ROM 函数表）。
+  空闲）、独占访问/`LDREX`/`STREX` 监视器、双核之间的 DMA 仲裁、作为调度点的
+  `WFI`/`WFE`/`SEV`（当前为空操作）、core1 调试接入与多核 GDB
+  `vCont`/线程模型。core1 不建模掩膜 ROM：启动直接跳到 `entry` 并复现
+  post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与 ROM 函数表）。
 
 ### DMA pump / DMA 泵送
 

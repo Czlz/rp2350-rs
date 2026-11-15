@@ -1,13 +1,6 @@
 //! Cortex-M33 register file (R0-R15, MSP/PSP, XPSR, CONTROL, PRIMASK, BASEPRI, FAULTMASK)
 //! Cortex-M33 寄存器文件（R0-R15、MSP/PSP、XPSR、CONTROL、PRIMASK、BASEPRI、FAULTMASK）
 
-// 寄存器文件按硬件原样保存独立的单位标志（事件寄存器、SEV 锁存、等待类型、
-// 同步故障），合并成枚举反而偏离架构定义。
-// The register file keeps independent hardware bits (event register, latched
-// SEV, wait kind, synchronous fault) as-is; merging them into enums would
-// misrepresent the architecture.
-#![allow(clippy::struct_excessive_bools)]
-
 use crate::fpu::{FpuRegisters, cpacr, fpexc};
 
 /// CONTROL.FPCA — floating-point context active / CONTROL.FPCA —— 浮点上下文活跃
@@ -94,26 +87,6 @@ pub struct CortexM33Registers {
     /// A synchronous UsageFault is pending from the instruction just executed
     /// 刚执行的指令已引发待处理的同步用法故障
     pub(crate) pending_usage_fault: bool,
-    /// Event register set by `SEV`/`SEVL` or by a peer core's `SEV`
-    /// 由 `SEV`/`SEVL` 或对端核心的 `SEV` 置位的事件寄存器
-    ///
-    /// `WFE` consumes this bit instead of sleeping. It is per core, exactly
-    /// like the exclusive monitor, so one core's `SEV` can only be forwarded
-    /// by the driver to the intended peer.
-    /// `WFE` 用该位代替睡眠；它与独占监视器一样按核私有，因此一个核心的 `SEV`
-    /// 只能由驱动器转发给预期的对端。
-    pub(crate) event: bool,
-    /// This core executed `SEV` and the signal is not yet forwarded
-    /// 本核执行过 `SEV`，且该信号尚未被转发
-    pub(crate) sev_signal: bool,
-    /// The current wait state was entered by `WFE`, so an event releases it
-    /// 当前等待态由 `WFE` 进入，因此事件可以解除它
-    ///
-    /// `WFI` never wakes on the event register (ARMv8-M), so the distinction
-    /// must be remembered between the hint and the next step.
-    /// `WFI` 不会被事件寄存器唤醒（ARMv8-M），因此必须在提示指令与下一次单步
-    /// 之间记住这一区别。
-    pub(crate) wait_on_event: bool,
 }
 
 impl CortexM33Registers {
@@ -139,9 +112,6 @@ impl CortexM33Registers {
             cpacr: 0,
             exclusive: None,
             pending_usage_fault: false,
-            event: false,
-            sev_signal: false,
-            wait_on_event: false,
         }
     }
 
@@ -316,61 +286,6 @@ impl CortexM33Registers {
     pub(crate) fn clear_exclusive(&mut self) {
         self.exclusive = None;
     }
-
-    /// Set the event register (`SEV` / `SEVL` / peer `SEV`)
-    /// 置位事件寄存器（`SEV` / `SEVL` / 对端 `SEV`）
-    pub(crate) fn set_event(&mut self) {
-        self.event = true;
-    }
-
-    /// Report whether the event register is set / 报告事件寄存器是否置位
-    #[must_use]
-    pub(crate) fn has_event(&self) -> bool {
-        self.event
-    }
-
-    /// Clear the event register / 清除事件寄存器
-    pub(crate) fn clear_event(&mut self) {
-        self.event = false;
-    }
-
-    /// Take and clear the event register / 取出并清除事件寄存器
-    ///
-    /// `WFE` uses this form: an event observed before the wait is consumed by
-    /// that wait and never wakes a later one.
-    /// `WFE` 使用该形式：等待前已置位的事件会被本次等待消费，不会唤醒之后的等待。
-    pub(crate) fn take_event(&mut self) -> bool {
-        core::mem::take(&mut self.event)
-    }
-
-    /// Latch a cross-core `SEV` signal for the driver to forward
-    /// 锁存一次跨核 `SEV` 信号供驱动器转发
-    pub(crate) fn set_sev_signal(&mut self) {
-        self.sev_signal = true;
-    }
-
-    /// Take the latched `SEV` signal, reporting `true` at most once
-    /// 取出锁存的 `SEV` 信号，最多返回一次 `true`
-    ///
-    /// Several `SEV` instructions before one poll collapse into a single
-    /// signal, which is sufficient because the peer only needs one wakeup.
-    /// 一次轮询前的多条 `SEV` 会合并为一个信号；对端只需要一次唤醒，故足够。
-    pub(crate) fn take_sev_signal(&mut self) -> bool {
-        core::mem::take(&mut self.sev_signal)
-    }
-
-    /// Record whether the wait just entered came from `WFE` or `WFI`
-    /// 记录刚进入的等待态来自 `WFE` 还是 `WFI`
-    pub(crate) fn set_wait_on_event(&mut self, on_event: bool) {
-        self.wait_on_event = on_event;
-    }
-
-    /// Report whether the current wait may be released by an event
-    /// 报告当前等待是否可被事件解除
-    #[must_use]
-    pub(crate) fn waits_on_event(&self) -> bool {
-        self.wait_on_event
-    }
 }
 
 impl Default for CortexM33Registers {
@@ -461,41 +376,5 @@ mod tests {
         assert!(regs.cp_access_enabled(1));
         regs.cpacr = 0b10 << 2; // CP1 reserved / CP1 保留值
         assert!(!regs.cp_access_enabled(1));
-    }
-
-    #[test]
-    fn event_register_is_per_core_and_resets_cleared() {
-        let mut core0 = CortexM33Registers::new();
-        let mut core1 = CortexM33Registers::new();
-        assert!(!core0.has_event());
-        core1.set_event();
-        // 一个寄存器文件的 SEV 不得让另一个核心的 WFE 提前完成。
-        // A SEV in one register file must not complete the other core's WFE.
-        assert!(core1.has_event());
-        assert!(!core0.has_event());
-        core0.set_event();
-        core0.clear_event();
-        assert!(!core0.has_event());
-        assert!(core1.has_event());
-    }
-
-    #[test]
-    fn take_event_reports_true_only_once() {
-        let mut regs = CortexM33Registers::new();
-        regs.set_event();
-        assert!(regs.take_event());
-        assert!(!regs.take_event());
-    }
-
-    #[test]
-    fn take_sev_signal_reports_true_only_once() {
-        let mut regs = CortexM33Registers::new();
-        assert!(!regs.take_sev_signal());
-        regs.set_sev_signal();
-        regs.set_sev_signal();
-        // 连续两条 SEV 合并为一个信号。
-        // Two back-to-back SEV instructions collapse into one signal.
-        assert!(regs.take_sev_signal());
-        assert!(!regs.take_sev_signal());
     }
 }

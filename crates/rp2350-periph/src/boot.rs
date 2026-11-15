@@ -56,7 +56,7 @@ use super::rosc::Rosc;
 use super::sha256::Sha256;
 use super::sio::Sio;
 use super::ticks::Ticks;
-use super::timer::Timer0;
+use super::timer::{Timer0, Timer1};
 use super::trng::Trng;
 use super::uart::{Uart0, UartSink};
 use super::watchdog::Watchdog;
@@ -163,6 +163,7 @@ pub struct BootPeripherals {
     uart0: Arc<Mutex<UartSink>>,
     cycles: CycleSink,
     timer: Timer0,
+    timer1: Timer1,
     sio: Sio,
     pads: GpioPads,
     dma: Dma,
@@ -198,6 +199,10 @@ impl BootPeripherals {
         let irq = IrqAssert::new();
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
+        // TIMER1 与 TIMER0 共享同一个微秒时基，但 alarm/中断寄存器与中断线独立。
+        // TIMER1 shares the microsecond timebase with TIMER0 but has independent
+        // alarm/interrupt registers and interrupt lines.
+        let timer1 = Timer1::new(Arc::clone(&timebase), irq.clone());
         // SIO 的 FIFO / 门铃中断按核投递：core0 用共享 `irq`，core1 用独立掩码。
         // SIO's FIFO/doorbell lines are per core: core 0 uses the shared `irq`
         // set and core 1 gets its own mask.
@@ -229,6 +234,7 @@ impl BootPeripherals {
         apb.mount(Box::new(Adc::new()))?;
         apb.mount(Box::new(Pwm::new()))?;
         apb.mount(Box::new(timer.clone()))?;
+        apb.mount(Box::new(timer1.clone()))?;
         // HSTX 控制寄存器位于 APB（0x400C_0000），FIFO 在 AHB 侧独立挂载。
         // The HSTX control registers live in APB (0x400C_0000); the FIFO is
         // mounted separately in AHB space.
@@ -286,6 +292,7 @@ impl BootPeripherals {
             uart0,
             cycles,
             timer,
+            timer1,
             sio,
             pads,
             dma,
@@ -430,8 +437,8 @@ impl BootPeripherals {
         self.core1_launch_pending.store(false, Ordering::Release);
     }
 
-    /// Advance the shared timebase and refresh TIMER0 interrupt lines
-    /// 推进共享时基并刷新 TIMER0 中断线
+    /// Advance the shared timebase and refresh the TIMER interrupt lines
+    /// 推进共享时基并刷新 TIMER 中断线
     ///
     /// The HSTX command expander is pumped with the same cycle budget; it does
     /// no work while `CSR.EN` is clear, so firmware that never touches HSTX is
@@ -446,6 +453,7 @@ impl BootPeripherals {
         // `Machine::pump_dma_batch`), so it is not advanced here.
         // HSTX 由宿主按 DMA 批次节拍推进（见 `Machine::pump_dma_batch`），此处不推进。
         self.timer.refresh();
+        self.timer1.refresh();
     }
 
     /// Currently asserted interrupt lines, refreshed for the new time
@@ -453,6 +461,7 @@ impl BootPeripherals {
     #[must_use]
     pub fn irq_mask(&self) -> u64 {
         self.timer.refresh();
+        self.timer1.refresh();
         self.irq.mask()
     }
 
@@ -465,6 +474,7 @@ impl BootPeripherals {
     #[must_use]
     pub fn core1_irq_mask(&self) -> u64 {
         self.timer.refresh();
+        self.timer1.refresh();
         let sio_bits = (1u64 << map::SIO_IRQ_FIFO) | (1u64 << map::SIO_IRQ_BELL);
         (self.irq.mask() & !sio_bits) | self.sio.core1_irq_mask()
     }
@@ -488,6 +498,28 @@ impl BootPeripherals {
     #[must_use]
     pub fn pads(&self) -> &GpioPads {
         &self.pads
+    }
+
+    /// Shared TIMER0 handle / 共享的 TIMER0 句柄
+    ///
+    /// The handle shares state with the bus-mounted device, so guest writes are
+    /// visible here and [`Timer0::refresh`] republishes the alarm lines.
+    /// 该句柄与总线设备共享状态，客户机写入在此可见，[`Timer0::refresh`] 会重新
+    /// 发布 alarm 中断线。
+    #[must_use]
+    pub fn timer(&self) -> &Timer0 {
+        &self.timer
+    }
+
+    /// Shared TIMER1 handle / 共享的 TIMER1 句柄
+    ///
+    /// TIMER1 shares the microsecond timebase with [`Self::timer`] but keeps its
+    /// own alarms, interrupt registers and `TIMER1_IRQ_0..3` lines.
+    /// TIMER1 与 [`Self::timer`] 共享微秒时基，但拥有自己的 alarm、中断寄存器与
+    /// `TIMER1_IRQ_0..3` 中断线。
+    #[must_use]
+    pub fn timer1(&self) -> &Timer1 {
+        &self.timer1
     }
 
     /// Shared DMA controller handle / 共享的 DMA 控制器句柄
@@ -930,6 +962,61 @@ mod tests {
                 "PIO{index} SM0 TXFULL"
             );
         }
+    }
+
+    #[test]
+    fn timer1_is_mounted_and_independent_of_timer0() {
+        // TIMER1 位于 0x400B_8000：寄存器布局与 TIMER0 相同、中断独立，且共享
+        // 同一个 64 位微秒计数器。
+        // TIMER1 sits at 0x400B_8000 with TIMER0's layout, independent interrupt
+        // state and the same 64-bit microsecond counter.
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+
+        // 使能四条线并强制 alarm 3，INTS 读回该位、中断线为 TIMER1_IRQ_3。
+        // Enable all four lines and force alarm 3: INTS reads the bit and the
+        // line is TIMER1_IRQ_3.
+        bus.write_u32(map::TIMER1_BASE + 0x40, 0xF, &mut cycles)
+            .expect("timer1 inte");
+        bus.write_u32(map::TIMER1_BASE + 0x44, 1 << 3, &mut cycles)
+            .expect("timer1 intf");
+        assert_eq!(
+            bus.read_u32(map::TIMER1_BASE + 0x48, &mut cycles)
+                .expect("timer1 ints"),
+            1 << 3
+        );
+        assert_eq!(
+            bus.read_u32(map::TIMER0_BASE + 0x48, &mut cycles)
+                .expect("timer0 ints"),
+            0
+        );
+        assert_ne!(
+            peripherals.irq_mask() & (1 << map::TIMER1_IRQ_3),
+            0,
+            "TIMER1 alarm 3 line"
+        );
+        assert_eq!(peripherals.irq_mask() & 0xF, 0, "TIMER0 lines stay clear");
+
+        // 两个块的 TIMERAWL 读回同一计数器。 / Both TIMERAWL registers agree.
+        let now0 = bus
+            .read_u32(map::TIMER0_BASE + 0x28, &mut cycles)
+            .expect("timer0 timerawl");
+        let now1 = bus
+            .read_u32(map::TIMER1_BASE + 0x28, &mut cycles)
+            .expect("timer1 timerawl");
+        assert_eq!(now0, now1);
+
+        // 清 TIMER0 的强制位不应影响 TIMER1。 / Clearing TIMER0 leaves TIMER1.
+        bus.write_u32(map::TIMER0_BASE + 0x44, 0, &mut cycles)
+            .expect("timer0 intf");
+        assert_eq!(
+            bus.read_u32(map::TIMER1_BASE + 0x48, &mut cycles)
+                .expect("timer1 ints"),
+            1 << 3
+        );
     }
 
     #[test]

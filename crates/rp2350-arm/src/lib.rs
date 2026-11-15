@@ -208,90 +208,6 @@ impl CortexM33Core {
         self.strict_decode = strict;
     }
 
-    /// Set this core's event register, as a peer core's `SEV` would
-    /// 置位本核事件寄存器，效果等同对端核心执行 `SEV`
-    ///
-    /// The driver calls this after the other core executed `SEV`; a sleeping
-    /// `WFE` resumes on the next [`CpuCore::step`].
-    /// 驱动器在另一核心执行 `SEV` 后调用此入口；睡眠中的 `WFE` 会在下一次
-    /// [`CpuCore::step`] 时继续执行。
-    pub fn set_event(&mut self) {
-        self.registers.set_event();
-    }
-
-    /// Report whether this core's event register is set
-    /// 报告本核事件寄存器是否置位
-    #[must_use]
-    pub fn has_event(&self) -> bool {
-        self.registers.has_event()
-    }
-
-    /// Clear this core's event register / 清除本核事件寄存器
-    pub fn clear_event(&mut self) {
-        self.registers.clear_event();
-    }
-
-    /// Take the `SEV` signal this core latched, reporting `true` at most once
-    /// 取出本核锁存的 `SEV` 信号，最多返回一次 `true`
-    ///
-    /// The driver forwards a `true` result to the peer core's
-    /// [`Self::set_event`], which is what makes a cross-core `SEV`/`WFE` pair
-    /// work without shared state between the two cores.
-    /// 驱动器把 `true` 结果转发到对端核心的 [`Self::set_event`]，两个核心因此
-    /// 无需共享状态即可完成跨核 `SEV`/`WFE` 配对。
-    pub fn take_sev_signal(&mut self) -> bool {
-        self.registers.take_sev_signal()
-    }
-
-    /// Report whether an enabled interrupt is pending on this core's NVIC
-    /// 报告本核 NVIC 上是否有已使能且挂起的中断
-    ///
-    /// Masking (`PRIMASK`) is deliberately ignored: WFI/WFE wake on a pending
-    /// interrupt even when the core would not take it yet.
-    /// 有意忽略屏蔽位（`PRIMASK`）：即使核心暂时不会进入异常，WFI/WFE 也会因
-    /// 挂起中断而唤醒。
-    #[must_use]
-    pub fn has_pending_interrupt(&self) -> bool {
-        self.pending_enabled()
-    }
-
-    /// Cheap "is there any wakeup exception" probe / 廉价的「是否存在唤醒异常」探测
-    ///
-    /// The core evaluates this on every sleep tick, so it returns on the first
-    /// match instead of ranking the whole NVIC. [`Nvic::find_highest_priority`]
-    /// is only needed when the exception is actually taken.
-    /// 核心在每个睡眠节拍都会判定它，因此命中第一条即返回，而不排序整个 NVIC。
-    /// 只有在真正进入异常时才需要 [`Nvic::find_highest_priority`]。
-    fn pending_enabled(&self) -> bool {
-        (0u16..256).any(|irq| {
-            self.nvic.is_enabled(irq) && self.nvic.is_pending(irq) && !self.nvic.is_active(irq)
-        })
-    }
-
-    /// Wake a sleeping core when a wake condition is present
-    /// 存在唤醒条件时唤醒睡眠中的核心
-    ///
-    /// ARMv8-M wakes a waiting core on an enabled pending exception (`WFI` and
-    /// `WFE`) or on the event register (`WFE` only). The event is consumed so
-    /// it wakes exactly one wait.
-    /// ARMv8-M 的等待可由已使能且挂起的异常（`WFI` 与 `WFE`）或事件寄存器
-    /// （仅 `WFE`）解除；事件会被消费，因此只能唤醒一次等待。
-    fn try_wake(&mut self) -> bool {
-        if self.state != CpuState::Sleeping {
-            return true;
-        }
-        // 先查异常，避免把事件寄存器白白消费掉。
-        // Check the exception first so a pending IRQ does not consume the event.
-        let pending = self.pending_enabled();
-        let event = self.registers.waits_on_event() && self.registers.take_event();
-        if !pending && !event {
-            return false;
-        }
-        self.registers.set_wait_on_event(false);
-        self.state = CpuState::Running;
-        true
-    }
-
     /// Report an undefined instruction, deduplicated by opcode
     /// 按操作码去重地报告未定义指令
     fn note_undefined(&mut self, pc: u32, opcode: u32, width: u8) -> Result<(), CoreError> {
@@ -644,18 +560,6 @@ impl CortexM33Core {
             self.note_undefined(old_pc, raw_opcode, width)?;
         }
 
-        if matches!(result, StepResult::Sleep) {
-            // ARMv8-M：WFI/WFE 在唤醒条件已满足时立即完成，不留下睡眠态。
-            // 否则置 Sleeping，由 `step`/`run_cycles` 在唤醒条件下恢复。
-            // ARMv8-M: WFI/WFE completes immediately when a wake condition is
-            // already present, leaving no sleep state behind. Otherwise the
-            // core enters Sleeping and `step`/`run_cycles` resume it.
-            let event_wakes = self.registers.waits_on_event() && self.registers.has_event();
-            if !self.pending_enabled() && !event_wakes {
-                self.state = CpuState::Sleeping;
-            }
-        }
-
         Ok(result)
     }
 
@@ -738,28 +642,6 @@ impl CpuCore for CortexM33Core {
         let mut consumed: CycleCount = 0;
 
         while remaining > 0 {
-            if self.state == CpuState::Sleeping {
-                if !self.try_wake() {
-                    break;
-                }
-                // 睡眠期间挂起的异常必须在取下一条指令之前进入。
-                // An exception that arrived during sleep must be taken before
-                // the next instruction, not after it.
-                let mut wake_cycles = 0u64;
-                if self.pending_enabled() {
-                    if let Err(e) = self.check_pending_exceptions(bus, &mut wake_cycles) {
-                        self.state = CpuState::Halted;
-                        log::error!("CPU halted: {e:?}");
-                        break;
-                    }
-                    self.total_cycles += wake_cycles;
-                }
-                // 唤醒本身不计入指令预算，避免空闲等待吃掉预算。
-                // Waking up does not consume the instruction budget, so an idle
-                // wait cannot exhaust it.
-                continue;
-            }
-
             if self.state != CpuState::Running {
                 break;
             }
@@ -795,26 +677,11 @@ impl CpuCore for CortexM33Core {
     }
 
     fn step(&mut self, bus: &mut dyn AddressBus) -> Result<CpuState, CoreError> {
-        let woke = self.state == CpuState::Sleeping && self.try_wake();
         if self.state != CpuState::Running {
             return Ok(self.state);
         }
 
         let mut cycle_count: u64 = 0;
-        if woke && self.pending_enabled() {
-            // 睡眠期间挂起的异常在取下一条指令之前进入，否则会先执行一条本应
-            // 位于异常处理程序之后的指令。
-            // An exception that arrived during sleep is taken before the next
-            // instruction; otherwise one instruction that belongs after the
-            // handler would execute first.
-            if let Err(e) = self.check_pending_exceptions(bus, &mut cycle_count) {
-                self.state = CpuState::Halted;
-                return Err(e);
-            }
-            self.total_cycles += cycle_count;
-            return Ok(self.state);
-        }
-
         match self.step_instruction(bus, &mut cycle_count) {
             Ok(result) => {
                 if result == StepResult::ExceptionReturn {
