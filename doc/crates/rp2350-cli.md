@@ -1433,8 +1433,10 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   `LDREX`/`STREX` exclusive monitor with `CLREX`.
   **已建模**：SIO 硬件自旋锁（`SPINLOCK0..31` 位于 `0x100+4n`，读即取/写即放，
   `SPINLOCK_ST` 为真实位图）与每核 `LDREX`/`STREX` 独占监视器 + `CLREX`。
-- **Not modelled / 未建模项**：DMA arbitration between cores and `SLEEPDEEP`/
-  `SCR.SLEEPONEXIT` power-down entry. Core-1
+- **Modelled / 已建模（2026-11-16）**：`SCR.SLEEPONEXIT` 在异常返回 Thread 后进入睡眠、
+  `SLEEPDEEP` 记录为深睡原因（不建模电气掉电）、`SVCall`/`HardFault`/`NMI` 与故障升级、
+  `AIRCR.SYSRESETREQ` 的宿主策略（`run` 最多重启 3 次，`repl`/`play` 停止）。
+- **Not modelled / 未建模项**：DMA arbitration between cores. Core-1
   writable registers: GDB exposes core 1 as thread 2 with read-only
   PC/SP, while per-core stepping is available through `Machine::step_cores`.
   Core 1 has no
@@ -1442,7 +1444,7 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   state, and only the trap stubs (`rom_table_lookup` at `0x74`, the ROM function
   table) are dispatched. SysTick is no longer in this list: the machine forwards
   the peripheral latch to exception 15 (see the forwarding entry above).
-  **未建模项**：双核之间的 DMA 仲裁、`SLEEPDEEP`/`SCR.SLEEPONEXIT` 掉电进入。
+  **未建模项**：双核之间的 DMA 仲裁（`SLEEPDEEP`/`SLEEPONEXIT` 已建模，见上）。
   core1 可写寄存器：GDB 把 core1 暴露为线程 2（PC/SP 只读），而按核步进已可通过
   `Machine::step_cores` 使用。core1 不建模掩膜 ROM：启动直接跳到
   `entry` 并复现 post-ROM 状态，仅分发陷阱桩（`0x74` 的 `rom_table_lookup` 与
