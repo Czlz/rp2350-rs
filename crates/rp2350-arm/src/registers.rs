@@ -315,8 +315,28 @@ impl CortexM33Registers {
     /// 永不失败。
     #[inline]
     pub(crate) fn trap_unaligned(&mut self, addr: u32, alignment: u32) -> bool {
+        if self.ccr & ccr::UNALIGN_TRP == 0 {
+            return false;
+        }
+        self.trap_unaligned_always(addr, alignment)
+    }
+
+    /// Trap an unaligned data access regardless of `CCR.UNALIGN_TRP`
+    /// 无论 `CCR.UNALIGN_TRP` 如何都捕获未对齐数据访问
+    ///
+    /// ARMv8-M B2.3.6 lists non-word-aligned `VLDR`/`VSTR`/`VLDM`/`VSTM`
+    /// (together with the multiple, dualword and atomic forms) as accesses that
+    /// **always** generate an alignment fault; `CCR.UNALIGN_TRP` only extends
+    /// the trap to the plain `LDR`/`LDRH`/`STR`/`STRH` transfers. Returns
+    /// `true` after recording the address when `addr` violates `alignment`.
+    /// ARMv8-M B2.3.6 把未按字对齐的 `VLDR`/`VSTR`/`VLDM`/`VSTM`（以及多寄存器、
+    /// 双字与原子形式）列为**始终**产生对齐故障的访问；`CCR.UNALIGN_TRP` 只把
+    /// 陷阱扩展到普通 `LDR`/`LDRH`/`STR`/`STRH` 传输。`addr` 违反 `alignment`
+    /// 时记录地址并返回 `true`。
+    #[inline]
+    pub(crate) fn trap_unaligned_always(&mut self, addr: u32, alignment: u32) -> bool {
         debug_assert!(alignment.is_power_of_two());
-        if self.ccr & ccr::UNALIGN_TRP == 0 || addr & (alignment - 1) == 0 {
+        if addr & (alignment - 1) == 0 {
             return false;
         }
         self.pending_unaligned = Some(addr);

@@ -5,6 +5,7 @@ mod ccr;
 mod decode_cache;
 mod faults;
 mod fp_lazy;
+mod fpu_align;
 mod irq_gate;
 mod scr;
 mod sleep;

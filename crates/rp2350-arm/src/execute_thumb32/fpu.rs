@@ -318,10 +318,18 @@ fn execute_memory(
         } else {
             base.wrapping_sub(offset)
         };
+        if double_precision && d == 1 {
+            return Ok(StepResult::Undefined); // D16-D31 do not exist
+        }
+        // ARMv8-M B2.3.6: a non word-aligned VLDR/VSTR always generates an
+        // alignment fault, independently of CCR.UNALIGN_TRP. Check before the
+        // transfer so neither the register nor memory is modified.
+        // ARMv8-M B2.3.6：未按字对齐的 VLDR/VSTR 始终产生对齐故障，与
+        // CCR.UNALIGN_TRP 无关。传输前检查，因此寄存器与内存都不会被修改。
+        if regs.trap_unaligned_always(addr, 4) {
+            return Ok(StepResult::Ok);
+        }
         if double_precision {
-            if d == 1 {
-                return Ok(StepResult::Undefined); // D16-D31 do not exist
-            }
             transfer_double(bus, regs, vd as u8, addr, load, cycles)?;
         } else {
             let sd = ((vd << 1) | d) as u8;
@@ -365,6 +373,15 @@ fn execute_memory(
     let size = if double_precision { 8 } else { 4 };
     let total = count * size;
     let base = regs.read(rn);
+    // ARMv8-M B2.3.6: VLDM/VSTM require a word-aligned base and always fault
+    // when it is not, independently of CCR.UNALIGN_TRP. The check runs before
+    // the first transfer, so no register, memory word or write-back is touched.
+    // ARMv8-M B2.3.6：VLDM/VSTM 要求基址按字对齐，否则始终故障，与
+    // CCR.UNALIGN_TRP 无关。检查位于首次传输之前，因此寄存器、内存与写回都
+    // 不会被修改。
+    if regs.trap_unaligned_always(base, 4) {
+        return Ok(StepResult::Ok);
+    }
     let addr = if p == 1 {
         if u == 1 {
             base.wrapping_add(total)
