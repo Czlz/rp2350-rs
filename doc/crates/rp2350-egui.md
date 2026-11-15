@@ -6,18 +6,21 @@
 > **Status**: 骨架 — 已实现 `EmuApp`（`app.rs`）、寄存器面板（`panels.rs` 的
 > `RegisterPanel`/`RegisterSnapshot`）、只读 DMA/HSTX/PIO 外设面板
 > （`panels.rs` 的快照类型与格式化函数 + `app.rs` 的渲染函数）、`canvas.rs` 的
-> 画布数据模型/几何层，以及 `canvas_view.rs` 的 egui 绘制与拖拽交互。应用顶部
-> 标签栏可在「虚拟实验室」与「寄存器与外设」之间切换。下文的 HSTX 视频解码面板、
-> 内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
+> 画布数据模型/几何层、`canvas_view.rs` 的 egui 绘制与拖拽交互，以及设备调色板
+> （`palette.rs`）与文本持久化（`canvas_io.rs`）。应用顶部标签栏可在「虚拟实验室」
+> 与「寄存器与外设」之间切换；虚拟实验室标签页带保存/加载工具栏。下文的 HSTX
+> 视频解码面板、内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
 >
 > **Status** (EN): skeleton — `EmuApp` (`app.rs`), the register panel
 > (`panels.rs`: `RegisterPanel`, `RegisterSnapshot`), the read-only DMA/HSTX/PIO
 > peripheral panels (`panels.rs` snapshot types and formatters, rendered by
-> `app.rs`), the canvas data model/geometry layer (`canvas.rs`) and the egui
-> painter + drag interaction (`canvas_view.rs`) are implemented. A top tab bar
-> switches between the Virtual Lab and the register/peripheral panels. The HSTX
-> video decoder panel and the memory/GPIO/terminal/debugger panels below remain
-> target designs.
+> `app.rs`), the canvas data model/geometry layer (`canvas.rs`), the egui painter
+> + drag interaction (`canvas_view.rs`), the built-in device palette
+> (`palette.rs`) and canvas text persistence (`canvas_io.rs`) are implemented. A
+> top tab bar switches between the Virtual Lab and the register/peripheral
+> panels, and the Virtual Lab tab carries a save/load toolbar. The HSTX video
+> decoder panel and the memory/GPIO/terminal/debugger panels below remain target
+> designs.
 
 ---
 
@@ -27,10 +30,13 @@
 rp2350-egui/
 └── src/
     ├── lib.rs            # module declarations + re-export EmuApp, CanvasState
-    ├── app.rs            # EmuApp — eframe::App + tab bar (已落地 / landed)
+    ├── app.rs            # EmuApp — eframe::App + tab bar + save/load toolbar (已落地 / landed)
     ├── panels.rs         # RegisterPanel / RegisterSnapshot / XpsrFlags (已落地 / landed)
     ├── canvas.rs         # Virtual Lab 数据模型与几何（已落地 / landed）
-    ├── canvas_view.rs    # Virtual Lab egui 绘制与输入（已落地 / landed）
+    ├── canvas_view.rs    # Virtual Lab egui 绘制、输入与调色板侧栏（已落地 / landed）
+    ├── palette.rs        # 内置设备调色板模板（已落地 / landed）
+    ├── canvas_io.rs      # 画布文本格式 to_text/from_text（已落地 / landed）
+    ├── canvas_tests.rs   # 调色板/持久化测试（仅 test 构建 / test-only）
     └── main.rs           # binary entry / 二进制入口
 
 Read-only peripheral panels landed in `panels.rs` + `app.rs`:
@@ -83,6 +89,12 @@ pub struct EmuApp {
     /// Virtual Lab canvas model, preserved while switching views
     /// 虚拟实验室画布模型，切换视图时保留
     canvas: CanvasState,
+    /// Last canvas text produced by the toolbar "Save"
+    /// 工具栏「保存」产生的最近一份画布文本
+    canvas_snapshot: String,
+    /// Result of the last save/load shown in the toolbar
+    /// 工具栏中显示的最近一次保存/加载结果
+    canvas_status: String,
     /// Active top-level view / 当前顶层视图
     view: ActiveView,
 }
@@ -102,6 +114,10 @@ impl EmuApp {
     /// Read or switch the active tab / 读取或切换当前标签页
     pub fn active_view(&self) -> ActiveView;
     pub fn set_active_view(&mut self, view: ActiveView);
+    /// Toolbar actions: snapshot to / restore from the in-memory text
+    /// 工具栏动作：保存到内存文本 / 从内存文本恢复
+    fn save_canvas(&mut self);
+    fn load_canvas(&mut self) -> Result<(), CanvasParseError>;
     /// Run the application with a native window
     /// 以原生窗口运行应用
     pub fn run(self) -> Result<(), eframe::Error>;
@@ -313,10 +329,105 @@ selected highlight.
 Wire legality in short: 自连（同设备或同端点）、输入→输入、输出→输出、重复连线都被
 拒绝；反向的输入→输出调用会被规范化为输出→输入。
 
+### Device palette / 设备调色板
+
+`palette.rs` 提供 `DevicePalette`（8 个内置模板）。侧栏位于画布左侧，点击按钮即在
+画布中心附近实例化一个节点（连续点击按 14 px 递增错开，避免完全重叠）：
+
+| # | 条目 / Entry | 尺寸 / Size | 默认端口 / Default ports |
+|---|--------------|-------------|--------------------------|
+| 0 | LED / 发光二极管 | 90×50 | `A` in |
+| 1 | UART Terminal / 终端 | 140×70 | `TX` in, `RX` out |
+| 2 | Button / 按钮 | 90×50 | `OUT` out |
+| 3 | Resistor / 电阻 | 96×36 | `P1` bidi, `P2` bidi |
+| 4 | Power / 电源 | 70×50 | `VCC` out |
+| 5 | Ground / 地 | 70×50 | `GND` in |
+| 6 | Logic Probe / 逻辑探针 | 96×50 | `PROBE` in |
+| 7 | Potentiometer / 电位器 | 90×60 | `VCC` in, `WIPER` out, `GND` in |
+
+```rust
+pub struct PalettePort {
+    pub name: &'static str,
+    pub kind: PortKind,
+    pub offset: Vec2,
+}
+
+pub struct PaletteEntry {
+    pub name: &'static str,
+    pub size: Vec2,
+    pub ports: &'static [PalettePort],
+}
+
+pub struct DevicePalette { /* 8 个静态模板 / 8 static templates */ }
+
+impl DevicePalette {
+    pub fn new() -> Self;
+    pub fn entries(&self) -> &'static [PaletteEntry];
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn get(&self, index: usize) -> Option<&'static PaletteEntry>;
+    /// 越界返回 None / returns None when out of range
+    pub fn instantiate(&self, index: usize, pos: Pos2) -> Option<DeviceNode>;
+}
+
+impl CanvasState {
+    /// 越界返回 None，画布不变 / returns None and leaves the canvas untouched
+    pub fn add_from_palette(&mut self, index: usize, pos: Pos2) -> Option<usize>;
+}
+```
+
+`instantiate` 生成的 id 固定为 `palette-<index>-<serial>`（进程级原子序号），因此同一
+模板重复实例化也不会出现重复 id；`pos` 是节点左上角的世界坐标。
+
+### Persistence / 持久化
+
+「Virtual Lab / 虚拟实验室」标签页顶部有工具栏，含两个按钮和一行状态：
+
+| Button / 按钮 | Effect / 效果 |
+|---------------|---------------|
+| `Save / 保存` | 把 `CanvasState::to_text()` 写入 `EmuApp` 的**内存快照**（不打开文件对话框），状态行显示字节数与设备/连线数。 |
+| `Load / 加载` | 用 `CanvasState::from_text()` 解析内存快照并整体替换画布；失败时保留当前画布，状态行显示 `canvas line N: ...`。 |
+
+文本格式（版本 1，首行为 `rp2350-canvas;1`）：
+
+```text
+rp2350-canvas;1
+zoom;1
+pan;0;0
+device;mcu;RP2350;60;70;170;130
+port;GPIO25;out;0;34
+port;GPIO26;in;0;62
+device;led;LED;360;60;120;70
+port;A;in;0;34
+wire;0;0;1;0
+```
+
+| 记录 / Record | 字段 / Fields | 说明 / Notes |
+|---------------|---------------|--------------|
+| `rp2350-canvas` | `rp2350-canvas;1` | 必须是首个非注释行；目前只支持版本 `1`。 |
+| `zoom` | `zoom;<f32>` | 载入后钳制到 `[0.25, 4.0]`。 |
+| `pan` | `pan;<x>;<y>` | 载入后钳制到 `±4096`。 |
+| `device` | `device;<id>;<name>;<x>;<y>;<w>;<h>` | 7 个字段；设备出现顺序就是 `wire` 使用的索引。 |
+| `port` | `port;<name>;<kind>;<ox>;<oy>` | 5 个字段，隶属上一条 `device`；`kind` 为 `in`/`out`/`bidi`（也接受 `input`/`output`/`bidirectional`）。 |
+| `wire` | `wire;<fdev>;<fport>;<tdev>;<tport>` | 读完全部设备后校验索引、方向、自连与重复。 |
+
+转义规则：字段以 `;` 分隔。文本字段（设备 id、设备名、端口名）内 `\` 是转义符：
+`\\` → `\`、`\;` → `;`、`\n` → 换行、`\r` → 回车，因此名称可以包含空格与 `;`。
+其它 `\x` 组合与结尾孤立的 `\` 都报错。空行与 `#` 开头的行被忽略。
+
+错误处理：`CanvasParseError` 带 1 起始行号与原因（缺字段、坏数字/索引、未知 kind、
+未知转义、未知记录、缺/重复头部、非法连线）。解析失败不会 panic，也不会部分替换
+画布。`selected`/`drag`/`cursor` 属于临时状态，不写入文本。
+
+The palette and the versioned text format live in dedicated modules so `canvas.rs`
+stays a pure model; the format is an internal snapshot, not a stable interchange
+format.
+
 ### Interaction / 交互
 
 | Input / 输入 | Effect / 效果 |
 |--------------|---------------|
+| Left click a palette entry | Instantiates that template near the canvas centre, cascaded by 14 px per click. / 在画布中心附近实例化该模板，每次点击错开 14 px。 |
 | Left press on a device, then drag | Moves the device by the grab offset; ports keep their relative offsets. / 按抓取偏移移动设备，端口相对位置不变。 |
 | Left press on a port, drag, release on another port | Shows a yellow preview line; on release adds a wire when legal. / 显示黄色预览线，合法的端口上释放即建线。 |
 | Left press on a wire | Selects the wire (yellow highlight); `Delete` removes it. |
@@ -332,11 +443,14 @@ selected devices/wires are yellow. A tiny window only shrinks the viewport
 
 - 画布是纯编辑模型：**不驱动仿真**，端口不会读写 `GPIO`，也不会调用
   `DeviceManager`/`WiringTable`。
-- **未持久化**：没有布局保存/加载、自动布局、网格吸附、撤销/重做、主题系统。
-- 没有设备面板/芯片视图：设备只能通过 `add_device` 或 `sample()` 代码添加，
-  连线只在设备端口之间建立，尚未连接到 RP2350 芯片引脚。
-- The canvas is editor-only: it never drives the simulator, never persists, and
-  has no device palette, chip view, snapping, undo/redo or theming yet.
+- 持久化只在内存中：没有文件对话框、路径配置或自动写盘，关闭应用即丢失快照。
+- 调色板固定为 8 个内置模板，不能自定义或从插件加载；`instantiate` 生成的 id
+  只保证进程内唯一。
+- 没有自动布局、网格吸附、撤销/重做、主题系统。
+- 没有芯片视图：连线只在设备端口之间建立，尚未连接到 RP2350 芯片引脚。
+- The canvas is editor-only: it never drives the simulator. Persistence is an
+  in-memory text snapshot (no file dialog, no autosave), the palette is a fixed
+  built-in set, and there is no auto-layout, snapping, undo/redo or chip view.
 
 ### Tests / 测试
 
@@ -357,6 +471,28 @@ rejection, input→input rejection, duplicate rejection in both orders,
 output→input normalisation, bidirectional ports, cascade deletion with index
 remapping, device drag with stable port offsets, wire drag/release, selected
 deletion, and headless rendering of empty/single-node canvases at 20×20.
+
+调色板与持久化测试位于 `canvas_tests.rs`（`#[cfg(test)] mod canvas_tests`，独立模块
+以免测试代码挤占 `canvas.rs`/`canvas_view.rs` 的行数预算）：
+
+- 调色板条目数 ≥ 6、条目名称/尺寸/端口有效；实例化复制尺寸与端口；连续实例化 id
+  形如 `palette-<index>-<serial>` 且互不相同；越界实例化与 `add_from_palette` 返回
+  `None` 且不改变画布；
+- `sample()` 画布与含调色板设备的画布 `to_text`→`from_text` 往返（设备、端口、连线、
+  缩放、平移逐项相等），空画布同样往返；
+- 名称含 `;` 与 `\` 的转义往返；
+- 非法输入：缺字段、越界连线端点、未知端口方向、坏数字/索引、缺/重复/错误版本头部、
+  未知记录、未知转义、方向不匹配连线——均返回带行号错误且不 panic；
+- 调色板侧栏在 80×60、320×240、800×600 下的无窗口渲染；
+- 应用层：保存→删除设备→加载后 `EmuApp` 的节点数与连线数恢复；加载失败时画布不变，
+  状态行包含 `load failed`。
+
+English: palette entry count/size/ports, unique instantiation ids, out-of-range
+`None`, sample/palette/empty text round-trips (devices, ports, wires, zoom, pan),
+`;`/`\` escaping, malformed-input errors (missing fields, bad indices/numbers,
+unknown kind/record/escape, header problems, direction mismatch), headless
+palette+canvas rendering at 80×60/320×240/800×600, and app-level save→mutate→load
+round-trips plus failure handling.
 
 ---
 

@@ -8,10 +8,12 @@
 
 use egui::epaint::CubicBezierShape;
 use egui::{
-    Align2, Color32, FontId, Key, PointerButton, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+    Align2, Color32, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
+    pos2, vec2,
 };
 
 use crate::canvas::{CanvasState, DeviceNode, DragState, PortKind, Selection, Wire};
+use crate::palette::DevicePalette;
 
 /// World-space grid spacing / 世界坐标网格间距
 const GRID_SPACING: f32 = 24.0;
@@ -29,19 +31,84 @@ const OUTPUT_COLOR: Color32 = Color32::from_rgb(0xE5, 0x73, 0x73);
 const BIDI_COLOR: Color32 = Color32::from_rgb(0xBA, 0x68, 0xC8);
 const HINT_COLOR: Color32 = Color32::from_rgb(0x8A, 0x94, 0xA6);
 
+/// Palette sidebar width for a given window width / 给定窗口宽度下的调色板侧栏宽度
+///
+/// The sidebar never claims more than 45% of a narrow window, so the canvas
+/// keeps a usable strip even at 80×60.
+/// 窄窗口下侧栏最多占 45%，因此 80×60 时画布仍有一条可用的绘制区域。
+fn sidebar_width(available: f32) -> f32 {
+    if available < 320.0 {
+        (available * 0.45).max(16.0)
+    } else {
+        (available * 0.3).clamp(140.0, 190.0)
+    }
+}
+
 impl CanvasState {
     /// Render and interact with the canvas inside `ui` / 在 `ui` 内渲染并交互画布
     ///
-    /// The canvas takes all remaining space; a tiny window only shrinks the
-    /// viewport, it never panics.
-    /// 画布占用全部剩余空间；窗口极小时只缩小视口，不会 panic。
+    /// A fixed-width palette sidebar is drawn on the left; clicking an entry
+    /// drops a new device near the canvas centre. The canvas takes the rest of
+    /// the space, and a tiny window only shrinks the viewport, it never panics.
+    /// 左侧绘制固定宽度的调色板侧栏，点击条目会在画布中心附近放置新设备；
+    /// 画布占用其余空间，窗口极小时只缩小视口，不会 panic。
     pub fn show(&mut self, ui: &mut Ui) {
-        let available = ui.available_size();
-        let desired = vec2(available.x.max(64.0), available.y.max(64.0));
-        let (response, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
-        let viewport = response.rect;
-        self.handle_input(ui, &response, viewport);
-        self.paint(&painter, viewport);
+        let full = ui.available_rect_before_wrap();
+        let sidebar = sidebar_width(full.width());
+        // 侧栏宽度加分隔符宽度，用于估算画布区域中心。
+        // Sidebar plus separator width, used to estimate the canvas centre.
+        let canvas_rect =
+            Rect::from_min_max(pos2(full.min.x + sidebar + 8.0, full.min.y), full.max);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                vec2(sidebar, full.height().max(1.0)),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| self.show_palette(ui, canvas_rect),
+            );
+            ui.separator();
+            let available = ui.available_size();
+            let desired = vec2(available.x.max(64.0), available.y.max(64.0));
+            let (response, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
+            let viewport = response.rect;
+            self.handle_input(ui, &response, viewport);
+            self.paint(&painter, viewport);
+        });
+    }
+
+    /// Draw the device palette sidebar / 绘制设备调色板侧栏
+    fn show_palette(&mut self, ui: &mut Ui, canvas_rect: Rect) {
+        ui.label("Palette / 调色板");
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let palette = DevicePalette::default();
+                for (index, entry) in palette.entries().iter().enumerate() {
+                    let text = format!("{}  {}×{}", entry.name, entry.size.x, entry.size.y);
+                    let width = ui.available_width().max(1.0);
+                    if ui
+                        .add_sized([width, 22.0], egui::Button::new(text))
+                        .clicked()
+                    {
+                        let pos = self.spawn_position(canvas_rect, entry.size);
+                        let _ = self.add_from_palette(index, pos);
+                    }
+                }
+            });
+    }
+
+    /// Top-left corner for a new palette device near the canvas centre
+    /// 新调色板设备在画布中心附近放置时的左上角
+    fn spawn_position(&self, canvas_rect: Rect, size: Vec2) -> Pos2 {
+        // 依次错开，连续点击不会完全重叠。
+        // Cascade the drop position so repeated clicks do not fully overlap.
+        const CASCADE: [f32; 6] = [0.0, 14.0, 28.0, 42.0, 56.0, 70.0];
+        let step = CASCADE[self.nodes.len() % CASCADE.len()];
+        let center = self.screen_to_world(canvas_rect, canvas_rect.center());
+        pos2(
+            center.x - size.x * 0.5 + step,
+            center.y - size.y * 0.5 + step,
+        )
     }
 
     fn handle_input(&mut self, ui: &Ui, response: &egui::Response, viewport: Rect) {
@@ -112,7 +179,7 @@ impl CanvasState {
         painter.text(
             viewport.left_bottom() + vec2(8.0, -8.0),
             Align2::LEFT_BOTTOM,
-            "drag device / 拖设备 · drag port / 拖端口连线 · Delete · wheel / 滚轮 · middle or space / 中键或空格",
+            "click palette / 点调色板添加 · drag device / 拖设备 · drag port / 拖端口连线 · Delete · wheel / 滚轮 · middle or space / 中键或空格",
             FontId::monospace(10.0),
             HINT_COLOR,
         );

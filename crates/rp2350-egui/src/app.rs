@@ -24,6 +24,7 @@ use rp2350_core::types::CpuId;
 use rp2350_cpu::CpuCore;
 
 use crate::canvas::CanvasState;
+use crate::canvas_io::CanvasParseError;
 use crate::panels::{
     DmaView, HstxView, NOT_EXPOSED, PioView, RegisterPanel, format_dma_busy, format_dma_channel,
     format_dma_count, format_hstx_fifo, format_hstx_row, format_hstx_scanline, format_pio_block,
@@ -82,6 +83,12 @@ pub struct EmuApp {
     /// Virtual Lab canvas model, preserved while switching views
     /// 虚拟实验室画布模型，切换视图时保留
     canvas: CanvasState,
+    /// Last canvas text produced by the toolbar "Save"
+    /// 工具栏「保存」产生的最近一份画布文本
+    pub(crate) canvas_snapshot: String,
+    /// Result of the last save/load shown in the toolbar
+    /// 工具栏中显示的最近一次保存/加载结果
+    pub(crate) canvas_status: String,
     /// Active top-level view / 当前顶层视图
     view: ActiveView,
 }
@@ -96,6 +103,8 @@ impl EmuApp {
             peripherals: None,
             selected_dma_channel: 0,
             canvas: CanvasState::sample(),
+            canvas_snapshot: String::new(),
+            canvas_status: String::from("snapshot: none / 快照：无"),
             view: ActiveView::default(),
         }
     }
@@ -120,6 +129,62 @@ impl EmuApp {
     /// Switch the active top-level view / 切换当前顶层视图
     pub fn set_active_view(&mut self, view: ActiveView) {
         self.view = view;
+    }
+
+    /// Save the canvas into the in-memory snapshot / 把画布保存到内存快照
+    ///
+    /// No file dialog is opened: the text lives inside `EmuApp` and the status
+    /// line reports its size and record counts.
+    /// 不打开文件对话框：文本仅保存在 `EmuApp` 内，状态行显示大小与记录数。
+    pub(crate) fn save_canvas(&mut self) {
+        self.canvas_snapshot = self.canvas.to_text();
+        let bytes = self.canvas_snapshot.len();
+        let devices = self.canvas.nodes.len();
+        let wires = self.canvas.wires.len();
+        self.canvas_status = format!(
+            "saved {bytes} bytes / 已保存 {bytes} 字节 · {devices} devices / 设备 · \
+             {wires} wires / 连线"
+        );
+    }
+
+    /// Load the in-memory snapshot back into the canvas / 从内存快照恢复画布
+    ///
+    /// # Errors
+    /// Returns the [`CanvasParseError`] of the snapshot and keeps the current
+    /// canvas untouched; the same message is written to the toolbar status.
+    /// 返回快照的 [`CanvasParseError`]，当前画布保持不变，同一错误也会写入
+    /// 工具栏状态。
+    pub(crate) fn load_canvas(&mut self) -> Result<(), CanvasParseError> {
+        match CanvasState::from_text(&self.canvas_snapshot) {
+            Ok(canvas) => {
+                let devices = canvas.nodes.len();
+                let wires = canvas.wires.len();
+                self.canvas = canvas;
+                self.canvas_status =
+                    format!("loaded / 已加载 · {devices} devices / 设备 · {wires} wires / 连线");
+                Ok(())
+            }
+            Err(error) => {
+                self.canvas_status = format!("load failed / 加载失败 — {error}");
+                Err(error)
+            }
+        }
+    }
+
+    /// Toolbar with the in-memory save/load buttons and their status
+    /// 带内存保存/加载按钮及状态的工具栏
+    fn show_canvas_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Save / 保存").clicked() {
+                self.save_canvas();
+            }
+            if ui.button("Load / 加载").clicked() {
+                let _ = self.load_canvas();
+            }
+            ui.separator();
+            ui.label(self.canvas_status.as_str());
+        });
+        ui.separator();
     }
 
     /// Attach a read-only peripheral snapshot source / 挂载只读外设快照来源
@@ -222,7 +287,10 @@ impl EmuApp {
     /// Render whichever view the tab bar selected / 渲染标签栏选中的视图
     fn show_active_view(&mut self, ui: &mut egui::Ui) {
         match self.view {
-            ActiveView::VirtualLab => self.canvas.show(ui),
+            ActiveView::VirtualLab => {
+                self.show_canvas_toolbar(ui);
+                self.canvas.show(ui);
+            }
             ActiveView::Panels => self.show_panels(ui),
         }
     }
