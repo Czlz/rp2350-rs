@@ -475,6 +475,11 @@ impl CortexM33Core {
         if self.registers.primask & 1 != 0 {
             return Ok(());
         }
+        // 没有「已使能且挂起」的中断时无需构造候选位图。
+        // Nothing enabled is pending, so building the candidate bitmaps is wasted.
+        if !self.nvic.has_runnable() {
+            return Ok(());
+        }
 
         if let Some(irq) = self.nvic.find_highest_priority() {
             // 外部中断 n 对应异常号 16 + n，向量位于 VTOR + (16 + n) * 4。

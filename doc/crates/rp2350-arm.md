@@ -225,6 +225,10 @@ impl Nvic {
     /// Find highest priority pending+enabled IRQ. Returns None if none.
     /// 查找最高优先级且挂起+已使能的中断。无则返回 None。
     pub fn find_highest_priority(&self) -> Option<IrqNumber>;
+
+    /// Conservative "some enabled IRQ is pending" hint (`false` is exact).
+    /// 保守的「存在已使能且挂起中断」提示位（`false` 精确）。
+    pub fn has_runnable(&self) -> bool;
 }
 ```
 
@@ -257,6 +261,28 @@ implementation over pseudorandom enable/pending/active/priority matrices.
 置位）；活跃中断不再被选中（由 `!IABR` 排除）；`PRIMASK`/`BASEPRI` 属于核级
 掩码，选择器语义不变——核在调用 NVIC 之前仍按 `PRIMASK` 短路，`BASEPRI` 保持
 「仅存储」语义。单元测试用伪随机矩阵把位图选择器与线性参考实现对表。
+
+### Pending gate / 挂起门控
+
+`has_runnable` is a conservative cache of `any(ISER & ISPR)`. Every writer of the
+enable or pending set maintains it — `write_iser`, `write_icer`, `write_ispr`,
+`write_icpr`, `set_pending`, `clear_pending` and `write_stir` — so a `false`
+value is exact: no interrupt can be selected while it is false. Active state is
+deliberately not folded in, so `true` may still select nothing (an active IRQ
+that is still pending); `CortexM33Core::check_pending_exceptions` therefore
+short-circuits on `PRIMASK` **or** a closed gate and only runs the selector when
+a delivery is actually possible. NVIC unit tests compare the gate against a
+linear `enabled && pending` reference, and the core tests pin delivery across
+enable/ICPR/`PRIMASK`/SysTick paths.
+
+`has_runnable` 是 `any(ISER & ISPR)` 的保守缓存：使能/挂起集合的每个写入口
+（`write_iser`、`write_icer`、`write_ispr`、`write_icpr`、`set_pending`、
+`clear_pending`、`write_stir`）都会维护它，因此为 `false` 时精确——此时选择器
+必然返回 `None`。活跃状态刻意不折算，所以 `true` 仍可能选不出中断（挂起且活跃
+的中断）；`CortexM33Core::check_pending_exceptions` 因此在 `PRIMASK` **或**
+门控为假时短路，只在真正可能投递时才运行选择器。NVIC 单元测试把门控与
+`enabled && pending` 的线性参考对表，核心测试锁定使能/ICPR/`PRIMASK`/SysTick
+各路径上的投递行为。
 
 ### `SysTick`
 

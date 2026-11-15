@@ -53,6 +53,9 @@ pub trait AddressBus: Send + Sync {
     /// Host-side byte write that bypasses guest write protection (loaders).
     /// 宿主侧字节写入，绕过客户机写保护（加载器路径）。
     fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()>;
+    /// Host-side bulk write (loader path); default = one `load_u8` per byte.
+    /// 宿主侧批量写入（加载器路径）；默认实现逐字节调用 `load_u8`。
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()>;
 }
 
 pub trait MemoryRegion: Send + Sync {
@@ -65,6 +68,7 @@ pub trait MemoryRegion: Send + Sync {
     fn write_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()>;
     // read_u16/u32, write_u16/u32: default implementations compose byte access
     fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()>;
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()>;
 }
 ```
 
@@ -73,8 +77,35 @@ diagnostic sees every word store.
 总线上的 `write_u32` 会调用 `watch::check_write`，使 `RP2350_WATCH` 诊断能看到
 每一次整字存储。
 
-`SimpleBus` overrides `write_u8` / `write_u16` / `write_u32` / `load_u8` for one
-extra side effect: guest writes into the ARMv8-M PPB window
+#### Host bulk transfer / 宿主批量传输
+
+`load_bytes` is the bulk form of the host-write channel. The trait default
+forwards to `load_u8` once per byte, so a bus or region that does not specialise
+it keeps byte-exact cycles, errors and watchpoints. `SimpleBus` resolves the
+region once for the whole span, and `FlashRegion` / `RamRegion` then write it
+with one bounds check and one copy:
+
+* `FlashRegion` takes the shared-store write lock **once** and bumps the content
+  generation **once** per transferred run; it charges one cycle per byte, and an
+  out-of-range span falls back to `load_u8` so the error kind and the
+  "bytes before the crossing landed" behaviour match the byte path.
+* `RamRegion` copies through one `&mut [u8]` slice and stays on the byte path
+  whenever a write watch is armed (the diagnostic reports every stored byte) or
+  the region is read-only.
+* `SimpleBus` still advances the PPB write epoch per byte when the span can
+  intersect `0xE000_0000..0xE010_0000`, so the replay gate keeps its meaning.
+
+`load_bytes` 是宿主写入通道的批量形式。trait 默认实现逐字节转发到 `load_u8`，
+因此未特化的总线/区域保持逐字节的周期、错误与监视点语义。`SimpleBus` 对整段只
+解析一次区域，随后由 `FlashRegion`/`RamRegion` 用一次边界检查加一次拷贝写完：
+`FlashRegion` 每次连续传输只取一次写锁、只递增一次内容世代，按每字节一个周期
+记账，越界时回退到 `load_u8`，使错误类型与「越界前字节已落下」的行为和逐字节
+路径一致；`RamRegion` 通过一个 `&mut [u8]` 切片拷贝，写监视安装期间或区域只读时
+仍走逐字节路径；`SimpleBus` 在跨度可能与 PPB 窗口相交时仍逐字节推进 PPB 写世代，
+保持回放门控语义不变。
+
+`SimpleBus` overrides `write_u8` / `write_u16` / `write_u32` / `load_u8` /
+`load_bytes` for one extra side effect: guest writes into the ARMv8-M PPB window
 (`0xE000_0000..0xE010_0000`) advance a monotonic counter exposed by
 [`SimpleBus::ppb_write_epoch`]. Those are the only writes that feed the core's
 system-register replay queue, so a frontend that sees an unchanged epoch can
@@ -383,8 +414,9 @@ impl FirmwareImage {
     pub fn from_elf_bytes(bytes: &[u8]) -> Result<Self, CoreError>;
     pub fn load_into(&self, bus: &mut dyn AddressBus) -> Result<(), CoreError>;
 }
-// Keeps PT_LOAD segments only; load_into uses the host write path (load_u8) so
-// it can program read-only flash, and zero-fills the .bss tail (mem_size).
+// Keeps PT_LOAD segments only; load_into writes each segment with one
+// `load_bytes` call on the host path (so it can program read-only flash) and
+// zero-fills the .bss tail in 4 KiB chunks.
 
 pub const UF2_BLOCK_SIZE: usize = 512;
 pub const UF2_MAX_PAYLOAD: usize = 476;
@@ -425,8 +457,13 @@ impl Uf2Image {
 ```
 
 The loader validates the container only; RP2350 `IMAGE_DEF` metadata is **not**
-interpreted.
-加载器只校验容器；**不**解析 RP2350 `IMAGE_DEF` 元数据。
+interpreted. Each loadable block is written with a single `load_bytes` call on
+the host write path, and duplicate `(family, block number)` pairs are detected
+with a hash set (the previous linear scan was O(n²): a 12 MB image carries
+~48 k blocks, which made container validation dominate startup time).
+加载器只校验容器；**不**解析 RP2350 `IMAGE_DEF` 元数据。每个可加载块都用一次
+`load_bytes` 经宿主写入通道写下去，重复的 `(家族, 块号)` 用哈希集合检出（原先的
+线性查重是 O(n²)：12 MB 映像有约 4.8 万块，容器校验因此占满启动时间）。
 
 ---
 

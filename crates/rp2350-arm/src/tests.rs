@@ -2,6 +2,7 @@
 //! Cortex-M33 核心集成与启动序列的单元测试
 
 mod fp_lazy;
+mod irq_gate;
 
 use super::*;
 

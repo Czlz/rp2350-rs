@@ -56,6 +56,17 @@ pub struct Nvic {
     /// are rebuilt only when a priority register changes.
     /// 选择时只遍历 8 个优先级桶而不是 256 个中断，位图仅在优先级寄存器变化时重建。
     priority_mask: [[u32; 8]; 8],
+    /// Conservative hint: "some enabled IRQ is pending"
+    /// 保守提示位：「存在已使能且挂起的中断」
+    ///
+    /// Kept up to date by every register that can change `ISER` or `ISPR`, so a
+    /// caller can skip [`Self::find_highest_priority`] entirely when it is
+    /// `false`. Active state is not folded in, so a `true` value may still
+    /// select nothing; a `false` value is always exact.
+    /// 每个可能改变 `ISER` 或 `ISPR` 的寄存器都会维护它，因此它为 `false` 时调用方
+    /// 可以完全跳过 [`Self::find_highest_priority`]；活跃状态不参与，因此 `true`
+    /// 仍可能选不出中断，而 `false` 永远精确。
+    runnable: bool,
 }
 
 /// Number of 32-bit groups covering the 256 implemented interrupts
@@ -85,7 +96,31 @@ impl Nvic {
                 mask[0] = [u32::MAX; IRQ_GROUPS];
                 mask
             },
+            // 复位时没有任何中断使能，因此提示位为假。
+            // Nothing is enabled at reset, so the hint starts clear.
+            runnable: false,
         }
+    }
+
+    /// Report whether some enabled interrupt may be pending
+    /// 报告是否可能存在已使能且挂起的中断
+    ///
+    /// `false` is exact: [`Self::find_highest_priority`] cannot select anything
+    /// while no `ISER & ISPR` bit is set. `true` is conservative because active
+    /// interrupts are not folded into the hint.
+    /// `false` 是精确的：没有置位的 `ISER & ISPR` 位时 [`Self::find_highest_priority`]
+    /// 必然选不出中断。`true` 是保守的，因为提示位未折算活跃状态。
+    #[inline]
+    #[must_use]
+    pub fn has_runnable(&self) -> bool {
+        self.runnable
+    }
+
+    /// Recompute the conservative pending hint from `ISER & ISPR`
+    /// 依据 `ISER & ISPR` 重算保守挂起提示位
+    #[inline]
+    fn refresh_runnable(&mut self) {
+        self.runnable = (0..IRQ_GROUPS).any(|group| self.iser[group] & self.ispr[group] != 0);
     }
 
     /// Check if an interrupt is enabled
@@ -188,6 +223,7 @@ impl Nvic {
             // ISER is write-1-to-set (reads return current enable state)
             // ISER 是写 1 置位（读返回当前使能状态）
             *reg |= value;
+            self.refresh_runnable();
         }
     }
 
@@ -209,6 +245,7 @@ impl Nvic {
             // ICER 是写 1 清除
             *en &= !value;
         }
+        self.refresh_runnable();
     }
 
     /// Read ISPR value (word at 4-byte offset)
@@ -224,6 +261,7 @@ impl Nvic {
         if let Some(reg) = self.ispr.get_mut(index) {
             *reg |= value;
         }
+        self.refresh_runnable();
     }
 
     /// Read ICPR value (word at 4-byte offset)
@@ -242,6 +280,7 @@ impl Nvic {
         if let Some(pend) = self.ispr.get_mut(index) {
             *pend &= !value;
         }
+        self.refresh_runnable();
     }
 
     /// Read IABR value (word at 4-byte offset)
@@ -279,6 +318,11 @@ impl Nvic {
         if let Some(reg) = self.ispr.get_mut(idx) {
             *reg |= 1 << bit;
         }
+        // 只在该中断已使能时点亮提示位；无需扫描全部 256 项。
+        // Raise the hint only when this interrupt is enabled; no 256-entry scan.
+        if self.iser.get(idx).is_some_and(|en| en & (1 << bit) != 0) {
+            self.runnable = true;
+        }
     }
 
     /// Clear interrupt pending
@@ -289,6 +333,7 @@ impl Nvic {
         if let Some(reg) = self.ispr.get_mut(idx) {
             *reg &= !(1 << bit);
         }
+        self.refresh_runnable();
     }
 
     /// Software Trigger Interrupt Register — trigger an IRQ via software
@@ -575,6 +620,100 @@ mod tests {
         let nvic = Nvic::new();
         for irq in 0u16..256 {
             assert_eq!(nvic.get_priority(irq), 0);
+        }
+    }
+
+    /// Reference predicate for the gate: some enabled IRQ is pending
+    /// 门控的参考判据：存在已使能且挂起的中断
+    fn reference_pending(nvic: &Nvic) -> bool {
+        (0u16..256).any(|irq| nvic.is_enabled(irq) && nvic.is_pending(irq))
+    }
+
+    #[test]
+    fn runnable_hint_tracks_every_writer_of_enable_and_pending() {
+        let mut nvic = Nvic::new();
+        assert!(
+            !nvic.has_runnable(),
+            "reset has nothing pending / 复位时无挂起"
+        );
+
+        // 使能但未挂起：提示位必须保持为假。
+        // Enabled but not pending: the hint must stay clear.
+        nvic.write_iser(0, 1 << 3);
+        assert!(!nvic.has_runnable());
+
+        nvic.write_stir(3);
+        assert!(nvic.has_runnable());
+
+        nvic.write_icpr(0, 1 << 3);
+        assert!(!nvic.has_runnable());
+
+        // ISPR 直接写入与硬件 set_pending 同样点亮提示位（需先使能）。
+        // A direct ISPR write and a hardware `set_pending` both raise it, but
+        // only for an enabled IRQ.
+        nvic.write_iser(1, 1 << 5);
+        nvic.write_ispr(1, 1 << 5);
+        assert!(nvic.has_runnable());
+        nvic.clear_pending(32 + 5);
+        assert!(!nvic.has_runnable());
+        nvic.set_pending(3);
+        assert!(nvic.has_runnable());
+        nvic.clear_pending(3);
+        assert!(!nvic.has_runnable());
+
+        // 挂起但未使能不会点亮；随后使能才点亮。
+        // Pending without enable stays clear; enabling raises it.
+        nvic.set_pending(200);
+        assert!(!nvic.has_runnable());
+        nvic.write_iser(6, 1 << 8);
+        assert!(nvic.has_runnable());
+        nvic.write_icer(6, 1 << 8);
+        assert!(!nvic.has_runnable());
+    }
+
+    #[test]
+    fn runnable_hint_stays_set_while_the_irq_is_active() {
+        let mut nvic = Nvic::new();
+        nvic.write_iser(0, 1 << 4);
+        nvic.set_pending(4);
+        nvic.set_active(4);
+        // 活跃中断不能抢占自身，但提示位是保守的：仍为真。
+        // An active IRQ cannot preempt itself, but the hint stays conservative.
+        assert!(nvic.has_runnable());
+        assert_eq!(nvic.find_highest_priority(), None);
+        nvic.clear_active(4);
+        assert_eq!(nvic.find_highest_priority(), Some(4));
+    }
+
+    #[test]
+    fn closed_gate_never_hides_a_runnable_irq() {
+        for seed in 1..16u64 {
+            let mut nvic = Nvic::new();
+            fill_pseudo_random(&mut nvic, seed);
+            assert_eq!(
+                nvic.has_runnable(),
+                reference_pending(&nvic),
+                "seed {seed} must match the linear reference / 必须与线性参考一致"
+            );
+            // 随机改写挂起集合后仍需与参考一致。
+            // Random pending rewrites must keep matching the reference.
+            let mut state = seed;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as u32
+            };
+            for _ in 0..32 {
+                let index = (next() % 8) as usize;
+                let value = next();
+                if next() & 1 == 0 {
+                    nvic.write_ispr(index, value);
+                } else {
+                    nvic.write_icpr(index, value);
+                }
+                assert_eq!(nvic.has_runnable(), reference_pending(&nvic));
+            }
         }
     }
 }

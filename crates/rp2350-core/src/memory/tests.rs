@@ -242,3 +242,133 @@ fn bus_cache_picks_up_a_newly_registered_region() {
     bus.write_u8(0x3000_0004, 0x5A, &mut cycles).unwrap();
     assert_eq!(bus.read_u8(0x3000_0004, &mut cycles).unwrap(), 0x5A);
 }
+
+#[test]
+fn bus_bulk_load_matches_the_byte_path_byte_for_byte() {
+    // 批量宿主写入必须与逐字节路径写入同样的字节、记同样的周期。
+    // A host bulk load must write the same bytes and book the same cycles as
+    // the byte-wise path.
+    let mut bulk_bus = SimpleBus::new();
+    let mut byte_bus = SimpleBus::new();
+    bulk_bus
+        .register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 64)))
+        .unwrap();
+    byte_bus
+        .register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 64)))
+        .unwrap();
+    let payload: Vec<u8> = (0..40u8).collect();
+
+    let mut bulk_cycles = 0u64;
+    bulk_bus
+        .load_bytes(0x2000_0008, &payload, &mut bulk_cycles)
+        .unwrap();
+    let mut byte_cycles = 0u64;
+    for (offset, byte) in payload.iter().enumerate() {
+        byte_bus
+            .load_u8(0x2000_0008 + offset as u32, *byte, &mut byte_cycles)
+            .unwrap();
+    }
+    assert_eq!(bulk_cycles, byte_cycles);
+    assert_eq!(bulk_cycles, payload.len() as u64);
+
+    let mut read_cycles = 0u64;
+    for offset in 0..payload.len() {
+        let addr = 0x2000_0008 + offset as u32;
+        assert_eq!(
+            bulk_bus.read_u8(addr, &mut read_cycles).unwrap(),
+            byte_bus.read_u8(addr, &mut read_cycles).unwrap()
+        );
+    }
+    // 未覆盖的尾部保持为零。
+    // The untouched tail stays zero.
+    assert_eq!(bulk_bus.read_u8(0x2000_0007, &mut read_cycles).unwrap(), 0);
+}
+
+#[test]
+fn bus_bulk_load_past_the_end_reports_the_same_error() {
+    let mut bulk_bus = SimpleBus::new();
+    let mut byte_bus = SimpleBus::new();
+    bulk_bus
+        .register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 8)))
+        .unwrap();
+    byte_bus
+        .register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 8)))
+        .unwrap();
+    let mut cycles = 0u64;
+    let bulk_error = bulk_bus
+        .load_bytes(0x2000_0004, &[1, 2, 3, 4, 5], &mut cycles)
+        .unwrap_err();
+    // 逐字节参考路径：每个字节一次 `load_u8`。
+    // Byte-wise reference path: one `load_u8` per byte.
+    let mut byte_error = None;
+    for (offset, byte) in [1u8, 2, 3, 4, 5].iter().enumerate() {
+        if let Err(error) = byte_bus.load_u8(0x2000_0004 + offset as u32, *byte, &mut cycles) {
+            byte_error = Some(error);
+            break;
+        }
+    }
+    let byte_error = byte_error.expect("the byte path must hit the same fault");
+    let kind = |error: &CoreError| match error {
+        CoreError::BusError { kind, .. } => *kind,
+        other => panic!("unexpected error: {other:?}"),
+    };
+    assert_eq!(kind(&bulk_error), kind(&byte_error));
+    // 越界前落地的字节与逐字节路径一致。
+    // Bytes that fit before the fault land exactly as in the byte path.
+    for addr in [0x2000_0004, 0x2000_0007] {
+        assert_eq!(
+            bulk_bus.read_u8(addr, &mut cycles).unwrap(),
+            byte_bus.read_u8(addr, &mut cycles).unwrap()
+        );
+    }
+}
+
+#[test]
+fn empty_bulk_load_is_a_no_op_even_when_unmapped() {
+    // 默认实现空循环、不解析地址；特化实现必须保持同样的语义。
+    // The default implementation loops zero times and never resolves the
+    // address; the specialised path must preserve that.
+    let mut bus = SimpleBus::new();
+    let mut cycles = 0u64;
+    bus.load_bytes(0x4000_0000, &[], &mut cycles).unwrap();
+    assert_eq!(cycles, 0);
+}
+
+#[test]
+fn bus_bulk_load_denies_a_read_only_region() {
+    let mut bus = SimpleBus::new();
+    bus.register_region(Box::new(RamRegion::new_rom("rom", 0x0000_0000, 16)))
+        .unwrap();
+    let mut cycles = 0u64;
+    let error = bus
+        .load_bytes(0x0000_0000, &[1, 2, 3], &mut cycles)
+        .unwrap_err();
+    match error {
+        CoreError::BusError { kind, .. } => assert_eq!(kind, BusErrorKind::AccessDenied),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn bulk_load_falls_back_to_the_byte_path_while_a_write_watch_is_armed() {
+    // 安装写监视时批量写入必须逐字节回退，否则诊断会漏报每个字节。
+    // With a write watch armed the bulk path must fall back per byte, or the
+    // diagnostic would miss stored bytes.
+    let mut bulk = RamRegion::new("ram", 0x2000_0000, 16);
+    let mut byte = RamRegion::new("ram", 0x2000_0000, 16);
+    crate::watch::set_write_value(Some(0x5A5A_5A5A));
+    assert!(crate::watch::write_watch_armed());
+    let mut bulk_cycles = 0u64;
+    let mut byte_cycles = 0u64;
+    bulk.load_bytes(0x2000_0004, &[0x5A; 6], &mut bulk_cycles)
+        .unwrap();
+    for offset in 0..6u32 {
+        byte.load_u8(0x2000_0004 + offset, 0x5A, &mut byte_cycles)
+            .unwrap();
+    }
+    crate::watch::set_write_value(None);
+    assert!(!crate::watch::write_watch_armed());
+    assert_eq!(bulk.bytes(), byte.bytes());
+    assert_eq!(bulk_cycles, byte_cycles);
+    assert_eq!(bulk_cycles, 6);
+}

@@ -297,6 +297,38 @@ impl MemoryRegion for FlashRegion {
         bump_content_generation();
         Ok(())
     }
+
+    /// Host-side bulk programming takes one shared-store write lock
+    /// 宿主侧批量编程只获取一次共享存储写锁
+    ///
+    /// The byte-wise path acquires the write lock, bumps the content generation
+    /// and pays a round trip for every byte; firmware loading writes megabytes
+    /// through it. One lock acquisition and one generation bump per contiguous
+    /// run writes the same bytes and books the same cycle count (one per byte).
+    /// 逐字节路径对每个字节都要获取写锁、递增内容世代并付出一次往返，而固件加载
+    /// 要写入数 MB。每次连续写入只取一次锁、递增一次世代，写入相同的字节并记账
+    /// 相同周期数（每字节一个周期）。
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()> {
+        // 跨度完整落在区域内才走快路径；否则逐字节回退，使越界处的错误类型
+        // 与「能写下的字节已写下」的行为和逐字节路径完全一致。
+        // The fast path needs the whole span inside the region; otherwise the
+        // byte-wise fallback reproduces both the error kind at the crossing and
+        // the "bytes before the crossing landed" behaviour.
+        let span = addr.checked_sub(self.base).map(|offset| offset as usize);
+        let span = span.filter(|offset| *offset <= self.size && bytes.len() <= self.size - *offset);
+        let Some(offset) = span else {
+            for (index, byte) in bytes.iter().enumerate() {
+                self.load_u8(addr.wrapping_add(index as u32), *byte, cycles)?;
+            }
+            return Ok(());
+        };
+        *cycles += bytes.len() as u64;
+        let mut data = self.write_store();
+        data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        drop(data);
+        bump_content_generation();
+        Ok(())
+    }
 }
 
 /// Host-only handle to the flash bytes shared by every XIP window
@@ -550,5 +582,62 @@ mod tests {
         bus.load_u8(FLASH_XIP_BASE, 0x42, &mut cycles).unwrap();
         assert_eq!(bus.read_u8(FLASH_XIP_BASE, &mut cycles).unwrap(), 0x42);
         assert!(bus.write_u8(FLASH_XIP_BASE, 0x00, &mut cycles).is_err());
+    }
+
+    #[test]
+    fn bulk_load_matches_the_byte_path_and_rejects_guest_writes() {
+        let mut bulk = FlashRegion::new("bulk", FLASH_XIP_BASE, 64);
+        let mut bytewise = FlashRegion::new("byte", FLASH_XIP_BASE, 64);
+        let payload: Vec<u8> = (0..32u8).map(|value| value.wrapping_mul(3)).collect();
+
+        let mut bulk_cycles = 0u64;
+        MemoryRegion::load_bytes(&mut bulk, FLASH_XIP_BASE + 8, &payload, &mut bulk_cycles)
+            .unwrap();
+        let mut byte_cycles = 0u64;
+        for (offset, byte) in payload.iter().enumerate() {
+            bytewise
+                .load_u8(FLASH_XIP_BASE + 8 + offset as u32, *byte, &mut byte_cycles)
+                .unwrap();
+        }
+        // 相同字节、相同周期（每字节一个周期）。
+        // Same bytes, same cycle count (one cycle per byte).
+        assert_eq!(
+            bulk.slice(FLASH_XIP_BASE, 64),
+            bytewise.slice(FLASH_XIP_BASE, 64)
+        );
+        assert_eq!(bulk_cycles, byte_cycles);
+        assert_eq!(bulk_cycles, payload.len() as u64);
+
+        // 客户机写入仍被拒绝，越界批量写入与逐字节路径报同样的错误。
+        // Guest writes stay rejected; an out-of-range bulk write reports the
+        // same error as the byte path.
+        let mut cycles = 0;
+        assert!(bulk.write_u8(FLASH_XIP_BASE + 8, 0, &mut cycles).is_err());
+        let bulk_error =
+            MemoryRegion::load_bytes(&mut bulk, FLASH_XIP_BASE + 56, &[0; 16], &mut cycles)
+                .unwrap_err();
+        let byte_error = bytewise
+            .load_u8(FLASH_XIP_BASE + 56 + 8, 0, &mut cycles)
+            .unwrap_err();
+        let kind = |error: &CoreError| match error {
+            CoreError::BusError { kind, .. } => *kind,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert_eq!(kind(&bulk_error), kind(&byte_error));
+    }
+
+    #[test]
+    fn bus_bulk_load_serves_flash_through_the_host_channel() {
+        let mut bus = SimpleBus::new();
+        let flash = FlashRegion::new("flash", FLASH_XIP_BASE, 64);
+        let handle = flash.handle();
+        bus.register_region(Box::new(flash)).unwrap();
+        let payload: Vec<u8> = (0..48u8).collect();
+        let mut cycles = 0u64;
+        bus.load_bytes(FLASH_XIP_BASE + 4, &payload, &mut cycles)
+            .unwrap();
+        assert_eq!(cycles, payload.len() as u64);
+        assert_eq!(handle.read(FLASH_XIP_BASE + 4, 48).unwrap(), payload);
+        assert_eq!(bus.read_u8(FLASH_XIP_BASE + 4, &mut cycles).unwrap(), 0);
     }
 }

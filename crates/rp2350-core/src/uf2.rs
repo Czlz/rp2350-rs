@@ -338,16 +338,21 @@ impl Uf2Image {
             blocks.push(Uf2Block::parse(chunk)?);
         }
 
-        let mut seen: Vec<(u32, u32)> = Vec::with_capacity(blocks.len());
+        // 用哈希集合代替 `Vec::contains`：emerald 这类 12 MB 映像有 4.8 万块，
+        // 线性查重是 O(n²)（十亿级比较），实测占启动时间的绝大部分。
+        // A hash set replaces `Vec::contains`: a 12 MB image like emerald has
+        // ~48 k blocks, and the linear duplicate scan is O(n²) (billions of
+        // comparisons), which dominated startup time.
+        let mut seen: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::with_capacity(blocks.len());
         for block in &blocks {
             let key = (block.family.id(), block.block_number);
-            if seen.contains(&key) {
+            if !seen.insert(key) {
                 return Err(CoreError::FirmwareError(format!(
                     "duplicate UF2 block {} for family {} / UF2 块号重复",
                     block.block_number, block.family
                 )));
             }
-            seen.push(key);
         }
 
         let family = select_primary_family(&blocks);
@@ -433,12 +438,10 @@ impl Uf2Image {
                 )));
             }
 
-            for (offset, byte) in block.payload.iter().enumerate() {
-                let addr = block.target_addr.wrapping_add(offset as u32);
-                // 加载器走宿主写入通道，因此可以直接编程只读的 Flash 区域。
-                // The loader uses the host write path so it can program read-only flash.
-                bus.load_u8(addr, *byte, &mut cycles)?;
-            }
+            // 整块载荷一次写入：区域只解析一次、只取一次锁、只递增一次世代。
+            // Write the whole payload in one call: the region is resolved once,
+            // takes one lock and bumps the content generation once.
+            bus.load_bytes(block.target_addr, &block.payload, &mut cycles)?;
 
             written += 1;
             min_address = min_address.min(block.target_addr);

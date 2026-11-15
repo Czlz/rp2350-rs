@@ -117,6 +117,27 @@ pub trait MemoryRegion: Send + Sync {
     fn load_u8(&mut self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()> {
         self.write_u8(addr, value, cycles)
     }
+
+    /// Host-side bulk write into a region / 宿主侧批量写入区域
+    ///
+    /// The default forwards to [`Self::load_u8`] once per byte, so regions that
+    /// do not specialise it keep byte-exact cycles, watchpoints and errors. A
+    /// region that owns a flat buffer overrides it with one bounds check and one
+    /// copy.
+    /// 默认逐字节转发到 [`Self::load_u8`]，因此未特化的区域保持逐字节的周期、
+    /// 监视点与错误语义；拥有扁平缓冲区的区域改为一次边界检查加一次拷贝。
+    ///
+    /// # Errors
+    /// Returns `BusError` if the address is invalid or access is denied.
+    /// 如果地址无效或访问被拒绝，返回 `BusError`。
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()> {
+        for (offset, byte) in bytes.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let offset = offset as u32;
+            self.load_u8(addr.wrapping_add(offset), *byte, cycles)?;
+        }
+        Ok(())
+    }
 }
 
 /// The central address bus that routes memory accesses to the correct region
@@ -239,5 +260,28 @@ pub trait AddressBus: Send + Sync {
                 kind: BusErrorKind::NoDevice,
             })?
             .load_u8(addr, value, cycles)
+    }
+
+    /// Host-side bulk write (loader path) / 宿主侧批量写入（加载器路径）
+    ///
+    /// Writes `bytes` starting at `addr` through the host-write channel. The
+    /// default implementation forwards to [`Self::load_u8`] once per byte, so a
+    /// bus that does not specialise it keeps byte-exact cycles, watchpoints and
+    /// error reporting. Buses that can prove a region accepts the whole span
+    /// override it with a bulk region transfer.
+    /// 经宿主写入通道把 `bytes` 写到 `addr`。默认实现逐字节转发到
+    /// [`Self::load_u8`]，因此未特化的总线保持逐字节的周期、监视点与错误语义；
+    /// 能证明区域接受整段写入的总线改为一次区域批量传输。
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()> {
+        for (offset, byte) in bytes.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let offset = offset as u32;
+            self.load_u8(addr.wrapping_add(offset), *byte, cycles)?;
+        }
+        Ok(())
     }
 }

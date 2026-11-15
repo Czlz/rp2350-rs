@@ -127,6 +127,22 @@ impl RamRegion {
         slot.try_into().ok()
     }
 
+    /// Borrow `len` writable bytes at `addr` / 借用 `addr` 处 `len` 个可写字节
+    ///
+    /// The variable-length form of [`Self::window_mut`], used by the host-side
+    /// bulk loader. Returns `None` for a read-only region or a span that is not
+    /// fully inside the buffer.
+    /// [`Self::window_mut`] 的变长版本，供宿主侧批量加载使用。只读区域或跨度未
+    /// 完全落在缓冲区内时返回 `None`。
+    fn span_mut(&mut self, addr: Address, len: usize) -> Option<&mut [u8]> {
+        if !self.writable {
+            return None;
+        }
+        let offset = addr.checked_sub(self.base)? as usize;
+        let end = offset.checked_add(len)?;
+        self.data.get_mut(offset..end)
+    }
+
     /// Store `bytes` one at a time through [`MemoryRegion::write_u8`]
     /// 通过 [`MemoryRegion::write_u8`] 逐字节存储
     ///
@@ -246,6 +262,33 @@ impl MemoryRegion for RamRegion {
             kind: BusErrorKind::DeviceError,
         })?;
         *slot = value;
+        Ok(())
+    }
+
+    /// A host-side bulk load is one bounds check and one copy
+    /// 宿主侧批量加载只需一次边界检查与一次拷贝
+    ///
+    /// 逐字节回退保留写监视与只读/越界错误语义：安装写监视时诊断必须逐字节
+    /// 上报，只读区域与非整块跨度也必须逐字节报错。
+    /// The per-byte fallback keeps write-watch and read-only/out-of-range
+    /// semantics: with a write watch armed the diagnostic reports every stored
+    /// byte, and a read-only region or a span that leaves the buffer must still
+    /// fail byte by byte.
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()> {
+        if crate::watch::write_watch_armed() || !self.writable {
+            for (offset, byte) in bytes.iter().enumerate() {
+                self.load_u8(addr.wrapping_add(offset as u32), *byte, cycles)?;
+            }
+            return Ok(());
+        }
+        if let Some(slot) = self.span_mut(addr, bytes.len()) {
+            slot.copy_from_slice(bytes);
+            *cycles += bytes.len() as u64;
+            return Ok(());
+        }
+        for (offset, byte) in bytes.iter().enumerate() {
+            self.load_u8(addr.wrapping_add(offset as u32), *byte, cycles)?;
+        }
         Ok(())
     }
 }
@@ -494,6 +537,47 @@ impl AddressBus for SimpleBus {
                 kind: BusErrorKind::NoDevice,
             })?
             .load_u8(addr, value, cycles)
+    }
+
+    /// Host-side bulk write, routed once for the whole span
+    /// 宿主侧批量写入，整段只路由一次
+    ///
+    /// Firmware loading writes megabytes through the host channel. Resolving the
+    /// region once and handing it the slice turns that into one bucket lookup
+    /// plus one region transfer per contiguous run. The PPB write epoch is still
+    /// advanced once per byte, because that counter records guest-visible PPB
+    /// traffic and must not change meaning; a bulk run never targets the PPB
+    /// window in practice.
+    /// 固件加载经宿主通道写入数 MB。整段只解析一次区域并把切片交给它，就把这段
+    /// 开销降为一次桶查找加一次区域传输。PPB 写世代仍按字节推进，因为该计数器
+    /// 记录客户机可见的 PPB 流量、语义不得改变；实际批量写入从不指向 PPB 窗口。
+    ///
+    /// # Errors
+    /// Returns `BusError` if no device is mapped at the given address.
+    /// 如果给定地址没有映射设备，返回 `BusError`。
+    fn load_bytes(&mut self, addr: Address, bytes: &[u8], cycles: &mut u64) -> BusResult<()> {
+        // 空写入与逐字节路径一致：不路由、不校验映射。
+        // An empty write matches the byte-wise path: no routing, no mapping check.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // 只有整段可能与 PPB 窗口相交时才逐字节记账，语义与逐字节路径相同。
+        // Only count per byte when the span can intersect the PPB window, which
+        // is equivalent to the byte-wise path.
+        let start = u64::from(addr);
+        let end = start + bytes.len() as u64;
+        if start < u64::from(PPB_WINDOW_BASE + PPB_WINDOW_SIZE) && end > u64::from(PPB_WINDOW_BASE)
+        {
+            for offset in 0..bytes.len() {
+                self.note_write(addr.wrapping_add(offset as u32));
+            }
+        }
+        self.find_region_mut(addr)
+            .ok_or(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            })?
+            .load_bytes(addr, bytes, cycles)
     }
 }
 

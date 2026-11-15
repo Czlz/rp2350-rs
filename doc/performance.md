@@ -1,11 +1,12 @@
 # 解释器热路径性能 / Interpreter hot-path performance
 
-本文件记录 **P0-1 第一轮** 与 **P0-2 第二轮** 的性能工作：测量方法、基线、每项优化
-的收益、最终数字、剩余瓶颈与下一轮建议。目标与实际结果并列，未达标处如实记录。
-This document records the first (P0-1) and second (P0-2) rounds of interpreter
-performance work: measurement method, baseline, per-optimization gains, final
-numbers, remaining bottlenecks and next-round suggestions. Targets and actual
-results are both listed, and any shortfall is reported as measured.
+本文件记录 **P0-1 第一轮**、**P0-2 第二轮** 与 **P0-3a 第三轮** 的性能工作：测量方法、
+基线、每项优化的收益、最终数字、剩余瓶颈与下一轮建议。目标与实际结果并列，未达标处
+如实记录。
+This document records the first (P0-1), second (P0-2) and third (P0-3a) rounds of
+interpreter performance work: measurement method, baseline, per-optimization
+gains, final numbers, remaining bottlenecks and next-round suggestions. Targets
+and actual results are both listed, and any shortfall is reported as measured.
 
 关联文档 / Related: [`playability-plan.md`](playability-plan.md)（为什么需要 ≥50 M steps/s）、
 [`crates/rp2350-core.md`](crates/rp2350-core.md)、[`crates/rp2350-cli.md`](crates/rp2350-cli.md)。
@@ -23,8 +24,9 @@ target\release\rp2350-cli.exe run --file "<MicroPython PICO2.uf2>" --max-cycles 
 
 - 固件 / Firmware：`E:\Source\mcu\pico\rp2350\gba\pokeemerald-rp2350\rp2350\hw\build_emerald\emerald.uf2`、
   `E:\Source\mcu\pico\python\micropython\RPI_PICO2-20260824-v1.29.0.uf2`。
-- 计时口径是**进程墙钟**（`Stopwatch`），包含构建好的 release 二进制启动与固件加载；
-  固件加载仅占几十毫秒，可忽略。
+- 计时口径是**进程墙钟**（`Stopwatch`），包含构建好的 release 二进制启动与固件加载。
+  第三轮实测发现 emerald 这类 12 MB UF2 的装载曾占 **0.72~1.27 s**（见 7.2），
+  修正了本文件早期「加载仅几十毫秒、可忽略」的判断。
 - 该机器上还有并行会话编译同一 workspace，个别样本会偏慢；表中以 3~5 次中的**最小值**
   为主、中位数为辅，并保留全部样本。
 - 诊断（`[run]`/`[tail]`/`[hstx]`/`[dma]`）内容在改动前后逐一比对，确认完全相同
@@ -314,3 +316,166 @@ IPR 字节写移动优先级桶、禁用/未挂起/活跃跳过、复位优先�
 
 要真正进入 **≥50 M steps/s** 区间（20 fps 游玩），仍需 JIT 或帧级并行，
 解释器微优化已接近上限；详见 [`playability-plan.md`](playability-plan.md)。
+
+---
+
+## 7. 第三轮 / Round 3（P0-3a：`rp2350-arm` + `rp2350-core`）
+
+第二轮把 emerald 50 M 步做到 3.21~3.39 s，并把剩余成本归因为「每步骨架」
+（取指/译码/调度/前端循环）。第三轮**先重新分桶**，结论与任务假设不同：
+`check_pending_exceptions` 在第二轮位图选择器之后已经只要 **约 4~5 周期/步**，
+真正的隐藏大头是**固件加载（启动）**，而不是每步解释器开销。
+Round 2 brought emerald's 50 M steps to 3.21–3.39 s and blamed the per-step
+skeleton. Round 3 re-measured first, and the task's premise was wrong:
+`check_pending_exceptions` already costs only **~4–5 cycles/step** after round
+2's bitmap selector. The real hidden cost was **firmware loading (startup)**.
+
+### 7.1 重新分桶 / Re-measured profile
+
+临时探针（交付前已删除）：`rdtsc` + 1/64 采样，并用一对空 `rdtsc` 标定探针自身
+开销（实测 **33 周期**）。第一批数字没有扣除该开销，因此把每个桶都放大了约
+30 周期——这正是第二轮「调度 40 周期」的来源。
+Temporary probe (removed before delivery): `rdtsc` with 1-in-64 sampling plus an
+empty-span calibration for the probe itself (**33 cycles**). The first numbers
+did not subtract it, so every bucket was inflated by ~30 cycles — which is
+exactly where round 2's "40 cycles for scheduling" came from.
+
+标定后（emerald 50 M，TSC 周期/步；`ARM-only` 一列是同机微基准，直接驱动
+`CortexM33Core::step`，不含 cli/外设）：
+
+| 区段 / Section | ARM 侧 | 整机 / full machine | 说明 |
+|---|---|---|---|
+| 取指（缓存命中 + 世代号） | 3~5 | 3~5 | 取指缓存 10 M 步内 **miss=0** |
+| 译码 + 执行（含数据访问） | 10~35 | 10~35 | 噪声较大；热循环 24 条指令/迭代 |
+| `check_pending_exceptions` | **4~5** | 4~5 | PRIMASK=0 时也只要一次位图构造 |
+| 单步其余部分 | ~1 | ~1 | usage-fault / undefined 检查 |
+| cli 骨架（`pc()`/`record_step`/泵送节流/通知） | — | ~20 ns/步 | `rp2350-cli`，本轮不可改 |
+| **合计** | **~27~30 ns/步** | **~50 ns/步** | 见 7.3 |
+
+计数器（emerald 前 20 M 步）：`PRIMASK=0` 仅占 **3.3 %**（第二轮窗口是 54 %），
+整段只投递 1 次中断；也就是说本轮基准里异常扫描本来就不是热点。
+Counters over the first 20 M steps: `PRIMASK=0` only **3.3 %** of steps (round
+2's window had 54 %) with one delivery, so the exception scan was never the hot
+spot in this benchmark.
+
+`Machine`/`run` 每步固定做的工作（预算检查、`pc()`、`record_step`、boot-ROM
+窗口比较、`core.step`、`record_sync_trap`、DMA/PIO 节流比较、自旋检测、PPB
+世代比较）合计约 **20 ns/步**，并且全部在 `rp2350-cli`（本轮白名单外）。
+
+### 7.2 逐项 A/B / Per-item A/B
+
+所有 50 M 数字都是**同一时段交错运行、取 3 次最小值**（并行会话编译会带来
+±15 % 抖动）。
+
+| # | 优化 / Optimization | 文件 / File | 前 / Before | 后 / After | 收益 / Gain |
+|---|---|---|---|---|---|
+| 1 | 异常门控：`Nvic::has_runnable`（`ISER & ISPR` 的保守缓存，全部写入口维护）+ `check_pending_exceptions` 短路 | `rp2350-arm/src/{nvic.rs,lib.rs}` | 27.24 ns/步¹ | 26.06 ns/步¹ | 上限 **−1.2 ns/步**（端到端 <0.2 %，见下） |
+| 2 | UF2 重复块检查：`Vec::contains`（O(n²)，4.8 万块）→ `HashSet` | `rp2350-core/src/uf2.rs` | 3.711 s | 3.032 s | **−0.68 s（−18 %）** |
+| 3 | UF2 整块宿主写入：逐字节 `load_u8`（每字节一次写锁 + 一次世代递增）→ `AddressBus::load_bytes`（一次路由/锁/世代） | `rp2350-core/src/{bus.rs,memory.rs,flash.rs,uf2.rs}` | 2.634 s | 2.502 s | −0.13 s（−5 %） |
+| 4 | ELF 段加载与 `.bss` 零填充同样走 `load_bytes`（4 KiB 分块） | `rp2350-core/src/firmware.rs` | — | — | 与 #3 同源；emerald 走 UF2，故本表未体现 |
+
+¹ 第 1 项只能在 ARM-only 微基准上测出：把 `check_pending_exceptions` **整体短路**
+（收益上限）也只省 1.2 ns/步。端到端 50 M 的差异低于噪声，因此如实记为「语义精确、
+零风险，但收益极小」。任务给出的「每步 40 周期」是未标定探针的读数。
+
+启动开销（`run --max-cycles 1000`，含进程启动 + 读 24 MB UF2 + 解析 + 装载）：
+
+| 版本 / Build | 样本 (s) | 最小值 |
+|---|---|---|
+| 原状（线性查重 + 逐字节装载） | 1.268 / 0.749 / 0.762 / 0.717 / 0.820 | **0.72 s** |
+| 仅哈希查重（逐字节装载） | 0.184 / 0.166 / 0.155 / 0.149 | **0.149 s** |
+| 本轮最终（哈希 + 批量装载） | 0.088 / 0.050 / 0.046 / 0.045 | **0.045 s** |
+
+即启动从 **0.72~1.27 s 降到 0.045 s**：12 MB 映像的 4.8 万块线性查重是
+O(n²)（十亿级比较），逐字节装载则要 1230 万次总线往返（每次一次写锁）。
+That is, startup drops from **0.72–1.27 s to 0.045 s**: the 48 k-block linear
+duplicate scan is O(n²) (billions of comparisons) and the byte-wise load costs
+12.3 M bus round trips, each taking the flash write lock.
+
+一致性论证 / Exactness：
+
+- `load_bytes` 的 trait 默认实现逐字节转发 `load_u8`；`SimpleBus` 只把整段路由
+  一次，`FlashRegion`/`RamRegion` 才做批量拷贝。越界跨度回退逐字节，因此错误类型
+  与「越界前字节已落下」的行为不变；写监视安装期间 `RamRegion` 强制逐字节
+  （诊断逐字节上报）；`FlashRegion` 仍拒绝客户机写，宿主侧每次连续写入只递增一次
+  内容世代（判定条件仍是「变了就失效」，取指缓存语义不变）；PPB 写世代在跨度可能
+  与 PPB 窗口相交时仍逐字节推进。
+- 哈希查重与线性查重判定完全相同（同一 `(family, block_number)` 键），错误报文
+  也相同；`cargo test` 的 `rejects_duplicate_block_numbers_within_family` /
+  `allows_duplicate_numbers_across_families` 覆盖。
+- `RP2350_WATCH=20000000-20082000` 下，改动前后 230 316 条 `[watch]` 输出逐字节
+  相同（用只差 UF2 装载路径的两个二进制对照）。
+
+### 7.3 最终数字 / Final numbers
+
+同一 release 二进制，预热后 8 次取最小值（并列全部样本）：
+
+| 场景 / Case | 步数 | 样本 (s) | 最小值 | 中位数 | 吞吐（最小值） |
+|---|---|---|---|---|---|
+| emerald | 50 M | 2.640 / 2.441 / 2.440 / 2.453 / 2.442 / 2.414 / 2.548 / 2.632 | **2.414 s** | 2.442 s | **20.7 M steps/s** |
+| emerald | 300 M | 20.52 | **20.52 s** | — | 14.6 M steps/s |
+
+（同一二进制更早一轮 5 次样本为 2.512 / 2.420 / 2.573 / 2.629 / 2.652，最小值
+2.420 s；并行负载下会看到 2.6 s 以上。）
+
+- emerald 50 M：**3.50 s → 2.414 s（1.45×）**（本轮开头同机同口径基线
+  3.502 / 3.527 / 3.501 s；第二轮记录的最好值 3.212 s）。目标 **≤2.6 s 达成**，
+  最小值 2.414 s、中位数 2.442 s，余量约 0.16 s。
+- emerald 300 M：**22.29 s → 20.52 s（1.09×）**。300 M 只付一次启动，因此收益主要
+  来自启动省下的 0.7~1.2 s；运行期每步成本本轮基本未变（ARM 侧只多了异常门控），
+  其余差异在并行负载噪声内。
+- ARM-only 微基准（同机、emerald 自旋循环 2000 万步、直接调 `CortexM33Core::step`）：
+  ~27~30 ns/步 → 整机 ~50 ns/步，即 **ARM 解释器约占 55 %，cli + 外设骨架约 45 %**。
+
+### 7.4 不变量核对 / Invariant checks
+
+| 检查 / Check | 结果 |
+|---|---|
+| emerald 50 M 全部 stdout（49 行） | 与改动前**逐字节相同**（`Compare-Object` 无差异） |
+| emerald 300 M `executed 300000000 steps`、`final PC=0x1000B3A6` | ✅ |
+| `dma=2195390 busy=0x0009` | ✅ |
+| `hstx words=5401204 underruns=0 fifo=8 enabled=true wof=false unknown=0` | ✅ |
+| `core1 state=Running pc=0x10009D92 sp=0x2003D680 launches=1` | ✅ |
+| 8 条 `[irq]` | ✅ |
+| 总线错误 | 无 |
+| `RP2350_WATCH` / `RP2350_WATCHV` | 输出逐字节不变（见 7.2） |
+| FV-1 / FV-2 / FV-3 | 均 `[repl] banner` + `stdout: 42` ✅ |
+| `cargo test --all-features` | 全绿（38 个测试目标；rp2350-arm 419、core 89、cli 73、periph 347…） |
+| `cargo fmt --check` / `clippy -D warnings -W clippy::pedantic` / `cargo doc --no-deps` | 全绿 |
+
+新增测试 15 项：`Nvic` 3 项（门控写入口全覆盖、活跃时保守、与线性参考对表）、
+核心级 5 项（未使能不投递、PRIMASK 屏蔽、ICPR 关闸、SysTick 置挂起、混合序列
+逐步一致性）、`rp2350-core` 7 项（总线批量与逐字节等价、越界同错、只读拒绝、
+写监视回退；Flash 批量与逐字节同字节/同周期；总线经宿主通道写 Flash；
+ELF `load_into` 与逐字节参考逐字节一致）。
+
+### 7.5 剩余瓶颈 / Remaining bottlenecks
+
+启动已从 **0.72~1.27 s 压到 0.045 s**，50 M 的墙钟现在几乎全部是运行期：
+
+| 组成 | 每步 | 占比 | 归属 |
+|---|---|---|---|
+| cli 骨架（`pc()`、`record_step`、boot-ROM 窗口、`core.step` 分派、`record_sync_trap`、DMA/PIO 节流、自旋检测、PPB 世代） | ~20 ns | ~40 % | `rp2350-cli` |
+| ARM 解释器（取指 + 译码 + 执行 + 数据访问） | ~27~30 ns | ~55 % | `rp2350-arm` + `rp2350-core` |
+| 外设/MMIO（定时器读、HSTX/DMA 批次） | 少数 ns | ~5 % | `rp2350-periph` |
+
+本轮未做、并说明理由：
+
+- **SRAM 取指缓存**：emerald 基准全程从 Flash 取指，实测取指缓存 **miss=0**；
+  SRAM 入缓存还必须在每次存储时失效（自修改代码），收益不可测而风险显著，故不做。
+- **数据访问快路径**（去掉第二次 `dyn` 调用）：热循环约 0.35 次数据访问/步，
+  每次最多省 5~8 周期，端到端 <1 %，与改动风险不成比例。
+- **译码优化**：分桶显示 `dec+exec` 波动 10~35 周期/步，噪声很大；第二轮结论
+  （收益 <3 %）仍然成立。
+
+### 7.6 下一轮建议 / Next round
+
+| 优先级 | 改动 | 归属 | 预期 |
+|---|---|---|---|
+| P0 | `run` 循环把 N 步合成一次 `step`（逐指令 watch/GDB 语义用分支守卫），把 ~20 ns/步的 cli 骨架摊薄 | `rp2350-cli` | 20~30 % |
+| P0 | MMIO 读路径（定时器轮询每步约 0.1 次、每次数百周期）：设备内联 + 只读寄存器快照 | `rp2350-periph` | 5~10 % |
+| P1 | 启动路径其余分配（4.8 万个 `Vec` 载荷）改为一次性 arena | `rp2350-core` | 启动再省 ~0.02 s（已很小） |
+| P2 | Thumb-32 热分支收敛（`fpu::try_execute`/`coproc::try_execute` 前置判断） | `rp2350-arm` | <3 % |
+
+若要达到 20 fps 游玩（≥50 M steps/s），在 cli 批量步进之后仍需 JIT 或帧级并行；
+详见 [`playability-plan.md`](playability-plan.md) 的风险节。

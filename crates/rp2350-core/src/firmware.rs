@@ -133,17 +133,23 @@ impl FirmwareImage {
     /// Returns a bus error if any segment address is not mapped.
     /// 若任一段地址未映射，返回总线错误。
     pub fn load_into(&self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
+        // `.bss` 尾部按块清零，避免为整段 `memsz` 分配临时缓冲区。
+        // The `.bss` tail is zero-filled in chunks so no temporary buffer for the
+        // whole `memsz` is allocated.
+        const ZERO_CHUNK: usize = 4096;
+        let zeroes = [0u8; ZERO_CHUNK];
         let mut cycles = 0u64;
         for segment in &self.segments {
-            for (offset, byte) in segment.data.iter().enumerate() {
+            // 整段一次写入：区域只解析一次、只取一次锁、只递增一次世代。
+            // One bulk write per segment: the region is resolved once, takes one
+            // lock and bumps the content generation once.
+            bus.load_bytes(segment.address, &segment.data, &mut cycles)?;
+            let mut offset = segment.data.len();
+            while offset < segment.mem_size {
+                let length = (segment.mem_size - offset).min(ZERO_CHUNK);
                 let addr = segment.address.wrapping_add(offset as u32);
-                // 加载器走宿主写入通道，因此可以直接编程只读的 Flash 区域。
-                // The loader uses the host write path so it can program read-only flash.
-                bus.load_u8(addr, *byte, &mut cycles)?;
-            }
-            for offset in segment.data.len()..segment.mem_size {
-                let addr = segment.address.wrapping_add(offset as u32);
-                bus.load_u8(addr, 0, &mut cycles)?;
+                bus.load_bytes(addr, &zeroes[..length], &mut cycles)?;
+                offset += length;
             }
         }
         Ok(())
@@ -239,6 +245,55 @@ mod tests {
         assert_eq!(bus.read_u8(0x2000_0002, &mut cycles).unwrap(), 0x33);
         for addr in 0x2000_0003..0x2000_0008 {
             assert_eq!(bus.read_u8(addr, &mut cycles).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn load_into_matches_the_byte_wise_reference() {
+        // 批量路径必须写入与逐字节路径完全相同的字节（含 `.bss` 零填充）。
+        // The bulk path must write exactly the same bytes as the byte-wise
+        // reference, including the zero-filled `.bss` tail.
+        let elf = build_elf(
+            0x2000_0000,
+            &[(0x2000_0000, &[0x11, 0x22, 0x33], 9), (0x2000_1000, &[], 5)],
+        );
+        let image = FirmwareImage::from_elf_bytes(&elf).unwrap();
+
+        let mut bulk = SimpleBus::new();
+        bulk.register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 0x2000)))
+            .unwrap();
+        let mut bytewise = SimpleBus::new();
+        bytewise
+            .register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 0x2000)))
+            .unwrap();
+        // 预填 0xFF，使零填充可观察。
+        // Pre-fill 0xFF so the zero fill is observable.
+        let mut cycles = 0u64;
+        for addr in 0x2000_0000..0x2000_2000 {
+            bulk.write_u8(addr, 0xFF, &mut cycles).unwrap();
+            bytewise.write_u8(addr, 0xFF, &mut cycles).unwrap();
+        }
+
+        image.load_into(&mut bulk).unwrap();
+        for segment in &image.segments {
+            for (offset, byte) in segment.data.iter().enumerate() {
+                bytewise
+                    .load_u8(segment.address + offset as u32, *byte, &mut cycles)
+                    .unwrap();
+            }
+            for offset in segment.data.len()..segment.mem_size {
+                bytewise
+                    .load_u8(segment.address + offset as u32, 0, &mut cycles)
+                    .unwrap();
+            }
+        }
+
+        for addr in 0x2000_0000..0x2000_2000 {
+            assert_eq!(
+                bulk.read_u8(addr, &mut cycles).unwrap(),
+                bytewise.read_u8(addr, &mut cycles).unwrap(),
+                "address {addr:#010X} must match the byte path"
+            );
         }
     }
 
