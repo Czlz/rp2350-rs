@@ -47,7 +47,7 @@
 > | GAP-04 | RISC-V 非法 CSR 陷阱 + ROM 表项 + `misa.B` | riscv + bootrom | — | ✅ |
 > | GAP-05 | USB 主机 1 ms SOF 调度 + 双缓冲 OUT | usb-host + usb | — | ✅ |
 > | GAP-06 | HSTX 原始路径计时 + 像素捕获 API | periph | — | ✅ |
-> | GAP-02b | `Machine` 按核步进，`vCont;s:1/s:2` 只推进选中核 | cli + gdb | GAP-02 | 🚧 wave 4 |
+> | GAP-02b | `Machine` 按核步进，`vCont;s:1/s:2` 只推进选中核 | cli + gdb | GAP-02 | ✅ |
 | GAP-07 | 阻塞式 `SIO_FIFO_RD`/FIFO IRQ，重新落地 `WFI`/`WFE` | periph → arm/cli | GAP-07a | ⏳ wave 4 |
 > | GAP-08 | PSRAM（XIP CS1）内存模型 + 挂载助手 | periph | — | ✅（CLI 接线见 GAP-08b） |
 > | GAP-08b | CLI 挂载 PSRAM 窗口（`run`/`repl` 地址映射） | cli | GAP-08 | ⏳ wave 5 |
@@ -55,6 +55,20 @@
 > | GAP-10 | MCP TLS 传输 | mcp | — | ⏳ wave 5 |
 > | GAP-11 | DMA `SNIFF` 其余模式 / 周期精确仲裁 / PERFCTR | periph | — | ⏳ wave 6 |
 > | GAP-12 | 文档陈旧段落同步 | doc | — | 🚧 主会话直接改 |
+>
+> **验收记录 / Acceptance（2026-11-15，wave 1–4）**
+>
+> 全仓 `cargo fmt --check` / `clippy --all-targets --all-features -D warnings -W pedantic`
+> / `cargo test --all-features`（36 个测试目标）/ `cargo doc --no-deps` 全绿；FV-1/2/3 均
+> `stdout: 42`；emerald 300M 步 135 s 跑满、`hstx words=5401204 underruns=0 wof=false
+> unknown=0`、`core1 Running`、无总线错误。
+>
+> 当前测试规模：periph 332、arm 398、cli 108(+1 ignored)、gdb 78、riscv 49、bootrom 21、
+> usb 53、usb-host 31、egui 55、core 65。
+>
+> Remaining: GAP-08b（CLI 挂载 PSRAM）、GAP-10（MCP TLS）、GAP-11（DMA 收尾）、
+> GAP-07（阻塞式 SIO FIFO → 睡眠语义，需要新的总线 stall/重试机制，已在 GAP 表标注前置
+> 条件）。
 >
 > 并发上限 2（crate 不相交）；每波完成后主会话复跑四道门禁 + FV-1/2/3 + emerald
 > 300M 冒烟，再派下一波。Concurrency is capped at 2 disjoint crates per wave; the main
