@@ -22,9 +22,11 @@
 | `execute_thumb32::coproc` | CP0 GPIO coprocessor and CP4 DCP stub (`MCR`/`MRC`/`MCRR`/`MRRC`) |
 | `fpu` | FPv5-SP state: S0-S31 / D0-D15 views, FPSCR, FPEXC, FPCCR/FPCAR/FPDSCR, CPACR fields |
 | `nvic` | NVIC: ISER/ICER/ISPR/ICPR/IABR/IPR/STIR, priority routing |
+| `scb` | `SCB_ICSR` PendSV/SysTick pending latches and `SHPR2`/`SHPR3` priorities |
+| `system_exceptions` | PendSV (14) / SysTick (15) arbitration, delivery, `ICSR` view and diagnostics |
 | `scr` | `SCR` sleep-control bits (`SLEEPONEXIT`/`SLEEPDEEP`/`SEVONPEND`) |
 | `systick` | SysTick 24-bit down counter with reload + interrupt |
-| `system_access` | System control space routing (`SCB_VTOR`/`SCB_CPACR`/`SCB_CFSR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
+| `system_access` | System control space routing (`SCB_VTOR`/`SCB_ICSR`/`SCB_SHPR2`/`SCB_SHPR3`/`SCB_CPACR`/`SCB_CFSR`/`SCB_SCR`/`SCB_STIR`, FPU system registers, NVIC/IPR aliases, SysTick) |
 | `fetch_cache` | Direct-mapped flash XIP instruction fetch cache (private, enabled per core) |
 | `decode_cache` | Direct-mapped decoded-instruction cache: length, raw word, dispatch tag per flash `PC` |
 | `execute_thumb16::fast` | Hot Thumb-16 executors shared by the decoder and the decode-cache fast path |
@@ -40,7 +42,8 @@
 pub struct CortexM33Core {
     pub core_id: CpuId,          // Core 0 or 1
     pub registers: CortexM33Registers,
-    pub nvic: Nvic,
+    pub nvic: Nvic,              // external IRQ lines 0..=255 only
+    pub scb: Scb,                // PendSV/SysTick latches + SHPR2/SHPR3
     pub systick: SysTick,
 }
 
@@ -59,6 +62,11 @@ impl CortexM33Core {
 
     // Flash fetch cache / Flash 取指缓存
     pub fn set_flash_fetch_cache(&mut self, enabled: bool);
+
+    // System exceptions / 系统异常
+    pub fn pend_pendsv(&mut self);         // ICSR.PENDSVSET
+    pub fn pend_systick(&mut self);        // ICSR.PENDSTSET + COUNTFLAG
+    pub fn system_exception_state(&self) -> SystemExceptionState;
 }
 
 impl CpuCore for CortexM33Core {
@@ -92,6 +100,23 @@ move.
 递增 `rp2350_core::flash::content_generation` 并清空整表。SRAM 从不入缓存，因此
 自修改 SRAM 代码语义完全不变。缓存按区域半字读记入同样的两个总线周期，因此
 `total_cycles` 不会漂移。
+
+`pend_pendsv()` / `pend_systick()` are the host-side entry points for the two
+system exceptions (the same effect as `ICSR.PENDSVSET` / `ICSR.PENDSTSET`).
+`system_exception_state()` returns a `Copy` snapshot whose `Display`/`summary()`
+is the stable diagnostic string `systick=<state> pendsv=<state>`, where `<state>`
+is one of `idle`, `pending`, `active` or `active+pending`.
+`CpuCore::description()` appends that string in brackets
+(`[systick=… pendsv=…]`), so `Machine::core_description()` and every frontend
+that prints the core description show the two system exceptions without a CLI
+change.
+`pend_pendsv()` / `pend_systick()` 是两个系统异常的宿主侧入口（效果等于
+`ICSR.PENDSVSET` / `ICSR.PENDSTSET`）。`system_exception_state()` 返回 `Copy`
+快照，其 `Display`/`summary()` 为稳定诊断字符串
+`systick=<state> pendsv=<state>`，`<state>` 为 `idle`、`pending`、`active` 或
+`active+pending`。`CpuCore::description()` 以方括号追加该字符串
+（`[systick=… pendsv=…]`），因此 `Machine::core_description()` 以及所有打印
+核心描述的前端都无需修改 CLI 就能看到两个系统异常。
 
 ### `CortexM33Registers`
 
@@ -232,8 +257,26 @@ impl Nvic {
     /// Conservative "some enabled IRQ is pending" hint (`false` is exact).
     /// 保守的「存在已使能且挂起中断」提示位（`false` 精确）。
     pub fn has_runnable(&self) -> bool;
+
+    /// Any pending external line, enabled or not (`ICSR.ISRPENDING` view).
+    /// 任何挂起的外部线（无论是否使能，`ICSR.ISRPENDING` 视图）。
+    pub fn has_any_pending(&self) -> bool;
+
+    /// `BASEPRI` rule for an already-decoded priority (system exceptions too).
+    /// 对已解码优先级应用 `BASEPRI` 规则（系统异常也可用）。
+    pub fn basepri_allows_priority(&self, priority: u8, basepri: u32) -> bool;
 }
 ```
+
+NVIC `IPR` bytes are addressed one per IRQ: the absolute address
+`0xE000_E400 + irq` selects byte `irq % 4` of word `irq / 4`. `system_access`
+decodes that mapping directly, so byte writes to IRQ 4 and above no longer land
+on IRQ0..3 (a pre-existing routing defect fixed together with the system
+exception work); `IPR` word accesses still pack four IRQs little-endian.
+NVIC 的 `IPR` 每个 IRQ 一个字节：绝对地址 `0xE000_E400 + irq` 选择字
+`irq / 4` 的字节 `irq % 4`。`system_access` 直接按该映射解码，因此 IRQ4 以上的
+字节写不再落到 IRQ0..3（该既有路由缺陷随系统异常工作一并修复）；字访问仍按小端
+打包 4 个 IRQ。
 
 ### Priority selection / 优先级选择
 
@@ -249,9 +292,11 @@ The result is identical to a 256-entry linear scan:
 * within one priority the lowest IRQ number wins (`trailing_zeros` returns the
   least significant set bit);
 * an active interrupt is never selected again (skipped by `!IABR`);
-* `PRIMASK` / `BASEPRI` are core-level masks, unchanged by this selector — the
-  core still short-circuits on `PRIMASK` before it calls into the NVIC, and
-  `BASEPRI` keeps its stored-only semantics.
+* `PRIMASK` / `FAULTMASK` / `BASEPRI` are applied by the core after the
+  selector returns a candidate, and the same gate covers PendSV/SysTick; an
+  active exception is only preempted by a strictly higher priority.
+* `PRIMASK` / `FAULTMASK` / `BASEPRI` 由核在选择器返回候选后应用，同一门控也
+  覆盖 PendSV/SysTick；活跃异常只能被严格更高的优先级抢占。
 
 `nvic.rs` unit tests compare the bitmap selector against a linear reference
 implementation over pseudorandom enable/pending/active/priority matrices.
@@ -261,9 +306,9 @@ implementation over pseudorandom enable/pending/active/priority matrices.
 优先级桶是一个 `u32` 掩码，由 `set_priority` / `write_ipr_word` 增量维护
 （`write_ipr_byte` 只在*解码后*优先级变化时移动位）。结果与 256 项线性扫描完全
 一致：数字越小优先级越高；同优先级取 IRQ 号最小者（`trailing_zeros` 返回最低
-置位）；活跃中断不再被选中（由 `!IABR` 排除）；`PRIMASK`/`BASEPRI` 属于核级
-掩码，选择器语义不变——核在调用 NVIC 之前仍按 `PRIMASK` 短路，`BASEPRI` 保持
-「仅存储」语义。单元测试用伪随机矩阵把位图选择器与线性参考实现对表。
+置位）；活跃中断不再被选中（由 `!IABR` 排除）；`PRIMASK`/`FAULTMASK`/`BASEPRI`
+由核在选择器返回候选后应用，同一门控也覆盖 PendSV/SysTick；活跃异常只能被严格
+更高的优先级抢占。单元测试用伪随机矩阵把位图选择器与线性参考实现对表。
 
 ### Pending gate / 挂起门控
 
@@ -350,14 +395,16 @@ impl SleepReason {
     wake behaviour as shallow sleep; power-down and clock-gating electrical
     effects are not modeled.
   * The core-side register is reached through `CpuCore::system_write`
-    (`0xE000_ED10`). In a full machine the `rp2350-periph` PPB stub currently
-    replays only `VTOR`, `CPACR`, SysTick and NVIC writes, so a firmware `STR`
-    to `SCR` remains in PPB storage until that replay whitelist also forwards
-    `0xE000_ED10`; the unit tests drive the core register directly.
+    (`0xE000_ED10`). In a full machine the `rp2350-periph` PPB stub also replays
+    `VTOR`, `CPACR`, `ICSR`, `SHPR2`, `SHPR3` and NVIC writes into the core, so a
+    firmware `STR` to `SCR` reaches it once the shared write log is drained.
+    SysTick itself is deliberately **not** replayed: the peripheral
+    `SysTickCounter` owns the counter and follows the live clock tree.
   * 核心侧寄存器通过 `CpuCore::system_write`（`0xE000_ED10`）访问。完整机器中
-    `rp2350-periph` 的 PPB 桩当前只回放 `VTOR`、`CPACR`、SysTick 与 NVIC 写入，
-    因此固件对 `SCR` 的 `STR` 会留在 PPB 存储中，直到该回放白名单也转发
-    `0xE000_ED10`；单元测试直接驱动核心寄存器。
+    `rp2350-periph` 的 PPB 桩还会把 `VTOR`、`CPACR`、`ICSR`、`SHPR2`、`SHPR3`
+    与 NVIC 写入回放到核，因此固件对 `SCR` 的 `STR` 会在共享写入日志被排空时
+    到达核心。SysTick 本身有意**不**回放：外设侧 `SysTickCounter` 拥有计数器并
+    跟随实时时钟树。
 * **Sleeping cores still age**: [`CpuCore::step`] on a sleeping core advances
   `SysTick` and `total_cycles` by one, then checks the wake condition. The first
   step whose condition holds executes the instruction at `PC` immediately
@@ -372,30 +419,33 @@ impl SleepReason {
   the bus (`MemoryRegion::read_would_stall`), so the device is never touched and
   nothing can be consumed or latched by a stalled access; the identical load is
   replayed once data arrives and then retires exactly once.
-* `check_pending_exceptions` now honours `FAULTMASK` and `BASEPRI` in addition to
-  `PRIMASK`, and the sleep wake path uses the same gate, so a sleeping core never
-  enters an interrupt it should keep masked.
+* `check_pending_exceptions` honours `FAULTMASK` and `BASEPRI` in addition to
+  `PRIMASK`, applies the strictly-higher-priority preemption rule, and arbitrates
+  external interrupts together with PendSV (14) and SysTick (15); the sleep wake
+  path uses the same gate, so a sleeping core never enters an exception it should
+  keep masked.
 
 **Not modelled**: the electrical effect of `SLEEPDEEP` (power-down, clock
-gating, state retention), `WFE`'s optional timeout (`-w`), SysTick exception
-delivery (`nvic.set_pending(EXC_SYSTICK)` marks the external IRQ of the same
-number; a dedicated SysTick exception entry is still a gap), and the
-`SCB_ICSR` `PENDSVSET`/`PENDSTSET` paths. `SEVONPEND` therefore covers NVIC
-external interrupts (including `STIR`/`ISPR` writes) and the SysTick pending
-bit as modeled, but not pending transitions that would be initiated through an
-unimplemented `ICSR`. A host that never signals an event and never enables an
-interrupt will see a `WFE`/`WFI` sleeper stay asleep while the machine clock
-keeps running — that is the hardware behaviour, and the CLI reports it as a
-`[run] sleep stall` diagnostic instead of hanging silently.
+gating, state retention), `WFE`'s optional timeout (`-w`), NMI/HardFault/SVCall
+delivery, and the `rp2350-cli` forwarding of a peripheral `SysTickCounter`
+expiry into [`CortexM33Core::pend_systick`] (the core side is implemented and
+covered by unit tests; until the driver forwards
+`BootPeripherals::take_systick_pending()`, a machine run keeps the expiry in the
+peripheral latch). `SEVONPEND` covers NVIC external interrupts, `STIR`/`ISPR`
+writes, `ICSR.PENDSVSET`/`PENDSTSET` and the SysTick underflow. A host that never
+signals an event and never enables an interrupt will see a `WFE`/`WFI` sleeper
+stay asleep while the machine clock keeps running — that is the hardware
+behaviour, and the CLI reports it as a `[run] sleep stall` diagnostic instead of
+hanging silently.
 
 未建模：`SLEEPDEEP` 的电气效果（掉电、时钟门控、状态保持）、`WFE` 的可选超时
-（`-w`）、SysTick 异常投递（`nvic.set_pending(EXC_SYSTICK)` 目前标记同号外部
-IRQ，专用 SysTick 异常进入仍是缺口）以及 `SCB_ICSR` 的
-`PENDSVSET`/`PENDSTSET` 路径。因此 `SEVONPEND` 覆盖 NVIC 外部中断（含
-`STIR`/`ISPR` 写入）与已建模的 SysTick 挂起位，但不覆盖经未实现 `ICSR` 发起的
-挂起跳变。若宿主从不发送事件、也从不使能中断，`WFE`/`WFI` 睡眠者会保持睡眠而
-机器时钟继续推进——这正是硬件行为，CLI 以 `[run] sleep stall` 诊断报告，而不是
-静默耗尽预算。
+（`-w`）、NMI/HardFault/SVCall 投递，以及 `rp2350-cli` 把外设 `SysTickCounter`
+到期转发给 [`CortexM33Core::pend_systick`]（核侧已实现并有单元测试；在驱动转发
+`BootPeripherals::take_systick_pending()` 之前，机器运行会把到期留在外设锁存中）。
+`SEVONPEND` 覆盖 NVIC 外部中断、`STIR`/`ISPR` 写入、`ICSR.PENDSVSET`/`PENDSTSET`
+与 SysTick 下溢。若宿主从不发送事件、也从不使能中断，`WFE`/`WFI` 睡眠者会保持
+睡眠而机器时钟继续推进——这正是硬件行为，CLI 以 `[run] sleep stall` 诊断报告，
+而不是静默耗尽预算。
 
 ### `SysTick`
 
@@ -425,8 +475,15 @@ impl SysTick {
     pub fn interrupt_enabled(&self) -> bool;
     pub fn read_cvr(&self) -> u32;
     pub fn write_cvr(&mut self, value: u32);
+    pub fn write_csr(&mut self, value: u32);   // ENABLE/TICKINT/CLKSOURCE; clears COUNTFLAG
+    pub fn set_countflag(&mut self);           // ICSR.PENDSTSET side effect
 }
 ```
+
+`tick()` pends the SysTick **system exception** through
+`CortexM33Core::pend_systick()` (exception 15), never NVIC external IRQ 15.
+`tick()` 通过 `CortexM33Core::pend_systick()` 挂起 SysTick **系统异常**（异常 15），
+绝不会挂起 NVIC 外部 IRQ 15。
 
 ### `ExceptionHandler`
 
@@ -1327,20 +1384,111 @@ DCP 被建模为永远空闲。`MRC`/`MRRC` 将目标寄存器置零，`MCR`/`MC
 | 15 | SysTick | configurable | System tick timer |
 | 16+ | IRQ(n) | configurable | External interrupts |
 
+**Vectors** are fetched from `VTOR + 4 * exception_number`: PendSV at
+`VTOR + 0x38`, SysTick at `VTOR + 0x3C`, external IRQ `n` at
+`VTOR + 0x40 + 4n`. `VTOR` masks its low 7 bits, so the table is
+128-byte aligned.
+**向量**取自 `VTOR + 4 * 异常号`：PendSV 位于 `VTOR + 0x38`、SysTick 位于
+`VTOR + 0x3C`、外部 IRQ `n` 位于 `VTOR + 0x40 + 4n`。`VTOR` 低 7 位被屏蔽，
+因此向量表按 128 字节对齐。
+
 **Stack frame on exception entry** (8 words): R0-R3, R12, LR, PC, XPSR.
 When the FPU is active the frame is **extended** with the 17-word FP context
 (S0-S15, FPSCR) plus one padding word; see
 [Lazy FP Stacking and Extended Frames](#lazy-fp-stacking-and-extended-frames--惰性浮点压栈与扩展帧).
-**EXC_RETURN** values: `0xFFFFFFF1` (return to handler), `0xFFFFFFF9` (thread MSP),
-`0xFFFFFFFD` (thread PSP). With an extended frame bit 4 is cleared, giving
-`0xFFFFFFE1` / `0xFFFFFFE9` / `0xFFFFFFED`.
-
 **异常进入栈帧**（8 字）：R0-R3、R12、LR、PC、XPSR。浮点单元活跃时栈帧为**扩展帧**，
 额外包含 17 字浮点上下文（S0-S15、FPSCR）与 1 字填充；详见
-[惰性浮点压栈与扩展帧](#lazy-fp-stacking-and-extended-frames--惰性浮点压栈与扩展帧)。
-**EXC_RETURN** 取值：`0xFFFFFFF1`（返回 Handler）、`0xFFFFFFF9`（Thread MSP）、
-`0xFFFFFFFD`（Thread PSP）。扩展帧会清除 bit4，得到 `0xFFFFFFE1` / `0xFFFFFFE9` /
-`0xFFFFFFED`。
+[惰性浮点压栈与扩展帧](#lazy-fp-stacking-and-extended-frames--惰性浮点压栈与扩展帧).
+**EXC_RETURN** values: `0xFFFFFFF1` (return to handler on MSP), `0xFFFFFFF5`
+(return to handler on PSP), `0xFFFFFFF9` (thread MSP), `0xFFFFFFFD` (thread PSP).
+With an extended frame bit 4 is cleared, giving `0xFFFFFFE1` / `0xFFFFFFE5` /
+`0xFFFFFFE9` / `0xFFFFFFED`. Exception entry always switches the handler to MSP
+(`CONTROL.SPSEL = 0`); bit 2 records the interrupted SPSEL and the return
+restores it, so a thread or handler that was using PSP resumes on PSP.
+**EXC_RETURN** 取值：`0xFFFFFFF1`（返回 Handler，MSP）、`0xFFFFFFF5`（返回
+Handler，PSP）、`0xFFFFFFF9`（Thread MSP）、`0xFFFFFFFD`（Thread PSP）。扩展帧会
+清除 bit4，得到 `0xFFFFFFE1` / `0xFFFFFFE5` / `0xFFFFFFE9` / `0xFFFFFFED`。
+异常进入总是让处理程序使用 MSP（`CONTROL.SPSEL = 0`）；bit2 记录被打断的 SPSEL，
+返回时恢复，因此原本使用 PSP 的线程或处理程序会继续使用 PSP。
+
+### PendSV / SysTick system exceptions / PendSV 与 SysTick 系统异常
+
+Execution numbering and pending representation are kept separate from the NVIC:
+
+- `Nvic` owns only external IRQ lines `0..=255`: `ISPR`/`ICPR`, `ISER`/`ICER`,
+  `IABR` and `IPR`. Bit `n` always means external interrupt `n`, whose exception
+  number is `16 + n`. Software-pending bit 15 through `ISPR`/`STIR` therefore
+  enters **exception 31**, never SysTick.
+- `Scb` (`scb.rs`) owns the two system-exception latches `ICSR.PENDSVSET` (14)
+  and `ICSR.PENDSTSET` (15) plus `SHPR2` (SVCall byte 3, stored) and `SHPR3`
+  (PendSV byte 2, SysTick byte 3).
+- SysTick expiry (`SYST_CSR.TICKINT` plus a counter wrap) calls `pend_systick()`,
+  which latches `PENDSTSET` and `SYST_CSR.COUNTFLAG`. Writing `PENDSTSET` from
+  software has exactly the same effect (ARMv8-M B3.2.6).
+- Taking an exception clears its latch (one-shot); `PENDSVCLR` / `PENDSTCLR`
+  clear it from software. `VECTPENDING` reads the highest-priority pending
+  exception number (0 when none), `VECTACTIVE` mirrors `IPSR`, `RETTOBASE` is 1
+  while at most one exception is active, and `ISRPENDING` reports any NVIC line
+  even when disabled.
+
+Arbitration is one numeric-priority pass over both sources:
+
+1. External candidates come from `Nvic::find_highest_priority()` (enabled,
+   pending, not active). PendSV/SysTick candidates come from their latches.
+2. A numerically smaller priority wins; ties compare the **exception number**,
+   so PendSV (14) beats SysTick (15), and both beat every external interrupt
+   (16+). This matches the ARMv8-M rule that ties pick the lowest exception
+   number.
+3. `PRIMASK` and `FAULTMASK` block every configurable exception (SysTick and
+   PendSV included), `BASEPRI` blocks priorities numerically at or above its
+   value, and an active exception is only preempted by a **strictly** higher
+   priority. Sleeping cores use the same gate, so a wake-up never takes a masked
+   exception.
+4. `WFI`, `WFE` and `SLEEPONEXIT` treat a pending PendSV/SysTick latch as a wake
+   source exactly like an enabled NVIC line.
+
+Diagnostics: `system_exception_state()` (`systick=<state> pendsv=<state>`) is
+the stable string exposed by the core; `pend_pendsv()`/`pend_systick()` are the
+host entry points. In the full machine the `rp2350-periph` PPB stub replays
+`ICSR`/`SHPR2`/`SHPR3` writes into the core, so firmware pends PendSV and sets
+system priorities; delivering a peripheral-side SysTick expiry to the core needs
+the driver to forward `BootPeripherals::take_systick_pending()` to
+`pend_systick()` (CLI wiring, outside this crate).
+执行编号与挂起表示与 NVIC 分开：
+
+- `Nvic` 只拥有外部中断线 `0..=255`：`ISPR`/`ICPR`、`ISER`/`ICER`、`IABR` 与
+  `IPR`。位 `n` 永远是外部中断 `n`（异常号 `16 + n`）。因此通过 `ISPR`/`STIR`
+  软件挂起位 15 进入的是**异常 31**，绝不是 SysTick。
+- `Scb`（`scb.rs`）拥有两个系统异常锁存 `ICSR.PENDSVSET`（14）与
+  `ICSR.PENDSTSET`（15），以及 `SHPR2`（第 3 字节 SVCall，仅存储）与 `SHPR3`
+  （第 2 字节 PendSV、第 3 字节 SysTick）。
+- SysTick 到期（`SYST_CSR.TICKINT` 且计数器回绕）调用 `pend_systick()`，置位
+  `PENDSTSET` 与 `SYST_CSR.COUNTFLAG`。软件写 `PENDSTSET` 效果完全相同
+  （ARMv8-M B3.2.6）。
+- 取走异常即清除锁存（一次性）；`PENDSVCLR`/`PENDSTCLR` 由软件清除。
+  `VECTPENDING` 读出最高优先级挂起异常的异常号（无挂起为 0），`VECTACTIVE`
+  等于 `IPSR`，最多只有一个活跃异常时 `RETTOBASE` 为 1，`ISRPENDING` 报告任何
+  NVIC 挂起线（即使未使能）。
+
+仲裁是一次数值优先级遍历：
+
+1. 外部候选来自 `Nvic::find_highest_priority()`（已使能、挂起、非活跃）；
+   PendSV/SysTick 候选来自各自锁存。
+2. 优先级数值更小者胜；并列时比较**异常号**，因此 PendSV（14）优先于
+   SysTick（15），两者都优先于任何外部中断（16+）。这与 ARMv8-M「并列取最小
+   异常号」的规则一致。
+3. `PRIMASK` 与 `FAULTMASK` 屏蔽所有可配置异常（含 SysTick 与 PendSV），
+   `BASEPRI` 屏蔽数值大于等于其值的优先级，活跃异常只能被**严格**更高优先级
+   抢占。睡眠核使用同一门控，因此唤醒绝不会取走被屏蔽的异常。
+4. `WFI`、`WFE` 与 `SLEEPONEXIT` 把 PendSV/SysTick 挂起锁存视作与已使能 NVIC 线
+   相同的唤醒源。
+
+诊断：`system_exception_state()`（`systick=<state> pendsv=<state>`）是核心暴露的
+稳定字符串；`pend_pendsv()`/`pend_systick()` 是宿主入口。完整机器中
+`rp2350-periph` 的 PPB 桩已把 `ICSR`/`SHPR2`/`SHPR3` 写入回放到核，因此固件可
+挂起 PendSV 并设置系统优先级；把外设侧 SysTick 到期投递到核仍需驱动把
+`BootPeripherals::take_systick_pending()` 转发到 `pend_systick()`（属 CLI 接线，
+不在本 crate 内）。
 
 ---
 

@@ -32,6 +32,8 @@ const ISER0: u32 = 0xE000_E100;
 const ISPR0: u32 = 0xE000_E200;
 /// NVIC ICPR0 / NVIC ICPR0
 const ICPR0: u32 = 0xE000_E280;
+/// NVIC IPR base (byte address = base + IRQ) / NVIC IPR 基址（字节地址 = 基址 + IRQ）
+const NVIC_IPR: u32 = 0xE000_E400;
 /// Software Trigger Interrupt Register / 软件触发中断寄存器
 const STIR: u32 = 0xE000_EF00;
 /// SysTick control and status register / SysTick 控制与状态寄存器
@@ -236,13 +238,17 @@ fn sev_on_pend_covers_systick_pending() {
     core.system_write(SYST_CVR, 2);
     core.system_write(SYST_CSR, 0x3); // ENABLE | TICKINT
     core.system_write(scr::SCR, scr::SEVONPEND);
+    // PRIMASK=1 让 SysTick 保持挂起，以便观察挂起跳变（否则同一步就会投递）。
+    // PRIMASK=1 keeps SysTick pending so the transition is observable; without
+    // it the same step would already enter the handler.
+    core.registers.primask = 1;
 
     core.step(&mut bus).unwrap();
-    assert!(!core.nvic.is_pending(15));
+    assert!(!core.system_exception_state().systick_pending);
     core.step(&mut bus).unwrap();
     assert!(
-        core.nvic.is_pending(15),
-        "SysTick underflow pends the exception / SysTick 下溢置位异常"
+        core.system_exception_state().systick_pending,
+        "SysTick underflow pends exception 15 / SysTick 下溢置位异常 15"
     );
     assert!(
         core.event_register(),
@@ -364,6 +370,10 @@ fn handler_to_handler_return_ignores_sleeponexit() {
     write_code(&mut bus, 0x300, &[NOP, NOP, BX_LR]);
     write_code(&mut bus, 0x380, &[BX_LR]);
 
+    // IRQ5 优先级 1、IRQ6 优先级 0：IRQ6 才允许抢占 IRQ5（同优先级不得抢占）。
+    // IRQ5 priority 1, IRQ6 priority 0: only IRQ6 may preempt IRQ5 (equal
+    // priority must not preempt).
+    core.system_write(NVIC_IPR + 5, 0x20);
     enable_and_raise(&mut core, 5);
     assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
     assert_eq!(core.pc(), 0x300);

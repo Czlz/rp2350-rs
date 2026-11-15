@@ -128,27 +128,29 @@ fn icpr_clear_before_the_step_closes_the_gate_again() {
 
 #[test]
 fn systick_overflow_opens_the_gate_for_its_vector() {
-    // SysTick 在本模型中按 IRQ15 挂起：异常号 31，向量位于 31 * 4 = 0x7C。
-    // SysTick pendings as IRQ15 in this model: exception 31, vector at 0x7C.
-    let mut bus = gate_bus(0x7C, 0x0000_0301);
+    // SysTick 是异常 15，向量位于 15 * 4 = 0x3C；NVIC 使能位不参与。
+    // SysTick is exception 15, vector at 15 * 4 = 0x3C; no NVIC enable is needed.
+    let mut bus = gate_bus(0x3C, 0x0000_0301);
     let mut core = CortexM33Core::new(CpuId::Core0);
     boot(&mut core, &mut bus);
-    core.system_write(ISER0, 1 << 15);
-    assert!(!core.nvic.has_runnable());
+    assert!(!core.has_pending_exception());
 
     // 使能 SysTick（ENABLE|TICKINT|CLKSOURCE），重载值 1，当前值 1。
     // Enable SysTick (ENABLE|TICKINT|CLKSOURCE) with reload 1 and current 1.
     core.system_write(SYST_RVR, 1);
     core.system_write(SYST_CVR, 1);
     core.system_write(SYST_CSR, 0x7);
-    assert!(!core.nvic.has_runnable());
+    assert!(!core.has_pending_exception());
 
-    // 一个周期后计数器归零并置挂起，同一步内即完成投递（PRIMASK=0）。
-    // One tick wraps the counter, pends the IRQ, and delivery happens in the
-    // same step because PRIMASK is clear.
+    // 一个周期后计数器归零并置 PENDSTSET，同一步内即完成投递（PRIMASK=0）。
+    // One tick wraps the counter, sets PENDSTSET and delivers in the same step.
     assert_eq!(core.step(&mut bus).unwrap(), CpuState::Running);
     assert_eq!(core.pc(), 0x0000_0300);
-    assert!(core.active_exceptions.contains(&31));
+    assert!(core.active_exceptions.contains(&15));
+    assert!(!core.has_pending_exception());
+    // 外部 IRQ15 的 NVIC 挂起位保持为 0：系统异常与外部线彼此独立。
+    // External IRQ15's NVIC pending bit stays clear: the two are independent.
+    assert!(!core.nvic.is_pending(15));
     assert!(!core.nvic.has_runnable());
 }
 

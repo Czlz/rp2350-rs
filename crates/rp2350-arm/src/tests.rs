@@ -6,6 +6,7 @@ mod fp_lazy;
 mod irq_gate;
 mod scr;
 mod sleep;
+mod systick;
 
 use super::*;
 

@@ -38,9 +38,11 @@ mod fetch_cache;
 pub mod fpu;
 pub mod nvic;
 pub mod registers;
+pub mod scb;
 pub mod scr;
 mod step_cached;
 mod system_access;
+mod system_exceptions;
 pub mod systick;
 
 /// Cortex-M33 register set / Cortex-M33 寄存器组
@@ -48,6 +50,9 @@ pub use registers::CortexM33Registers;
 
 /// Dual-core scheduling scaffold / 双核调度脚手架
 pub use dual_core::DualCoreM33;
+
+/// PendSV / SysTick exception-state snapshot / PendSV / SysTick 异常状态快照
+pub use system_exceptions::SystemExceptionState;
 
 use std::collections::BTreeSet;
 
@@ -57,10 +62,10 @@ use rp2350_core::types::{CpuId, CycleCount, IrqNumber};
 use rp2350_cpu::{CpuArch, CpuCore, CpuState};
 
 use conditions::ITBlockState;
-use exceptions::EXC_SYSTICK;
 use execute_thumb16::{SleepKind, StepResult, execute_thumb16};
 use execute_thumb32::execute_thumb32;
 use nvic::Nvic;
+use scb::Scb;
 use systick::SysTick;
 
 #[allow(dead_code)]
@@ -81,7 +86,12 @@ const SCB_CFSR: u32 = 0xE000_ED28;
 
 /// First exception number that maps to an external interrupt
 /// 映射到外部中断的第一个异常号
-const FIRST_EXTERNAL_EXCEPTION: u32 = 16;
+///
+/// ARMv8-M numbers PendSV as 14 and SysTick as 15; only `16 + n` is an external
+/// NVIC line. Keeping this as `u16` makes exception-number arithmetic lossless.
+/// ARMv8-M 的 PendSV 为 14、SysTick 为 15；只有 `16 + n` 才是外部 NVIC 线。
+/// 使用 `u16` 使异常号运算无损。
+const FIRST_EXTERNAL_EXCEPTION: u16 = 16;
 
 /// Address of the initial stack pointer in the boot vector table
 /// 启动向量表中初始栈指针的地址
@@ -179,6 +189,9 @@ pub struct CortexM33Core {
     registers: CortexM33Registers,
     /// NVIC interrupt controller / NVIC 中断控制器
     nvic: Nvic,
+    /// SCB PendSV/SysTick pending latches and `SHPR2`/`SHPR3`
+    /// SCB PendSV/SysTick 挂起锁存与 `SHPR2`/`SHPR3`
+    scb: Scb,
     /// SysTick timer / SysTick 定时器
     systick: SysTick,
     /// Vector table offset register value / 向量表偏移寄存器值
@@ -244,6 +257,7 @@ impl CortexM33Core {
             cpu_id,
             registers: CortexM33Registers::new(),
             nvic: Nvic::new(),
+            scb: Scb::new(),
             systick: SysTick::new(),
             vtor: 0,
             cfsr: 0,
@@ -368,6 +382,7 @@ impl CortexM33Core {
     fn clear_core_state(&mut self) {
         self.registers = CortexM33Registers::new();
         self.nvic = Nvic::new();
+        self.scb = Scb::new();
         self.systick = SysTick::new();
         self.vtor = 0;
         self.cfsr = 0;
@@ -508,8 +523,11 @@ impl CortexM33Core {
 
         // SysTick tick (1 cycle per instruction fetch)
         // SysTick 计时（每条指令获取 1 个周期）
+        //
+        // 到期置位 `SCB_ICSR.PENDSTSET`（异常 15），而不是 NVIC 的外部 IRQ 15。
+        // An expiry sets `SCB_ICSR.PENDSTSET` (exception 15), never external IRQ 15.
         if self.systick.tick(1) {
-            self.set_pending_irq(EXC_SYSTICK);
+            self.pend_systick();
         }
 
         // 被 stall 的载入必须完整回滚：PC 与 IT 状态回到指令前，寄存器由访问本身保证
@@ -593,7 +611,7 @@ impl CortexM33Core {
         let deep = self.scr & scr::SLEEPDEEP != 0;
         match kind {
             SleepKind::WaitForInterrupt => {
-                if self.nvic.has_runnable() {
+                if self.has_pending_exception() {
                     return;
                 }
                 self.sleep_reason = Some(if deep {
@@ -610,7 +628,7 @@ impl CortexM33Core {
                     self.event_register = false;
                     return;
                 }
-                if self.nvic.has_runnable() {
+                if self.has_pending_exception() {
                     return;
                 }
                 self.sleep_reason = Some(if deep {
@@ -636,7 +654,7 @@ impl CortexM33Core {
     /// 唤醒，与 `WFI` 完全一致，因此挂起异常可在同一步内被响应。`SCR.SLEEPDEEP`
     /// 同样只改变上报原因。
     fn apply_sleep_on_exit(&mut self) {
-        if self.nvic.has_runnable() {
+        if self.has_pending_exception() {
             return;
         }
         let deep = self.scr & scr::SLEEPDEEP != 0;
@@ -693,37 +711,19 @@ impl CortexM33Core {
     fn wake_ready(&self) -> bool {
         match self.sleep_reason {
             Some(SleepReason::WaitForInterrupt | SleepReason::SleepOnExit { .. }) => {
-                self.nvic.has_runnable()
+                self.has_pending_exception()
             }
             Some(
                 SleepReason::WaitForEvent
                 | SleepReason::SleepDeep {
                     wait_for_event: true,
                 },
-            ) => self.event_register || self.nvic.has_runnable(),
+            ) => self.event_register || self.has_pending_exception(),
             Some(SleepReason::SleepDeep {
                 wait_for_event: false,
-            }) => self.nvic.has_runnable(),
+            }) => self.has_pending_exception(),
             Some(SleepReason::BlockedRead) | None => true,
         }
-    }
-
-    /// Whether an enabled interrupt may be taken right now
-    /// 当前是否允许进入已使能的中断
-    ///
-    /// `PRIMASK`, `FAULTMASK` and `BASEPRI` all gate exception entry; the same
-    /// gate decides whether a wake-up turns into exception entry, so a sleeping
-    /// core never takes an interrupt it should keep masked.
-    /// `PRIMASK`、`FAULTMASK` 与 `BASEPRI` 都会门控异常进入；唤醒是否变成异常进入也用
-    /// 同一门控，因此睡眠核心绝不会进入本应保持屏蔽的中断。
-    fn irq_gate_open(&self, irq: IrqNumber) -> bool {
-        if self.registers.primask & 1 != 0 || self.registers.faultmask & 1 != 0 {
-            return false;
-        }
-        // BASEPRI == 0 表示不屏蔽；否则优先级数值 >= BASEPRI 的中断被屏蔽。
-        // BASEPRI == 0 disables the mask; otherwise priorities numerically at or
-        // above BASEPRI are masked.
-        self.nvic.basepri_allows(irq, self.registers.basepri)
     }
 
     /// Advance a sleeping core by one cycle without retiring an instruction
@@ -742,7 +742,7 @@ impl CortexM33Core {
         let mut cycles = 0u64;
         self.total_cycles = self.total_cycles.saturating_add(1);
         if self.systick.tick(1) {
-            self.set_pending_irq(EXC_SYSTICK);
+            self.pend_systick();
         }
         if !self.wake_ready() {
             return Ok(false);
@@ -759,27 +759,12 @@ impl CortexM33Core {
         }) {
             self.event_register = false;
         }
-        if self.nvic.has_runnable() {
-            if let Some(irq) = self.nvic.find_highest_priority() {
-                if self.irq_gate_open(irq) {
-                    let exception_number = FIRST_EXTERNAL_EXCEPTION + u32::from(irq);
-                    exceptions::enter_exception(
-                        bus,
-                        &mut self.registers,
-                        &mut self.nvic,
-                        exception_number,
-                        self.vtor,
-                        &mut self.it_state,
-                        &mut cycles,
-                    )?;
-                    self.active_exceptions.push(exception_number as u16);
-                    // 异常进入是事件源；进入后事件寄存器置位（ARMv8-M）。
-                    // Exception entry is an event source: set the register.
-                    self.event_register = true;
-                    self.total_cycles = self.total_cycles.saturating_add(cycles);
-                    return Ok(false);
-                }
-            }
+        // 唤醒条件成立后尝试投递最高优先级异常；成功进入时本步不退役指令。
+        // After the wake condition holds, try to take the highest-priority
+        // exception; a successful entry retires no instruction in this step.
+        if self.deliver_pending_exception(bus, &mut cycles)? {
+            self.total_cycles = self.total_cycles.saturating_add(cycles);
+            return Ok(false);
         }
         Ok(true)
     }
@@ -947,6 +932,7 @@ impl CortexM33Core {
                 bus,
                 &mut self.registers,
                 &mut self.nvic,
+                &mut self.scb,
                 u32::from(exceptions::EXC_USAGE_FAULT),
                 self.vtor,
                 &mut self.it_state,
@@ -976,46 +962,26 @@ impl CortexM33Core {
         Ok(result)
     }
 
-    /// Check for pending interrupts and initiate exception entry if needed
-    /// 检查挂起的中断并在需要时发起异常进入
+    /// Check for pending exceptions and initiate exception entry if needed
+    /// 检查挂起异常并在需要时发起异常进入
+    ///
+    /// The arbitration covers external NVIC lines, PendSV (14) and SysTick (15)
+    /// in one numeric-priority pass, so a SysTick underflow enters exception 15
+    /// at `VTOR + 0x3C` instead of being mistaken for external IRQ 15
+    /// (exception 31). See [`Self::pending_exception`].
+    /// 仲裁在一次数值优先级遍历中同时覆盖外部 NVIC 线、PendSV（14）与
+    /// SysTick（15），因此 SysTick 下溢进入异常 15 且向量位于 `VTOR + 0x3C`，
+    /// 而不会被误当作外部 IRQ 15（异常 31）。见 [`Self::pending_exception`]。
     fn check_pending_exceptions(
         &mut self,
         bus: &mut dyn AddressBus,
         cycles: &mut u64,
     ) -> Result<(), CoreError> {
-        // 没有「已使能且挂起」的中断时无需构造候选位图。
-        // Nothing enabled is pending, so building the candidate bitmaps is wasted.
-        if !self.nvic.has_runnable() {
+        // 没有任何挂起时直接跳过候选构造。 / Skip candidate building when idle.
+        if !self.has_pending_exception() {
             return Ok(());
         }
-
-        if let Some(irq) = self.nvic.find_highest_priority() {
-            // PRIMASK/FAULTMASK/BASEPRI 都门控异常进入；睡眠唤醒使用同一个门控，
-            // 因此睡眠核心不会进入本应保持屏蔽的中断。
-            // PRIMASK/FAULTMASK/BASEPRI all gate exception entry, and the sleep
-            // wake path uses the same gate, so a sleeping core never takes an
-            // interrupt it should keep masked.
-            if !self.irq_gate_open(irq) {
-                return Ok(());
-            }
-            // 外部中断 n 对应异常号 16 + n，向量位于 VTOR + (16 + n) * 4。
-            // External interrupt n maps to exception number 16 + n, so its
-            // vector lives at VTOR + (16 + n) * 4.
-            let exception_number = FIRST_EXTERNAL_EXCEPTION + u32::from(irq);
-            exceptions::enter_exception(
-                bus,
-                &mut self.registers,
-                &mut self.nvic,
-                exception_number,
-                self.vtor,
-                &mut self.it_state,
-                cycles,
-            )?;
-            self.active_exceptions.push(exception_number as u16);
-            // 异常进入是 ARMv8-M 的事件源。 / Exception entry is an event source.
-            self.event_register = true;
-        }
-
+        let _ = self.deliver_pending_exception(bus, cycles)?;
         Ok(())
     }
 
@@ -1184,11 +1150,17 @@ impl CpuCore for CortexM33Core {
     }
 
     fn description(&self) -> String {
+        // 固定后缀 `[systick=<state> pendsv=<state>]` 让前端在核心描述里看到两个系统
+        // 异常的挂起/活跃状态，格式由 `SystemExceptionState::summary` 定义。
+        // The fixed `[systick=<state> pendsv=<state>]` suffix exposes both system
+        // exceptions in the core description; the format is defined by
+        // `SystemExceptionState::summary`.
         format!(
-            "ARM Cortex-M33 Core{} (PC=0x{:08X}, {:?})",
+            "ARM Cortex-M33 Core{} (PC=0x{:08X}, {:?}) [{}]",
             self.cpu_id as u8,
             self.pc(),
-            self.state
+            self.state,
+            self.system_exception_state().summary()
         )
     }
 

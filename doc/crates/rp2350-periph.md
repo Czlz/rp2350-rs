@@ -1873,15 +1873,25 @@ legacy cumulative-cycle tracker.
 `ClockTree::generation()` 会传入 `Timebase::advance`，因此频率写入在下一批次先按
 旧频率结算。`SimulationClock` 仅作为旧的累计周期追踪器保留。
 
-Known gap / 已知缺口：`rp2350-arm` maps every NVIC pending bit to external
-exception `16 + n`, so pending SysTick (exception 15) cannot be delivered
-correctly. The peripheral counter still models `COUNTFLAG`, reload and the
-one-shot lifting latch (`BootPeripherals::take_systick_pending`); delivery needs
-an `rp2350-arm` task (outside the P4-2 whitelist).
-`rp2350-arm` 把所有 NVIC 挂起位映射为外部异常 `16 + n`，因此挂起的 SysTick
-（异常 15）无法正确投递。外设计数器仍建模 `COUNTFLAG`、重载与一次性锁存
-（`BootPeripherals::take_systick_pending`）；投递需要单独的 `rp2350-arm` 任务
-（不在 P4-2 白名单内）。
+SysTick exception delivery / SysTick 异常投递：the peripheral counter still owns
+timing, `COUNTFLAG`, reload and the one-shot expiry latch
+(`BootPeripherals::take_systick_pending`). The core now models the architectural
+target correctly: `rp2350-arm` keeps SysTick's pending bit in `SCB_ICSR`
+(exception 15, vector `VTOR + 0x3C`) instead of NVIC bit 15 (exception 31), and
+exposes `CortexM33Core::pend_systick()` for a driver. The full machine still
+needs the `rp2350-cli` step loop to forward `take_systick_pending()` to that
+method; until then the counter latch keeps the expiry observable but no SysTick
+handler runs in a machine run. PPB writes to `ICSR`, `SHPR2` and `SHPR3` are now
+replayed into the core, so firmware-side PendSV pending requests and
+system-exception priorities take effect.
+外设计数器仍然负责计时、`COUNTFLAG`、重载与一次性到期锁存
+（`BootPeripherals::take_systick_pending`）。核侧现在正确建模架构目标：
+`rp2350-arm` 把 SysTick 挂起位放在 `SCB_ICSR`（异常 15，向量 `VTOR + 0x3C`），
+而不是 NVIC 位 15（异常 31），并提供 `CortexM33Core::pend_systick()` 供驱动使用。
+完整机器仍需 `rp2350-cli` 的步进循环把 `take_systick_pending()` 转发到该方法；
+在此之前计数器锁存保持到期可观察，但机器运行中不会执行 SysTick 处理程序。PPB 对
+`ICSR`、`SHPR2`、`SHPR3` 的写入现在会回放到核，因此固件侧的 PendSV 挂起请求与
+系统异常优先级立即生效。
 
 ### Not modelled / 未建模
 

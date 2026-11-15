@@ -23,6 +23,17 @@
 
 use super::{CortexM33Core, NVIC_BASE, SCB_CFSR, SCB_CPACR, SCB_VTOR, SYSTICK_BASE, fpu, scr};
 
+/// `SCB_ICSR` — pending/active exception control and status
+/// `SCB_ICSR` —— 挂起/活跃异常控制与状态
+const SCB_ICSR: u32 = 0xE000_ED04;
+
+/// `SCB_SHPR2` — SVCall priority in byte 3 / `SCB_SHPR2` —— 第 3 字节为 SVCall 优先级
+const SCB_SHPR2: u32 = 0xE000_ED1C;
+
+/// `SCB_SHPR3` — PendSV priority in byte 2, SysTick priority in byte 3
+/// `SCB_SHPR3` —— 第 2 字节 PendSV 优先级、第 3 字节 SysTick 优先级
+const SCB_SHPR3: u32 = 0xE000_ED20;
+
 /// Software Trigger Interrupt Register (`SCB_STIR`) / 软件触发中断寄存器
 const SCB_STIR: u32 = 0xE000_EF00;
 
@@ -40,10 +51,12 @@ impl CortexM33Core {
             0x00 => {
                 // SYST_CSR
                 if write {
-                    self.systick.csr = value & 0x7;
-                    if value & (1 << 16) != 0 {
-                        self.systick.csr &= !(1 << 16); // Clear COUNTFLAG
-                    }
+                    // `write_csr` keeps `ENABLE`/`TICKINT`/`CLKSOURCE`, clears
+                    // `COUNTFLAG` when software writes bit 16, and drops a pending
+                    // latch when TICKINT is disabled.
+                    // `write_csr` 保留 `ENABLE`/`TICKINT`/`CLKSOURCE`，软件写 bit16
+                    // 时清除 `COUNTFLAG`，并在关闭 TICKINT 时丢弃挂起锁存。
+                    self.systick.write_csr(value);
                 }
                 Some(self.systick.csr)
             }
@@ -108,6 +121,31 @@ impl CortexM33Core {
                 self.scr = value & scr::MODELED_MASK;
             }
             Some(self.scr)
+        } else if addr == SCB_ICSR {
+            // ICSR 承载 PendSV/SysTick 挂起位与 VECTPENDING/VECTACTIVE 只读视图；
+            // 写入只解释四个置位/清除位。
+            // ICSR carries the PendSV/SysTick pending bits and the read-only
+            // VECTPENDING/VECTACTIVE view; a write only interprets the four
+            // set/clear bits.
+            if write {
+                self.write_icsr(value);
+            }
+            Some(self.read_icsr())
+        } else if addr == SCB_SHPR2 {
+            // SHPR2 第 3 字节为 SVCall 优先级（目前只存储，未投递 SVCall）。
+            // Byte 3 of SHPR2 is the SVCall priority (stored; SVCall delivery is
+            // not modelled yet).
+            if write {
+                self.scb.write_shpr2(value);
+            }
+            Some(self.scb.read_shpr2())
+        } else if addr == SCB_SHPR3 {
+            // SHPR3：第 2 字节 PendSV、第 3 字节 SysTick，参与抢占仲裁。
+            // SHPR3: byte 2 PendSV, byte 3 SysTick; both take part in preemption.
+            if write {
+                self.scb.write_shpr3(value);
+            }
+            Some(self.scb.read_shpr3())
         } else if addr == SCB_STIR {
             // STIR 写入挂起一个外部中断；SEVONPEND 事件由打开挂起位的跳变产生。
             // A STIR write pends an external interrupt; the SEVONPEND event comes
@@ -190,26 +228,24 @@ impl CortexM33Core {
                     None
                 }
             }
-            // IPRn: priority register, 4 bytes per IRQ, byte-accessible
+            // IPRn: priority register, one byte per IRQ
             o @ 0x300..=0x3FC => {
-                let irq_idx = ((o - 0x300) >> 2) as u16;
-                if irq_idx < 256 {
-                    let byte_idx = ((o - 0x300) & 3) as u16;
-                    // Each IPR word covers 4 IRQs at byte granularity
-                    // 每个 IPR 字以字节粒度覆盖 4 个 IRQ
-                    let group_start = (irq_idx & !3u16) as usize;
-                    let value_shift = (byte_idx * 8) as u8;
-                    if write {
-                        let mask = !(0xFFu32 << value_shift);
-                        let existing = self.nvic.read_ipr_word(group_start / 4);
-                        let new_val = (existing & mask) | ((value & 0xFF) << value_shift);
-                        self.nvic.write_ipr_word(group_start / 4, new_val);
-                    }
-                    let word = self.nvic.read_ipr_word(group_start / 4);
-                    Some((word >> value_shift) & 0xFF)
-                } else {
-                    None
+                // 每个 IRQ 占一个 IPR 字节：字节地址 = 0x300 + IRQ，字索引 = IRQ / 4。
+                // 旧实现把字索引又当成 IRQ 号，导致 IRQ4 以上的字节写落到 IRQ0..3。
+                // One IPR byte per IRQ: byte address = 0x300 + IRQ, word index =
+                // IRQ / 4. The previous mapping treated the word index as an IRQ
+                // number, so byte writes for IRQ >= 4 landed on IRQ0..3.
+                let irq = (o - 0x300) as usize;
+                let word_index = irq / 4;
+                let value_shift = ((irq % 4) * 8) as u8;
+                if write {
+                    let mask = !(0xFFu32 << value_shift);
+                    let existing = self.nvic.read_ipr_word(word_index);
+                    let new_val = (existing & mask) | ((value & 0xFF) << value_shift);
+                    self.nvic.write_ipr_word(word_index, new_val);
                 }
+                let word = self.nvic.read_ipr_word(word_index);
+                Some((word >> value_shift) & 0xFF)
             }
             _ => None,
         }

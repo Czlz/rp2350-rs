@@ -13,6 +13,7 @@ use crate::conditions::ITBlockState;
 use crate::fpu::{fpccr, fpexc, fpscr, sys_reg};
 use crate::nvic::Nvic;
 use crate::registers::{CONTROL_FPCA, CortexM33Registers};
+use crate::scb::Scb;
 
 /// Initial MSP used by the fixture / 测试夹具使用的初始 MSP
 const MSP_TOP: u32 = 0x2000_1000;
@@ -26,6 +27,7 @@ struct FpFixture {
     bus: rp2350_core::memory::SimpleBus,
     regs: CortexM33Registers,
     nvic: Nvic,
+    scb: Scb,
     it: ITBlockState,
     cycles: u64,
 }
@@ -47,6 +49,7 @@ impl FpFixture {
             bus,
             regs,
             nvic: Nvic::new(),
+            scb: Scb::new(),
             it: ITBlockState::new(),
             cycles,
         }
@@ -69,6 +72,7 @@ impl FpFixture {
             &mut self.bus,
             &mut self.regs,
             &mut self.nvic,
+            &mut self.scb,
             EXC_IRQ0,
             0,
             &mut self.it,

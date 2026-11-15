@@ -88,6 +88,23 @@ impl SysTick {
         self.csr & csr::CLKSOURCE != 0
     }
 
+    /// Write `SYST_CSR` / 写 `SYST_CSR`
+    ///
+    /// Only `ENABLE`, `TICKINT` and `CLKSOURCE` are writable. Writing 1 to
+    /// `COUNTFLAG` clears the latch (ARMv8-M B3.2.9), and disabling `TICKINT`
+    /// drops a pending interrupt request. The counter itself keeps running.
+    /// 只有 `ENABLE`、`TICKINT` 与 `CLKSOURCE` 可写。写 1 到 `COUNTFLAG` 清除锁存
+    /// （ARMv8-M B3.2.9），关闭 `TICKINT` 会丢弃挂起的中断请求。计数器本身继续运行。
+    pub fn write_csr(&mut self, value: u32) {
+        self.csr = value & (csr::ENABLE | csr::TICKINT | csr::CLKSOURCE);
+        if value & csr::COUNTFLAG != 0 {
+            self.csr &= !csr::COUNTFLAG;
+        }
+        if !self.interrupt_enabled() {
+            self.interrupt_pending = false;
+        }
+    }
+
     /// Tick the SysTick timer by `cycles` clock cycles
     /// 将 SysTick 定时器计时 `cycles` 个时钟周期
     ///
@@ -129,6 +146,19 @@ impl SysTick {
     pub fn write_cvr(&mut self, value: u32) {
         self.cvr = value & 0x00FF_FFFF;
         self.csr &= !csr::COUNTFLAG;
+    }
+
+    /// Latch `COUNTFLAG` without touching the counter
+    /// 在不改变计数器的情况下锁存 `COUNTFLAG`
+    ///
+    /// `SCB_ICSR.PENDSTSET` sets the SysTick exception pending **and**
+    /// `SYST_CSR.COUNTFLAG` (ARMv8-M B3.2.6), so software-pended SysTick is
+    /// indistinguishable from a counter expiry through `COUNTFLAG`.
+    /// `SCB_ICSR.PENDSTSET` 在置位 SysTick 异常挂起的同时置位
+    /// `SYST_CSR.COUNTFLAG`（ARMv8-M B3.2.6），因此软件挂起的 SysTick 与计数器
+    /// 到期在 `COUNTFLAG` 上不可区分。
+    pub fn set_countflag(&mut self) {
+        self.csr |= csr::COUNTFLAG;
     }
 
     /// Write to the reload value register
@@ -195,5 +225,15 @@ mod tests {
         let irq = st.tick(10);
         assert!(!irq);
         assert!(!st.interrupt_pending);
+    }
+
+    #[test]
+    fn countflag_can_be_latched_by_a_pended_exception() {
+        let mut st = SysTick::new();
+        assert_eq!(st.csr & csr::COUNTFLAG, 0);
+        st.set_countflag();
+        assert_ne!(st.csr & csr::COUNTFLAG, 0);
+        st.write_cvr(5);
+        assert_eq!(st.csr & csr::COUNTFLAG, 0, "CVR write clears COUNTFLAG");
     }
 }

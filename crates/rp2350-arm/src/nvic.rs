@@ -24,7 +24,12 @@ const NVIC_REGISTER_STRIDE: usize = 32;
 
 /// Number of NVIC priority bits implemented
 /// 实现的 NVIC 优先级位数
-const PRIORITY_BITS: u8 = 3;
+///
+/// Also used by [`crate::scb::Scb`] for the `SHPR2`/`SHPR3` system-exception
+/// priority bytes, so every configurable exception decodes its priority with
+/// the same width. / 也被 [`crate::scb::Scb`] 用于 `SHPR2`/`SHPR3` 系统异常
+/// 优先级字节，使所有可配置异常用同一宽度解码优先级。
+pub(crate) const PRIORITY_BITS: u8 = 3;
 
 /// Nested Vectored Interrupt Controller for Cortex-M33
 /// Cortex-M33 的嵌套向量中断控制器
@@ -355,8 +360,34 @@ impl Nvic {
     /// [`Self::get_priority`] 使用相同宽度。
     #[must_use]
     pub fn basepri_allows(&self, irq: IrqNumber, basepri: u32) -> bool {
+        self.basepri_allows_priority(self.get_priority(irq), basepri)
+    }
+
+    /// Whether a raw priority value passes a `BASEPRI` mask
+    /// 原始优先级数值是否通过 `BASEPRI` 屏蔽
+    ///
+    /// System exceptions (PendSV, SysTick) have no NVIC IRQ number, so their
+    /// `SHPR2`/`SHPR3` priority must be tested with the same rule without going
+    /// through [`Self::get_priority`].
+    /// 系统异常（PendSV、SysTick）没有 NVIC 中断号，其 `SHPR2`/`SHPR3` 优先级必须
+    /// 用同一规则判定，而不能经过 [`Self::get_priority`]。
+    #[must_use]
+    pub fn basepri_allows_priority(&self, priority: u8, basepri: u32) -> bool {
         let basepri = (basepri & 0xFF) as u8;
-        basepri == 0 || self.get_priority(irq) < (basepri >> (8 - PRIORITY_BITS))
+        basepri == 0 || priority < (basepri >> (8 - PRIORITY_BITS))
+    }
+
+    /// Whether any external interrupt line is pending, enabled or not
+    /// 是否有任何外部中断线挂起（无论是否使能）
+    ///
+    /// This is the `ICSR.ISRPENDING` view: the NVIC pending lines with active
+    /// exceptions excluded (an active line that is still asserted has already
+    /// been taken and is not reported as pending again).
+    /// 这是 `ICSR.ISRPENDING` 的视图：NVIC 挂起线，排除活跃异常（仍然保持电平的
+    /// 活跃线已被取走，不再报告为挂起）。
+    #[must_use]
+    pub fn has_any_pending(&self) -> bool {
+        (0..IRQ_GROUPS).any(|group| self.ispr[group] & !self.iabr[group] != 0)
     }
 
     /// Find the highest-priority pending enabled interrupt
@@ -635,6 +666,37 @@ mod tests {
         for irq in 0u16..256 {
             assert_eq!(nvic.get_priority(irq), 0);
         }
+    }
+
+    #[test]
+    fn basepri_priority_mask_matches_the_irq_helper() {
+        let mut nvic = Nvic::new();
+        nvic.set_priority(5, 2);
+        nvic.set_priority(6, 0);
+        // BASEPRI=0 关闭屏蔽；优先级 2 在 BASEPRI 2/3 下被屏蔽。
+        // BASEPRI=0 disables the mask; priority 2 is masked by BASEPRI 2 and 3.
+        assert!(nvic.basepri_allows(5, 0));
+        assert!(nvic.basepri_allows_priority(2, 0));
+        assert!(!nvic.basepri_allows(5, 0x40));
+        assert!(!nvic.basepri_allows_priority(2, 0x40));
+        assert!(nvic.basepri_allows_priority(1, 0x40));
+        assert!(nvic.basepri_allows(6, 0x40));
+    }
+
+    #[test]
+    fn any_pending_ignores_enable_state_but_not_active_state() {
+        let mut nvic = Nvic::new();
+        assert!(!nvic.has_any_pending());
+        // 未使能也必须报告为挂起（ICSR.ISRPENDING 不检查 ISER）。
+        // Pending without enable must still report (ISRPENDING ignores ISER).
+        nvic.set_pending(200);
+        assert!(nvic.has_any_pending());
+        nvic.set_active(200);
+        assert!(!nvic.has_any_pending());
+        nvic.clear_active(200);
+        assert!(nvic.has_any_pending());
+        nvic.clear_pending(200);
+        assert!(!nvic.has_any_pending());
     }
 
     /// Reference predicate for the gate: some enabled IRQ is pending

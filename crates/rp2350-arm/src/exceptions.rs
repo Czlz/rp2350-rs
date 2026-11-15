@@ -15,7 +15,13 @@
     clippy::missing_errors_doc,
     clippy::fn_params_excessive_bools,
     clippy::module_name_repetitions,
-    clippy::struct_excessive_bools
+    clippy::struct_excessive_bools,
+    // 异常进入需要总线、寄存器组、NVIC、SCB、异常号、向量表、IT 状态与周期记账
+    // 八个独立输入；拆成结构体会让每次调用都构造临时体，反而降低可读性。
+    // Exception entry needs eight independent inputs (bus, registers, NVIC, SCB,
+    // exception number, vector table, IT state, cycle accounting); bundling them
+    // into a struct would force a temporary at every call site.
+    clippy::too_many_arguments
 )]
 
 use rp2350_core::bus::AddressBus;
@@ -26,6 +32,7 @@ use super::conditions::ITBlockState;
 use super::fpu::{FpuRegisters, fpccr, fpexc};
 use super::nvic::Nvic;
 use super::registers::{CONTROL_FPCA, CortexM33Registers};
+use super::scb::Scb;
 
 /// ITSTATE bits inside xPSR (`[26:25,15:10]`) / xPSR 中的 ITSTATE 位
 pub const XPSR_IT_MASK: u32 = 0x0600_FC00;
@@ -375,12 +382,26 @@ pub fn fetch_exception_vector(
 /// Enter an exception handler — full sequence
 /// 进入异常处理程序 —— 完整序列
 ///
+/// `exception_number` is the ARMv8-M exception number: 14 for PendSV, 15 for
+/// SysTick, `16 + n` for external interrupt `n`. The vector is always fetched
+/// from `VTOR + 4 * exception_number`, so the SysTick handler lives at
+/// `VTOR + 0x3C` and the PendSV handler at `VTOR + 0x38`.
+/// `exception_number` 为 ARMv8-M 异常号：PendSV 为 14、SysTick 为 15、外部中断
+/// `n` 为 `16 + n`。向量总是取自 `VTOR + 4 * exception_number`，因此 SysTick
+/// 处理程序位于 `VTOR + 0x3C`、PendSV 处理程序位于 `VTOR + 0x38`。
+///
+/// `scb` receives the pending clear of an entered PendSV/SysTick exception; the
+/// external NVIC is cleared through `nvic` for `16 + n` exceptions.
+/// `scb` 接收已进入的 PendSV/SysTick 异常的挂起清除；`16 + n` 外部异常则通过
+/// `nvic` 清除。
+///
 /// Returns `Ok(())` on success, with registers and SP updated.
 /// 成功返回 `Ok(())`，寄存器和 SP 已更新。
 pub fn enter_exception(
     bus: &mut dyn AddressBus,
     regs: &mut CortexM33Registers,
     nvic: &mut Nvic,
+    scb: &mut Scb,
     exception_number: u32,
     vtor: u32,
     it: &mut ITBlockState,
@@ -395,15 +416,14 @@ pub fn enter_exception(
     // target is then Handler, so EXC_RETURN bit 3 must be 0 or a nested
     // interrupt would incorrectly return to Thread mode.
     let from_handler = regs.xpsr & 0x1FF != 0;
-    let sp = if exception_number >= 16 {
-        // External interrupt: always use MSP during handler
-        // 外部中断：处理程序期间始终使用 MSP
-        regs.msp
-    } else if thread_used_psp {
-        regs.psp
-    } else {
-        regs.msp
-    };
+    // ARMv8-M 的异常压栈使用当前 SP：CONTROL.SPSEL=0 为 MSP，1 为 PSP。这与异常
+    // 号无关——SysTick（15）从使用 PSP 的线程进入时同样压 PSP，EXC_RETURN bit2
+    // 记录该选择，返回时据此出栈。
+    // ARMv8-M stacks on the current SP: CONTROL.SPSEL = 0 selects MSP, 1 selects
+    // PSP. This is independent of the exception number — a SysTick (15) taken
+    // from a PSP thread stacks on PSP, and EXC_RETURN bit 2 records the choice
+    // so the return unstacks from the same bank.
+    let sp = if thread_used_psp { regs.psp } else { regs.msp };
 
     // ---- Floating-point context reservation ----
     // 浮点上下文预留：
@@ -474,39 +494,39 @@ pub fn enter_exception(
 
     // Update SP based on mode
     // 根据模式更新 SP
-    if exception_number >= 16 || (regs.control & 0x2 == 0) {
-        regs.msp = new_sp;
-        regs.sp = new_sp;
-    } else {
+    if thread_used_psp {
         regs.psp = new_sp;
-        regs.sp = new_sp;
+    } else {
+        regs.msp = new_sp;
     }
+    regs.sp = new_sp;
 
-    // Set CONTROL.SPSEL=0 (use MSP in handler) if external interrupt
-    // 如果是外部中断，设置 CONTROL.SPSEL=0（处理程序中使用 MSP）
-    if exception_number >= 16 {
-        regs.control &= !0x2;
-    }
+    // 异常进入后处理程序使用 MSP：CONTROL.SPSEL 清 0。EXC_RETURN bit2 已记录被
+    // 打断上下文的 SPSEL，异常返回会恢复它。
+    // An entered handler runs on MSP: clear CONTROL.SPSEL. EXC_RETURN bit 2
+    // already records the interrupted SPSEL, which the return restores.
+    regs.control &= !0x2;
 
     // Set up return value in LR (EXC_RETURN)
     // 在 LR 中设置返回值（EXC_RETURN）
     //
-    // Bit 3 selects Handler (0) vs Thread (1), bit 2 selects PSP, and bit 4 is
-    // the frame type patched below. A nested exception entered from Handler
-    // mode must return to Handler mode.
-    // bit3 选择 Handler（0）或 Thread（1），bit2 选择 PSP，bit4 为下方修补的帧类型。
-    // 从 Handler 模式进入的嵌套异常必须返回 Handler 模式。
-    if from_handler {
-        regs.lr = 0xFFFF_FFF1; // Return to Handler mode / 返回 Handler 模式
-    } else if thread_used_psp {
-        // 0xFFFF_FFFD = standard frame; bit 4 is cleared below when the
-        // entry allocated an extended frame (0xFFFF_FFED).
-        // 0xFFFF_FFFD 为标准帧；若本次进入分配了扩展帧，下方会清除 bit 4
-        // （变为 0xFFFF_FFED）。
-        regs.lr = 0xFFFF_FFFD; // Return to Thread, PSP
+    // Bit 3 selects Handler (0) vs Thread (1), bit 2 records the interrupted
+    // CONTROL.SPSEL, and bit 4 is the frame type patched below. A nested
+    // exception entered from Handler mode must return to Handler mode, and a
+    // Handler that had switched to PSP must return to that PSP handler
+    // (`0xFFFF_FFF5`).
+    // bit3 选择 Handler（0）或 Thread（1），bit2 记录被打断的 CONTROL.SPSEL，bit4 为
+    // 下方修补的帧类型。从 Handler 模式进入的嵌套异常必须返回 Handler 模式；已切换到
+    // PSP 的 Handler 必须返回到那个 PSP 处理程序（`0xFFFF_FFF5`）。
+    let mut exc_return = if from_handler {
+        0xFFFF_FFF1
     } else {
-        regs.lr = 0xFFFF_FFF9; // Return to Thread, MSP
+        0xFFFF_FFF9
+    };
+    if thread_used_psp {
+        exc_return |= 0x4;
     }
+    regs.lr = exc_return;
 
     // EXC_RETURN bit 4 records the frame type: 1 = standard, 0 = extended.
     // EXC_RETURN bit 4 记录帧类型：1 = 标准帧，0 = 扩展帧。
@@ -527,6 +547,13 @@ pub fn enter_exception(
         let irq = exception_number as u16 - 16;
         nvic.set_active(irq);
         nvic.clear_pending(irq);
+    } else {
+        // PendSV/SysTick 的挂起位是一次性锁存：取走异常即清除。其它系统异常
+        // （UsageFault/SVCall 等）在本块中没有挂起状态，调用无副作用。
+        // The PendSV/SysTick pending bit is a one-shot latch: taking the
+        // exception clears it. Other system exceptions (UsageFault/SVCall) have
+        // no pending state here, so the call is a no-op for them.
+        scb.clear_pending(exception_number as u16);
     }
 
     Ok(())
@@ -610,14 +637,17 @@ pub fn exit_exception(
     }
     regs.sp = new_sp;
 
-    // Restore CONTROL bits if returning to Thread mode
-    // 如果返回 Thread 模式，恢复 CONTROL 位
-    if !exc_return_info.to_handler {
-        regs.control = if exc_return_info.use_psp {
-            regs.control | 0x2
-        } else {
-            regs.control & !0x2
-        };
+    // Restore CONTROL.SPSEL from EXC_RETURN bit 2
+    // 按 EXC_RETURN bit2 恢复 CONTROL.SPSEL
+    //
+    // This applies to Handler-to-Handler returns as well: a handler that had
+    // switched to PSP is entered with bit 2 set and must resume on PSP.
+    // 该规则同样适用于 Handler→Handler 返回：已切换到 PSP 的处理程序在进入时 bit2
+    // 置位，返回后必须继续使用 PSP。
+    if exc_return_info.use_psp {
+        regs.control |= 0x2;
+    } else {
+        regs.control &= !0x2;
     }
 
     // ARMv8-M B3.4.4: an exception return sets CONTROL.FPCA to the inverse of

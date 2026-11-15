@@ -116,6 +116,7 @@ UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 
 |----|------|------|------|
 | P4-1 ✅ | `CLOCKS` 时钟树：`ClockTree` 共享 XOSC/ROSC/PLL_SYS/PLL_USB（REFDIV/FBDIV/PDIV/VDIV/LOCK）、`CLK_*_CTRL`/`CLK_*_DIV`、`CLK_*_SELECTED`、源切换与实时频率 API（`sysclk_hz`/`refclk_hz`/`periclk_hz`/`usbclk_hz`/`adcclk_hz`/`rtcclk_hz`、`generation()`）；bootrom 等价初值（150 MHz）；`PERFCTR` 默认机器接线；已知向量 12 MHz→150 MHz、252 MHz 超频、REF/DIV 切换、PERI/USB、非法分频 0 Hz；`rp2350-periph` 404 测试（+27），总线级 252 MHz 一致 | `rp2350-periph` + `rp2350-core` | ✅ `cargo test -p rp2350-periph` 404 passed；`cargo test -p rp2350-core` 98 passed；emerald 启动后 `sysclk_hz() = 252000000` |
 | P4-2 | 动态频率接入全部计时消费者：`cycles→µs`、SysTick、TIMER、PIO `CLKDIV`、HSTX 像素时钟、UART 波特率、ADC/RTC、DMA 节拍；端到端固件验证（含 252 MHz 固件样例） | `rp2350-periph` + `rp2350-core` + `rp2350-cli` | ⏳ 待派发（P4-1 已提供 `ClockTree::generation`/实时频率 API） |
+| P4-2b ✅ | **修复 P4-2 精度缺陷**：SysTick（异常 15）与 PendSV（14）曾按 NVIC 位映射成异常 31；现 `Scb` 单独保存 `ICSR` 挂起锁存 + `SHPR2`/`SHPR3`，`check_pending_exceptions` 按（优先级，异常号）统一仲裁，SysTick 向量 `VTOR+0x3C`、PendSV `VTOR+0x38`，`PRIMASK`/`FAULTMASK`/`BASEPRI`/严格更高优先级抢占生效；PPB 回放 `ICSR`/`SHPR2`/`SHPR3`。`rp2350-arm` 492（+24）、`rp2350-periph` 435（+2）测试绿 | `rp2350-arm` + `rp2350-periph` | ✅ 核侧投递完成；机器侧仍需 CLI 把 `take_systick_pending()` 转发到 `pend_systick()` |
 | P4-3 | 时钟/频率回归与文档：超频/降频/源切换的 300M 计数器对照、`doc/architecture.md` 时钟章节 | 主会话 | ⏳ |
 
 ## 3.5 通用性任务（与帧率无关，必须推进）/ Generality tasks
