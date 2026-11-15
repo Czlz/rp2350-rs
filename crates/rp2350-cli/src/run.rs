@@ -758,18 +758,59 @@ impl Machine {
     /// marker word, so the caller sees the readable prefix.
     /// `read_block(addr, len).len() == len` therefore proves the whole block was
     /// readable.
+    /// The body is copied with 32-bit bus reads (an unaligned head and a short
+    /// tail fall back to byte reads), which cuts a 76 800-byte frame copy from
+    /// 76 800 bus round trips to ~19 200. A wide read that fails is re-read
+    /// byte-wise, so the returned prefix is exactly the byte-wise prefix even
+    /// when the block straddles the end of a region.
     /// 与 [`Self::dump_memory`] 不同，这是面向帧缓冲的连续字节拷贝：遇到首个未映射
     /// 地址即停止，而不是填充标记字，因此调用方看到的是可读前缀。
     /// `read_block(addr, len).len() == len` 即可证明整块可读。
+    /// 主体按 32 位总线读拷贝（不对齐的头与不足一字的尾回退到字节读），把
+    /// 76 800 字节的整帧拷贝从 76 800 次总线往返降到约 19 200 次。失败的宽读会退回
+    /// 逐字节读，因此即使区间跨越末尾，返回的前缀也与逐字节读完全一致。
     pub fn read_block(&mut self, addr: u32, len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(len);
         let mut cycles = 0u64;
-        for offset in 0..len {
-            let address = addr.wrapping_add(offset as u32);
+        let mut address = addr;
+        let mut remaining = len;
+        // 头部：读到 4 字节对齐为止。 / Head: byte reads up to a word boundary.
+        while remaining > 0 && address & 3 != 0 {
             match self.bus.read_u8(address, &mut cycles) {
                 Ok(byte) => out.push(byte),
-                Err(_) => break,
+                Err(_) => return out,
             }
+            address = address.wrapping_add(1);
+            remaining -= 1;
+        }
+        // 主体：整字读取。 / Body: whole words.
+        while remaining >= 4 {
+            let Ok(word) = self.bus.read_u32(address, &mut cycles) else {
+                // 宽读越界不代表首字节不可读：退回逐字节读以复现精确前缀。
+                // A failed wide read does not mean the first byte is
+                // unreadable: fall back to bytes to reproduce the exact prefix.
+                while remaining > 0 {
+                    match self.bus.read_u8(address, &mut cycles) {
+                        Ok(byte) => out.push(byte),
+                        Err(_) => return out,
+                    }
+                    address = address.wrapping_add(1);
+                    remaining -= 1;
+                }
+                return out;
+            };
+            out.extend_from_slice(&word.to_le_bytes());
+            address = address.wrapping_add(4);
+            remaining -= 4;
+        }
+        // 尾部：不足一字的余数。 / Tail: the sub-word remainder.
+        while remaining > 0 {
+            match self.bus.read_u8(address, &mut cycles) {
+                Ok(byte) => out.push(byte),
+                Err(_) => return out,
+            }
+            address = address.wrapping_add(1);
+            remaining -= 1;
         }
         out
     }
@@ -1079,7 +1120,7 @@ impl Machine {
     pub fn run_cycles(&mut self, cycles: u64) {
         let target = self.steps.saturating_add(cycles).min(self.budget);
         while self.steps < target && self.halt.is_none() {
-            match self.step() {
+            match self.run_steps(target - self.steps) {
                 Ok(CpuState::Running) => {}
                 Ok(_) => break,
                 Err(error) => {
@@ -1374,38 +1415,7 @@ impl Machine {
                 self.spin_steps += 1;
                 if self.spin_steps == SPIN_REPORT_STEPS && self.spin_reports < SPIN_REPORT_LIMIT {
                     self.spin_reports += 1;
-                    let registers = match self.core.arch() {
-                        rp2350_cpu::CpuArch::RiscVHazard3 => format!(
-                            "ra={:#010X} sp={:#010X} s0={:#010X} s1={:#010X} \
-                             a0={:#010X} a1={:#010X} a2={:#010X} a3={:#010X} \
-                             a4={:#010X} a5={:#010X}",
-                            self.core.read_register(1),
-                            self.core.read_register(2),
-                            self.core.read_register(8),
-                            self.core.read_register(9),
-                            self.core.read_register(10),
-                            self.core.read_register(11),
-                            self.core.read_register(12),
-                            self.core.read_register(13),
-                            self.core.read_register(14),
-                            self.core.read_register(15),
-                        ),
-                        rp2350_cpu::CpuArch::ArmCortexM33 => format!(
-                            "r0={:#010X} r1={:#010X} r2={:#010X} r3={:#010X} sp={:#010X}",
-                            self.core.read_register(0),
-                            self.core.read_register(1),
-                            self.core.read_register(2),
-                            self.core.read_register(3),
-                            self.core.read_register(13),
-                        ),
-                    };
-                    self.notices.push(format!(
-                        "[run] tight spin: PC stayed in {:#010X}..{:#010X} for {} steps, \
-                         likely polling a value that never changes / 疑似轮询等待; {registers}",
-                        self.spin_base,
-                        self.spin_base + SPIN_WINDOW_BYTES,
-                        self.spin_steps
-                    ));
+                    self.emit_spin_notice(self.spin_base, self.spin_steps);
                 }
             } else {
                 self.spin_base = pc;
@@ -1441,6 +1451,47 @@ impl Machine {
         if self.steps - self.advanced >= ADVANCE_INTERVAL {
             self.advance_timebase();
         }
+    }
+
+    /// Format and queue one tight-spin warning / 生成并排队一条自旋告警
+    ///
+    /// Kept separate from [`Self::after_running_step`] so [`Self::run_steps`] can
+    /// emit the identical line from the batched loop.
+    /// 与 [`Self::after_running_step`] 分离，使 [`Self::run_steps`] 能从批量循环中
+    /// 输出完全相同的文本。
+    fn emit_spin_notice(&mut self, spin_base: u32, spin_steps: u64) {
+        let registers = match self.core.arch() {
+            rp2350_cpu::CpuArch::RiscVHazard3 => format!(
+                "ra={:#010X} sp={:#010X} s0={:#010X} s1={:#010X} \
+                 a0={:#010X} a1={:#010X} a2={:#010X} a3={:#010X} \
+                 a4={:#010X} a5={:#010X}",
+                self.core.read_register(1),
+                self.core.read_register(2),
+                self.core.read_register(8),
+                self.core.read_register(9),
+                self.core.read_register(10),
+                self.core.read_register(11),
+                self.core.read_register(12),
+                self.core.read_register(13),
+                self.core.read_register(14),
+                self.core.read_register(15),
+            ),
+            rp2350_cpu::CpuArch::ArmCortexM33 => format!(
+                "r0={:#010X} r1={:#010X} r2={:#010X} r3={:#010X} sp={:#010X}",
+                self.core.read_register(0),
+                self.core.read_register(1),
+                self.core.read_register(2),
+                self.core.read_register(3),
+                self.core.read_register(13),
+            ),
+        };
+        self.notices.push(format!(
+            "[run] tight spin: PC stayed in {:#010X}..{:#010X} for {} steps, \
+             likely polling a value that never changes / 疑似轮询等待; {registers}",
+            spin_base,
+            spin_base + SPIN_WINDOW_BYTES,
+            spin_steps
+        ));
     }
 
     /// Run one throttled DMA batch before interrupt delivery
@@ -1578,9 +1629,12 @@ pub fn run(options: &RunOptions) -> Result<()> {
         }
     }
     while machine.halt_reason().is_none() && !machine.budget_exhausted() {
-        machine.step()?;
+        let state = machine.run_steps(machine.budget() - machine.steps())?;
         if machine.notices_pending() {
             drain_notices(&mut machine, &mut stdout)?;
+        }
+        if state != CpuState::Running {
+            break;
         }
     }
     machine.finalize();
@@ -1946,5 +2000,6 @@ fn log_irq(irq_log: &mut Vec<String>, core: &str, irq: u16, pc: u32) {
     irq_log.push(format!("[irq] {core}signal {irq} at PC={pc:#010X}"));
 }
 
+mod batch;
 #[cfg(test)]
 mod tests;

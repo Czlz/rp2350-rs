@@ -5,7 +5,7 @@
 //! 从 `run.rs` 拆出，使两个文件都落在项目的单文件代码预算内；测试内容不变。
 
 use super::*;
-use crate::test_support::{cpacr_write_elf, infinite_loop_elf};
+use crate::test_support::{counter_elf, cpacr_write_elf, infinite_loop_elf, unmapped_branch_elf};
 use rp2350_periph::dma::{
     CTRL_CHAIN_TO_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_INCR_WRITE, CTRL_TREQ_SEL_SHIFT,
     TREQ_PERMANENT,
@@ -1219,4 +1219,211 @@ fn emerald_runs_core1_hstx_without_bus_errors() {
         hstx.unknown_commands()
     );
     assert!(machine.dma_transfers() > 0);
+}
+
+// ---- 批量步进 / batched stepping ------------------------------------------
+
+/// Everything a batched run must keep identical to single stepping
+/// 批量推进必须与逐指令推进完全一致的全部状态
+#[derive(Debug, PartialEq, Eq)]
+struct SteppedState {
+    /// Executed steps / 已执行步数
+    steps: u64,
+    /// Core 0 program counter / core0 程序计数器
+    pc: u32,
+    /// Core 0 stack pointer / core0 栈指针
+    sp: u32,
+    /// Core 0 program status register / core0 程序状态寄存器
+    xpsr: u32,
+    /// Core 0 accumulated cycles / core0 累计周期
+    cycles: u64,
+    /// DMA data units moved by the host pump / 宿主泵送搬运的 DMA 数据单元
+    dma: u64,
+    /// HSTX words drained by the host pump / 宿主泵送排空的 HSTX 字数
+    hstx: u64,
+    /// Logged interrupt deliveries / 已记录的中断投递
+    irqs: Vec<String>,
+    /// Core 1 program counter / core1 程序计数器
+    core1_pc: Option<u32>,
+    /// Core 1 execution state / core1 执行状态
+    core1_state: Option<CpuState>,
+    /// Recent-step ring, including opcodes / 最近步数环形缓冲（含操作码）
+    tail: Vec<(u64, u32, u16)>,
+}
+
+/// Capture the state `run_steps` must preserve / 捕获 `run_steps` 必须保持的状态
+fn stepped_state(machine: &mut Machine) -> SteppedState {
+    SteppedState {
+        steps: machine.steps(),
+        pc: machine.pc(),
+        sp: machine.sp(),
+        xpsr: machine.xpsr(),
+        cycles: machine.core.total_cycles(),
+        dma: machine.dma_transfers(),
+        hstx: machine.hstx_words(),
+        irqs: machine.irqs().to_vec(),
+        core1_pc: machine.core1_pc(),
+        core1_state: machine.core1_state(),
+        tail: machine.recent_steps(),
+    }
+}
+
+#[test]
+fn batched_steps_match_single_steps_over_a_counter_loop() {
+    // 计数器循环使 PC 在三个地址间变化，环形缓冲因此包含不同 PC。
+    // The counter loop moves the PC between three addresses, so the ring holds
+    // distinct PCs.
+    let elf = counter_elf();
+    let options = MachineOptions {
+        arch: Some(ArchArg::Arm),
+        max_cycles: 100_000,
+        strict_decode: false,
+    };
+    let mut single = Machine::new(&elf, &options).expect("single machine");
+    let mut batched = Machine::new(&elf, &options).expect("batched machine");
+    for _ in 0..3_000 {
+        single.step().expect("single step");
+    }
+    assert_eq!(
+        batched.run_steps(3_000).expect("batched steps"),
+        CpuState::Running
+    );
+    assert_eq!(stepped_state(&mut single), stepped_state(&mut batched));
+}
+
+#[test]
+fn batched_steps_advance_both_cores_like_step() {
+    // 双核都在运行时，core1 必须与逐指令路径同样推进。
+    // With both cores running, core 1 must advance exactly like the per-step path.
+    let mut single = dual_core_machine(100_000);
+    let mut batched = dual_core_machine(100_000);
+    for _ in 0..500 {
+        single.step().expect("single step");
+    }
+    assert_eq!(
+        batched.run_steps(500).expect("batched steps"),
+        CpuState::Running
+    );
+    assert_eq!(stepped_state(&mut single), stepped_state(&mut batched));
+    assert_ne!(
+        batched.core1_pc(),
+        Some(0),
+        "core1 retired instructions / core1 必须推进"
+    );
+}
+
+#[test]
+fn batched_steps_keep_interrupt_delivery_on_the_same_step() {
+    // PIO 在泵送批次内执行 `IRQ set`，中断线随后由共享投递路径送达；两条路径的
+    // 投递步号必须一致，因此 `[irq]` 日志必须逐条相同。
+    // `IRQ set` runs inside a pump batch and the line is then delivered by the
+    // shared path; both paths must deliver on the same steps, so the `[irq]`
+    // log must match entry by entry.
+    let elf = counter_elf();
+    let options = MachineOptions {
+        arch: Some(ArchArg::Arm),
+        max_cycles: 100_000,
+        strict_decode: false,
+    };
+    let mut single = Machine::new(&elf, &options).expect("single machine");
+    let mut batched = Machine::new(&elf, &options).expect("batched machine");
+    let base = rp2350_periph::map::PIO0_BASE;
+    for machine in [&mut single, &mut batched] {
+        write_word(machine, base + PIO_INSTR_MEM0, pio_irq_set(2));
+        write_word(machine, base + PIO_CTRL, 1);
+    }
+    for _ in 0..1_000 {
+        single.step().expect("single step");
+    }
+    assert_eq!(
+        batched.run_steps(1_000).expect("batched steps"),
+        CpuState::Running
+    );
+    let single_state = stepped_state(&mut single);
+    let batched_state = stepped_state(&mut batched);
+    assert!(!single_state.irqs.is_empty(), "PIO IRQ must be delivered");
+    assert_eq!(single_state, batched_state);
+}
+
+#[test]
+fn batched_steps_wake_the_dma_pump_after_it_goes_idle() {
+    // 空闲门控不能让泵送永久休眠：控制器空闲后再次使能通道仍必须推进。
+    // The idle gate must not put the pump to sleep forever: re-enabling a
+    // channel after the controller went idle must still make progress.
+    let mut machine = machine_with_budget(100_000);
+    let src = SRAM_BASE + 0x1000;
+    let dst = SRAM_BASE + 0x2000;
+    program_channel(&mut machine, 0, src, dst, 4, 0);
+    machine.run_steps(200).expect("batched steps");
+    assert_eq!(machine.dma_transfers(), 4);
+    assert!(
+        !machine
+            .peripherals
+            .dma()
+            .channel_state(0)
+            .expect("ch0")
+            .busy
+    );
+
+    program_channel(&mut machine, 0, src, dst + 0x100, 4, 0);
+    machine.run_steps(200).expect("batched steps");
+    assert_eq!(machine.dma_transfers(), 8, "pump must wake up again");
+}
+
+#[test]
+fn run_steps_stops_exactly_at_the_budget() {
+    let mut machine = machine_with_budget(100);
+    assert_eq!(
+        machine.run_steps(u64::MAX).expect("batched steps"),
+        CpuState::Running
+    );
+    assert_eq!(machine.steps(), 100);
+    assert!(machine.budget_exhausted());
+    // 预算耗尽后不再推进，返回 Halted。 / No progress after the budget: Halted.
+    assert_eq!(
+        machine.run_steps(10).expect("batched steps"),
+        CpuState::Halted
+    );
+    assert_eq!(machine.steps(), 100);
+}
+
+#[test]
+fn fault_tail_survives_batched_stepping() {
+    // 故障回溯依赖逐指令的最近步数环形缓冲，批量推进不得让它变短或改变内容。
+    // The fault tail depends on the per-instruction recent-step ring; batched
+    // stepping must neither shorten it nor change its contents.
+    let elf = unmapped_branch_elf();
+    let options = MachineOptions {
+        arch: Some(ArchArg::Arm),
+        max_cycles: 1_000,
+        strict_decode: false,
+    };
+    let mut single = Machine::new(&elf, &options).expect("single machine");
+    let mut batched = Machine::new(&elf, &options).expect("batched machine");
+    while single.halt_reason().is_none() && !single.budget_exhausted() {
+        single.step().expect("single step");
+    }
+    machine_run_to_halt(&mut batched);
+    assert!(single.halt_reason().is_some(), "the image must fault");
+    assert_eq!(single.halt_reason(), batched.halt_reason());
+    assert_eq!(single.steps(), batched.steps());
+
+    let single_lines = fault_tail_lines(&mut single);
+    let batched_lines = fault_tail_lines(&mut batched);
+    assert_eq!(single_lines, batched_lines);
+    let tails = batched_lines
+        .iter()
+        .filter(|line| line.starts_with("[tail]"))
+        .count();
+    assert_eq!(
+        tails, 3,
+        "both retired instructions plus the faulting fetch are recorded"
+    );
+}
+
+/// Drive a machine to its halt with batched steps / 用批量步进跑到停机
+fn machine_run_to_halt(machine: &mut Machine) {
+    while machine.halt_reason().is_none() && !machine.budget_exhausted() {
+        machine.run_steps(1_000).expect("batched steps");
+    }
 }

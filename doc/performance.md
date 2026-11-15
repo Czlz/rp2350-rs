@@ -1,11 +1,12 @@
 # 解释器热路径性能 / Interpreter hot-path performance
 
-本文件记录 **P0-1 第一轮**、**P0-2 第二轮** 与 **P0-3a 第三轮** 的性能工作：测量方法、
-基线、每项优化的收益、最终数字、剩余瓶颈与下一轮建议。目标与实际结果并列，未达标处
-如实记录。
-This document records the first (P0-1), second (P0-2) and third (P0-3a) rounds of
-interpreter performance work: measurement method, baseline, per-optimization
-gains, final numbers, remaining bottlenecks and next-round suggestions. Targets
+本文件记录 **P0-1 第一轮**、**P0-2 第二轮**、**P0-3a 第三轮** 与 **P0-3b 第四轮**
+（`rp2350-cli` 批量步进）的性能工作：测量方法、基线、每项优化的收益、最终数字、
+剩余瓶颈与下一轮建议。目标与实际结果并列，未达标处如实记录。
+This document records the first (P0-1), second (P0-2), third (P0-3a) and fourth
+(P0-3b, batched stepping in `rp2350-cli`) rounds of interpreter performance work:
+measurement method, baseline, per-optimization gains, final numbers, remaining
+bottlenecks and next-round suggestions. Targets
 and actual results are both listed, and any shortfall is reported as measured.
 
 关联文档 / Related: [`playability-plan.md`](playability-plan.md)（为什么需要 ≥50 M steps/s）、
@@ -479,3 +480,167 @@ ELF `load_into` 与逐字节参考逐字节一致）。
 
 若要达到 20 fps 游玩（≥50 M steps/s），在 cli 批量步进之后仍需 JIT 或帧级并行；
 详见 [`playability-plan.md`](playability-plan.md) 的风险节。
+
+---
+
+## 8. 第四轮 / Round 4（P0-3b：`rp2350-cli`）
+
+第三轮把 50 M 步做到 2.41 s，并把 ~40 % 的时间归给「cli 骨架」（`pc()`、
+`record_step`、泵送节流、自旋检测、PPB 世代比较、core1 探测）。本轮**只改
+`rp2350-cli`**：先重新分桶确认骨架的真实构成，再用批量步进把它摊薄，顺带修复
+`play` 的两处体验缺陷（按键每帧采样的输入延迟、逐字节整屏拷贝）。
+Round 3 brought 50 M steps to 2.41 s and attributed ~40 % of the time to the
+"cli skeleton". Round 4 only touches `rp2350-cli`: it re-profiles that skeleton,
+amortizes it with batched stepping, and fixes two `play` experience defects
+(per-frame button sampling and a byte-wise full-screen copy).
+
+### 8.1 重新分桶 / Re-measured profile
+
+临时探针（交付前已删除）：`rdtsc` 每次采样只包住**一个**区段（每 64 步采样一次），
+另有一次空跨度采样标定探针自身开销。空跨度实测 **35~37 周期**，因此单段读数
+= 真实值 + 35 左右；短于此的区段无法区分。
+Temporary probe (removed before delivery): one `rdtsc` pair around a **single**
+section per run, sampled every 64 steps, plus an empty-span calibration.
+The empty span measured **35–37 cycles**, so each section reading is the real
+value + ~35 and anything shorter is below the resolution.
+
+改动前（emerald 20 M 步，`run` 路径；周期/步，TSC 3.29 GHz）：
+
+| 区段 / Section | 探针读数 | 扣除标定 | 说明 |
+|---|---|---|---|
+| 空跨度（标定） | 35.3 / 37.2 | 0 | 探针本身的开销 |
+| `core.step`（取指+译码+执行+数据访问） | 106.2 / 121.1 | **~71 / ~84** | 两次独立采样；占整步的 40~45 % |
+| `pc()` + `record_step` | 37.9 | **< 1** | 单段短于探针分辨率 |
+| `record_sync_trap` | 35.7 | **< 1** | 同上 |
+| DMA/PIO 泵送（节流后） | 36.2 | **< 1** | 同上 |
+| `after_running_step`（自旋+PPB+IRQ 节流+时基） | 36.3 | **< 1** | 同上 |
+| `step_core1`（core1 未运行时） | 37.8 | **< 1** | 同上 |
+
+单段都低于探针分辨率，但它们的**合计**可以从两条路径的差看出来：
+
+- 把上述六段按 `step()` 的顺序写进一个扁平循环（`prof` 探针循环）：
+  **148.6 周期/步**；
+- 真实的 `run` 前端循环（`machine.step()?` + `notices_pending()` + 外层
+  `halt_reason()`/`budget_exhausted()` 检查）：50 M 步 2.83~2.86 s =
+  **186 周期/步**。
+
+即：约 **35 周期/步**花在 `Machine::step` → `step_cores_with_trace` →
+`execute_core0_step` → `after_running_step` 的调用层与外层循环上，其余约
+**65 周期/步**是那五段自身的合计。这解释了为什么「每步骨架 ~20 ns」难以靠单点
+优化拿掉：它由五六个 5~15 周期的短函数调用组成。
+Each section alone is shorter than the probe resolution, but their sum is
+visible by comparing two whole loops: the same six pieces written as one flat
+loop cost **148.6 cycles/step**, while the real `run` front-end loop
+(`step()?` + `notices_pending()` + the outer halt/budget checks) costs
+**186 cycles/step**. That is ~35 cycles/step in call layers plus ~65 cycles/step
+across the five short sections.
+
+### 8.2 逐项 A/B / Per-item A/B
+
+同一 release 二进制、同一时段交错运行 3 次取最小值（emerald 50 M 步）。
+三项都通过临时环境变量开关（交付前已删除）。
+
+| # | 优化 / Optimization | 文件 / File | 前 / Before | 后 / After | 收益 / Gain |
+|---|---|---|---|---|---|
+| 1 | 批量步进 `Machine::run_steps`（扁平循环 + 步边界提升） | `run/batch.rs` | 2.464 s¹ | 1.802 s¹ | **−27 %** |
+| 2 | core1 门控（仅在 `Running` 或 PSM 复位 / FIFO 启动挂起时调用 `step_core1`） | `run/batch.rs` | 2.025 s | 1.802 s | **−11 %** |
+| 3 | Arm 跳过 `record_sync_trap`（`csr_read(0x342)` 恒为 0） | `run/batch.rs` | 1.828 s | 1.802 s | **−1.4 %**（噪声内） |
+| 4 | PC 缓存（下一步的 PC = 上一步结束时的 PC，省一次 `core.pc()`） | — | 1.791 s | 1.802 s | **无收益，已回退** |
+
+¹ 第 1 项是整项开关：前值 = 用 `machine.step()` 逐指令跑同一个 `run`（同一二进制、
+同一时段），后值 = 用 `run_steps` 一次跑完。前后差 **0.66 s ≈ 43 周期/步**，与
+8.1 测出的调用层 35 周期 + 五个短段的一部分吻合。
+
+说明 / Notes：
+
+- 第 1 项的语义约束是**逐事件步号不变**：DMA/PIO 批次仍每 64 步一次、中断投递
+  仍每 64 步一次（`service_core1_peer` + `deliver_irqs`）、时基仍每 10 000 步一次，
+  且 core1 的步进被挪到「边界工作之后」以保持原顺序（`service_core1_peer` 能在
+  同一步挂起 core1 启动，原路径就是在同一步消费它）。这一条曾在第一版实现里弄错
+  （core1 启动晚一步，300 M 步最终 PC 偏移 6 条指令），由逐步对照工具定位后修正，
+  现已在 300 M 步上逐字节一致（见 8.4）。
+- 仍然逐指令进行的工作：预算/停机检查（步号精确）、`RecentSteps` 环形缓冲
+  （`[tail]`/故障回溯）、PPB 回放世代比较（CPACR 必须在下一条指令前生效）、
+  自旋检测（`[run] tight spin` 的步号与文本不变）、RISC-V 的 `mcause` 探测。
+  `record_step` **没有**加门控：`run` 总会打印 `[tail]`，故障回溯也依赖它，加
+  `AtomicBool` 只会多一次原子读，故保持无锁环形缓冲。
+- 第 2 项收益最大的一块是 `step_core1` 的 `SIO select_core`/状态查询调用层；
+  未运行时它没有任何副作用（复位与启动都各自有 relaxed 守卫）。
+- 第 4 项实测无收益（1.791 vs 1.802 在噪声内），按「只做实测有效」原则回退。
+
+### 8.3 `play` 体验修复 / Play fixes
+
+| # | 缺陷 / Defect | 修复 / Fix | 效果 / Effect |
+|---|---|---|---|
+| a | 按键**每帧**采样一次：8 fps 下输入延迟 ~120 ms，帧内快速点按被吞掉 | 每 **4096 客户机步**采样一次（与停止标志同一节拍），一帧按 4096 步切片执行 | 延迟从 ~120 ms 降到 ~0.14 ms 客户机时间 |
+| b | `read_block` **逐字节**读整屏：76 800 次总线往返 | 对齐主体用 `AddressBus::read_u32`（每次 4 字节），不对齐的头/短尾/失败宽读回退字节读 | 每帧 ~19 200 次总线读；`play` 8.26 → **11.7~12.5 fps** |
+
+`read_block` 的等价性：宽读失败时从该字起退回逐字节读，因此返回前缀与逐字节遍历
+完全一致（含跨越 SRAM 末尾的情形）；有单测覆盖 4 种对齐 × 11 种长度与越界前缀。
+
+### 8.4 最终数字 / Final numbers
+
+同一 release 二进制，预热后 5 次（并列出全部样本）：
+
+| 场景 / Case | 步数 | 样本 (s) | 最小值 | 中位数 | 吞吐（最小值 / 中位数） |
+|---|---|---|---|---|---|
+| emerald | 50 M | 1.879 / 1.689 / 1.704 / 1.723 / 1.655 | **1.655 s** | 1.704 s | **30.2 / 29.3 M steps/s** |
+| emerald | 300 M | 15.80 | **15.80 s** | — | **19.0 M steps/s** |
+| `play --frames 20` | 50 M | 两轮：11.74 / 12.46 fps | — | — | **29.4 / 31.2 M steps/s** |
+
+- emerald 50 M：**2.83~2.86 s（本轮开头同机同口径）→ 1.655 s（最小值）**，
+  **−41 %**，吞吐 **17.7 → 30.2 M steps/s**。目标 **≤1.8 s（≥28 M steps/s）
+  达成**，余量约 8 %；中位数 1.704 s 也在目标内。
+- emerald 300 M：**20.52 s（第三轮）→ 15.80 s**，吞吐 14.6 → 19.0 M steps/s。
+  300 M 区间的 cli 骨架占比本来就比 50 M 小（中断、双核与 DMA 都在跑），因此
+  收益（−23 %）小于 50 M 的 −41 %。
+- `play`：**8.26 → 11.7~12.5 fps**（+42~51 %），同时修掉 120 ms 输入延迟。
+
+### 8.5 不变量核对 / Invariant checks
+
+| 检查 / Check | 结果 |
+|---|---|
+| emerald 50 M 全部 stdout（49 行） | 与改动前**逐字节相同**（`Compare-Object` 无差异） |
+| emerald 300 M 全部 stdout | 与「逐指令 `step()`」构建**逐字节相同**（`Compare-Object` 无差异） |
+| 300 M `final PC=0x1000B3A6`、`dma=2195390 busy=0x0009`、`hstx words=5401204 underruns=0 fifo=8 enabled=true wof=false unknown=0`、`core1 state=Running pc=0x10009D92 sp=0x2003D680 launches=1`、8 条 `[irq]` | 全部 ✅（逐字段相同） |
+| 总线错误 | 无 |
+| `RP2350_WATCH=20000000-20082000`（50 M 步） | stdout 与 stderr（237 MB、约 970 万条 `[watch]`）与逐指令构建 **SHA-256 相同** |
+| 逐步对照（同一进程内两台机器，每 64 步比一次 PC/core1 PC/DMA/HSTX/节流游标/IRQ 条数） | 300 M 步**无分歧** |
+| `--trace-steps` / `--dump` / `gdb` / `repl` | 输出格式不变；GDB 与 `--trace-steps` 仍走逐指令 `step`/`trace_step` |
+| FV-1 / FV-2 / FV-3 | 均 `[repl] banner` + `stdout: 42` ✅ |
+| `cargo test --all-features` | 全绿（40 个测试目标） |
+| `cargo fmt --check` / `clippy -D warnings -W clippy::pedantic` / `cargo doc --no-deps` | 全绿 |
+
+新增测试 10 项：批量步进与逐指令逐步一致（计数器循环、双核都在跑）、批中途中断
+（PIO `IRQ set`）投递相同、DMA 空闲后能再次唤醒、预算精确停在预算步、故障回溯
+（`[tail]` 内容相同、含故障取指共 3 条）、`read_block` 批量 vs 逐字节（4 种对齐 ×
+11 种长度、越界前缀、全未映射）、按键在帧首生效、按键在帧内被重新采样。
+
+### 8.6 剩余瓶颈 / Remaining bottlenecks
+
+50 M 步现在 **1.655~1.70 s ≈ 109~112 周期/步**：
+
+| 组成 | 每步 | 占比 | 归属 |
+|---|---|---|---|
+| ARM 解释器（`core.step`：取指 + 译码 + 执行 + 数据访问） | **~71~84 周期** | **~65~75 %** | `rp2350-arm` + `rp2350-core` |
+| cli 骨架（`pc()`、`record_step`/环形缓冲、ROM 窗口、PPB 世代、自旋比较、循环与边界摊薄） | ~28~40 周期 | ~25~35 % | `rp2350-cli`（本轮） |
+
+- 本轮把 cli 骨架从 ~100 周期/步（占 55 %）压到 ~30 周期/步（占 25~35 %），
+  剩余部分已经是「每条指令必须做」的最小集合：一次 PC 读、一次环形缓冲写、
+  一次 PPB 世代原子读、一次自旋窗口比较。
+- 再要提升只能动解释器本体或改架构：`core.step` 的 `dyn AddressBus` 数据访问、
+  Thumb-32 热分支、以及双核分线程。cli 侧继续优化的理论上限约 **−15 %**
+  （1.66 s → ~1.45 s），达不到 20 fps（≥50 M steps/s）所需的 3.4× 差距。
+
+### 8.7 下一轮建议 / Next round
+
+| 优先级 | 改动 | 归属 | 预期 |
+|---|---|---|---|
+| P0 | `AddressBus` 去虚化（`CortexM33Core::step` 泛型化或 SRAM/Flash 专用快路径） | `rp2350-arm` + `rp2350-core` | 10~20 % |
+| P0 | MMIO 读路径（定时器轮询 + 只读寄存器快照） | `rp2350-periph` | 5~10 % |
+| P1 | 双核分线程（core0/core1 各占一线程，300 M 区间） | `rp2350-cli` | 1.3~1.5×（渲染阶段） |
+| P2 | `record_step` 仅在需要时写入（`play`/`repl` 无 `[tail]` 读者时可关） | `rp2350-cli` | <2 % |
+
+要进入 ≥50 M steps/s（20 fps 游玩）仍需 JIT 或帧级并行，详见
+[`playability-plan.md`](playability-plan.md)。
+

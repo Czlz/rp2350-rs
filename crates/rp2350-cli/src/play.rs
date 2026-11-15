@@ -50,7 +50,12 @@ const WORKER_NAME: &str = "rp2350-play";
 /// Target frame period (60 fps ceiling) / 目标帧周期（60 fps 上限）
 const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
 
-/// Steps between stop-flag polls / 停止标志的轮询步数间隔
+/// Steps between stop-flag and button samples / 停止标志与按键采样的步数间隔
+///
+/// Buttons are sampled at this cadence, not once per frame, so a press is visible
+/// to the firmware within ~0.1 ms of guest time even when a frame takes 120 ms.
+/// 按键按此步数节拍采样（而不是每帧一次），因此即使单帧需要 120 ms，固件也能在
+/// 约 0.1 ms 的客户机时间内看到按下。
 const STOP_POLL_STEPS: u64 = 4096;
 
 /// Length of the rolling rate window / 滚动速率窗口长度（秒）
@@ -415,39 +420,66 @@ pub(crate) fn apply_buttons(machine: &Machine, mask: u16, button_pins: u16) {
 ///
 /// Returns `None` when the budget was consumed normally. `trace_left` counts the
 /// `[trace]` steps still owed to the first frame.
+/// The frame is executed in [`STOP_POLL_STEPS`] slices: the stop flag **and the
+/// button mask** are re-read at every slice, so input latency is one slice of
+/// guest time instead of one whole frame.
 /// 预算正常耗尽时返回 `None`。`trace_left` 是第一帧尚未打印的 `[trace]` 步数。
+/// 一帧按 [`STOP_POLL_STEPS`] 步切片执行：每个切片重新读取停止标志**与按键掩码**，
+/// 因此输入延迟是一个切片的客户机时间，而不是一整帧。
 fn step_frame(
     machine: &mut Machine,
     config: &PlayConfig,
     stop: &AtomicBool,
+    buttons: &AtomicU16,
     trace_left: &mut usize,
 ) -> Option<String> {
     let mut stepped = 0u64;
     while stepped < config.steps_per_frame {
-        if stepped % STOP_POLL_STEPS == 0 && stop.load(Ordering::Relaxed) {
-            return None;
-        }
-        if machine.budget_exhausted() {
-            return Some(BUDGET_REASON.to_owned());
-        }
-        if let Some(reason) = machine.halt_reason() {
-            return Some(reason.to_owned());
-        }
-        let outcome = if *trace_left > 0 {
-            *trace_left -= 1;
-            let index = config.trace_steps - *trace_left - 1;
-            let outcome = machine.trace_step(index);
-            for line in machine.take_notices() {
-                println!("{line}");
+        if stepped % STOP_POLL_STEPS == 0 {
+            apply_buttons(machine, buttons.load(Ordering::Relaxed), config.button_pins);
+            if stop.load(Ordering::Relaxed) {
+                return None;
             }
-            outcome
-        } else {
-            machine.step()
-        };
-        if let Err(error) = outcome {
-            return Some(error.to_string());
+            if machine.budget_exhausted() {
+                return Some(BUDGET_REASON.to_owned());
+            }
+            if let Some(reason) = machine.halt_reason() {
+                return Some(reason.to_owned());
+            }
         }
-        stepped += 1;
+        let slice = (config.steps_per_frame - stepped).min(STOP_POLL_STEPS);
+        if *trace_left > 0 {
+            // 前 `trace_steps` 步必须逐步执行，才能打印与 `run --trace-steps`
+            // 相同的 `[trace]` 行。
+            // The leading `trace_steps` must be stepped one by one so the
+            // `[trace]` lines match `run --trace-steps` exactly.
+            let mut done = 0u64;
+            while done < slice && *trace_left > 0 {
+                *trace_left -= 1;
+                let index = config.trace_steps - *trace_left - 1;
+                let outcome = machine.trace_step(index);
+                for line in machine.take_notices() {
+                    println!("{line}");
+                }
+                if let Err(error) = outcome {
+                    return Some(error.to_string());
+                }
+                done += 1;
+            }
+            stepped += done;
+            let rest = slice - done;
+            if rest > 0 {
+                if let Err(error) = machine.run_steps(rest) {
+                    return Some(error.to_string());
+                }
+                stepped += rest;
+            }
+        } else {
+            if let Err(error) = machine.run_steps(slice) {
+                return Some(error.to_string());
+            }
+            stepped += slice;
+        }
     }
     None
 }
@@ -511,13 +543,8 @@ fn run_worker(
             break;
         }
         let frame_started = Instant::now();
-        apply_buttons(
-            &machine,
-            buttons.load(Ordering::Relaxed),
-            config.button_pins,
-        );
 
-        let halted = step_frame(&mut machine, &config, stop, &mut trace_left);
+        let halted = step_frame(&mut machine, &config, stop, buttons, &mut trace_left);
 
         let bytes = machine.read_block(config.frame.base, config.frame.buffer_len());
         stats.frames += 1;

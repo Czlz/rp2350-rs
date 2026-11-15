@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::run::Machine;
+use rp2350_core::AddressBus;
 
 /// SRAM base address used by the fixtures / 夹具使用的 SRAM 基地址
 const SRAM_BASE: u32 = 0x2000_0000;
@@ -374,4 +375,125 @@ fn buttons_setter_round_trips_and_drop_stops_the_worker() {
     // Drop 必须安全停止线程：不能 panic，也不能重复 join。
     // Dropping must stop the thread safely: no panic and no double join.
     drop(session);
+}
+
+// ---- 帧缓冲批量读与按键采样 / batched frame reads and button sampling ------
+
+/// Write a byte pattern through the machine bus / 通过机器总线写入字节图案
+fn write_bytes(machine: &mut Machine, addr: u32, bytes: &[u8]) {
+    let mut cycles = 0u64;
+    for (offset, byte) in bytes.iter().enumerate() {
+        machine
+            .bus
+            .write_u8(addr + offset as u32, *byte, &mut cycles)
+            .expect("bus write");
+    }
+}
+
+/// Byte-wise reference implementation of `read_block` / `read_block` 的逐字节参考实现
+fn read_byte_wise(machine: &mut Machine, addr: u32, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut cycles = 0u64;
+    for offset in 0..len {
+        match machine
+            .bus
+            .read_u8(addr.wrapping_add(offset as u32), &mut cycles)
+        {
+            Ok(byte) => out.push(byte),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn read_block_matches_byte_wise_reads_at_every_alignment() {
+    // 32 位批量读必须与逐字节读返回完全相同的字节，包括不对齐的起点与不足一字的尾部。
+    // The 32-bit batched read must return exactly the byte-wise bytes, including
+    // unaligned starts and sub-word tails.
+    let mut machine = machine();
+    let base = SRAM_BASE + 0x2000;
+    let pattern: Vec<u8> = (0..64u32).map(|index| (index * 7 + 3) as u8).collect();
+    write_bytes(&mut machine, base, &pattern);
+
+    for start in 0..4u32 {
+        for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 17, 32, 61] {
+            let address = base + start;
+            let batched = machine.read_block(address, len);
+            let expected = read_byte_wise(&mut machine, address, len);
+            assert_eq!(batched, expected, "start={start} len={len}");
+        }
+    }
+}
+
+#[test]
+fn read_block_stops_at_the_same_unreadable_byte_as_byte_reads() {
+    // 区间跨过 SRAM 末尾：宽读失败必须回退逐字节读，返回与逐字节路径相同的前缀。
+    // The range crosses the end of SRAM: a failed wide read must fall back to
+    // byte reads and return the same prefix as the byte-wise path.
+    let mut machine = machine();
+    let end = SRAM_BASE + 520 * 1024;
+    let start = end - 6;
+    write_bytes(&mut machine, start, &[1, 2, 3, 4, 5, 6]);
+
+    let batched = machine.read_block(start, 16);
+    let expected = read_byte_wise(&mut machine, start, 16);
+    assert_eq!(batched, expected);
+    assert_eq!(batched.len(), 6, "only the readable prefix is returned");
+
+    // 完全未映射的起点两条路径都返回空。
+    // A fully unmapped start returns nothing on both paths.
+    assert_eq!(machine.read_block(0x3000_0000, 16), Vec::<u8>::new());
+    assert_eq!(
+        read_byte_wise(&mut machine, 0x3000_0000, 16),
+        Vec::<u8>::new()
+    );
+}
+
+#[test]
+fn step_frame_applies_the_current_button_mask() {
+    // 帧开始时就必须把掩码写到 pad 上，固件在帧内第一次读引脚即可看到按下。
+    // The mask must reach the pads at the start of a frame, so the firmware's
+    // first pin read inside the frame already sees the press.
+    let mut machine = machine();
+    let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 32);
+    let stop = AtomicBool::new(false);
+    let buttons = AtomicU16::new(1 << 3);
+    let mut trace_left = 0;
+    assert_eq!(
+        step_frame(&mut machine, &config, &stop, &buttons, &mut trace_left),
+        None
+    );
+    assert_eq!(machine.steps(), 32);
+    let levels = machine.peripherals().pads().input_levels();
+    assert_eq!(levels & (1 << 3), 0, "pressed is low / 按下为低");
+}
+
+#[test]
+fn buttons_are_resampled_inside_a_frame() {
+    // 一帧内部（而不是帧边界）就要重新读取按键掩码：宿主在帧中途按下时，
+    // 本帧内后续的切片必须已经看到。
+    // The button mask must be re-read inside a frame, not only at frame
+    // boundaries: a press arriving mid-frame must be visible to a later slice.
+    let mut machine = machine();
+    let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 400_000);
+    let stop = AtomicBool::new(false);
+    let buttons = Arc::new(AtomicU16::new(0));
+    let mut trace_left = 0;
+
+    let host = Arc::clone(&buttons);
+    let presser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(2));
+        host.store(1 << 4, Ordering::Relaxed);
+    });
+    assert_eq!(
+        step_frame(&mut machine, &config, &stop, &buttons, &mut trace_left),
+        None
+    );
+    presser.join().expect("button thread");
+    // 一帧耗时远大于 2 ms，因此本帧内至少有一次采样看到按下。
+    // A frame takes far longer than 2 ms, so at least one in-frame sample saw
+    // the press and left the pin low.
+    let levels = machine.peripherals().pads().input_levels();
+    assert_eq!(levels & (1 << 4), 0, "press sampled inside the frame");
 }

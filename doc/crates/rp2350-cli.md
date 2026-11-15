@@ -276,14 +276,15 @@ read completely (unmapped window) prints `[play] warn: frame buffer unreadable`
 once and the affected pixels are black; nothing panics.
 
 Measured on `emerald.uf2` (`--fb 0x20063DF4:240x160 --steps-per-frame 2500000
---frames 20`): **6.1–7.0 fps / 15.3–17.5 M steps/s** (two runs), 20 frames in
-3.7–4.1 s wall clock.
+--frames 20`): **11.7–12.5 fps / 29.3–31.2 M steps/s** (two runs), 20 frames in
+1.6–1.7 s wall clock. Before the round-4 batched stepping and the word-wise
+`read_block` the same command measured 8.26 fps.
 该子命令在 worker 线程上启动固件，每帧推进 `--steps-per-frame` 步，拷贝客户机
 帧缓冲并为每帧打印一行。`--frames N` 跑满 N 帧后以状态码 0 退出；不带该参数时
 运行到机器停机或进程被杀。帧缓冲读不全（窗口未映射）时只打印一次
 `[play] warn: frame buffer unreadable`，缺失像素为黑色，不会 panic。
-`emerald.uf2` 实测：**6.1–7.0 fps / 15.3–17.5 M steps/s**（两次运行），20 帧约
-3.7–4.1 秒墙钟。
+`emerald.uf2` 实测：**11.7–12.5 fps / 29.3–31.2 M steps/s**（两次运行），20 帧约
+1.6–1.7 秒墙钟。第四轮批量步进与按字 `read_block` 之前，同一命令为 8.26 fps。
 
 #### Frame format and button semantics / 帧格式与按键语义
 
@@ -300,10 +301,14 @@ Measured on `emerald.uf2` (`--fb 0x20063DF4:240x160 --steps-per-frame 2500000
   `GpioPads::set_external_pin`; a clear bit means released and drives it
   **high** (the firmware enables internal pull-ups). Only pins present in
   `button_pins`/`--buttons` are driven, so other injected inputs are untouched.
+  The mask is re-read every 4096 guest steps (not once per frame), so a press
+  reaches the firmware within one slice of guest time even when a frame takes
+  85 ms; a fast tap inside one frame can no longer be swallowed.
   掩码为 `u16` 位图（位 `n` = GP`n`）。置位表示**按下**，通过
   `GpioPads::set_external_pin` 把引脚拉**低**；清零表示松开并把引脚拉**高**
   （固件启用内部上拉）。只驱动 `button_pins`/`--buttons` 中置位的引脚，其它注入
-  输入不受影响。
+  输入不受影响。掩码**每 4096 客户机步**重新采样一次（不是每帧一次），因此即使
+  一帧需要 85 ms，按下也能在一个切片内到达固件；帧内快速点按不再被吞掉。
 - **Triple buffer / 三缓冲**：the worker publishes `Arc<Frame>` into a
   single-slot "latest frame" mailbox. The producer never blocks; a frame the
   consumer has not taken is replaced and counted (`replaced_frames`).
@@ -313,20 +318,22 @@ Measured on `emerald.uf2` (`--fb 0x20063DF4:240x160 --steps-per-frame 2500000
   until the 60 fps boundary; a slower frame runs at full speed (no sleep).
   一帧耗时小于 1/60 秒时 worker 睡到 60 fps 边界；更慢的帧全速运行（不 sleep）。
 
-#### Why ~7 fps / 为什么只有约 7 fps
+#### Why ~12 fps / 为什么只有约 12 fps
 
-The measured throughput is ~17.5 M steps/s while one game frame needs ~2.5 M
-steps (dual core + software PPU), so a frame takes ~0.14 s → ~7 fps. Playability
+The measured throughput is ~29–31 M steps/s while one game frame needs ~2.5 M
+steps (dual core + software PPU), so a frame takes ~85 ms → ~12 fps. Playability
 needs 30 fps (≥75 M steps/s) or 60 fps (≥150 M steps/s); closing that gap is the
-P0 performance track in `doc/playability-plan.md` (interpreter hot paths,
-batched stepping, JIT or frame-parallel evaluation). The play worker deliberately
-adds no extra per-step work: the only per-frame costs are one `read_block`
-(76.8 KB) and one RGB565 conversion, both far below one frame of emulation.
-实测吞吐约 17.5 M steps/s，而一个游戏帧约需 2.5 M 步（双核 + 软件 PPU），因此
-一帧约 0.14 秒 → 约 7 fps。可玩需要 30 fps（≥75 M steps/s）或 60 fps
+P0 performance track in `doc/playability-plan.md` (interpreter hot paths, JIT or
+frame-parallel evaluation). The play worker deliberately adds almost no
+per-step work: after round 4 a frame costs one `read_block` (76.8 KB, copied with
+32-bit bus reads) and one RGB565 conversion, both far below one frame of
+emulation.
+实测吞吐约 29–31 M steps/s，而一个游戏帧约需 2.5 M 步（双核 + 软件 PPU），因此
+一帧约 85 ms → 约 12 fps。可玩需要 30 fps（≥75 M steps/s）或 60 fps
 （≥150 M steps/s），差距由 `doc/playability-plan.md` 的 P0 性能线负责（解释器
-热路径、批量步进、JIT 或帧级并行）。play worker 刻意不增加每步开销：每帧仅一次
-`read_block`（76.8 KB）与一次 RGB565 转换，都远低于一帧仿真成本。
+热路径、JIT 或帧级并行）。play worker 刻意几乎不增加每步开销：第四轮之后每帧仅
+一次 `read_block`（76.8 KB，按 32 位总线读拷贝）与一次 RGB565 转换，都远低于
+一帧仿真成本。
 
 ### `gdb` — GDB remote debug server / GDB 远程调试服务器
 
@@ -763,7 +770,9 @@ impl Machine {
     pub fn step(&mut self) -> Result<CpuState>;   // both runnable cores
     pub fn step_cores(&mut self, core0: bool, core1: bool) -> Result<CpuState>;
     pub fn trace_step(&mut self, index: usize) -> Result<CpuState>;  // prints [trace]
+    pub fn run_steps(&mut self, max_steps: u64) -> Result<CpuState>; // batched stepping
     pub fn run_cycles(&mut self, cycles: u64);   // CdcLink cycle callback, both cores
+    pub fn read_block(&mut self, addr: u32, len: usize) -> Vec<u8>;  // frame copies
     pub fn finalize(&mut self);                  // flush timebase + UART
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
@@ -798,6 +807,20 @@ must not block on emulation.
 `Machine` 位于库目标（`rp2350_cli::run::Machine`），因此 GUI 或其它宿主可以直接
 链接，而不必调用可执行文件。下面的帧/输入 worker 是「前端不能被仿真阻塞」时受支持
 的驱动方式。
+
+`Machine::read_block` is a prefix copy meant for frame buffers: it stops at the
+first unmapped address, reads the aligned body with `AddressBus::read_u32`
+(one bus round trip per four bytes) and falls back to byte reads for an
+unaligned head, a sub-word tail and any wide read that fails, so the returned
+prefix is byte-for-byte the same as a byte-wise walk. A 240x160 RGB565 frame
+(76 800 bytes) therefore costs ~19 200 bus reads instead of 76 800. It is not a
+side-effect-free guarantee for MMIO ranges: like `dump_memory`, callers must
+only point it at memory.
+`Machine::read_block` 是面向帧缓冲的前缀拷贝：遇到首个未映射地址即停止，对齐主体
+用 `AddressBus::read_u32` 读取（每 4 字节一次总线往返），不对齐的头、不足一字的尾
+以及失败的宽读都回退到字节读，因此返回的前缀与逐字节遍历逐字节相同。240x160 的
+RGB565 帧（76 800 字节）因此只需约 19 200 次总线读，而不是 76 800 次。它不保证
+MMIO 区间无副作用：与 `dump_memory` 一样，调用方只能指向内存。
 
 ## `PlaySession` — background frame worker / 后台帧 worker
 
@@ -890,6 +913,15 @@ panic，因此 worker panic 不会在收尾阶段拖垮宿主。
 
 ### egui usage / egui 用法示例
 
+GUI 侧不必自己写适配器：`rp2350-egui` 的 `play_view/cli_source.rs` 已提供
+`CliPlaySource` / `CliPlayStarter`，依赖方向为 `rp2350-egui → rp2350-cli`（CLI 不再
+依赖 GUI），`main.rs` 默认挂载。下面是最小用法，供其它前端参考。
+
+The GUI does not need its own adapter: `rp2350-egui` ships `CliPlaySource` /
+`CliPlayStarter` in `play_view/cli_source.rs` with the dependency pointing
+`rp2350-egui → rp2350-cli` (the CLI no longer depends on the GUI), attached by
+`main.rs`. The snippet below is the minimal usage for any other frontend.
+
 ```rust
 use std::sync::Arc;
 use rp2350_cli::play::{Frame, FrameSpec, PlayConfig, PlaySession, PlayStats};
@@ -909,10 +941,11 @@ let stats: PlayStats = session.stats();
 ctx.request_repaint_after(std::time::Duration::from_millis(16));
 ```
 
-Keyboard-to-mask mapping belongs to the frontend (P1-2); the worker only
-consumes the mask. `PlaySession::audio_tap()` returns the same tap the machine
-installed, so a playback plugin can drain `i16` samples concurrently.
-按键到掩码的映射属于前端（P1-2），worker 只消费掩码。
+Keyboard-to-mask mapping belongs to the frontend (landed for the egui Play tab as
+P1-2); the worker only consumes the mask. `PlaySession::audio_tap()` returns the
+same tap the machine installed, so a playback plugin can drain `i16` samples
+concurrently.
+按键到掩码的映射属于前端（egui 的「游戏」标签页已落地，P1-2），worker 只消费掩码。
 `PlaySession::audio_tap()` 返回机器实际安装的同一个 tap，因此播放插件可并发取走
 `i16` 样本。
 
@@ -976,6 +1009,34 @@ Boot ROM 陷阱只对 Arm 核生效（RISC-V 时 `bootrom_applicable` 为 false�
 
 ### Execution loop details / 执行循环细节
 
+- **Batched stepping / 批量步进**：`run`, `repl` and `perfbench` drive the
+  machine through `Machine::run_steps` (`crates/rp2350-cli/src/run/batch.rs`),
+  which is equivalent to calling `step()` N times but hoists host-only work to
+  the step boundary where it takes effect: DMA/PIO batches, IRQ delivery
+  (`service_core1_peer` + `deliver_irqs`) and the timebase still run on exactly
+  the same step numbers (every 64 / 64 / 10 000 retired steps), so guest-visible
+  behaviour is byte-identical. Per-instruction work that diagnostics can read is
+  kept per instruction: the budget/halt check, the `RecentSteps` ring, the PPB
+  replay gate, the tight-spin detector and core-1 stepping. `step()`,
+  `step_cores()` and `trace_step()` keep their original granularity for the GDB
+  stub and `--trace-steps`.
+  `run`、`repl` 与 `perfbench` 通过 `Machine::run_steps`
+  （`crates/rp2350-cli/src/run/batch.rs`）驱动机器：它等价于调用 `step()` N 次，
+  但把与指令无关的宿主工作提升到真正生效的步边界——DMA/PIO 批次、中断投递
+  （`service_core1_peer` + `deliver_irqs`）与时基仍在与原先完全相同的步号上执行
+  （每 64 / 64 / 10 000 步），因此客户机可观察行为逐字节不变。诊断会读取的
+  逐指令工作仍保留逐指令粒度：预算/停机检查、`RecentSteps` 环形缓冲、PPB 回放
+  门控、自旋检测与 core1 步进。`step()`、`step_cores()` 与 `trace_step()` 仍保持
+  原来的粒度，供 GDB stub 与 `--trace-steps` 使用。
+- **Hoisted checks / 提升的检查**：the synchronous-trap probe (`csr_read(0x342)`)
+  runs per instruction only on RISC-V; the Cortex-M33 has no CSR window (`csr_read`
+  is always 0), so on Arm the probe is statically impossible to observe. Core 1 is
+  only stepped when it is `Running` or a PSM reset / SIO FIFO launch is pending,
+  which is exactly when `step_core1` can have an effect.
+  同步陷阱探测（`csr_read(0x342)`）只在 RISC-V 上逐指令执行；Cortex-M33 没有 CSR
+  窗口（`csr_read` 恒为 0），因此在 Arm 上该探测在语义上不可能被观察到。core1
+  仅在 `Running` 或存在 PSM 复位 / SIO FIFO 启动挂起时才步进，这正是
+  `step_core1` 可能产生作用的条件。
 - Steps double as cycles: `steps == now_cycles`, and the peripheral timebase
   advances in 10 000-step batches (`time_us` includes pending steps).
   步数同时充当周期：`steps == now_cycles`；外设时基按 10 000 步批量推进
@@ -1292,7 +1353,7 @@ because the guest writes `CTRL.SM_ENABLE`.
 | `rp2350-virt-periph` | `DeviceManager` behind `list-devices` / `wire` / 设备管理器 |
 | `rp2350-gdb` | RSP server behind `gdb` / `gdb` 子命令的 RSP 服务器 |
 | `rp2350-mcp` | `McpServer` + HTTP transport behind `mcp-serve` / `mcp-serve` 的服务器与 HTTP 传输 |
-| `rp2350-egui`, `rp2350-ffi`, `tokio` | linked for the future egui integration; `tokio` also waits for Ctrl-C / 为后续 egui 集成预留；`tokio` 另用于等待 Ctrl-C |
+| `rp2350-ffi`, `tokio` | C ABI export; `tokio` waits for Ctrl-C / C ABI 导出；`tokio` 用于等待 Ctrl-C |
 
 ---
 

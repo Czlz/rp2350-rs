@@ -5,8 +5,10 @@
 //! 测试不依赖真实 `MicroPython` 固件。
 
 // 测试夹具按 ELF32 布局手工拼装字节，需要定长整数转换。
-// The fixture assembles ELF32 bytes by hand, which requires fixed-width casts.
-#![allow(clippy::cast_possible_truncation)]
+// 夹具被 lib 与 bin 两个测试目标共享，每个目标只用到其中一部分。
+// The fixture assembles ELF32 bytes by hand, which requires fixed-width casts;
+// the fixtures are shared by the lib and bin test targets, each using a subset.
+#![allow(clippy::cast_possible_truncation, dead_code)]
 
 use rp2350_core::FLASH_XIP_BASE;
 
@@ -96,6 +98,42 @@ pub(crate) fn cpacr_write_elf() -> Vec<u8> {
     data[0x14..0x18].copy_from_slice(&0x0030_0303u32.to_le_bytes());
     let memsz = data.len() as u32;
     build_elf(FLASH_XIP_BASE | 1, &[(FLASH_XIP_BASE, &data, memsz)])
+}
+
+/// ELF image that counts in `r0` inside a two-instruction loop
+/// 在两条指令的循环里用 `r0` 计数的 ELF 映像
+///
+/// Thumb program / Thumb 程序:
+/// `movs r0, #0` → `adds r0, #1` → `b` back to `adds`, so the PC alternates
+/// between two addresses and the recent-step ring holds three distinct PCs.
+/// `movs r0, #0` → `adds r0, #1` → 跳回 `adds`，因此 PC 在两个地址间交替，
+/// 最近步数环形缓冲包含三种不同的 PC。
+pub(crate) fn counter_elf() -> Vec<u8> {
+    // movs r0,#0 / adds r0,#1 / b <adds>
+    let data = [0x00u8, 0x20, 0x01, 0x30, 0xFD, 0xE7];
+    build_elf(
+        FLASH_XIP_BASE | 1,
+        &[(FLASH_XIP_BASE, &data, data.len() as u32)],
+    )
+}
+
+/// ELF image that branches to the unmapped address `0x3000_0000`
+/// 跳转到未映射地址 `0x3000_0000` 的 ELF 映像
+///
+/// Thumb program / Thumb 程序: `ldr r0, [pc, #0]` → `bx r0`, with the literal
+/// `0x3000_0001` right behind it, so the fetch after the branch faults on an
+/// unmapped address (a bus error, not an INVSTATE).
+/// `ldr r0, [pc, #0]` → `bx r0`，字面量 `0x3000_0001` 紧随其后，因此跳转后的取指
+/// 落在未映射地址上（总线错误，而不是 INVSTATE）。
+pub(crate) fn unmapped_branch_elf() -> Vec<u8> {
+    let mut data = vec![0u8; 8];
+    // ldr r0, [pc, #0] / bx r0
+    data[0..4].copy_from_slice(&[0x00, 0x48, 0x00, 0x47]);
+    data[4..8].copy_from_slice(&0x3000_0001u32.to_le_bytes());
+    build_elf(
+        FLASH_XIP_BASE | 1,
+        &[(FLASH_XIP_BASE, &data, data.len() as u32)],
+    )
 }
 
 #[cfg(test)]
