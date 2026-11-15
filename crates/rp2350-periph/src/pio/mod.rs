@@ -34,6 +34,8 @@
 //! `SMx_PINCTRL = 0x1400_0000`、`DBG_CFGINFO = 0x1020_0404`。
 
 #[cfg(test)]
+mod clock_tests;
+#[cfg(test)]
 mod dreq_tests;
 #[cfg(test)]
 mod pin_tests;
@@ -264,10 +266,13 @@ impl Pio {
         match register {
             SM_CLKDIV => {
                 // Bit 31 is a self-clearing clock-restart stroke, not storage.
-                // 位 31 是自清零的时钟重启脉冲，不属于存储值。
-                if value & CLKDIV_RESTART_BIT != 0 {
-                    self.sm[index].clock_phase = 0;
-                }
+                // Writing the divider itself also restarts the fractional
+                // accumulator, so a new CLKDIV takes effect on the next PIO
+                // clock edge instead of finishing the old period.
+                // 位 31 是自清零的时钟重启脉冲，不属于存储值。写入分频值本身也会
+                // 重启小数累加器，因此新的 CLKDIV 在下一个 PIO 时钟边沿立即生效，
+                // 而不是先走完旧周期。
+                self.sm[index].clock_phase = 0;
                 self.sm[index].clkdiv = value & CLKDIV_MASK & !CLKDIV_RESTART_BIT;
             }
             SM_EXECCTRL => {

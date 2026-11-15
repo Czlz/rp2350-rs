@@ -912,3 +912,68 @@ GAP-07 落地后 emerald 的启动延时（`sleep_ms(1500)`）真正进入 `WFE`
 
 下一步性能工作的度量口径改为「300–500 M 窗口的吞吐」，避免再被启动段的睡眠/自旋误导。
 
+### 9.1 时钟树接入后的最终口径（P4-2）
+
+`clk_sys` 现在按固件写入的 **252 MHz** 计时（启动阶段仍是 150 MHz）：
+
+| 关系 | 数值 |
+|---|---|
+| 252 MHz 下 1 秒客户机时间 | 252 M 周期 |
+| 60 fps 一帧（16.67 ms） | **4.2 M 周期** |
+| emerald 300 M 步 | 1.7986 s（前 225 M 步为 150 MHz 启动睡眠） |
+| emerald 300 → 360 M 步（60 M） | +0.238 s → **252 M 周期/秒**（与频率一致） |
+
+按 4.2 M 周期/帧与真实游戏段 8.5 M 步/秒计算，**实际游戏帧率约 2 fps**；此前记录的
+3.3 fps 是按 150 MHz 假设的 2.5 M 步/帧算出的，已过时。
+
+本项目**不做 JIT**，因而不会以跳过客户机工作换取帧率；当前目标是把「精确时钟 + 精确
+指令 + 功能/插件稳定」做好，帧率作为已知限制记录。
+
+
+---
+
+## 10. P4-2 时钟接入后的重新基线 / Rebaseline after P4-2
+
+时钟树接入后，`steps` 仍然是一条指令一个 `clk_sys` 周期，但**每秒墙钟/模拟时间对应的
+步数随实时频率变化**。因此旧的「同样 300 M 步、逐字段相同」判据不再成立：300 M 步在
+252 MHz 下只覆盖约 1.19 s，而在 150 MHz 下覆盖 2.0 s。新的比较口径是**相同模拟时间**
+（`time_us`），并同时报告 `steps`、`cycles`、`time_us`。
+
+After P4-2 a step is still one `clk_sys` cycle, but the number of steps per second of
+**simulated** time follows the live frequency. The old "same 300 M steps, identical
+counters" baseline is no longer meaningful: 300 M steps cover ~1.19 s at 252 MHz versus
+2.0 s at 150 MHz. Comparisons now use the same `time_us` and report `steps`, `cycles` and
+`time_us` together.
+
+| 频率 / Rate | 1 s 模拟时间所需步数 / Steps per simulated second |
+|---|---|
+| 150 MHz | 150 000 000 |
+| 252 MHz | 252 000 000 |
+
+**合成固件 150 vs 252 MHz（同一段写 `PLL_SYS` 的 Thumb 代码）**
+**Synthetic firmware, same PLL-writing Thumb code at 150 vs 252 MHz**
+
+| 频率 | 运行步数 | 模拟时间 | 每步覆盖 |
+|---|---|---|---|
+| 150 MHz (`FBDIV=125`, `/5/2`) | 1 000 000 | **6 666 µs** | 6.67 ns |
+| 252 MHz (`FBDIV=126`, `/6/1`) | 1 000 000 | **3 968 µs** | 3.97 ns |
+
+（`run/tests.rs::the_same_guest_code_runs_slower_in_simulated_time_at_252_mhz`；
+10 ms 对照由 `ten_milliseconds_of_simulated_time_needs_the_live_rate_in_steps`
+覆盖：1.5 M 步与 2.52 M 步都得到 10 000 µs。）
+
+**emerald（固件在启动睡眠后把时钟升到 252 MHz）**
+
+| 运行 | steps | time_us | 说明 |
+|---|---|---|---|
+| `--max-cycles 300000000` | 300 000 000 | **1 798 617**（1.80 s） | 前约 225 M 步仍是 150 MHz 的 `sleep_ms(1500)`，之后 252 MHz |
+| `--max-cycles 360000000` | 360 000 000 | **2 036 712**（2.04 s） | 跨过 2 s 模拟时间；`hstx underruns=0`、`core1 Running`、8 条 `[irq]` |
+
+- 300 M 步的 `dma=2 195 390`、`hstx words=5 401 204`、`underruns=0`；
+  360 M 步为 `dma=3 958 856`、`hstx words=9 746 080`、`underruns=0`。
+- 启动睡眠 `sleep core0 steps=224 994 790` 正好对应 150 MHz 下的 1.5 s；接入前同一段
+  固件在模型时间里要 2.5 s 才走完，这是 P4-2 最直接的端到端证据。
+- **不要**再用「300 M 步计数器相同」做回归判据；改用「跑到 `time_us >= 2_000_000`」
+  或一组固定 `time_us` 检查点，并附上当时的 `steps` 与频率。
+
+

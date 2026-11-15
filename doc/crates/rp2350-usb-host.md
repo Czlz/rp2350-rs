@@ -70,8 +70,12 @@ pub enum HostError {
 
 pub struct UsbHostBridge { /* private */ }
 impl UsbHostBridge {
-    pub fn new(controller: Controller) -> Self;
+    pub fn new(controller: Controller) -> Self;    // 150 MHz / 48 MHz defaults
+    /// Constructor with explicit CLK_SYS and CLK_USB / 显式 CLK_SYS 与 CLK_USB
+    pub fn with_clock(controller: Controller, sysclk_hz: u32, usbclk_hz: u32) -> Self;
     pub fn set_sysclk_hz(&mut self, hz: u32);      // timing conversion clock
+    pub fn set_clocks(&mut self, sysclk_hz: u32, usbclk_hz: u32);
+    pub fn usbclk_hz(&self) -> u32;                // SOF generator clock
     pub fn device_info(&self) -> Option<DeviceInfo>;
     pub fn config_info(&self) -> Option<&ConfigInfo>;
     pub fn address(&self) -> u8;                   // address assigned by SET_ADDRESS
@@ -83,6 +87,20 @@ impl UsbHostBridge {
     pub fn poll(&mut self, now: u64) -> HostProgress;
 }
 ```
+
+`poll(now)` receives `CLK_SYS` cycles, while the 1 ms SOF is generated in the
+USB clock domain: `SofScheduler` carries `CLK_USB` and one frame is
+`usbclk_hz / 1 MHz` USB cycles (48 000 at full speed), which converts back to
+`sysclk_hz / 1 MHz` CPU cycles (150 000 at 150 MHz, 252 000 at 252 MHz).
+P4-2 injects both clocks from the guest clock tree (`BootPeripherals::sysclk_hz`
+and `usbclk_hz`) through `with_clock`/`set_clocks`; `CdcLink::with_clock` does
+the same for the data phase.
+`poll(now)` 接收 `CLK_SYS` 周期，而 1 ms SOF 在 USB 时钟域产生：`SofScheduler`
+携带 `CLK_USB`，一帧为 `usbclk_hz / 1 MHz` 个 USB 周期（全速 48 000），换算回
+`sysclk_hz / 1 MHz` 个 CPU 周期（150 MHz 下 150 000、252 MHz 下 252 000）。
+P4-2 通过 `with_clock`/`set_clocks` 从客户机时钟树注入两个时钟
+（`BootPeripherals::sysclk_hz` 与 `usbclk_hz`）；`CdcLink::with_clock` 对数据阶段
+做同样的事。
 
 ### Enumeration flow / 枚举流程
 

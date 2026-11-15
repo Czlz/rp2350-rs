@@ -18,6 +18,12 @@ const ALARM0: u32 = ALARM0_OFFSET;
 /// One clock cycle per microsecond / 每微秒 150 个周期
 const CYCLES_PER_US: u32 = 150;
 
+/// Bootrom `clk_sys` / bootrom `clk_sys`
+const SYSCLK_HZ: u32 = 150_000_000;
+
+/// Bootrom `clk_ref` / bootrom `clk_ref`
+const REFCLK_HZ: u32 = 12_000_000;
+
 /// Both timer instances over one timebase and interrupt set
 /// 共享一个时基与中断集合的两个定时器实例
 struct Rig {
@@ -34,7 +40,7 @@ struct Rig {
 impl Rig {
     /// Build the rig / 构建测试装置
     fn new() -> Self {
-        let timebase = Arc::new(Mutex::new(Timebase::new(CYCLES_PER_US)));
+        let timebase = Arc::new(Mutex::new(Timebase::new(SYSCLK_HZ, REFCLK_HZ)));
         let irq = IrqAssert::new();
         Self {
             timer: Timer0::new(Arc::clone(&timebase), irq.clone()),
@@ -48,7 +54,7 @@ impl Rig {
     fn advance_us(&self, micros: u64) {
         self.timebase
             .lock()
-            .advance(u64::from(CYCLES_PER_US) * micros);
+            .advance(u64::from(CYCLES_PER_US) * micros, SYSCLK_HZ, REFCLK_HZ, 1);
     }
 }
 
@@ -293,7 +299,32 @@ fn clones_share_state() {
     let mut peer = timer.clone();
     let mut writer = timer;
     assert!(writer.write32(ALARM0, 5));
-    timebase.lock().advance(u64::from(CYCLES_PER_US) * 6);
+    timebase
+        .lock()
+        .advance(u64::from(CYCLES_PER_US) * 6, SYSCLK_HZ, REFCLK_HZ, 2);
     peer.refresh();
     assert_eq!(peer.read32(INTR), Some(1));
+}
+
+#[test]
+fn the_timer_alarm_hits_the_same_microsecond_at_150_and_252_mhz() {
+    // TIMER 的 µs 计数器由 clk_ref 驱动：同样的 1 000 µs 截止时间在 150 MHz 与
+    // 252 MHz 下都在 TIMELR == 1 000 时命中。
+    // The TIMER microsecond counter is clocked from clk_ref: the same 1000 µs
+    // deadline is reached at TIMELR == 1000 under both 150 and 252 MHz.
+    for (sysclk, cycles_per_us) in [(150_000_000u32, 150u64), (252_000_000, 252)] {
+        let timebase = Arc::new(Mutex::new(Timebase::new(sysclk, REFCLK_HZ)));
+        let mut timer = Timer0::new(Arc::clone(&timebase), IrqAssert::new());
+        assert!(timer.write32(ALARM0, 1_000));
+        // 999 µs 不命中。 / 999 µs does not fire.
+        timebase
+            .lock()
+            .advance(cycles_per_us * 999, sysclk, REFCLK_HZ, 1);
+        assert_eq!(timer.read32(TIMERAWL), Some(999));
+        assert_eq!(timer.read32(INTR), Some(0));
+        // 第 1 000 µs 命中。 / The 1000th microsecond fires.
+        timebase.lock().advance(cycles_per_us, sysclk, REFCLK_HZ, 1);
+        assert_eq!(timer.read32(TIMERAWL), Some(1_000));
+        assert_eq!(timer.read32(INTR), Some(1), "{sysclk} Hz");
+    }
 }

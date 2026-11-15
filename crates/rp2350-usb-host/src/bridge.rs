@@ -128,6 +128,7 @@ impl Transfer {
 pub struct UsbHostBridge {
     controller: Controller,
     sysclk_hz: u32,
+    usbclk_hz: u32,
     stage: Stage,
     queue: VecDeque<Request>,
     transfer: Option<Transfer>,
@@ -148,16 +149,35 @@ pub struct UsbHostBridge {
 }
 
 impl UsbHostBridge {
-    /// Default system clock used for cycle conversion (150 MHz)
-    /// 用于周期换算的默认系统时钟（150 MHz）
+    /// Nominal bootrom `CLK_SYS` used by [`UsbHostBridge::new`]
+    /// [`UsbHostBridge::new`] 使用的 bootrom 标称 `CLK_SYS`
     pub const DEFAULT_SYSCLK_HZ: u32 = 150_000_000;
 
     /// Create a bridge over the given controller / 在给定控制器上创建主机桥
+    ///
+    /// The two clocks are constructor parameters: `sysclk_hz` converts the
+    /// `poll(now)` CPU-cycle argument and `usbclk_hz` clocks the SOF generator.
+    /// Use [`UsbHostBridge::with_clock`] to follow the guest's clock tree.
+    /// 两个时钟由构造参数注入：`sysclk_hz` 换算 `poll(now)` 的 CPU 周期，
+    /// `usbclk_hz` 驱动 SOF 发生器。使用 [`UsbHostBridge::with_clock`] 跟随
+    /// 客户机时钟树。
     #[must_use]
     pub fn new(controller: Controller) -> Self {
+        Self::with_clock(
+            controller,
+            Self::DEFAULT_SYSCLK_HZ,
+            crate::sof::USB_FULL_SPEED_HZ,
+        )
+    }
+
+    /// Create a bridge with explicit `CLK_SYS` and `CLK_USB` rates
+    /// 用显式的 `CLK_SYS` 与 `CLK_USB` 频率创建主机桥
+    #[must_use]
+    pub fn with_clock(controller: Controller, sysclk_hz: u32, usbclk_hz: u32) -> Self {
         Self {
             controller,
-            sysclk_hz: Self::DEFAULT_SYSCLK_HZ,
+            sysclk_hz,
+            usbclk_hz,
             stage: Stage::Detached,
             queue: VecDeque::new(),
             transfer: None,
@@ -169,7 +189,7 @@ impl UsbHostBridge {
             last_error: None,
             failed_transfer: None,
             trace: VecDeque::new(),
-            sof: SofScheduler::new(Self::DEFAULT_SYSCLK_HZ),
+            sof: SofScheduler::new_with_usb(sysclk_hz, usbclk_hz),
         }
     }
 
@@ -178,6 +198,19 @@ impl UsbHostBridge {
     pub fn set_sysclk_hz(&mut self, hz: u32) {
         self.sysclk_hz = hz;
         self.sof.set_sysclk_hz(hz);
+    }
+
+    /// Override both the system and USB clocks / 覆盖系统与 USB 时钟
+    pub fn set_clocks(&mut self, sysclk_hz: u32, usbclk_hz: u32) {
+        self.sysclk_hz = sysclk_hz;
+        self.usbclk_hz = usbclk_hz;
+        self.sof.set_clocks(sysclk_hz, usbclk_hz);
+    }
+
+    /// `CLK_USB` rate driving the 1 ms SOF generator / 驱动 1 ms SOF 的 `CLK_USB` 频率
+    #[must_use]
+    pub fn usbclk_hz(&self) -> u32 {
+        self.usbclk_hz
     }
 
     /// Frame number of the last SOF sent to the device

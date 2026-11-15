@@ -14,15 +14,16 @@
 //! # Timing model / 时间模型
 //!
 //! Writing `CYCLES` while the channel is enabled pushes the whole period into the
-//! shared [`CycleSink`], i.e. the simulated clock advances by the programmed
-//! delay immediately instead of being burned by a busy loop. `COUNT` therefore
-//! reads zero right after the write: the period has already elapsed in simulated
-//! time. Writes to `CYCLES` while the channel is disabled are ignored, matching
-//! the datasheet rule that the period only takes effect once `ENABLE` is set.
-//! 通道使能时写 `CYCLES` 会把整个周期推入共享 [`CycleSink`]，即仿真时钟立即
-//! 前进编程的延时量，而不是由忙等循环空转消耗。因此 `COUNT` 在写入后立即读到
-//! 零：该周期在仿真时间里已经过去。通道未使能时对 `CYCLES` 的写入被忽略，
-//! 与数据手册"周期只有在 `ENABLE` 置位后才生效"的规则一致。
+//! shared [`CycleSink`] as `clk_ref` cycles, i.e. the timer-domain clock advances
+//! by the programmed delay immediately instead of being burned by a busy loop.
+//! `COUNT` therefore reads zero right after the write: the period has already
+//! elapsed in simulated time. Writes to `CYCLES` while the channel is disabled
+//! are ignored, matching the datasheet rule that the period only takes effect
+//! once `ENABLE` is set.
+//! 通道使能时写 `CYCLES` 会把整个周期作为 `clk_ref` 周期推入共享 [`CycleSink`]，
+//! 即定时器域时钟立即前进编程的延时量，而不是由忙等循环空转消耗。因此 `COUNT`
+//! 在写入后立即读到零：该周期在仿真时间里已经过去。通道未使能时对 `CYCLES` 的
+//! 写入被忽略，与数据手册"周期只有在 `ENABLE` 置位后才生效"的规则一致。
 
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
@@ -125,7 +126,7 @@ impl MmioDevice for Ticks {
                 if channel.enabled {
                     let period = value & PERIOD_MASK;
                     channel.cycles = period;
-                    self.sink.push(u64::from(period));
+                    self.sink.push_ref(u64::from(period));
                 }
             }
             // COUNT 只读。COUNT is read-only.
@@ -147,7 +148,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::boot::Timebase;
+    use crate::clock_time::Timebase;
 
     /// Offset of a channel register / 通道寄存器的偏移
     fn reg(channel: u32, reg: u32) -> u32 {
@@ -155,7 +156,7 @@ mod tests {
     }
 
     fn ticks() -> (Ticks, CycleSink) {
-        let sink = CycleSink::new(Arc::new(Mutex::new(Timebase::new(150))));
+        let sink = CycleSink::new(Arc::new(Mutex::new(Timebase::new(150_000_000, 12_000_000))));
         (Ticks::new(sink.clone()), sink)
     }
 
@@ -173,7 +174,8 @@ mod tests {
         let (mut ticks, sink) = ticks();
         assert!(ticks.write32(reg(0, CTRL), CTRL_ENABLE));
         assert!(ticks.write32(reg(0, CYCLES), 12));
-        assert_eq!(sink.cycles(), 12);
+        assert_eq!(sink.timer_us(), 1, "12 clk_ref cycles are one microsecond");
+        assert_eq!(sink.cycles(), 0, "the CPU domain is untouched");
         assert_eq!(ticks.read32(reg(0, CYCLES)), Some(12));
         // 周期已整体计入时基，剩余计数为零。The period was fully credited already.
         assert_eq!(ticks.read32(reg(0, COUNT)), Some(0));
@@ -194,17 +196,17 @@ mod tests {
         assert!(ticks.write32(reg(0, CTRL), CTRL_ENABLE));
         assert!(ticks.write32(reg(0, CYCLES), 0xFFFF_FFFF));
         assert_eq!(ticks.read32(reg(0, CYCLES)), Some(PERIOD_MASK));
-        assert_eq!(sink.cycles(), u64::from(PERIOD_MASK));
+        assert_eq!(sink.timer_us(), u64::from(PERIOD_MASK) / 12);
     }
 
     #[test]
     fn count_is_read_only() {
         let (mut ticks, sink) = ticks();
         assert!(ticks.write32(reg(0, CTRL), CTRL_ENABLE));
-        assert!(ticks.write32(reg(0, CYCLES), 5));
+        assert!(ticks.write32(reg(0, CYCLES), 12));
         assert!(ticks.write32(reg(0, COUNT), 0x1FF));
         assert_eq!(ticks.read32(reg(0, COUNT)), Some(0));
-        assert_eq!(sink.cycles(), 5);
+        assert_eq!(sink.timer_us(), 1);
     }
 
     #[test]
@@ -215,7 +217,7 @@ mod tests {
         assert!(ticks.write32(reg(2, CYCLES), 12));
         // 未使能通道的写入不推进时间。A disabled channel does not advance time.
         assert!(ticks.write32(reg(1, CYCLES), 99));
-        assert_eq!(sink.cycles(), 12);
+        assert_eq!(sink.timer_us(), 1);
         assert_eq!(ticks.read32(reg(1, CYCLES)), Some(0));
     }
 

@@ -347,14 +347,14 @@ fn pump_dma_resamples_pio_dreq_between_units() {
         f.write_word(RAM_BASE + index * 4, 0xC000_0000 | index);
     }
     f.program_tx_channel(0, RAM_BASE, map::PIO0_BASE + PIO_TXF0, 8, dreq::PIO0_TX0);
-    let moved = f.peripherals.pump_dma(&mut f.bus, 16);
+    let moved = f.peripherals.pump_dma(&mut f.bus, 16, 64);
     assert_eq!(moved, 4, "only the free FIFO slots may be written");
     assert_eq!(f.channel(0).trans_count, 4);
     assert!(f.channel(0).busy);
 
     assert_eq!(f.pop_tx(0, 0), Some(0xC000_0000));
     assert_eq!(f.pop_tx(0, 0), Some(0xC000_0001));
-    let moved = f.peripherals.pump_dma(&mut f.bus, 16);
+    let moved = f.peripherals.pump_dma(&mut f.bus, 16, 64);
     assert_eq!(moved, 2, "two freed slots, then the FIFO is full again");
     assert_eq!(f.channel(0).trans_count, 2);
 }

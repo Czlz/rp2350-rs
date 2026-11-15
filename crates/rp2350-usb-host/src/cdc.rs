@@ -41,8 +41,25 @@ impl CdcChannel {
     /// 阶段仍能拿到新帧号，而不会看到 `SOF_RD` 跳回零。
     #[must_use]
     pub fn new(controller: Controller, endpoints: CdcEndpoints) -> Self {
+        Self::with_clock(
+            controller,
+            endpoints,
+            UsbHostBridge::DEFAULT_SYSCLK_HZ,
+            crate::sof::USB_FULL_SPEED_HZ,
+        )
+    }
+
+    /// Create a channel with explicit `CLK_SYS` and `CLK_USB` rates
+    /// 用显式的 `CLK_SYS` 与 `CLK_USB` 频率创建通道
+    #[must_use]
+    pub fn with_clock(
+        controller: Controller,
+        endpoints: CdcEndpoints,
+        sysclk_hz: u32,
+        usbclk_hz: u32,
+    ) -> Self {
         let frame = controller.with_core(|core| core.sof_frame());
-        let mut sof = SofScheduler::new(UsbHostBridge::DEFAULT_SYSCLK_HZ);
+        let mut sof = SofScheduler::new_with_usb(sysclk_hz, usbclk_hz);
         sof.reset_at(0, frame);
         Self {
             controller,
@@ -58,6 +75,11 @@ impl CdcChannel {
     /// 覆盖用于 SOF 帧周期的系统时钟
     pub fn set_sysclk_hz(&mut self, hz: u32) {
         self.sof.set_sysclk_hz(hz);
+    }
+
+    /// Override both the system and USB clocks / 覆盖系统与 USB 时钟
+    pub fn set_clocks(&mut self, sysclk_hz: u32, usbclk_hz: u32) {
+        self.sof.set_clocks(sysclk_hz, usbclk_hz);
     }
 
     /// Advance simulated time and issue every SOF frame that is due
@@ -195,12 +217,29 @@ pub struct CdcLink<F: FnMut(u64)> {
 impl<F: FnMut(u64)> CdcLink<F> {
     /// Wrap a channel and a cycle runner (150 MHz system clock)
     /// 包装通道与周期运行器（150 MHz 系统时钟）
+    ///
+    /// Use [`CdcLink::with_clock`] to follow the guest's live `CLK_SYS`.
+    /// 使用 [`CdcLink::with_clock`] 跟随客户机的实时 `CLK_SYS`。
     #[must_use]
     pub fn new(channel: CdcChannel, run_cycles: F) -> Self {
         Self {
             channel,
             run_cycles,
-            sysclk_hz: 150_000_000,
+            sysclk_hz: UsbHostBridge::DEFAULT_SYSCLK_HZ,
+            now_micros: 0,
+        }
+    }
+
+    /// Wrap a channel and runner at an explicit system clock
+    /// 以显式系统时钟包装通道与运行器
+    #[must_use]
+    pub fn with_clock(channel: CdcChannel, run_cycles: F, sysclk_hz: u32) -> Self {
+        let mut channel = channel;
+        channel.set_sysclk_hz(sysclk_hz);
+        Self {
+            channel,
+            run_cycles,
+            sysclk_hz,
             now_micros: 0,
         }
     }
@@ -320,6 +359,25 @@ mod tests {
         link.advance(500);
         assert_eq!(link.channel().sof_frame(), 2);
         assert_eq!(link.channel().now_cycles(), 300_000);
+    }
+
+    #[test]
+    fn a_cdc_link_at_252_mhz_keeps_the_one_millisecond_cadence() {
+        // 252 MHz 下 500 µs 是 126 000 个客户机周期；两轮正好 1 ms，SOF 仍为
+        // 1 ms 节拍，且 USB 时钟域每帧仍是 48 000 个周期。
+        // At 252 MHz, 500 µs is 126_000 guest cycles; two rounds are exactly
+        // 1 ms, so the SOF cadence stays 1 ms and the USB domain still runs
+        // 48_000 cycles per frame.
+        let controller = ready_controller();
+        let channel = CdcChannel::with_clock(controller, endpoints(), 252_000_000, 48_000_000);
+        let mut link = CdcLink::with_clock(channel, |_cycles| {}, 252_000_000);
+        assert_eq!(link.channel().sof_frame(), 0);
+        link.advance(500);
+        assert_eq!(link.channel().sof_frame(), 0);
+        assert_eq!(link.channel().now_cycles(), 126_000);
+        link.advance(500);
+        assert_eq!(link.channel().sof_frame(), 1);
+        assert_eq!(link.channel().now_cycles(), 252_000);
     }
 
     #[test]

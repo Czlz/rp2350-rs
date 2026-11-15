@@ -643,49 +643,52 @@ which is clocked at `clk_hstx / CSR.CLKDIV` and shifts `CSR.N_SHIFTS` times per
 word, so one word occupies
 
 ```text
-CSR.N_SHIFTS * 2 * CSR.CLKDIV   clk_sys cycles
+CSR.N_SHIFTS * ceil(CSR.CLKDIV * clk_sys / clk_hstx)   clk_sys cycles
 ```
 
-(`2 * CLKDIV` `clk_sys` per shift because `clk_hstx = clk_sys / 2`). The
-validated DVI setup (`N_SHIFTS = 5`, `CLKDIV = 5`) therefore takes 50 `clk_sys`
-per raw word, and a word only reaches the host queue when its shift period
-completes — `advance(49)` does not consume it, `advance(1)` does. `N_SHIFTS = 0`
-is modelled as one shift (and `CLKDIV = 0` as one, matching the pixel-clock
-derivation); the datasheet's "0 means shift 32 times" / "CLKDIV 0 means a period
-of 16" encodings are not modelled.
+(`ceil(CLKDIV * clk_sys / clk_hstx)` `clk_sys` per shift; `clk_hstx` is the
+`CLK_HSTX` channel, not an assumed `clk_sys / 2`). The validated DVI setup
+(`N_SHIFTS = 5`, `CLKDIV = 5`, 252 MHz `CLK_SYS`, 126 MHz `CLK_HSTX`) therefore
+takes 50 `clk_sys` per raw word, and a word only reaches the host queue when its
+shift period completes — `advance(49)` does not consume it, `advance(1)` does.
+`N_SHIFTS = 0` is modelled as one shift (and `CLKDIV = 0` as one, matching the
+pixel-clock derivation); the datasheet's "0 means shift 32 times" / "CLKDIV 0
+means a period of 16" encodings are not modelled.
 `EXPAND_EN = 0` 时每个 FIFO 字都是原始输出数据，不做命令解码，对应数据手册的
 “原始 FIFO 数据直通”模式。该路径**已计时**：字直接进入输出移位寄存器，移位
 寄存器由 `clk_hstx / CSR.CLKDIV` 驱动、每字移位 `CSR.N_SHIFTS` 次，因此每字占用
 
 ```text
-CSR.N_SHIFTS * 2 * CSR.CLKDIV   个 clk_sys 周期
+CSR.N_SHIFTS * ceil(CSR.CLKDIV * clk_sys / clk_hstx)   个 clk_sys 周期
 ```
 
-（因 `clk_hstx = clk_sys / 2`，每次移位为 `2 * CLKDIV` 个 `clk_sys`）。已验证的
-DVI 配置（`N_SHIFTS = 5`、`CLKDIV = 5`）因此每字占 50 个 `clk_sys`；字的移位周期
-结束后才进入宿主队列——`advance(49)` 不消费它，`advance(1)` 才消费。`N_SHIFTS = 0`
-按 1 次移位处理（`CLKDIV = 0` 按 1 处理，与像素时钟推导一致）；数据手册中
-“0 表示移位 32 次”“CLKDIV 0 表示周期 16”的编码未建模。
+（每次移位为 `ceil(CLKDIV * clk_sys / clk_hstx)` 个 `clk_sys`；`clk_hstx` 取自
+`CLK_HSTX` 通道，不是假定的 `clk_sys / 2`）。已验证的 DVI 配置（`N_SHIFTS = 5`、
+`CLKDIV = 5`、`CLK_SYS` 252 MHz、`CLK_HSTX` 126 MHz）因此每字占 50 个 `clk_sys`；
+字的移位周期结束后才进入宿主队列——`advance(49)` 不消费它，`advance(1)` 才消费。
+`N_SHIFTS = 0` 按 1 次移位处理（`CLKDIV = 0` 按 1 处理，与像素时钟推导一致）；
+数据手册中“0 表示移位 32 次”“CLKDIV 0 表示周期 16”的编码未建模。
 
 ### Host-side output / 宿主侧输出
 
 `advance(cycles)` is paced by the pixel clock, not by the clock count of words:
-the pixel period is `clk_hstx / CSR.CLKDIV` with `clk_hstx = clk_sys / 2`, so
-`2 * CLKDIV` `clk_sys` cycles per pixel (10 cycles with the validated
-`CLKDIV = 5`). Every popped word occupies the pixel time of the command that
-owns it — one period for `RAW`/`RAW_REPEAT`, `32 / ENC_SHIFT` periods per word
-for `TMDS`, `count` periods for a repeat command. A 256-word scanline block
-therefore lasts exactly 800 pixel periods (8000 `clk_sys` cycles at 252 MHz),
-which is one 640x480p60 scanline; that is what keeps the expander in step with
-the DMA ring instead of draining the FIFO 20x too fast and dropping words.
+the pixel period is `ceil(CLKDIV * clk_sys / clk_hstx)` `clk_sys` cycles (10
+cycles with 252 MHz `CLK_SYS`, 126 MHz `CLK_HSTX` and `CLKDIV = 5`; 20 cycles
+when `CLK_HSTX` is divided by four instead). Every popped word occupies the pixel
+time of the command that owns it — one period for `RAW`/`RAW_REPEAT`,
+`32 / ENC_SHIFT` periods per word for `TMDS`, `count` periods for a repeat
+command. A 256-word scanline block therefore lasts exactly 800 pixel periods
+(8000 `clk_sys` cycles at 252/126 MHz with `CLKDIV = 5`), which is one
+640x480p60 scanline; that is what keeps the expander in step with the DMA ring
+instead of draining the FIFO 20x too fast and dropping words.
 `advance(cycles)` 由像素时钟而非「每周期一字」节拍：像素周期为
-`clk_hstx / CSR.CLKDIV`，其中 `clk_hstx = clk_sys / 2`，即每像素
-`2 * CLKDIV` 个 `clk_sys` 周期（已验证的 `CLKDIV = 5` 为 10 周期）。每个被弹出
-的字占用其所属命令的像素时长——`RAW`/`RAW_REPEAT` 一个周期，`TMDS` 每字
-`32 / ENC_SHIFT` 个周期，重复命令为 `count` 个周期。因此一个 256 字扫描行块
-正好持续 800 个像素周期（252 MHz 下 8000 个 `clk_sys` 周期），即一条
-640x480p60 扫描线；这正是扩展器与 DMA 环保持同步、而不是快 20 倍排空 FIFO
-并丢字的原因。
+`ceil(CLKDIV * clk_sys / clk_hstx)` 个 `clk_sys` 周期（`CLK_SYS` 252 MHz、
+`CLK_HSTX` 126 MHz、`CLKDIV = 5` 时为 10 周期；把 `CLK_HSTX` 再四分频则为 20
+周期）。每个被弹出的字占用其所属命令的像素时长——`RAW`/`RAW_REPEAT` 一个周期，
+`TMDS` 每字 `32 / ENC_SHIFT` 个周期，重复命令为 `count` 个周期。因此一个 256 字
+扫描行块恰好持续 800 个像素周期（252/126 MHz、`CLKDIV = 5` 时 8000 个 `clk_sys`
+周期），即一条 640x480p60 扫描线；这正是扩展器与 DMA 环保持同步、而不是快 20 倍
+排空 FIFO 并丢字的原因。
 
 `advance(cycles)` pops at most one FIFO word per word period while `EN` is set,
 expands it and queues the resulting 32-bit output words. `drain_output()` takes
@@ -1252,12 +1255,15 @@ assert_eq!(moved, 64);
 ## TIMER / 定时器
 
 RP2350 exposes two identical timer blocks. Both share **one** 64-bit
-microsecond counter driven by the simulation timebase (`Timebase`, advanced from
-executed cycles at 150 MHz); `ALARM0..3`, `ARMED`, `INTR`, `INTE`, `INTF` and
-`INTS` are per block.
-RP2350 提供两个相同的定时器块。它们共享**同一个** 64 位微秒计数器（由仿真时基
-`Timebase` 按 150 MHz 的已执行周期推进）；`ALARM0..3`、`ARMED`、`INTR`、
-`INTE`、`INTF`、`INTS` 均按块独立。
+microsecond counter driven by the reference domain of the simulation timebase
+(`Timebase::timer_us`): the datasheet clocks `TIMELR`/`TIMERAWH` from `clk_ref`
+through the TICKS divider (`TICK = clk_ref / 1 MHz`), so the microsecond rate is
+independent of runtime `clk_sys` overclocking. `ALARM0..3`, `ARMED`, `INTR`,
+`INTE`, `INTF` and `INTS` are per block.
+RP2350 提供两个相同的定时器块。它们共享**同一个** 64 位微秒计数器（由仿真时基的
+参考域 `Timebase::timer_us` 驱动）：数据手册中 `TIMELR`/`TIMERAWH` 由 `clk_ref` 经
+TICKS 分频（`TICK = clk_ref / 1 MHz`），因此微秒速率与运行期 `clk_sys` 超频无关。
+`ALARM0..3`、`ARMED`、`INTR`、`INTE`、`INTF`、`INTS` 均按块独立。
 
 | Block | Base | Alarm lines |
 | --- | --- | --- |
@@ -1413,25 +1419,45 @@ let psram = mount_psram(&mut bus, 8 * 1024 * 1024).expect("psram window");
 
 ## UART
 
+`uart::Uart0` is the mounted PL011 model. Transmit bytes written to `UARTDR`
+are appended to the shared `UartSink` with the simulated microsecond of the
+write. `UARTIBRD`, `UARTFBRD` and `UARTLCR_H` are stored, and the line rate is
+derived from the live `clk_peri`:
+
+```text
+baud = clk_peri * 4 / (64 * IBRD + FBRD)
+bit  = 1 / baud
+```
+
 ```rust
-pub struct RpUart {
-    pub index: u8,
-    pub tx_fifo: VecDeque<u8>,
-    pub rx_fifo: VecDeque<u8>,
-    pub baud_rate_div: u32,
-    pub ctrl: UartCtrl,
-    pub line_ctrl: UartLineCtrl,
-    pub irq_mask: UartIrqMask,
-    pub irq_status: UartIrqStatus,
+pub struct UartSink { /* bytes + last_byte_us */ }
+impl UartSink {
+    pub fn push(&mut self, byte: u8);          // no timestamp / 无时间戳
+    pub fn push_at(&mut self, byte: u8, time_us: u64);
+    pub fn last_byte_us(&self) -> Option<u64>;
+    pub fn len(&self) -> usize;
+    pub fn take(&mut self) -> Vec<u8>;
 }
 
-impl RpUart {
-    pub fn push_rx(&mut self, byte: u8);
-    pub fn pop_tx(&mut self) -> Option<u8>;
-    pub fn rx_fifo_full(&self) -> bool;
-    pub fn tx_fifo_empty(&self) -> bool;
+pub struct Uart0 { /* sink + timebase + clock tree + registers */ }
+impl Uart0 {
+    pub fn new(sink: Arc<Mutex<UartSink>>) -> Self;
+    pub fn with_clock(sink, timebase, tree: ClockTree) -> Self;
+    pub fn baud_divisor(&self) -> u64;          // 64*IBRD + FBRD
+    pub fn baud_rate(&self) -> u32;             // 0 until programmed
+    pub fn bit_time_ns(&self) -> Option<u64>;
+    pub fn last_byte_us(&self) -> Option<u64>;
 }
 ```
+
+**Not modelled / 未建模**：byte-level shifting and the ten bit periods a real
+UART spends on the wire, TX FIFO occupancy, receive data, framing/parity errors
+and interrupts. A byte enters the sink immediately (with its timestamp); only
+the baud rate and timestamp mapping follow the real peripheral clock, so host
+logs and throughput estimates are meaningful while wire-level timing is not.
+**不建模**：字节级移位、真实 UART 在线上花费的十个位周期、TX FIFO 占用、接收
+数据、帧/校验错误与中断。字节立即进入 sink（带时间戳）；只有波特率与时间戳映射
+跟随真实外设时钟，因此宿主日志与吞吐估计有意义，但位级时序不是。
 
 ---
 
@@ -1808,15 +1834,54 @@ PLL 中断寄存器、`XOSC_STARTUP` 等无关写入不改变它。P4-2 用它�
 | `ClockTree::pll_sys_hz/pll_usb_hz`, `pll_locked` | PLL outputs and lock / PLL 输出与锁定 |
 | `ClockTree::roscclk_hz`, `channel_hz(n)` | ROSC output and any channel / ROSC 输出与任意通道 |
 | `BootPeripherals::clock_tree`, `sysclk_hz` | mounted tree and `CLK_SYS` / 已挂载的树与 `CLK_SYS` |
+| `BootPeripherals::refclk_hz/periclk_hz/hstxclk_hz/usbclk_hz/adcclk_hz/rtcclk_hz` | live frequencies for consumers / 消费者使用的实时频率 |
 | `Xosc::set_frequency_hz`, `ClockTree::set_rosc_hz` | board-specific crystal/ring / 板级晶振/环形频率 |
 
-`SimulationClock` (`rp2350-core`) exposes `set_sysclk_hz`/`set_periphclk_hz`/
-`set_refclk_hz`; wiring the remaining timing consumers (`cycles → µs`,
-SysTick, TIMER, PIO `CLKDIV`, HSTX pixel clock, UART baud, ADC/RTC, DMA pacing)
-is P4-2.
-`SimulationClock`（`rp2350-core`）提供 `set_sysclk_hz`/`set_periphclk_hz`/
-`set_refclk_hz`；其余计时消费者（`cycles → µs`、SysTick、TIMER、PIO `CLKDIV`、
-HSTX 像素时钟、UART 波特率、ADC/RTC、DMA 节拍）的接入属于 P4-2。
+### Unified time base and consumers (P4-2) / 统一时间基与消费者（P4-2）
+
+`rp2350-core::TimeBase` integrates executed `clk_sys` cycles into microseconds.
+It keeps `cycles`, settled `micros` and a sub-microsecond numerator, and it
+**settles the carried fraction at the old rate before a retune**, so a guest
+write that changes `CLK_SYS` cannot lose or double-count cycles. A zero
+frequency stops time (cycles are still counted) and warns once.
+`rp2350-core::TimeBase` 把已执行的 `clk_sys` 周期积分为微秒。它保存 `cycles`、
+已结算的 `micros` 与不足一微秒的分子，并在**改频前按旧频率结算携带的小数**，
+因此客户机改写 `CLK_SYS` 不会丢失或重复计算周期。零频率会停止时间（仍统计周期）
+并只告警一次。
+
+`rp2350-periph::Timebase` composes two integrators: the CPU domain (uptime,
+`BootPeripherals::time_us`) and the `clk_ref` domain (`TIMELR`/`TIMERAWH`, fed by
+executed cycles converted with the live `clk_sys`/`clk_ref` ratio). All
+consumers in the mounted machine share it:
+
+| Consumer | Clock / 时钟 | Behaviour / 行为 |
+|----------|--------------|------------------|
+| `cycles → µs` | `clk_sys` | `BootPeripherals::time_us`, `Machine::time_us` / 运行时间 |
+| TIMER0/1 | `clk_ref / TICK` | 1 µs counter, same µs at 150/252 MHz / 1 µs 计数 |
+| `SYST_CSR.CLKSOURCE=1` | `clk_sys` | countdown in processor cycles / 处理器周期 |
+| `SYST_CSR.CLKSOURCE=0` | `clk_ref / 2` | countdown in reference cycles / 参考周期 |
+| PIO state machines | `clk_sys / CLKDIV` | integer+fractional 16.8 divider, write restarts it / 16.8 分频，写即重启 |
+| HSTX pixels | `CLK_HSTX / CSR.CLKDIV` | `ceil(CLKDIV·clk_sys/clk_hstx)` cycles/pixel / 每像素周期 |
+| UART0 baud | `clk_peri` | `baud = clk_peri·4/(64·IBRD+FBRD)` |
+| ADC conversion | `clk_adc` | 96 `clk_adc` cycles → `ceil(96·clk_sys/clk_adc)` CPU cycles |
+| POWMAN RTC | `clk_rtc` (LPOSC) | 32.768 kHz ticks drive milliseconds / 毫秒计数 |
+| DMA pacing | `clk_sys` | `(X/Y)·sys_clk`, credited with real elapsed cycles / 真实经过周期 |
+
+`ClockTree::generation()` is passed to `Timebase::advance`, so a frequency write
+settles at the old rate on the next batch. `SimulationClock` remains only as a
+legacy cumulative-cycle tracker.
+`ClockTree::generation()` 会传入 `Timebase::advance`，因此频率写入在下一批次先按
+旧频率结算。`SimulationClock` 仅作为旧的累计周期追踪器保留。
+
+Known gap / 已知缺口：`rp2350-arm` maps every NVIC pending bit to external
+exception `16 + n`, so pending SysTick (exception 15) cannot be delivered
+correctly. The peripheral counter still models `COUNTFLAG`, reload and the
+one-shot lifting latch (`BootPeripherals::take_systick_pending`); delivery needs
+an `rp2350-arm` task (outside the P4-2 whitelist).
+`rp2350-arm` 把所有 NVIC 挂起位映射为外部异常 `16 + n`，因此挂起的 SysTick
+（异常 15）无法正确投递。外设计数器仍建模 `COUNTFLAG`、重载与一次性锁存
+（`BootPeripherals::take_systick_pending`）；投递需要单独的 `rp2350-arm` 任务
+（不在 P4-2 白名单内）。
 
 ### Not modelled / 未建模
 

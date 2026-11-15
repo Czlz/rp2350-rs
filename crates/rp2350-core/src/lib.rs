@@ -30,7 +30,7 @@ pub mod xip_maintenance;
 pub use bus::{AccessWidth, AddressBus, BusResult, MemoryRegion};
 pub use chip::RP2350Chip;
 pub use chip_family::{ChipCapabilities, ChipFamily, ChipInfo, RP2040Chip};
-pub use clock::SimulationClock;
+pub use clock::{SimulationClock, TimeBase};
 pub use error::{BusErrorKind, CoreError};
 pub use firmware::{FirmwareImage, FirmwareSegment};
 pub use flash::{FLASH_XIP_BASE, FLASH_XIP_NOCACHE_BASE, FLASH_XIP_SIZE, FlashHandle, FlashRegion};

@@ -2,19 +2,25 @@
 //!
 //! Both RP2350 timer blocks share one 64-bit microsecond counter driven by the
 //! shared [`Timebase`], which the simulation driver advances with executed
-//! cycles. Each block owns its own `ALARM0..3`, `ARMED`, `INTR`, `INTE`, `INTF`
-//! and `INTS` registers and its own interrupt lines. `INTR` is write-one-to-clear
-//! raw status, `INTF` is a plain read/write force register (pico-sdk's alarm pool
-//! pokes it with `hw_set_bits`), and `INTS = (INTR | INTF) & INTE` drives the
-//! four alarm lines into the shared [`IrqAssert`]. An alarm that reaches its
-//! deadline latches its `INTR` bit and clears its `ARMED` bit, exactly like the
-//! hardware; it stays latched until firmware writes a one to `INTR`.
+//! cycles. The datasheet clocks this counter from `clk_ref` through the TICKS
+//! divider (`TICK = clk_ref / 1 MHz`), so [`Timebase::timer_us`] keeps a
+//! reference-domain integrator: runtime `clk_sys` overclocking does not change
+//! the microsecond rate. Each block owns its own `ALARM0..3`, `ARMED`, `INTR`,
+//! `INTE`, `INTF` and `INTS` registers and its own interrupt lines. `INTR` is
+//! write-one-to-clear raw status, `INTF` is a plain read/write force register
+//! (pico-sdk's alarm pool pokes it with `hw_set_bits`), and
+//! `INTS = (INTR | INTF) & INTE` drives the four alarm lines into the shared
+//! [`IrqAssert`]. An alarm that reaches its deadline latches its `INTR` bit and
+//! clears its `ARMED` bit, exactly like the hardware; it stays latched until
+//! firmware writes a one to `INTR`.
 //! 两个 RP2350 定时器块共享一个由共享 [`Timebase`] 驱动的 64 位微秒计数器，
-//! 仿真驱动按已执行周期推进它。每个块拥有各自的 `ALARM0..3`、`ARMED`、`INTR`、
-//! `INTE`、`INTF`、`INTS` 寄存器与中断线。`INTR` 是写 1 清零的原始状态，`INTF`
-//! 是普通读写的强制位（pico-sdk 的 alarm pool 用 `hw_set_bits` 置位），
-//! `INTS = (INTR | INTF) & INTE` 驱动四条 alarm 线进入共享 [`IrqAssert`]。到期
-//! 的 alarm 会锁存自己的 `INTR` 位并清掉 `ARMED` 位，与硬件一致；在固件向
+//! 仿真驱动按已执行周期推进它。数据手册中该计数器由 `clk_ref` 经 TICKS 分频
+//! （`TICK = clk_ref / 1 MHz`）驱动，因此 [`Timebase::timer_us`] 保留参考域积分器：
+//! 运行期 `clk_sys` 超频不会改变微秒速率。每个块拥有各自的 `ALARM0..3`、
+//! `ARMED`、`INTR`、`INTE`、`INTF`、`INTS` 寄存器与中断线。`INTR` 是写 1 清零的
+//! 原始状态，`INTF` 是普通读写的强制位（pico-sdk 的 alarm pool 用 `hw_set_bits`
+//! 置位），`INTS = (INTR | INTF) & INTE` 驱动四条 alarm 线进入共享 [`IrqAssert`]。
+//! 到期的 alarm 会锁存自己的 `INTR` 位并清掉 `ARMED` 位，与硬件一致；在固件向
 //! `INTR` 写 1 之前它保持锁存。
 //!
 //! TIMER0 is mounted at [`map::TIMER0_BASE`] and raises `TIMER0_IRQ_0..3`
@@ -29,7 +35,7 @@ use parking_lot::Mutex;
 use rp2350_core::mmio::{MmioDevice, MmioWindow, RegisterFile};
 use rp2350_core::types::Address;
 
-use super::boot::Timebase;
+use super::clock_time::Timebase;
 use super::irq::IrqAssert;
 use super::map;
 
@@ -144,7 +150,7 @@ impl TimerBlock {
 
     /// Current 64-bit microsecond counter / 当前 64 位微秒计数器
     fn now_us(&self) -> u64 {
-        self.timebase.lock().time_us()
+        self.timebase.lock().timer_us()
     }
 
     /// Current counter as compared with the alarm registers / 与 alarm 寄存器比较用的当前计数

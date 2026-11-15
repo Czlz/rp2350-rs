@@ -34,6 +34,7 @@ use super::adc::Adc;
 use super::audio::AudioTap;
 use super::bootram::BootRam;
 use super::busctrl::{BusCtrl, BusPerf};
+pub use super::clock_time::Timebase;
 use super::clock_tree::ClockTree;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
@@ -50,7 +51,7 @@ use super::pads_qspi::PadsQspi;
 use super::pio::{PIO_BLOCKS, PIO_SM_COUNT, Pio, SharedPio};
 use super::pll::Pll;
 use super::powman::Powman;
-use super::ppb::{Ppb, SystemWriteLog, new_system_write_log};
+use super::ppb::{Ppb, SysTickHandle, SystemWriteLog, new_system_write_log, new_systick};
 use super::psm::Psm;
 use super::pwm::Pwm;
 use super::resets::Resets;
@@ -65,57 +66,6 @@ use super::watchdog::Watchdog;
 use super::xip_qmi::XipQmi;
 use super::xosc::Xosc;
 
-/// Cycles per microsecond of the bootrom-equivalent system clock (150 MHz)
-/// bootrom 等价系统时钟每微秒周期数（150 MHz）
-///
-/// This is only the initial timebase rate used by TIMER0/TICKS. The clock tree
-/// (`BootPeripherals::sysclk_hz`) is the authoritative live frequency; P4-2
-/// rewires the cycle-driven consumers to it so runtime overclocking also
-/// changes `cycles → µs`.
-/// 这只是 TIMER0/TICKS 的初始时基速率。时钟树（`BootPeripherals::sysclk_hz`）
-/// 才是实时频率的权威来源；P4-2 会把周期驱动的消费者接到它上面，使运行时
-/// 超频/降频同样改变 `cycles → µs`。
-pub const DEFAULT_CYCLES_PER_US: u32 = 150;
-
-/// Cycle-driven microsecond timebase shared with TIMER0
-/// 与 TIMER0 共享的周期驱动微秒时基
-#[derive(Debug, Clone, Copy)]
-pub struct Timebase {
-    cycles: u64,
-    cycles_per_us: u32,
-}
-
-impl Timebase {
-    /// Create a timebase with the given clock rate / 以给定时钟频率创建时基
-    #[must_use]
-    pub const fn new(cycles_per_us: u32) -> Self {
-        Self {
-            cycles: 0,
-            cycles_per_us,
-        }
-    }
-
-    /// Advance the timebase by executed CPU cycles / 按已执行 CPU 周期推进时基
-    pub fn advance(&mut self, cycles: u64) {
-        self.cycles = self.cycles.saturating_add(cycles);
-    }
-
-    /// Elapsed microseconds / 已经过的微秒数
-    #[must_use]
-    pub fn time_us(&self) -> u64 {
-        match self.cycles_per_us {
-            0 => 0,
-            rate => self.cycles / u64::from(rate),
-        }
-    }
-
-    /// Total elapsed cycles / 已经过的总周期数
-    #[must_use]
-    pub fn cycles(&self) -> u64 {
-        self.cycles
-    }
-}
-
 /// Words in the SDK's `multicore_launch_core1_raw` FIFO command stream
 /// SDK `multicore_launch_core1_raw` 的 FIFO 命令流字数
 ///
@@ -124,16 +74,6 @@ impl Timebase {
 /// 命令流为 `{0, 0, 1, vtor, sp, entry}`：两个丢弃字、一个协议版本，随后是向量
 /// 表、栈指针与入口点。
 pub const CORE1_LAUNCH_WORDS: usize = 6;
-
-/// DMA cycles advanced per [`BootPeripherals::pump_dma`] call
-/// 每次 [`BootPeripherals::pump_dma`] 调用推进的 DMA 周期数
-///
-/// A fixed budget keeps the pacing timers ticking without threading the CPU
-/// cycle delta through the host pump hook. Reset pacing timers (`X == 0`) never
-/// assert, so this is invisible to firmware that does not use them.
-/// 固定预算让节拍定时器无需宿主把 CPU 周期差传入泵送钩子；复位的节拍定时器
-/// （`X == 0`）永不断言，因此不使用它的固件看不到差异。
-const DMA_PUMP_CYCLES: u64 = 64;
 
 /// Boot vectors handed to a launcher after the FIFO launch handshake
 /// FIFO 启动握手完成后交给启动器的启动向量
@@ -175,6 +115,9 @@ pub struct BootPeripherals {
     clock_tree: ClockTree,
     timer: Timer0,
     timer1: Timer1,
+    systick: SysTickHandle,
+    adc: Adc,
+    powman: Powman,
     sio: Sio,
     pads: GpioPads,
     dma: Dma,
@@ -221,11 +164,21 @@ impl BootPeripherals {
     /// Returns a bus error if a window is invalid or overlaps a region already
     /// registered on `bus`.
     /// 窗口非法或与 `bus` 已注册区域重叠时返回总线错误。
+    // 挂载顺序是一个线性清单，拆分会把同一寄存器窗口的接线分散到多个函数。
+    // The mount order is a linear bill of materials; splitting it would scatter
+    // one wiring sequence across several functions.
+    #[allow(clippy::too_many_lines)]
     pub fn mount(bus: &mut dyn AddressBus) -> BusResult<Self> {
-        let uart0 = Arc::new(Mutex::new(UartSink::default()));
-        let timebase = Arc::new(Mutex::new(Timebase::new(DEFAULT_CYCLES_PER_US)));
-        let cycles = CycleSink::new(Arc::clone(&timebase));
         let clock_tree = ClockTree::new();
+        let uart0 = Arc::new(Mutex::new(UartSink::default()));
+        let timebase = Arc::new(Mutex::new(Timebase::new(
+            clock_tree.sysclk_hz(),
+            clock_tree.refclk_hz(),
+        )));
+        let cycles = CycleSink::new(Arc::clone(&timebase));
+        let systick = new_systick();
+        let adc = Adc::with_clock(clock_tree.clone());
+        let powman = Powman::with_clock(clock_tree.clone());
         let irq = IrqAssert::new();
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
@@ -244,7 +197,7 @@ impl BootPeripherals {
         // PERFCTR0/1 actually count.
         let busctrl = BusCtrl::with_perf(BusPerf::new());
         let dma = Dma::with_perf(irq.clone(), busctrl.perf());
-        let hstx = Hstx::new(irq.clone());
+        let hstx = Hstx::with_clock(irq.clone(), clock_tree.clone());
         let core1_release = Arc::new(AtomicBool::new(false));
         let core1_reset = Arc::new(AtomicBool::new(false));
         let core1_boot = Arc::new(Mutex::new(Core1Boot::default()));
@@ -268,8 +221,12 @@ impl BootPeripherals {
         apb.mount(Box::new(Xosc::with_tree(clock_tree.clone())))?;
         apb.mount(Box::new(Pll::sys_with(clock_tree.clone())))?;
         apb.mount(Box::new(Pll::usb_with(clock_tree.clone())))?;
-        apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
-        apb.mount(Box::new(Adc::new()))?;
+        apb.mount(Box::new(Uart0::with_clock(
+            Arc::clone(&uart0),
+            Arc::clone(&timebase),
+            clock_tree.clone(),
+        )))?;
+        apb.mount(Box::new(adc.clone()))?;
         apb.mount(Box::new(Pwm::new()))?;
         apb.mount(Box::new(timer.clone()))?;
         apb.mount(Box::new(timer1.clone()))?;
@@ -299,7 +256,7 @@ impl BootPeripherals {
             "AON",
             MmioWindow::new(map::POWMAN_BASE, MMIO_BLOCK_SIZE as usize),
         );
-        aon.mount(Box::new(Powman::new()))?;
+        aon.mount(Box::new(powman.clone()))?;
         bus.register_region(Box::new(aon))?;
         // RP2350 的三个 PIO 块位于 AHB 空间，按基地址顺序独立挂载。共享句柄与
         // 总线适配器共用同一个寄存器文件，因此宿主可以直接 tick 状态机并观察
@@ -327,7 +284,13 @@ impl BootPeripherals {
         // by the host through `Dma::run`.
         mount_device(bus, Box::new(dma.clone()))?;
         mount_device(bus, Box::new(sio.clone()))?;
-        mount_device(bus, Box::new(Ppb::with_log(Arc::clone(&system_writes))))?;
+        mount_device(
+            bus,
+            Box::new(Ppb::with_state(
+                Arc::clone(&system_writes),
+                Arc::clone(&systick),
+            )),
+        )?;
 
         Ok(Self {
             uart0,
@@ -335,6 +298,9 @@ impl BootPeripherals {
             clock_tree,
             timer,
             timer1,
+            systick,
+            adc,
+            powman,
             sio,
             pads,
             dma,
@@ -375,6 +341,48 @@ impl BootPeripherals {
     #[must_use]
     pub fn sysclk_hz(&self) -> u32 {
         self.clock_tree.sysclk_hz()
+    }
+
+    /// Live `CLK_REF` frequency in Hz / 实时的 `CLK_REF` 频率（Hz）
+    #[must_use]
+    pub fn refclk_hz(&self) -> u32 {
+        self.clock_tree.refclk_hz()
+    }
+
+    /// Live `CLK_PERI` frequency in Hz / 实时的 `CLK_PERI` 频率（Hz）
+    #[must_use]
+    pub fn periclk_hz(&self) -> u32 {
+        self.clock_tree.periclk_hz()
+    }
+
+    /// Live `CLK_HSTX` frequency in Hz / 实时的 `CLK_HSTX` 频率（Hz）
+    #[must_use]
+    pub fn hstxclk_hz(&self) -> u32 {
+        self.clock_tree.hstxclk_hz()
+    }
+
+    /// Live `CLK_USB` frequency in Hz / 实时的 `CLK_USB` 频率（Hz）
+    #[must_use]
+    pub fn usbclk_hz(&self) -> u32 {
+        self.clock_tree.usbclk_hz()
+    }
+
+    /// Live `CLK_ADC` frequency in Hz / 实时的 `CLK_ADC` 频率（Hz）
+    #[must_use]
+    pub fn adcclk_hz(&self) -> u32 {
+        self.clock_tree.adcclk_hz()
+    }
+
+    /// Live RTC (LPOSC) frequency in Hz / 实时的 RTC（LPOSC）频率（Hz）
+    #[must_use]
+    pub fn rtcclk_hz(&self) -> u32 {
+        self.clock_tree.rtcclk_hz()
+    }
+
+    /// Clock-tree write generation / 时钟树写入世代
+    #[must_use]
+    pub fn clock_generation(&self) -> u32 {
+        self.clock_tree.generation()
     }
 
     /// Emulate the resident core-1 boot ROM once per driver pump
@@ -510,18 +518,28 @@ impl BootPeripherals {
     /// Advance the shared timebase and refresh the TIMER interrupt lines
     /// 推进共享时基并刷新 TIMER 中断线
     ///
-    /// The HSTX command expander is pumped with the same cycle budget; it does
-    /// no work while `CSR.EN` is clear, so firmware that never touches HSTX is
-    /// unaffected. DMA transfers are deliberately not pumped here: the host
-    /// decides when to call [`Dma::run`] with its own bus handle and cycle
-    /// budget. HSTX 命令扩展器按同一周期预算泵送；`CSR.EN` 清零时不做任何
-    /// 事，因此不接触 HSTX 的固件不受影响。这里有意不泵送 DMA 传输：由宿主用
-    /// 自己的总线句柄与周期预算决定何时调用 [`Dma::run`]。
+    /// The live `clk_sys`/`clk_ref` rates and the clock-tree generation are
+    /// handed to [`Timebase::advance`], so a frequency written by the guest since
+    /// the previous call settles at the old rate first. SysTick, ADC conversion
+    /// time and the POWMAN RTC run in the same call, keeping every timing
+    /// consumer on one clock source. The HSTX command expander is pumped with
+    /// the same cycle budget from the host's DMA batch; it does no work while
+    /// `CSR.EN` is clear.
+    /// 把实时 `clk_sys`/`clk_ref` 与时钟树世代交给 [`Timebase::advance`]，因此
+    /// 客户机自上次调用以来写入的频率会先按旧频率结算。SysTick、ADC 转换时间与
+    /// POWMAN RTC 在同一次调用中推进，所有计时消费者共享一个时钟源。HSTX 命令
+    /// 扩展器由宿主按 DMA 批次用同一周期预算泵送；`CSR.EN` 清零时不做任何事。
     pub fn advance(&self, cycles: u64) {
-        self.cycles.push(cycles);
-        // HSTX is pumped by the host at the DMA batch cadence (see
-        // `Machine::pump_dma_batch`), so it is not advanced here.
-        // HSTX 由宿主按 DMA 批次节拍推进（见 `Machine::pump_dma_batch`），此处不推进。
+        let sysclk = self.clock_tree.sysclk_hz();
+        let refclk = self.clock_tree.refclk_hz();
+        self.cycles
+            .advance(cycles, sysclk, refclk, self.clock_tree.generation());
+        self.systick
+            .lock()
+            .advance(cycles, sysclk, self.clock_tree.refclk_hz());
+        self.adc.advance(cycles, sysclk);
+        self.powman
+            .advance(cycles, sysclk, self.clock_tree.rtcclk_hz());
         self.timer.refresh();
         self.timer1.refresh();
     }
@@ -756,6 +774,12 @@ impl BootPeripherals {
     /// Run one DMA pump, refreshing PIO DREQ levels before every unit batch
     /// 执行一次 DMA 泵送，在每个单元批次前刷新 PIO DREQ 电平
     ///
+    /// `elapsed_cycles` is the number of `clk_sys` cycles executed since the
+    /// previous pump. It is credited to the fractional pacing timers exactly
+    /// once, so pacing follows the live system clock instead of a hardcoded
+    /// budget.
+    /// `elapsed_cycles` 是自上次泵送以来执行的 `clk_sys` 周期数，会恰好一次计入
+    /// 小数节拍定时器，因此节拍跟随实时系统时钟而不是写死的预算。
     /// The PIO and HSTX levels are republished first, because the FIFO state may
     /// have changed since the previous pump. Two pacing rules keep a batch from
     /// overrunning a FIFO:
@@ -781,12 +805,17 @@ impl BootPeripherals {
     ///   上限对 PIO 太粗糙，因为一批可能写入多个 4 深度 FIFO。
     ///
     /// 返回尝试的单元数。
-    pub fn pump_dma(&mut self, bus: &mut dyn AddressBus, max_units: u64) -> u64 {
-        // 先推进节拍定时器：复位值 X == 0 时请求永不断言，因此未使用定时器的
-        // 固件行为不变。Advance the pacing timers first: with the reset value
-        // X == 0 no request is asserted, so firmware that never programs a
-        // timer is unaffected.
-        self.dma.advance(DMA_PUMP_CYCLES);
+    pub fn pump_dma(
+        &mut self,
+        bus: &mut dyn AddressBus,
+        max_units: u64,
+        elapsed_cycles: u64,
+    ) -> u64 {
+        // 先按真实经过周期推进节拍定时器：复位值 X == 0 时请求永不断言，因此未
+        // 使用定时器的固件行为不变。Credit the pacing timers with the real
+        // elapsed cycles first: with the reset value X == 0 no request is
+        // asserted, so firmware that never programs a timer is unaffected.
+        self.dma.advance(elapsed_cycles);
         let mut total = 0u64;
         while total < max_units {
             self.sync_pio_dreqs();
@@ -822,10 +851,63 @@ impl BootPeripherals {
             .set_dreq(dreq::HSTX_DREQ, self.hstx.fifo_not_full());
     }
 
-    /// Elapsed microseconds since boot / 自启动以来的微秒数
+    /// Elapsed microseconds since boot (`clk_sys` domain) / 自启动以来的微秒数（`clk_sys` 域）
     #[must_use]
     pub fn time_us(&self) -> u64 {
         self.cycles.time_us()
+    }
+
+    /// TIMER0/1 microsecond counter (`clk_ref` domain) / TIMER0/1 微秒计数器（`clk_ref` 域）
+    ///
+    /// This is the value `TIMELR`/`TIMERAWH` report: `clk_ref` through the TICKS
+    /// divider, independent of runtime `clk_sys` overclocking.
+    /// 即 `TIMELR`/`TIMERAWH` 报告的值：`clk_ref` 经 TICKS 分频，与运行期
+    /// `clk_sys` 超频无关。
+    #[must_use]
+    pub fn timer_time_us(&self) -> u64 {
+        self.cycles.timer_us()
+    }
+
+    /// Elapsed microseconds including not-yet-advanced cycles
+    /// 含尚未推进周期的已过去微秒数
+    ///
+    /// Diagnostics call this between [`Self::advance`] batches; the projection
+    /// is read-only and uses the live `clk_sys`. 诊断在两次 [`Self::advance`]
+    /// 批次之间调用；该预测只读，并使用实时 `clk_sys`。
+    #[must_use]
+    pub fn time_us_including(&self, pending_cycles: u64) -> u64 {
+        let now = self.cycles.time_us();
+        let projected = self
+            .cycles
+            .project_time_us(pending_cycles, self.clock_tree.sysclk_hz());
+        now.max(projected)
+    }
+
+    /// Take a pending SysTick expiry for NVIC delivery / 取走待投递的 SysTick 到期
+    ///
+    /// The host observes this latch; SysTick interrupt delivery is currently
+    /// blocked because `rp2350-arm` maps NVIC pending bits to external
+    /// exceptions only (see `deliver_irqs` in `rp2350-cli`). The latch is
+    /// one-shot, so a host that does deliver it never re-pends on the next pump.
+    /// 宿主可观察该锁存；SysTick 中断投递目前受限于 `rp2350-arm` 只把 NVIC
+    /// 挂起位映射为外部异常（见 `rp2350-cli` 的 `deliver_irqs`）。锁存是一次性的，
+    /// 因此真正投递它的宿主不会在下一次泵送时重复挂起。
+    #[must_use]
+    pub fn take_systick_pending(&self) -> bool {
+        self.systick.lock().take_pending()
+    }
+
+    /// Shared SysTick counter handle / 共享 SysTick 计数器句柄
+    #[must_use]
+    pub fn systick(&self) -> SysTickHandle {
+        Arc::clone(&self.systick)
+    }
+
+    /// Cumulative DMA pacing cycles converted at the live `clk_sys`
+    /// 按实时 `clk_sys` 换算的 DMA 节拍累计时间（微秒）
+    #[must_use]
+    pub fn dma_time_us(&self) -> u64 {
+        self.dma.time_us(self.clock_tree.sysclk_hz())
     }
 
     /// Drain buffered UART0 transmit bytes / 取出 UART0 已缓冲的发送字节
@@ -1005,7 +1087,12 @@ mod tests {
         let mut cycles = 0u64;
         bus.write_u32(0x4010_2088, 0x5AFE_0002, &mut cycles)
             .expect("alias write");
-        assert_eq!(bus.read_u32(0x4010_0088, &mut cycles).expect("read"), 2);
+        // RUN 置位后 USING_LPOSC 是只读状态位，数据位仍为 2。
+        // Once RUN is set, USING_LPOSC is a read-only status bit; the data bits stay 2.
+        assert_eq!(
+            bus.read_u32(0x4010_0088, &mut cycles).expect("read") & !(1 << 17),
+            2
+        );
     }
 
     #[test]
@@ -1267,5 +1354,88 @@ mod tests {
             8,
             "4 units = 4 reads + 4 writes in SRAM bank 0"
         );
+    }
+
+    #[test]
+    fn advance_uses_the_live_sysclk_and_settles_before_a_retune() {
+        // 150 MHz 下 150 个周期 = 1 µs；切到 252 MHz 后 252 个周期再得 1 µs。
+        // 150 cycles at 150 MHz = 1 µs; 252 cycles at 252 MHz add another.
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        peripherals.advance(150);
+        assert_eq!(peripherals.time_us(), 1);
+        let mut cycles = 0u64;
+        bus.write_u32(map::PLL_SYS_BASE + 0x08, 126, &mut cycles)
+            .expect("fbdiv");
+        bus.write_u32(map::PLL_SYS_BASE + 0x0C, (6 << 16) | (1 << 12), &mut cycles)
+            .expect("prim");
+        peripherals.advance(252);
+        assert_eq!(peripherals.sysclk_hz(), 252_000_000);
+        assert_eq!(peripherals.time_us(), 2);
+        assert!(peripherals.clock_generation() > 0);
+        // 1 秒模拟时间在 252 MHz 下需要 252M 周期。
+        // One simulated second needs 252M cycles at 252 MHz.
+        peripherals.advance(252_000_000);
+        assert_eq!(peripherals.time_us(), 1_000_002);
+    }
+
+    #[test]
+    fn the_shared_timebase_projects_pending_cycles_at_the_live_rate() {
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        peripherals.advance(75);
+        assert_eq!(peripherals.time_us(), 0);
+        assert_eq!(peripherals.time_us_including(75), 1);
+        assert_eq!(peripherals.time_us(), 0, "projection is read-only");
+    }
+
+    #[test]
+    fn dma_pacing_time_follows_the_live_sysclk() {
+        // 150 个节拍周期在 150 MHz 下是 1 µs；同一计数在 252 MHz 下是 0 µs。
+        // 150 pacing cycles are 1 µs at 150 MHz and 0 µs at 252 MHz.
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let mut peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        peripherals.pump_dma(&mut bus, 0, 150);
+        assert_eq!(peripherals.dma().pacing_cycles(), 150);
+        assert_eq!(peripherals.dma_time_us(), 1);
+        let mut cycles = 0u64;
+        bus.write_u32(map::PLL_SYS_BASE + 0x08, 126, &mut cycles)
+            .expect("fbdiv");
+        bus.write_u32(map::PLL_SYS_BASE + 0x0C, (6 << 16) | (1 << 12), &mut cycles)
+            .expect("prim");
+        assert_eq!(peripherals.dma_time_us(), 0);
+        peripherals.pump_dma(&mut bus, 0, 102);
+        assert_eq!(peripherals.dma().pacing_cycles(), 252);
+        assert_eq!(peripherals.dma_time_us(), 1);
+    }
+
+    #[test]
+    fn the_ppb_systick_follows_the_clock_tree_and_latches_one_expiry() {
+        // SYST_RVR = 149 999（1 ms @ 150 MHz）；advance 到 1 ms 时应锁存一次
+        // 到期，由宿主取走后不再重复。
+        // SYST_RVR = 149_999 (1 ms at 150 MHz); advancing 1 ms latches exactly one
+        // expiry which the host takes once.
+        use crate::map;
+        use crate::ppb::{SYST_CVR, SYST_RVR};
+
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        bus.write_u32(map::PPB_BASE + SYST_RVR, 149_999, &mut cycles)
+            .expect("rvr");
+        bus.write_u32(map::PPB_BASE + SYST_CVR, 150_000, &mut cycles)
+            .expect("cvr");
+        bus.write_u32(map::PPB_BASE + crate::ppb::SYST_CSR, 7, &mut cycles)
+            .expect("csr");
+        peripherals.advance(149_999);
+        assert!(!peripherals.take_systick_pending());
+        peripherals.advance(1);
+        assert!(peripherals.take_systick_pending());
+        assert!(!peripherals.take_systick_pending(), "one-shot latch");
+        assert_eq!(peripherals.systick().lock().rvr(), 149_999);
     }
 }

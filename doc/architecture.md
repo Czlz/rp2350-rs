@@ -316,12 +316,15 @@ pico-sdk 大量依赖这套别名（`hw_set_bits`/`hw_clear_bits` 会写 `RESETS
 这类设备不做忙等空转，而是持有一个 `CycleSink`（`rp2350-periph/src/cycle.rs`），
 把硬件会花费的周期数推入共享 `Timebase`：
 
-- `CycleSink::push(cycles)` 推进共享时基，`TIMER0`、`time_us()` 与上报的仿真时间
-  立即反映这次"停顿"；`BootPeripherals::advance` 也走同一句柄。
+- `CycleSink::advance(cycles, sysclk, refclk, generation)` 推进共享时基，
+  `TIMER0`、`time_us()` 与上报的仿真时间立即反映这次"停顿"；
+  `CycleSink::push_ref(cycles)` 用于已在 `clk_ref` 域的周期（TICKS）。
+  `BootPeripherals::advance` 也走同一句柄。
 - 句柄可克隆、跨设备复用，后续块直接使用，不需要改 `MmioDevice` trait，也不需要
   CPU 侧新增"取停顿周期"的接口。
-- 首个使用者是 `TICKS`：通道使能后写 `CYCLES`，整段周期一次性计入时基，随后读
-  `COUNT` 为 0（剩余量已耗尽），忙等循环因此立即通过而仿真时间正确前进。
+- 首个使用者是 `TICKS`：通道使能后写 `CYCLES`，整段 `clk_ref` 周期一次性计入
+  定时器域，随后读 `COUNT` 为 0（剩余量已耗尽），忙等循环因此立即通过而仿真时间
+  正确前进。
 
 `TICKS` 通道记录步长 `0x0C`（`CTRL`+0x00 / `CYCLES`+0x04 / `COUNT`+0x08），
 `CTRL.ENABLE` 未置位时写 `CYCLES` 不生效、不推进时间，避免固件初始化阶段
@@ -352,15 +355,25 @@ CLK_RTC: RP2350 无该分频器，RTC 直接使用 LPOSC
 - 初始状态是 **bootrom 等价**：XOSC 12 MHz、`PLL_SYS` 125/5/2 → 150 MHz、
   `CLK_SYS` = AUX/PLL_SYS；`PLL_USB` 100/5/5 → 48 MHz。`Clocks::reset()` 等恢复
   该状态，不是上电复位值。
-- `rp2350-core`：`SimulationClock` 提供 `set_sysclk_hz`/`set_periphclk_hz`/
-  `set_refclk_hz`。**P4-2 待接入**：`cycles→µs`（`Timebase` 目前固定
-  `DEFAULT_CYCLES_PER_US = 150`）、`SysTick`、TIMER、PIO `CLKDIV`、HSTX 像素时钟、
-  UART 波特率、ADC/RTC、DMA 节拍；这些消费者必须读取实时频率而非常量。
+- `rp2350-core`：`TimeBase` 是权威的按频率积分器，保存 `cycles`、已结算 `micros`
+  与不足一微秒的分子；`advance(cycles, sysclk_hz)` 每次检查实时频率，改频前先按
+  **旧**频率结算，零频率停止时间并只告警一次。`SimulationClock` 仅保留为旧的
+  累计周期追踪器。
+- `rp2350-periph`：`Timebase` 组合 CPU 域（`BootPeripherals::time_us`）与
+  `clk_ref` 域（`TIMELR`/`TIMERAWH`，1 µs 节拍），并接收
+  `ClockTree::generation()`。SysTick、ADC、POWMAN RTC、UART 与 HSTX 都持有共享
+  时钟树/时基；PIO 的一个宿主 tick 是一个 `clk_sys` 周期，`CLKDIV`（16.8 定点）
+  在其上分频，写入 `SMx_CLKDIV` 立即重启分频器；DMA pacing 按真实经过周期记账。
+- 消费者与时钟对照见 [`crates/rp2350-periph.md`](crates/rp2350-periph.md) 的
+  「Unified time base and consumers」表。已知缺口：`rp2350-arm` 只把 NVIC 挂起位
+  映射为外部异常 `16+n`，SysTick（异常 15）的**投递**仍需 `rp2350-arm` 任务；
+  外设侧计数、`COUNTFLAG` 与一次性锁存已建模。
 - 精度测试：12 MHz + 125/5/2 = 150 MHz、252 MHz 超频（126/6/1）、`CLK_SYS` 切
   `REF` + DIV 3 = 4 MHz、`CLK_PERI` = PLL_SYS/2 = 75 MHz、`CLK_USB` 48 MHz、
   非法分频 0 Hz、`generation` 递增规则、总线级 252 MHz 与 `CLK_SYS_SELECTED`
   一致性、默认机器 `PERFCTR` 随 DMA 累加（见
-  `crates/rp2350-periph/src/clock_tree.rs`、`clocks.rs`、`boot.rs` 单测）。
+  `crates/rp2350-periph/src/clock_tree.rs`、`clocks.rs`、`boot.rs`、`clock_time.rs`、
+  `systick.rs` 单测）。
 
 ### Unmodelled Accesses / 未建模访问清单
 

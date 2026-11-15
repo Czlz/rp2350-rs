@@ -16,6 +16,7 @@ keyboard/gamepad input, audio output, and no crashes.
 |---|---|---|
 | 模拟吞吐 / Emulation throughput | **3.0 M steps/s**（emerald 50M 步 16.6 s） | ≥50 M steps/s（≈20 fps）…≥150 M steps/s（60 fps） |
 | 每游戏帧步数 / Steps per game frame | ≈2.5 M（双核 + 软件 PPU） | 不变 |
+| 每秒模拟时间 / Steps per simulated second | **252 M @ 252 MHz**（150 M @ 150 MHz） | 与频率解耦的 `time_us` 口径 |
 | 画面输出 / Video | `g_fb` 在 SRAM（`0x20063DF4`，240×160 RGB565），仅 `run --dump` 导出 | GUI 实时纹理 |
 | 输入 / Input | 固件读 GP0..9（低有效、上拉），模拟器可 `GpioPads` 注入 | 键盘/手柄映射 |
 | 音频 / Audio | 固件 I2S（PIO2 + DMA）已运行，模拟器无采样出口 | 采样捕获 + 播放插件 |
@@ -33,6 +34,13 @@ keyboard/gamepad input, audio output, and no crashes.
 模拟器（见 `.trae/rules/project.md` 的「通用性与指令精确」），`WFI`/`WFE`/`SEV` 与阻塞式
 FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保留在队列中并行推进，且不得
 为了本示例的帧率而用「跳过自旋」之类的取巧手段替代。
+
+**2026-11-15 更新（P4-2 时钟接入）**：`cycles → µs`、TIMER、PIO `CLKDIV`、HSTX、
+UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 252 MHz 下是 252 M 步**
+（150 MHz 下 150 M 步），因此帧预算不能只按步数写死：`play --steps-per-frame 2500000`
+在 252 MHz 下只覆盖 ≈9.9 ms，需按 `time_us` 或实时频率换算。emerald 的启动睡眠在
+150 MHz 下 1.5 s（≈225 M 步），升频后游戏段才按 252 MHz 计。详见
+[`performance.md`](performance.md) 第 10 节。
 
 ## 1. 组件与依赖 / Components and dependencies
 
@@ -122,7 +130,7 @@ FIFO 是架构语义，必须实现；GAP-07 因此是**正确性任务**，保�
 
 ## 4. 风险 / Risks
 
-- **性能与定位（2026-11-15 决定）**：总步数吞吐 29.5–34 M/s 主要来自启动段（睡眠/自旋）；**真实游戏段 8.0–8.5 M steps/s ≈ 3.3 fps**（`doc/performance.md` §9）。**不做 JIT**：优先级是精确时钟/精确指令/功能与插件稳定；吞吐只优化宿主侧（缓存、去虚化、事件门控）。60 fps 不在当前目标内，3.3 fps 作为「运行真实固件」的当前水平记录；
+- **性能与定位（2026-11-15 决定）**：时钟已按固件实际配置运行（**252 MHz**，启动 150 MHz），60 fps 一帧 = **4.2 M 周期**；真实游戏段 8.5 M 步/s → **≈2 fps**（`doc/performance.md` §9/§9.1）。**不做 JIT**：优先级是精确时钟/精确指令/功能与插件稳定；吞吐只优化宿主侧。60 fps 不在当前目标内，2 fps 作为已知限制记录；
   备选方案：双核分线程（≈1.5×）、JIT（大工程）、或把 PPU 的 HSTX 路径换成直接帧输出
   （不改变访客代码，无法绕过）。结论写入 `doc/performance.md`。
 - **GUI 架构**：`rp2350-cli` 提供 lib target（`rp2350_cli::run::Machine` +

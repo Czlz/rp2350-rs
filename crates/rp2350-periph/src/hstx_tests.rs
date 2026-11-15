@@ -356,6 +356,75 @@ fn a_scanline_block_streams_for_800_pixel_periods() {
     assert_eq!(hstx.output_underrun(), 0, "the FIFO never runs dry");
 }
 
+/// Clock tree configured by the firmware: 252 MHz `CLK_SYS`, 126 MHz `CLK_HSTX`
+/// 固件配置的时钟树：`CLK_SYS` 252 MHz、`CLK_HSTX` 126 MHz
+fn tree_252_126() -> crate::clock_tree::ClockTree {
+    use crate::clock_tree::{CLK_HSTX, ClockTree, PllId};
+    let tree = ClockTree::new();
+    tree.write_pll(PllId::Sys, 0x08, 126);
+    tree.write_pll(PllId::Sys, 0x0C, (6 << 16) | (1 << 12));
+    tree.write_channel_div(CLK_HSTX, 2 << 16);
+    assert_eq!(tree.sysclk_hz(), 252_000_000);
+    assert_eq!(tree.hstxclk_hz(), 126_000_000);
+    tree
+}
+
+#[test]
+fn the_scanline_block_keeps_800_pixel_periods_at_252_126_mhz() {
+    // 时钟树配置为 252/126 MHz、CLKDIV=5：像素周期 = 5 * 252/126 = 10 个
+    // clk_sys，256 字行块仍是 800 像素 = 8 000 个 clk_sys 周期。
+    // With the tree at 252/126 MHz and CLKDIV=5 the pixel period is
+    // 5 * 252/126 = 10 clk_sys cycles, so a 256-word block still spans 800
+    // pixels = 8000 clk_sys cycles.
+    let mut hstx = Hstx::with_clock(IrqAssert::new(), tree_252_126());
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, (2 << 24) | (16 << 16) | (1 << 8));
+    let block = scanline_block();
+    let mut fed = 0usize;
+    let mut used = 0u64;
+    while used < 8_000 {
+        while fed < block.len() && hstx.fifo_level() < FIFO_DEPTH as u8 {
+            assert!(hstx.push_command(block[fed]), "push {fed}");
+            fed += 1;
+        }
+        hstx.advance(1);
+        used += 1;
+    }
+    assert_eq!(fed, block.len(), "the whole block is fed");
+    assert_eq!(hstx.output_words(), block.len() as u64);
+    assert_eq!(hstx.output_underrun(), 0);
+}
+
+#[test]
+fn a_different_hstx_divider_changes_the_pixel_period() {
+    // 252 MHz / CLK_HSTX=/4 = 63 MHz、CLKDIV=5：像素周期 = 20 个 clk_sys，
+    // 同一个 256 字块需要 16 000 个周期，证明时序来自 CLK_HSTX 通道。
+    // 252 MHz with CLK_HSTX /4 = 63 MHz and CLKDIV=5 gives 20 clk_sys per
+    // pixel, so the same 256-word block needs 16 000 cycles — proving the
+    // timing comes from the CLK_HSTX channel.
+    use crate::clock_tree::CLK_HSTX;
+    let tree = tree_252_126();
+    tree.write_channel_div(CLK_HSTX, 4 << 16);
+    assert_eq!(tree.hstxclk_hz(), 63_000_000);
+    let mut hstx = Hstx::with_clock(IrqAssert::new(), tree);
+    write_ctrl(&hstx, 0x00, CSR_EN | CSR_EXPAND_EN | (5 << 28));
+    write_ctrl(&hstx, 0x24, (2 << 24) | (16 << 16) | (1 << 8));
+    let block = scanline_block();
+    let mut fed = 0usize;
+    let mut used = 0u64;
+    while used < 16_000 {
+        while fed < block.len() && hstx.fifo_level() < FIFO_DEPTH as u8 {
+            assert!(hstx.push_command(block[fed]), "push {fed}");
+            fed += 1;
+        }
+        hstx.advance(1);
+        used += 1;
+    }
+    assert_eq!(fed, block.len(), "the whole block is fed");
+    assert_eq!(hstx.output_words(), block.len() as u64);
+    assert_eq!(hstx.output_underrun(), 0);
+}
+
 #[test]
 fn a_dma_burst_cannot_overrun_the_hstx_fifo() {
     // The HSTX FIFO is 8 words deep, so a 64-unit pump must stop at 8 and never
@@ -392,7 +461,7 @@ fn a_dma_burst_cannot_overrun_the_hstx_fifo() {
         .expect("count");
     bus.write_u32(base + 0x0C, ctrl, &mut cycles).expect("ctrl");
 
-    let moved = peripherals.pump_dma(&mut bus, 64);
+    let moved = peripherals.pump_dma(&mut bus, 64, 64);
     assert_eq!(
         moved, FIFO_DEPTH as u64,
         "only the free slots may be filled"

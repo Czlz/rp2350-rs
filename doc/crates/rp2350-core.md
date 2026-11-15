@@ -454,7 +454,19 @@ pub struct SimulationClock { /* total_cycles + config */ }
 // new() | with_config(config) | total_cycles() -> CycleCount | config() -> ClockConfig
 // tick(cycles: CycleCount) | systick_value(reload, enable) -> u32 (24-bit view)
 // peripheral_cycles(target_hz, ticks) -> CycleCount
+
+pub struct TimeBase { /* cycles, micros, sub-µs numerator, rate */ }
+// new(sysclk_hz) | advance(cycles, sysclk_hz) | set_sysclk_hz(hz)
+// time_us() | project_us(extra, hz) | cycles() | micros() | remainder() | sysclk_hz()
 ```
+
+`TimeBase` is the authoritative frequency-aware timer: within one rate the
+integration is integer-exact, and a retune settles the carried fraction at the
+**old** rate first. `SimulationClock` remains as a legacy cumulative-cycle
+tracker and no longer feeds timing consumers.
+`TimeBase` 是权威的按频率计时器：同一频率内积分是整数精确的，改频会先按**旧**
+频率结算携带的小数。`SimulationClock` 仅保留为旧的累计周期追踪器，不再供计时
+消费者使用。
 
 ---
 

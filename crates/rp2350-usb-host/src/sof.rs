@@ -16,6 +16,9 @@ use rp2350_usb::controller::Controller;
 /// USB 全速帧间隔标称值（微秒）
 pub const FRAME_INTERVAL_MICROS: u64 = 1_000;
 
+/// Nominal USB full-speed clock (PLL_USB) in Hz / USB 全速时钟（PLL_USB）标称频率
+pub const USB_FULL_SPEED_HZ: u32 = 48_000_000;
+
 /// Mask of the 11-bit SOF frame number / 11 位 SOF 帧号掩码
 pub const SOF_FRAME_MASK: u16 = 0x07FF;
 
@@ -38,13 +41,33 @@ pub struct SofScheduler {
     next_cycle: u64,
     frame: u16,
     emitted: u64,
+    /// `CLK_SYS` rate used to convert `poll(now)` cycles / 用于换算 `poll(now)` 周期的 `CLK_SYS`
+    sysclk_hz: u32,
+    /// `CLK_USB` rate that generates the 1 ms frame / 产生 1 ms 帧的 `CLK_USB`
+    usbclk_hz: u32,
 }
 
 impl SofScheduler {
     /// Create a scheduler ticking at `sysclk_hz` with no frame delivered yet
     /// 以 `sysclk_hz` 为基准创建调度器，尚未下发任何帧
+    ///
+    /// The USB clock defaults to full speed (48 MHz). Because one millisecond is
+    /// 1000 `CLK_USB` cycles and the host passes `CLK_SYS` cycles, the frame
+    /// period is `usb_period * sysclk / usbclk = sysclk / 1000`; the USB clock is
+    /// still carried so diagnostics can prove the SOF generator is in the USB
+    /// domain.
+    /// USB 时钟默认全速（48 MHz）。一毫秒是 1000 个 `CLK_USB` 周期，而宿主传入
+    /// `CLK_SYS` 周期，因此帧周期为 `usb_period * sysclk / usbclk = sysclk / 1000`；
+    /// 同时保留 USB 时钟值，使诊断能证明 SOF 发生器位于 USB 时钟域。
     #[must_use]
     pub const fn new(sysclk_hz: u32) -> Self {
+        Self::new_with_usb(sysclk_hz, USB_FULL_SPEED_HZ)
+    }
+
+    /// Create a scheduler with explicit `CLK_SYS` and `CLK_USB` rates
+    /// 用显式的 `CLK_SYS` 与 `CLK_USB` 频率创建调度器
+    #[must_use]
+    pub const fn new_with_usb(sysclk_hz: u32, usbclk_hz: u32) -> Self {
         // 第一个帧边界在起点之后一个周期，因此 new() 等价于 reset(0)。
         // The first frame boundary sits one period after the start, so `new()`
         // is equivalent to `reset(0)`.
@@ -54,6 +77,8 @@ impl SofScheduler {
             next_cycle: period,
             frame: 0,
             emitted: 0,
+            sysclk_hz,
+            usbclk_hz,
         }
     }
 
@@ -65,10 +90,39 @@ impl SofScheduler {
         if cycles == 0 { 1 } else { cycles }
     }
 
+    /// One frame in the USB clock domain (never zero) / USB 时钟域的一帧（永不为零）
+    ///
+    /// This is `CLK_USB / 1 MHz`, nominally 48000 cycles. `/ 即 `CLK_USB / 1 MHz`，
+    /// 标称 48000 个周期。`
+    #[must_use]
+    pub const fn usb_period_cycles(&self) -> u64 {
+        let cycles = self.usbclk_hz as u64 / FRAME_INTERVAL_MICROS;
+        if cycles == 0 { 1 } else { cycles }
+    }
+
     /// Override the system clock used for the frame period
     /// 覆盖用于帧周期换算的系统时钟
     pub const fn set_sysclk_hz(&mut self, sysclk_hz: u32) {
+        self.sysclk_hz = sysclk_hz;
         self.period_cycles = Self::cycles_for(sysclk_hz);
+    }
+
+    /// Override both clocks / 覆盖两个时钟
+    pub const fn set_clocks(&mut self, sysclk_hz: u32, usbclk_hz: u32) {
+        self.usbclk_hz = usbclk_hz;
+        self.set_sysclk_hz(sysclk_hz);
+    }
+
+    /// `CLK_SYS` rate used for the CPU-cycle argument / 用于 CPU 周期参数的 `CLK_SYS`
+    #[must_use]
+    pub const fn sysclk_hz(&self) -> u32 {
+        self.sysclk_hz
+    }
+
+    /// `CLK_USB` rate that generates the frame / 产生帧的 `CLK_USB` 频率
+    #[must_use]
+    pub const fn usbclk_hz(&self) -> u32 {
+        self.usbclk_hz
     }
 
     /// Frame period in simulated cycles / 模拟周期表示的帧周期
@@ -194,6 +248,28 @@ mod tests {
         assert_eq!(sof.advance(&controller, 2 * MS), 1);
         assert_eq!(sof_rd(&controller), 2);
         assert_eq!(sof.emitted(), 2);
+    }
+
+    #[test]
+    fn the_frame_comes_from_the_usb_clock_domain() {
+        // 252 MHz CLK_SYS + 48 MHz CLK_USB：USB 域一帧是 48 000 个周期，
+        // 换算到 CPU 周期是 252 000，仍然是 1 ms。
+        // 252 MHz CLK_SYS with 48 MHz CLK_USB: one USB-domain frame is 48_000
+        // cycles, which converts to 252_000 CPU cycles — still 1 ms.
+        let controller = visible_controller();
+        let mut sof = SofScheduler::new_with_usb(252_000_000, 48_000_000);
+        assert_eq!(sof.usb_period_cycles(), 48_000);
+        assert_eq!(sof.period_cycles(), 252_000);
+        assert_eq!(sof.usbclk_hz(), 48_000_000);
+        sof.reset(0);
+        assert_eq!(sof.advance(&controller, 251_999), 0);
+        assert_eq!(sof.advance(&controller, 252_000), 1);
+        // 系统时钟改频只改变 CPU 周期数，USB 域仍是 48 000 周期。
+        // Retuning the CPU clock only changes the CPU count; the USB domain
+        // still runs 48_000 cycles per frame.
+        sof.set_clocks(150_000_000, 48_000_000);
+        assert_eq!(sof.usb_period_cycles(), 48_000);
+        assert_eq!(sof.period_cycles(), 150_000);
     }
 
     #[test]

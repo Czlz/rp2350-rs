@@ -486,6 +486,8 @@ struct DmaState {
     cursor: usize,
     /// Bus-occupancy totals of this master / 本主设备的总线占用总计
     bus: DmaBusCounters,
+    /// `clk_sys` cycles credited to the pacing timers / 计入节拍定时器的 `clk_sys` 周期
+    pacing_cycles: u64,
 }
 
 impl Default for DmaState {
@@ -511,6 +513,7 @@ impl Default for DmaState {
             sniff_data: 0,
             cursor: 0,
             bus: DmaBusCounters::default(),
+            pacing_cycles: 0,
         }
     }
 }
@@ -623,16 +626,36 @@ impl Dma {
     /// cycle and `X = 1, Y = 4` one every four cycles. Pulses are queued, and a
     /// [`Self::run`] transfer that samples the asserted `DREQ_DMA_TIMERn`
     /// selector (`59..=62`) consumes one. `X == 0` or `Y == 0` never asserts.
-    /// [`crate::BootPeripherals::pump_dma`] calls this with a fixed 64-cycle
-    /// budget per pump.
+    /// [`crate::BootPeripherals::pump_dma`] calls this with the real elapsed
+    /// `clk_sys` cycles.
     /// `TIMERx` 的 `<31:16>`（X）是被除数，`<15:0>`（Y）是除数，因此定时器以
     /// `(X / Y) * sys_clk` 的速率请求：`X == Y` 每个周期一次，`X = 1, Y = 4`
     /// 每四个周期一次。脉冲进入队列，[`Self::run`] 中采样到 `DREQ_DMA_TIMERn`
     /// （`59..=62`）电平的传输消费一个。`X == 0` 或 `Y == 0` 永不断言。
-    /// [`crate::BootPeripherals::pump_dma`] 每次泵送用固定的 64 周期预算调用本方法。
+    /// [`crate::BootPeripherals::pump_dma`] 以真实经过的 `clk_sys` 周期调用本方法。
     pub fn advance(&mut self, cycles: u64) {
         let mut state = self.state.lock();
+        state.pacing_cycles = state.pacing_cycles.saturating_add(cycles);
         pacing::advance(&mut state, cycles);
+    }
+
+    /// `clk_sys` cycles credited to the pacing timers so far
+    /// 累计计入节拍定时器的 `clk_sys` 周期
+    #[must_use]
+    pub fn pacing_cycles(&self) -> u64 {
+        self.state.lock().pacing_cycles
+    }
+
+    /// Microseconds represented by the credited pacing cycles at `sysclk_hz`
+    /// 已计入的节拍周期在 `sysclk_hz` 下对应的微秒数
+    ///
+    /// Zero when `sysclk_hz` is zero. / `sysclk_hz` 为零时返回 0。
+    #[must_use]
+    pub fn time_us(&self, sysclk_hz: u32) -> u64 {
+        if sysclk_hz == 0 {
+            return 0;
+        }
+        self.pacing_cycles() * 1_000_000 / u64::from(sysclk_hz)
     }
 
     /// Execute at most `max_transfers` data units across all channels

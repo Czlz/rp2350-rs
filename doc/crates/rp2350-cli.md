@@ -87,14 +87,17 @@ rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
 the first `trace_steps` steps as `[trace]` lines, then runs to halt or budget
 exhaustion. The report ends with the halt reason, a 32-step `[tail]` PC
 history, the simulated time, up to 8 logged IRQ deliveries, and any buffered
-UART0 output. Arm machines also print one `[run] core1 state=… pc=… sp=…
-launches=…` line (plus `[run] core1 halt: …` if core 1 stopped) after the
-DMA/HSTX counters.
+UART0 output. `simulated=<µs>` comes from the live time base, so the same
+`--max-cycles` covers less simulated time once the guest raises `CLK_SYS`
+(252 MHz: 252 M steps per second; 150 MHz: 150 M). Arm machines also print one
+`[run] core1 state=… pc=… sp=… launches=…` line (plus `[run] core1 halt: …` if
+core 1 stopped) after the DMA/HSTX counters.
 `run` 打印映像摘要、核心描述与启动向量，先按 `[trace]` 行执行前
 `trace_steps` 步，然后运行至停机或预算耗尽。报告以停机原因、32 步 `[tail]`
 PC 轨迹、模拟时间、最多 8 条已记录的中断投递以及缓冲的 UART0 输出收尾。
-Arm 机器还会在 DMA/HSTX 计数之后打印一行
-`[run] core1 state=… pc=… sp=… launches=…`（core1 停机时另有
+`simulated=<µs>` 来自实时时基，因此客户机升频后同样 `--max-cycles` 覆盖的模拟时间
+会变短（252 MHz 每秒 252 M 步，150 MHz 每秒 150 M 步）。Arm 机器还会在 DMA/HSTX
+计数之后打印一行 `[run] core1 state=… pc=… sp=… launches=…`（core1 停机时另有
 `[run] core1 halt: …`）。
 
 The diagnostic block is `[run] dma=<units> busy=<mask>`, then
@@ -177,24 +180,27 @@ Ctrl-C/Ctrl-A/Ctrl-B/Ctrl-D，协议完全由对端（`pyboard.py`、
   feeds a bounded queue (16 slots × 4 KiB = 64 KiB in flight); the main loop
   sends queued bytes, drains CDC IN to stdout and flushes, then advances the
   simulation by `STDIO_CHUNK_MICROS` (500 µs, i.e. 75 000 guest cycles at
-  150 MHz). Smaller steps lower latency but add host loop overhead; 100–1000 µs
-  is the useful range.
+  150 MHz or 126 000 at 252 MHz; the live `CLK_SYS` is injected into
+  `CdcLink`). Smaller steps lower latency but add host loop overhead;
+  100–1000 µs is the useful range.
   后台线程阻塞读取 stdin，并送入有界队列（16 槽 × 4 KiB = 64 KiB 在途）；
   主循环发送队列字节、把 CDC IN 排空到 stdout 并 flush，然后按
-  `STDIO_CHUNK_MICROS`（500 微秒，150 MHz 下 75 000 个客户机周期）推进模拟。
-  更小的步长降低延迟但增加宿主循环开销；100–1000 微秒是有效范围。
+  `STDIO_CHUNK_MICROS`（500 微秒；150 MHz 下 75 000 个客户机周期，252 MHz 下
+  126 000 个，实时 `CLK_SYS` 注入 `CdcLink`）推进模拟。更小的步长降低延迟但增加
+  宿主循环开销；100–1000 微秒是有效范围。
 - **EOF and budget / EOF 与预算**：after stdin EOF the bridge sends every
   queued byte and keeps simulating for a 50 ms (simulated) drain window so a
   late banner/prompt is not truncated, then exits with a stdin-byte count on
   stderr. The default `--max-cycles 300_000_000` is about two simulated seconds
-  and may be too small for long benchmark sessions; pass `--max-cycles 0` for
-  an unlimited budget (`u64::MAX`). This `0` interpretation applies to `repl`
-  (both `--exec` and `--stdio`); `repl --exec` keeps its historical default of
-  `300_000_000`.
+  at 150 MHz but only ≈1.19 s at 252 MHz; use `time_us` or the live frequency
+  when a wall-clock budget matters. Pass `--max-cycles 0` for an unlimited
+  budget (`u64::MAX`). This `0` interpretation applies to `repl` (both `--exec`
+  and `--stdio`); `repl --exec` keeps its historical default of `300_000_000`.
   stdin EOF 后桥接会把队列字节全部送出，并继续模拟 50 毫秒（模拟时间）的
   排空窗口，避免截断迟到的 banner/提示符，然后在 stderr 打印已处理的 stdin
-  字节数并退出。默认 `--max-cycles 300_000_000` 约等于两秒模拟时间，长时间
-  基准可能不够；传 `--max-cycles 0` 表示不限制预算（`u64::MAX`）。该 `0`
+  字节数并退出。默认 `--max-cycles 300_000_000` 在 150 MHz 下约两秒模拟时间，
+  但在 252 MHz 下只有约 1.19 秒；需要墙钟预算时应按 `time_us` 或实时频率换算。
+  传 `--max-cycles 0` 表示不限制预算（`u64::MAX`）。该 `0`
   语义仅适用于 `repl`（`--exec` 与 `--stdio`）；`repl --exec` 的默认值仍为
   `300_000_000`。
 - **Mask-ROM view / 掩膜 ROM 视图**：before enumeration `repl` calls

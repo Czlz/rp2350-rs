@@ -937,12 +937,13 @@ impl Machine {
     /// Elapsed simulated microseconds / 已模拟的微秒数
     #[must_use]
     pub fn time_us(&self) -> u64 {
-        // 外设时基按 10_000 步批量推进，诊断时把尚未推进的步数也算进来。
-        // The peripheral timebase advances in 10_000-step batches; include the
-        // not-yet-advanced steps so diagnostics report the current time.
+        // 外设时基按 10_000 步批量推进，诊断时把尚未推进的步数按实时
+        // clk_sys 投影进去，因此时钟改频后报告值仍然精确。
+        // The peripheral timebase advances in 10_000-step batches; diagnostics
+        // project the not-yet-advanced steps at the live clk_sys, so the value
+        // stays exact across a retune.
         let pending = self.steps.saturating_sub(self.advanced);
-        let pending_us = pending / u64::from(rp2350_periph::boot::DEFAULT_CYCLES_PER_US);
-        self.peripherals.time_us().saturating_add(pending_us)
+        self.peripherals.time_us_including(pending)
     }
 
     /// Total instruction budget / 总指令预算
@@ -1812,8 +1813,11 @@ impl Machine {
             return;
         }
         // 先记节流点：即使当前空闲，下一次检查也推迟一整批，避免每步加锁。
+        // 同时把真实经过的步数交给节拍定时器，pacing 因此跟随实时 clk_sys。
         // Record the throttle point first: even when idle, the next probe waits
-        // a full batch instead of locking on every step.
+        // a full batch instead of locking on every step. The real elapsed steps
+        // are handed to the pacing timers, so pacing follows the live clk_sys.
+        let elapsed = self.steps - self.dma_pumped;
         self.dma_pumped = self.steps;
         // HSTX advances independently of DMA: drain the host queue every batch,
         // advance the expander by one batch of cycles and publish its FIFO-room
@@ -1830,7 +1834,9 @@ impl Machine {
         // bus 与外设是不同字段，可直接分开借用，无需 RefCell。
         // `bus` and the peripheral handle are distinct fields, so they borrow
         // separately without a RefCell.
-        let moved = self.peripherals.pump_dma(&mut self.bus, DMA_PUMP_TRANSFERS);
+        let moved = self
+            .peripherals
+            .pump_dma(&mut self.bus, DMA_PUMP_TRANSFERS, elapsed);
         self.dma_transfers = self.dma_transfers.saturating_add(moved);
     }
 
@@ -2273,6 +2279,20 @@ fn deliver_irqs(
         core.signal_interrupt(irq);
         log_irq(irq_log, "", irq, core.pc());
     }
+    // SysTick 的计时与 COUNTFLAG 由外设侧计数器负责（见
+    // `BootPeripherals::systick`），但**不**在此处向 NVIC 投递：`rp2350-arm`
+    // 目前把所有 NVIC 挂起位按「外部中断 n = 异常 16+n」映射，挂起 15 会进入
+    // 异常 31 而不是 SysTick 的异常 15。在 rp2350-arm 增加内部异常投递之前，
+    // 这里保持不投递，避免把错误向量送进客户机；计时与状态仍可通过
+    // `BootPeripherals::take_systick_pending` 观察。
+    // SysTick timing/COUNTFLAG live in the peripheral counter (see
+    // `BootPeripherals::systick`), but it is **not** delivered to the NVIC here:
+    // `rp2350-arm` currently maps every NVIC pending bit as "external IRQ n =
+    // exception 16+n", so pending 15 would enter exception 31 instead of the
+    // SysTick exception 15. Until rp2350-arm gains internal-exception delivery,
+    // no delivery is attempted, which keeps a wrong vector out of the guest;
+    // timing and status remain observable through
+    // `BootPeripherals::take_systick_pending`.
     // USB 控制器把 INTR & INTE 聚合到 INTS；固件清 INTS 后条件自然撤销。
     // The USB controller aggregates INTR & INTE into INTS; the condition
     // disappears when firmware clears INTS.

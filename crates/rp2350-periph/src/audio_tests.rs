@@ -256,7 +256,7 @@ fn boot_tap_captures_cpu_and_dma_paths_end_to_end() {
     f.write_word(RAM_BASE, 0x0002_0001);
     f.write_word(RAM_BASE + 4, 0x0004_0003);
     f.program_tx_channel(0, RAM_BASE, map::PIO2_BASE + PIO_TXF0, 2, dreq::PIO2_TX0);
-    assert_eq!(f.peripherals.pump_dma(&mut f.bus, 8), 2);
+    assert_eq!(f.peripherals.pump_dma(&mut f.bus, 8, 64), 2);
     assert_eq!(
         tap.take_samples(32),
         vec![-2, 255, 1, 2, 3, 4],

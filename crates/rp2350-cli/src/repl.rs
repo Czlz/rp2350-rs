@@ -32,9 +32,11 @@ pub const DEFAULT_ENUM_CYCLES: u64 = 100_000_000;
 
 /// Default simulation step for the stdio bridge (µs) / stdio 桥接的默认模拟步长（微秒）
 ///
-/// 500 µs at the 150 MHz system clock is 75 000 guest cycles per iteration:
-/// large enough for throughput, small enough for interactive latency.
-/// 150 MHz 下 500 微秒等于每轮 75 000 个客户机周期：兼顾吞吐与交互延迟。
+/// 500 µs is converted to guest cycles with the live `CLK_SYS` supplied to
+/// [`CdcLink`] (75 000 cycles at 150 MHz, 126 000 at 252 MHz): large enough for
+/// throughput, small enough for interactive latency.
+/// 500 微秒按传给 [`CdcLink`] 的实时 `CLK_SYS` 换算为客户机周期（150 MHz 下
+/// 75 000、252 MHz 下 126 000）：兼顾吞吐与交互延迟。
 pub const STDIO_CHUNK_MICROS: u64 = 500;
 
 /// Bytes read per stdin chunk before handing them to the bridge
@@ -205,7 +207,13 @@ pub fn open_session<'a>(
 ) -> Result<OpenSession<'a>, EnumerationError> {
     let start = machine.now_cycles();
     let deadline = start.saturating_add(enum_cycles);
-    let mut bridge = UsbHostBridge::new(machine.usb().clone());
+    // 枚举与后续 CDC 传输都使用客户机当前的时钟树：CLK_SYS 换算周期，
+    // CLK_USB 驱动 1 ms SOF。
+    // Enumeration and the following CDC data phase use the guest's clock tree:
+    // CLK_SYS converts cycles and CLK_USB drives the 1 ms SOF.
+    let sysclk = machine.peripherals().sysclk_hz();
+    let usbclk = machine.peripherals().usbclk_hz();
+    let mut bridge = UsbHostBridge::with_clock(machine.usb().clone(), sysclk, usbclk);
     let mut last = String::from("not polled");
     let endpoints = loop {
         if let Some(reason) = machine.halt_reason() {
@@ -249,9 +257,9 @@ pub fn open_session<'a>(
         }
     };
 
-    let channel = CdcChannel::new(machine.usb().clone(), endpoints);
+    let channel = CdcChannel::with_clock(machine.usb().clone(), endpoints, sysclk, usbclk);
     let runner: Box<dyn FnMut(u64) + 'a> = Box::new(move |cycles| machine.run_cycles(cycles));
-    let link = CdcLink::new(channel, runner);
+    let link = CdcLink::with_clock(channel, runner, sysclk);
     Ok(OpenSession {
         endpoints,
         session: RawReplSession::new(link),

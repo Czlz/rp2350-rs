@@ -1445,3 +1445,174 @@ fn machine_run_to_halt(machine: &mut Machine) {
         machine.run_steps(1_000).expect("batched steps");
     }
 }
+
+/// Address where the synthetic PLL program is bound / 合成 PLL 程序绑定的地址
+const PLL_PROGRAM: u32 = SRAM_BASE + 0x8000;
+
+/// `PLL_SYS_FBDIV_INT` address / `PLL_SYS_FBDIV_INT` 地址
+const PLL_SYS_FBDIV: u32 = 0x4005_0008;
+
+/// `PLL_SYS_PRIM` address / `PLL_SYS_PRIM` 地址
+const PLL_SYS_PRIM: u32 = 0x4005_000C;
+
+/// Synthetic Thumb program that writes `PLL_SYS` and spins
+/// 写 `PLL_SYS` 后自旋的合成 Thumb 程序
+///
+/// Literal layout: `+24` PRIM, `+28` FBDIV, `+32` FBDIV address,
+/// `+36` PRIM address. 字面量布局：`+24` PRIM、`+28` FBDIV、`+32` FBDIV 地址、
+/// `+36` PRIM 地址。
+const PLL_WRITE_PROGRAM: [u16; 8] = [
+    0x4806, // LDR r0,[pc,#24] -> +28 (FBDIV value)
+    0x4907, // LDR r1,[pc,#28] -> +32 (FBDIV address)
+    0x6008, // STR r0,[r1]
+    0x4804, // LDR r0,[pc,#16] -> +24 (PRIM value)
+    0x4906, // LDR r1,[pc,#24] -> +36 (PRIM address)
+    0x6008, // STR r0,[r1]
+    0xE7FE, // B .
+    0x0000,
+];
+
+/// Bind and start the synthetic PLL program / 绑定并启动合成 PLL 程序
+///
+/// `fbdiv`/`prim` are the two `PLL_SYS` register values the guest writes; the
+/// program bytes are otherwise identical, so the same client code can run at
+/// 150 MHz (`125`, `/5/2`) and 252 MHz (`126`, `/6/1`).
+/// `fbdiv`/`prim` 是客户机写入的两个 `PLL_SYS` 寄存器值；程序其余字节完全相同，
+/// 因此同一段客户机代码可以分别运行在 150 MHz（`125`、`/5/2`）与 252 MHz
+/// （`126`、`/6/1`）。
+fn bind_pll_program(machine: &mut Machine, fbdiv: u32, prim: u32) {
+    bind_halfwords(machine, PLL_PROGRAM, &PLL_WRITE_PROGRAM);
+    write_word(machine, PLL_PROGRAM + 24, prim);
+    write_word(machine, PLL_PROGRAM + 28, fbdiv);
+    write_word(machine, PLL_PROGRAM + 32, PLL_SYS_FBDIV);
+    write_word(machine, PLL_PROGRAM + 36, PLL_SYS_PRIM);
+    machine.write_register(15, PLL_PROGRAM);
+    // 6 条真实指令 + 自旋。 / Six real instructions then the spin.
+    machine.run_steps(16).expect("run the PLL program");
+}
+
+#[test]
+fn the_same_guest_code_runs_slower_in_simulated_time_at_252_mhz() {
+    // 同一段写 PLL 的程序：125 保持 150 MHz，126 得到 252 MHz。之后同样执行
+    // 1 000 000 条指令，模拟时间分别为 6 666 µs 与 3 968 µs。
+    // The same PLL-writing program: 125 keeps 150 MHz, 126 gives 252 MHz. Both
+    // then execute 1_000_000 instructions, simulating 6_666 µs and 3_968 µs.
+    let mut slow = machine_with_budget(2_000_000);
+    bind_pll_program(&mut slow, 125, (5 << 16) | (2 << 12));
+    assert_eq!(slow.peripherals.sysclk_hz(), 150_000_000);
+    let slow_start = (slow.steps(), slow.time_us());
+    slow.run_steps(1_000_000).expect("slow run");
+    let slow_us = slow.time_us() - slow_start.1;
+    assert_eq!(slow.steps() - slow_start.0, 1_000_000);
+
+    let mut fast = machine_with_budget(2_000_000);
+    bind_pll_program(&mut fast, 126, (6 << 16) | (1 << 12));
+    assert_eq!(fast.peripherals.sysclk_hz(), 252_000_000);
+    let fast_start = (fast.steps(), fast.time_us());
+    fast.run_steps(1_000_000).expect("fast run");
+    let fast_us = fast.time_us() - fast_start.1;
+    assert_eq!(fast.steps() - fast_start.0, 1_000_000);
+
+    // 整数换算的期望值。 / Integer expectations.
+    assert_eq!(slow_us, 6_666, "150 MHz");
+    assert_eq!(fast_us, 3_968, "252 MHz");
+    assert!(
+        slow_us > fast_us * 3 / 2,
+        "252 MHz must cover less simulated time per step / \
+         252 MHz 下每步覆盖的模拟时间更短"
+    );
+}
+
+#[test]
+fn ten_milliseconds_of_simulated_time_needs_the_live_rate_in_steps() {
+    // 同样 10 ms 模拟时间：150 MHz 需要 1.5M 步，252 MHz 需要 2.52M 步。
+    // The same 10 ms of simulated time: 1.5M steps at 150 MHz, 2.52M at 252 MHz.
+    let mut slow = machine_with_budget(1_600_000);
+    bind_pll_program(&mut slow, 125, (5 << 16) | (2 << 12));
+    let start = slow.steps();
+    slow.run_steps(1_500_000).expect("10 ms at 150 MHz");
+    assert_eq!(slow.steps() - start, 1_500_000);
+    assert_eq!(slow.time_us(), 10_000, "150 MHz");
+
+    let mut fast = machine_with_budget(2_600_000);
+    bind_pll_program(&mut fast, 126, (6 << 16) | (1 << 12));
+    let start = fast.steps();
+    fast.run_steps(2_520_000).expect("10 ms at 252 MHz");
+    assert_eq!(fast.steps() - start, 2_520_000);
+    assert_eq!(fast.time_us(), 10_000, "252 MHz");
+}
+
+#[test]
+fn scr_and_stir_writes_replay_into_the_arm_core() {
+    // PPB 必须回放 SCR（0xE000_ED10）与 STIR（0xE000_EF00）：前者让固件的
+    // SLEEPONEXIT 到达核心，后者挂起软件中断。
+    // The PPB must replay SCR (0xE000_ED10) and STIR (0xE000_EF00): the first
+    // carries SLEEPONEXIT into the core, the second pends a software interrupt.
+    let mut machine = machine_with_budget(100);
+    write_word(&mut machine, 0xE000_ED10, 2);
+    write_word(&mut machine, 0xE000_EF00, 9);
+    machine.step().expect("replay step");
+    assert_eq!(
+        machine.core.system_read(0xE000_ED10),
+        Some(2),
+        "SCR.SLEEPONEXIT reaches the core / SCR.SLEEPONEXIT 到达核心"
+    );
+    let ispr0 = machine.core.system_read(0xE000_E200).expect("ISPR0");
+    assert_ne!(ispr0 & (1 << 9), 0, "STIR pends IRQ 9 / STIR 挂起 IRQ 9");
+}
+
+#[test]
+fn a_guest_scr_write_makes_sleeponexit_suspend_the_core() {
+    // 客户机 `STR SCR` 与 `STR STIR` 经 PPB 日志回放到核后：IRQ 9 进入处理程序，
+    // 处理程序 `BX LR` 返回 Thread 模式时 SCR.SLEEPONEXIT 必须挂起核心。
+    // After the guest's `STR SCR`/`STR STIR` are replayed, IRQ 9 enters the
+    // handler; returning to Thread mode with `BX LR` must suspend the core via
+    // SCR.SLEEPONEXIT.
+    const VTOR: u32 = SRAM_BASE + 0x4000;
+    const IRQ9_HANDLER: u32 = SRAM_BASE + 0x5000;
+    const PROGRAM: u32 = SRAM_BASE + 0x8000;
+    const SCR_VALUE: u32 = 2;
+    const STIR_IRQ: u32 = 9;
+
+    let mut machine = machine_with_budget(100);
+    // IRQ 9 = 异常 25。 / IRQ 9 is exception 25.
+    write_word(&mut machine, VTOR + 25 * 4, IRQ9_HANDLER | 1);
+    bind_halfwords(&mut machine, IRQ9_HANDLER, &[0x4770]);
+    // `LDR r0,[pc,#16]; LDR r1,[pc,#20]; STR; LDR r0,[pc,#20]; LDR r1,[pc,#20]; STR; B .`
+    bind_halfwords(
+        &mut machine,
+        PROGRAM,
+        &[
+            0x4804, 0x4905, 0x6008, 0x4805, 0x4905, 0x6008, 0xE7FE, 0x0000, 0x0000, 0x0000,
+        ],
+    );
+    write_word(&mut machine, PROGRAM + 20, SCR_VALUE);
+    write_word(&mut machine, PROGRAM + 24, 0xE000_ED10);
+    write_word(&mut machine, PROGRAM + 28, STIR_IRQ);
+    write_word(&mut machine, PROGRAM + 32, 0xE000_EF00);
+    // VTOR 与 NVIC ISER9 都经 PPB 回放。 / VTOR and NVIC ISER9 replay through the PPB.
+    write_word(&mut machine, 0xE000_ED08, VTOR);
+    write_word(&mut machine, 0xE000_E100, 1 << 9);
+    machine.write_register(13, SRAM_BASE + 0x8000);
+    machine.step().expect("VTOR/ISER replay");
+    assert_eq!(
+        machine.core.system_read(0xE000_ED08),
+        Some(VTOR),
+        "VTOR replayed / VTOR 已回放"
+    );
+    machine.write_register(15, PROGRAM);
+    for _ in 0..24 {
+        machine.step().expect("guest step");
+    }
+    assert_eq!(
+        machine.core.system_read(0xE000_ED10),
+        Some(SCR_VALUE),
+        "the guest's STR SCR reached the core / 客户机的 STR SCR 到达核心"
+    );
+    let pc = machine.pc();
+    assert_eq!(
+        machine.core.state(),
+        CpuState::Sleeping,
+        "SLEEPONEXIT suspends the core after the IRQ return / IRQ 返回后进入睡眠 (PC={pc:#010X})"
+    );
+}

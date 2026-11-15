@@ -75,31 +75,36 @@
 //! # Timing model / 时序模型
 //!
 //! [`Hstx::advance`] paces the block from the pixel clock
-//! (`clk_hstx / CSR.CLKDIV`, with `clk_hstx = clk_sys / 2`):
+//! (`clk_hstx / CSR.CLKDIV`), taking `clk_hstx` from the **`CLK_HSTX` clock
+//! tree channel** rather than assuming `clk_hstx = clk_sys / 2`. One pixel
+//! therefore occupies `ceil(CLKDIV * clk_sys / clk_hstx)` `clk_sys` cycles, so a
+//! 252 MHz `CLK_SYS` with 126 MHz `CLK_HSTX` and `CLKDIV = 5` gives ten cycles
+//! per pixel, while the bootrom 150/150 pair with `CLKDIV = 1` gives one.
 //!
 //! - `EXPAND_EN = 1`: the expander pops one FIFO word per command word period
 //!   and pushes the expanded words onto the host queue drained by
 //!   [`Hstx::drain_output`] / [`Hstx::take_scanline`]. While a `CMD_WAIT` is
-//!   pending no FIFO word is consumed.
+//!   pending no FIFO word is consumed; `count` is in `clk_hstx` cycles and is
+//!   converted with the same ratio.
 //! - `EXPAND_EN = 0`: raw FIFO words feed the output shift register directly, so
-//!   one word occupies `CSR.N_SHIFTS * 2 * CSR.CLKDIV` `clk_sys` cycles — the
-//!   shift clock is `clk_hstx / CLKDIV`, i.e. `2 * CLKDIV` `clk_sys` per shift,
-//!   and the register shifts `N_SHIFTS` times per word (`0` is treated as `1`).
-//!   A word only reaches the host queue once its shift period completes.
+//!   one word occupies `CSR.N_SHIFTS * pixel_period` `clk_sys` cycles and only
+//!   reaches the host queue once its shift period completes.
 //!
 //! [`Hstx::advance`] never synthesises pixels, so an idle HSTX only refreshes
 //! status. [`Hstx::take_pixels`] decodes the TMDS data words of the host queue
 //! into [`HstxPixel`]s (three lane symbols per pixel, before TMDS encoding).
-//! [`Hstx::advance`] 由像素时钟（`clk_hstx / CSR.CLKDIV`，`clk_hstx` 取
-//! `clk_sys / 2`）推进：
+//! [`Hstx::advance`] 由像素时钟（`clk_hstx / CSR.CLKDIV`）推进，`clk_hstx` 取自
+//! **`CLK_HSTX` 时钟树通道**，而不是假定 `clk_hstx = clk_sys / 2`。因此一个像素
+//! 占用 `ceil(CLKDIV * clk_sys / clk_hstx)` 个 `clk_sys` 周期：252 MHz `CLK_SYS`
+//! 配 126 MHz `CLK_HSTX`、`CLKDIV = 5` 时每像素十个周期；bootrom 的 150/150 配
+//! `CLKDIV = 1` 时每像素一个周期。
 //!
 //! - `EXPAND_EN = 1`：扩展器按命令的字周期弹出 FIFO 字，并把展开后的字压入
 //!   宿主队列（由 [`Hstx::drain_output`] / [`Hstx::take_scanline`] 取走）。
-//!   `CMD_WAIT` 等待期间不消费 FIFO 字。
+//!   `CMD_WAIT` 等待期间不消费 FIFO 字；`count` 以 `clk_hstx` 周期计，按同一
+//!   比值换算。
 //! - `EXPAND_EN = 0`：原始 FIFO 字直接进入输出移位寄存器，因此每个字占用
-//!   `CSR.N_SHIFTS * 2 * CSR.CLKDIV` 个 `clk_sys` 周期——移位时钟为
-//!   `clk_hstx / CLKDIV`（即每次移位 `2 * CLKDIV` 个 `clk_sys`），每个字移位
-//!   `N_SHIFTS` 次（值为 `0` 时按 `1` 处理）。移位周期结束后该字才进入宿主队列。
+//!   `CSR.N_SHIFTS * 像素周期` 个 `clk_sys` 周期，移位周期结束后才进入宿主队列。
 //!
 //! 空闲 HSTX 只刷新状态，不会凭空产生像素。[`Hstx::take_pixels`] 把宿主队列中
 //! 的 TMDS 数据字解码为 [`HstxPixel`]（每像素三路通道符号，TMDS 编码前）。
@@ -137,6 +142,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
+use super::clock_tree::{CLK_HSTX, ClockTree};
 use super::irq::IrqAssert;
 use super::map;
 
@@ -234,9 +240,14 @@ const ENC_SHIFT_SHIFT: u32 = 16;
 /// `EXPAND_SHIFT.ENC_SHIFT` mask / `EXPAND_SHIFT.ENC_SHIFT` 掩码
 const ENC_SHIFT_MASK: u32 = 0x1f;
 
-/// Default `clk_hstx` divider from `clk_sys` (the validated DVI setup uses /2)
-/// 默认 `clk_hstx` 相对 `clk_sys` 的分频（已验证的 DVI 配置为 /2）
-const CLK_HSTX_DIV: u64 = 2;
+/// `CLK_HSTX` boot divider selected by [`Hstx::new`] / [`Hstx::new`] 选择的 `CLK_HSTX` 启动分频
+///
+/// The helper constructor reproduces the validated 640x480p60 DVI setup, whose
+/// HSTX clock is half of `clk_sys`. Production mounts pass the real clock tree
+/// through [`Hstx::with_clock`], so this constant is only a default vector.
+/// 该便捷构造函数复现已验证的 640x480p60 DVI 配置（HSTX 时钟为 `clk_sys` 的一半）。
+/// 生产挂载通过 [`Hstx::with_clock`] 传入真实时钟树，因此这个常量只是默认配置向量。
+const DEFAULT_HSTX_DIV: u32 = 2;
 
 /// Command opcode shift (`[15:12]`) / 命令操作码移位（`[15:12]`）
 pub const CMD_OPCODE_SHIFT: u32 = 12;
@@ -326,6 +337,12 @@ struct HstxState {
     unknown_commands: u64,
     last_unknown: Option<u32>,
     unknown_opcodes: u16,
+    /// `clk_sys` frequency from the last advance / 上次推进时的 `clk_sys` 频率
+    sysclk_hz: u32,
+    /// `clk_hstx` frequency from the last advance / 上次推进时的 `clk_hstx` 频率
+    hstxclk_hz: u32,
+    /// One-shot warning for a stopped HSTX pixel clock / HSTX 像素时钟停止的一次性告警
+    clock_warned: bool,
 }
 
 impl HstxState {
@@ -335,6 +352,11 @@ impl HstxState {
         Self {
             csr: CSR_RESET,
             expand_shift: EXPAND_SHIFT_RESET,
+            // 首次 advance 会用时钟树覆盖这两个值；初值对应 bootrom 150 MHz。
+            // The first advance overwrites both with the clock tree; the initial
+            // values match the bootrom's 150 MHz.
+            sysclk_hz: 150_000_000,
+            hstxclk_hz: 150_000_000,
             ..Self::default()
         }
     }
@@ -454,15 +476,18 @@ impl HstxState {
 
     /// `clk_sys` cycles per pixel / 每个像素占用的 `clk_sys` 周期
     ///
-    /// The pixel clock is `clk_hstx / CSR.CLKDIV`, and `clk_hstx` is assumed to
-    /// run at `clk_sys / 2` (the validated 640x480p60 DVI setup). This is what
-    /// paces the expander: one 256-word scanline block covers 800 pixels, so it
-    /// takes 800 pixel periods no matter how fast the FIFO is refilled.
-    /// 像素时钟为 `clk_hstx / CSR.CLKDIV`，`clk_hstx` 假定为 `clk_sys / 2`
-    /// （已验证的 640x480p60 DVI 配置）。这正是扩展器的节拍来源：一个 256 字的
-    /// 扫描行块覆盖 800 像素，因此无论 FIFO 补字多快，都占用 800 个像素周期。
+    /// The pixel clock is `clk_hstx / CSR.CLKDIV`, and `clk_hstx` comes from the
+    /// live `CLK_HSTX` channel. This is what paces the expander: one 256-word
+    /// scanline block covers 800 pixels, so it takes 800 pixel periods no matter
+    /// how fast the FIFO is refilled. Returns 0 when either clock is stopped.
+    /// 像素时钟为 `clk_hstx / CSR.CLKDIV`，`clk_hstx` 取自实时 `CLK_HSTX` 通道。
+    /// 这正是扩展器的节拍来源：一个 256 字的扫描行块覆盖 800 像素，因此无论 FIFO
+    /// 补字多快，都占用 800 个像素周期。任一时钟停止时返回 0。
     fn cycles_per_pixel(&self) -> u64 {
-        CLK_HSTX_DIV * self.clkdiv()
+        if self.sysclk_hz == 0 || self.hstxclk_hz == 0 {
+            return 0;
+        }
+        (self.clkdiv() * u64::from(self.sysclk_hz)).div_ceil(u64::from(self.hstxclk_hz))
     }
 
     /// `clk_sys` cycles one raw (pass-through) FIFO word occupies
@@ -471,17 +496,24 @@ impl HstxState {
     /// With `EXPAND_EN = 0` the FIFO word is loaded straight into the output
     /// shift register, which is clocked at `clk_hstx / CSR.CLKDIV` and shifts
     /// `CSR.N_SHIFTS` times before the next fetch. One word therefore lasts
-    /// `N_SHIFTS * 2 * CLKDIV` `clk_sys` cycles (the validated DVI setup gives
-    /// `5 * 2 * 5 = 50`). `N_SHIFTS = 0` is modelled as 1 shift, consistent with
-    /// the `CLKDIV = 0` handling above.
+    /// `N_SHIFTS * pixel_period` `clk_sys` cycles. `N_SHIFTS = 0` is modelled as
+    /// 1 shift, consistent with the `CLKDIV = 0` handling above.
     /// `EXPAND_EN = 0` 时 FIFO 字直接装入输出移位寄存器；移位寄存器由
     /// `clk_hstx / CSR.CLKDIV` 驱动，并在下一次取字前移位 `CSR.N_SHIFTS` 次。
-    /// 因此每个字占用 `N_SHIFTS * 2 * CLKDIV` 个 `clk_sys` 周期（已验证的 DVI
-    /// 配置为 `5 * 2 * 5 = 50`）。`N_SHIFTS = 0` 按 1 次移位处理，与上面的
-    /// `CLKDIV = 0` 处理保持一致。
+    /// 因此每个字占用 `N_SHIFTS * 像素周期` 个 `clk_sys` 周期。`N_SHIFTS = 0`
+    /// 按 1 次移位处理，与上面的 `CLKDIV = 0` 处理保持一致。
     fn raw_word_cycles(&self) -> u64 {
         let n_shifts = u64::from((self.csr >> CSR_N_SHIFTS_SHIFT) & CSR_N_SHIFTS_MASK).max(1);
-        self.clkdiv() * CLK_HSTX_DIV * n_shifts
+        self.cycles_per_pixel() * n_shifts
+    }
+
+    /// Convert `clk_hstx` cycles to `clk_sys` cycles (rounded up)
+    /// 把 `clk_hstx` 周期换算为 `clk_sys` 周期（向上取整）
+    fn hstx_to_sys_cycles(&self, cycles: u32) -> u64 {
+        if self.sysclk_hz == 0 || self.hstxclk_hz == 0 {
+            return 0;
+        }
+        (u64::from(cycles) * u64::from(self.sysclk_hz)).div_ceil(u64::from(self.hstxclk_hz))
     }
 
     /// Bits per lane symbol on the encoded path / 编码路径每通道每符号的位数
@@ -559,7 +591,7 @@ impl HstxState {
                 self.start_repeat(count, u64::from(count) * cpp, true)
             }
             0xe => {
-                self.wait_cycles = u64::from(count);
+                self.wait_cycles = self.hstx_to_sys_cycles(count);
                 true
             }
             0xf => true,
@@ -683,6 +715,16 @@ impl HstxState {
         if cycles == 0 || self.csr & CSR_EN == 0 {
             return;
         }
+        if self.cycles_per_pixel() == 0 {
+            if !self.clock_warned {
+                self.clock_warned = true;
+                log::warn!(
+                    "HSTX: clk_hstx or clk_sys is 0 Hz; the pixel clock is stopped / \
+                     HSTX：clk_hstx 或 clk_sys 为 0 Hz，像素时钟停止"
+                );
+            }
+            return;
+        }
         if self.csr & CSR_EXPAND_EN == 0 {
             self.advance_raw(cycles);
             return;
@@ -728,15 +770,32 @@ impl HstxState {
 pub struct Hstx {
     state: Arc<Mutex<HstxState>>,
     irq: IrqAssert,
+    tree: ClockTree,
 }
 
 impl Hstx {
     /// Create an HSTX block that asserts `irq` / 创建断言 `irq` 的 HSTX 块
+    ///
+    /// The helper uses a private clock tree whose `CLK_HSTX` divider is the
+    /// validated DVI `/2` vector. Mounted systems use [`Hstx::with_clock`] so
+    /// pixel timing follows the guest's real clock tree.
+    /// 该便捷构造函数使用私有时钟树，其 `CLK_HSTX` 分频为已验证的 DVI `/2`
+    /// 配置。挂载到系统的实例使用 [`Hstx::with_clock`]，使像素时序跟随客户机的
+    /// 真实时钟树。
     #[must_use]
     pub fn new(irq: IrqAssert) -> Self {
+        let tree = ClockTree::new();
+        tree.write_channel_div(CLK_HSTX, DEFAULT_HSTX_DIV << 16);
+        Self::with_clock(irq, tree)
+    }
+
+    /// Create an HSTX block following `tree` / 创建跟随 `tree` 的 HSTX 块
+    #[must_use]
+    pub fn with_clock(irq: IrqAssert, tree: ClockTree) -> Self {
         Self {
             state: Arc::new(Mutex::new(HstxState::power_on())),
             irq,
+            tree,
         }
     }
 
@@ -786,19 +845,23 @@ impl Hstx {
     ///
     /// The expander is paced by the pixel clock: every popped word occupies the
     /// pixel time of the command that owns it, so a 256-word scanline block
-    /// lasts 800 pixel periods (matching the real 25.2 MHz scanout). With
-    /// `EXPAND_EN = 0` the raw path is paced the same way, one word per
-    /// `CSR.N_SHIFTS * 2 * CSR.CLKDIV` `clk_sys` cycles. The call does nothing
-    /// when `EN` is clear or the FIFO is idle, so it never invents pixels, and it
-    /// refreshes the shared interrupt line.
+    /// lasts 800 pixel periods. With `EXPAND_EN = 0` the raw path is paced the
+    /// same way, one word per `CSR.N_SHIFTS * pixel_period` `clk_sys` cycles.
+    /// The call does nothing when `EN` is clear, the FIFO is idle or either
+    /// clock is stopped, so it never invents pixels, and it refreshes the shared
+    /// interrupt line.
     /// 扩展器按像素时钟节拍推进：每个被弹出的字占用其所属命令的像素时长，因此
-    /// 一个 256 字扫描行块持续 800 个像素周期（与真实 25.2 MHz 扫描一致）。
-    /// `EXPAND_EN = 0` 时原始路径同样计时：每个字占用
-    /// `CSR.N_SHIFTS * 2 * CSR.CLKDIV` 个 `clk_sys` 周期。`EN` 清零或 FIFO 空闲时
-    /// 不做任何事，因此不会凭空产生像素；调用后刷新共享中断线。
+    /// 一个 256 字扫描行块持续 800 个像素周期。`EXPAND_EN = 0` 时原始路径同样
+    /// 计时：每个字占用 `CSR.N_SHIFTS * 像素周期` 个 `clk_sys` 周期。`EN` 清零、
+    /// FIFO 空闲或任一时钟停止时不做任何事，因此不会凭空产生像素；调用后刷新共享
+    /// 中断线。
     pub fn advance(&self, cycles: u64) {
+        let sysclk = self.tree.sysclk_hz();
+        let hstxclk = self.tree.hstxclk_hz();
         let asserted = {
             let mut state = self.state.lock();
+            state.sysclk_hz = sysclk;
+            state.hstxclk_hz = hstxclk;
             state.advance(cycles);
             state.irq_asserted()
         };
