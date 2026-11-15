@@ -246,13 +246,13 @@ Stage 4 只建模启动路径需要的外设；基地址已按 RP2350 数据手�
 | Base | Peripheral | Stage 4 |
 |------|------------|---------|
 | 0x4000_0000 | SYSINFO | 未建模 |
-| 0x4001_0000 | CLOCKS | 桩：`CLK_*_SELECTED` 由 CTRL 的 `SRC`/`AUXSRC` 推导 |
+| 0x4001_0000 | CLOCKS | 时钟树：10 个 `CLK_*` 通道，`CLK_*_SELECTED` 实时推导 |
 | 0x4002_0000 | RESETS | 桩：`RESET_DONE` 恒读全 1 |
 | 0x4002_8000 | IO_BANK0 | 桩：寄存器存储 |
 | 0x4003_8000 | PADS_BANK0 | 桩：48 个 pad 复位值 0x56 |
-| 0x4004_8000 | XOSC | 桩：`STATUS`（0x04）恒为 STABLE\|ENABLED，`CTRL`（0x00）只写 |
-| 0x4005_0000 | PLL_SYS | 桩：`CS.LOCK` 恒为 1 |
-| 0x4005_8000 | PLL_USB | 桩：`CS.LOCK` 恒为 1 |
+| 0x4004_8000 | XOSC | 12 MHz 晶振：`CTRL`/`STATUS` 解码进时钟树 |
+| 0x4005_0000 | PLL_SYS | 125/5/2 → 150 MHz，`LOCK` 实时 |
+| 0x4005_8000 | PLL_USB | 100/5/5 → 48 MHz，`LOCK` 实时 |
 | 0x4007_0000 | UART0 (PL011) | 桩：写 `DR` 进入宿主串口缓冲 |
 | 0x400B_0000 | TIMER0 | 桩：共享微秒时基 + 4 个闹钟 |
 | 0x400D_8000 | WATCHDOG | 桩：scratch 存储，`REASON` 读 0 |
@@ -326,6 +326,41 @@ pico-sdk 大量依赖这套别名（`hw_set_bits`/`hw_clear_bits` 会写 `RESETS
 `TICKS` 通道记录步长 `0x0C`（`CTRL`+0x00 / `CYCLES`+0x04 / `COUNT`+0x08），
 `CTRL.ENABLE` 未置位时写 `CYCLES` 不生效、不推进时间，避免固件初始化阶段
 （先写 `CYCLES`、后置 `ENABLE`）造成虚假的时间跳跃。
+
+### Clock Data Flow / 时钟数据流
+
+时钟树是唯一频率来源，寄存器写入沿 `ClockTree` 立即传播到所有导出接口：
+
+```
+XOSC 12 MHz ──┐
+ROSC ring/div ─┼─► PLL_CS.REFDIV + PLL_FBDIV_INT + PLL_PRIM
+LPOSC 32 kHz ─┘        │
+                       ├─► PLL_SYS ──┬─► CLK_SYS (SRC=AUX, AUXSRC=0) ──► CLK_PERI/HSTX (AUXSRC=0)
+                       │             └─► CLK_PERI/HSTX (AUXSRC=1)
+                       └─► PLL_USB ──┬─► CLK_USB / CLK_ADC (AUXSRC=0)
+                                     └─► CLK_REF aux (AUXSRC=0)
+
+CLK_REF: SRC=ROSC_PH / AUX / XOSC / LPOSC ──► CLK_SYS (SRC=CLK_REF)
+CLK_GPOUTn: AUXSRC 0..=0xE（PLL、ROSC、XOSC、LPOSC、其它 CLK_*）
+CLK_RTC: RP2350 无该分频器，RTC 直接使用 LPOSC
+```
+
+- `rp2350-periph`：`ClockTree`（`clock_tree.rs`）持有 XOSC/ROSC/PLL/10 个通道的
+  寄存器镜像与解码；`CLOCKS`、`XOSC`、`PLL_SYS`、`PLL_USB`、`ROSC` 共享同一句柄
+  （`BootPeripherals::mount` 创建，`clock_tree()` 暴露）。任何写入立即生效，
+  `generation()` 单调递增供时序缓存失效。
+- 初始状态是 **bootrom 等价**：XOSC 12 MHz、`PLL_SYS` 125/5/2 → 150 MHz、
+  `CLK_SYS` = AUX/PLL_SYS；`PLL_USB` 100/5/5 → 48 MHz。`Clocks::reset()` 等恢复
+  该状态，不是上电复位值。
+- `rp2350-core`：`SimulationClock` 提供 `set_sysclk_hz`/`set_periphclk_hz`/
+  `set_refclk_hz`。**P4-2 待接入**：`cycles→µs`（`Timebase` 目前固定
+  `DEFAULT_CYCLES_PER_US = 150`）、`SysTick`、TIMER、PIO `CLKDIV`、HSTX 像素时钟、
+  UART 波特率、ADC/RTC、DMA 节拍；这些消费者必须读取实时频率而非常量。
+- 精度测试：12 MHz + 125/5/2 = 150 MHz、252 MHz 超频（126/6/1）、`CLK_SYS` 切
+  `REF` + DIV 3 = 4 MHz、`CLK_PERI` = PLL_SYS/2 = 75 MHz、`CLK_USB` 48 MHz、
+  非法分频 0 Hz、`generation` 递增规则、总线级 252 MHz 与 `CLK_SYS_SELECTED`
+  一致性、默认机器 `PERFCTR` 随 DMA 累加（见
+  `crates/rp2350-periph/src/clock_tree.rs`、`clocks.rs`、`boot.rs` 单测）。
 
 ### Unmodelled Accesses / 未建模访问清单
 

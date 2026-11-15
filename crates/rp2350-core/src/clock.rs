@@ -71,6 +71,27 @@ impl SimulationClock {
         self.config
     }
 
+    /// Update the system clock frequency / 更新系统时钟频率
+    ///
+    /// This only changes the value the tracker reports; the timing consumers
+    /// (`SysTick`, `TIMER`, PIO, HSTX, ...) are wired to the live clock tree in a
+    /// follow-up task.
+    /// 只改变追踪器报告的值；各计时消费者（SysTick、TIMER、PIO、HSTX 等）将在
+    /// 后续任务中接入实时时钟树。
+    pub fn set_sysclk_hz(&mut self, hz: u32) {
+        self.config.sysclk_hz = hz;
+    }
+
+    /// Update the peripheral clock frequency / 更新外设时钟频率
+    pub fn set_periphclk_hz(&mut self, hz: u32) {
+        self.config.periphclk_hz = hz;
+    }
+
+    /// Update the reference clock frequency / 更新参考时钟频率
+    pub fn set_refclk_hz(&mut self, hz: u32) {
+        self.config.refclk_hz = hz;
+    }
+
     /// Advance the simulation by `n` system clock cycles
     /// 将仿真推进 n 个系统时钟周期
     pub fn tick(&mut self, cycles: CycleCount) {
@@ -132,5 +153,30 @@ mod tests {
     fn zero_frequency_returns_zero() {
         let clock = SimulationClock::new();
         assert_eq!(clock.peripheral_cycles(0, 100), 0);
+    }
+
+    #[test]
+    fn set_sysclk_hz_updates_the_reported_config() {
+        // 运行时超频：150 MHz → 252 MHz 只改报告值，周期计数不变。
+        // Runtime overclock: 150 MHz → 252 MHz only changes the reported
+        // config; the cycle count is untouched.
+        let mut clock = SimulationClock::new();
+        clock.tick(42);
+        clock.set_sysclk_hz(252_000_000);
+        assert_eq!(clock.config().sysclk_hz, 252_000_000);
+        assert_eq!(clock.config().refclk_hz, 12_000_000);
+        assert_eq!(clock.total_cycles(), 42);
+    }
+
+    #[test]
+    fn set_periphclk_hz_drives_peripheral_scaling() {
+        // 外设时钟 252 MHz、目标 126 MHz → 每 2 个周期 1 个外设周期。
+        // periphclk 252 MHz with a 126 MHz target → one peripheral cycle
+        // every two ticks.
+        let mut clock = SimulationClock::new();
+        clock.set_periphclk_hz(252_000_000);
+        assert_eq!(clock.peripheral_cycles(126_000_000, 100), 50);
+        clock.set_refclk_hz(24_000_000);
+        assert_eq!(clock.config().refclk_hz, 24_000_000);
     }
 }

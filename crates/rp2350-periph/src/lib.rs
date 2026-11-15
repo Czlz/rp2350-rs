@@ -24,6 +24,7 @@ pub mod audio;
 pub mod boot;
 pub mod bootram;
 pub mod busctrl;
+pub mod clock_tree;
 pub mod clocks;
 pub mod cycle;
 pub mod dma;
@@ -59,6 +60,7 @@ pub mod xosc;
 
 pub use audio::{AudioSink, AudioTap};
 pub use boot::{BootPeripherals, Core1Launch, Timebase};
+pub use clock_tree::{ClockTree, PllId};
 pub use cycle::CycleSink;
 pub use dma::Dma;
 pub use hstx::Hstx;

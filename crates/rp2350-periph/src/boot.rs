@@ -33,7 +33,8 @@ use rp2350_core::mmio::{MMIO_BLOCK_SIZE, MmioRouter, MmioWindow, mount_device};
 use super::adc::Adc;
 use super::audio::AudioTap;
 use super::bootram::BootRam;
-use super::busctrl::BusCtrl;
+use super::busctrl::{BusCtrl, BusPerf};
+use super::clock_tree::ClockTree;
 use super::clocks::Clocks;
 use super::cycle::CycleSink;
 use super::dma::Dma;
@@ -64,8 +65,16 @@ use super::watchdog::Watchdog;
 use super::xip_qmi::XipQmi;
 use super::xosc::Xosc;
 
-/// Default RP2350 system clock in cycles per microsecond (150 MHz)
-/// 默认 RP2350 系统时钟每微秒周期数（150 MHz）
+/// Cycles per microsecond of the bootrom-equivalent system clock (150 MHz)
+/// bootrom 等价系统时钟每微秒周期数（150 MHz）
+///
+/// This is only the initial timebase rate used by TIMER0/TICKS. The clock tree
+/// (`BootPeripherals::sysclk_hz`) is the authoritative live frequency; P4-2
+/// rewires the cycle-driven consumers to it so runtime overclocking also
+/// changes `cycles → µs`.
+/// 这只是 TIMER0/TICKS 的初始时基速率。时钟树（`BootPeripherals::sysclk_hz`）
+/// 才是实时频率的权威来源；P4-2 会把周期驱动的消费者接到它上面，使运行时
+/// 超频/降频同样改变 `cycles → µs`。
 pub const DEFAULT_CYCLES_PER_US: u32 = 150;
 
 /// Cycle-driven microsecond timebase shared with TIMER0
@@ -163,6 +172,7 @@ struct Core1Boot {
 pub struct BootPeripherals {
     uart0: Arc<Mutex<UartSink>>,
     cycles: CycleSink,
+    clock_tree: ClockTree,
     timer: Timer0,
     timer1: Timer1,
     sio: Sio,
@@ -197,6 +207,16 @@ impl BootPeripherals {
     /// SIO 与 PPB 使用独立窗口区域。APB 中无设备建模的偏移由路由器吸收并只
     /// 警告一次，从而保持启动固件继续运行。
     ///
+    /// `CLOCKS`, `XOSC`, both PLLs and `ROSC` share one [`ClockTree`]
+    /// initialised to the **bootrom-equivalent** state (XOSC 12 MHz, PLL_SYS
+    /// 150 MHz, `CLK_SYS` = `PLL_SYS`), not the power-on reset values. Any
+    /// later guest write takes effect immediately and is visible through
+    /// [`Self::sysclk_hz`].
+    /// `CLOCKS`、`XOSC`、两个 PLL 与 `ROSC` 共享同一 [`ClockTree`]，初始化为
+    /// **bootrom 等价**状态（XOSC 12 MHz、PLL_SYS 150 MHz、`CLK_SYS` =
+    /// `PLL_SYS`），不是上电复位值。之后的客户机写入立即生效，并可通过
+    /// [`Self::sysclk_hz`] 观察。
+    ///
     /// # Errors
     /// Returns a bus error if a window is invalid or overlaps a region already
     /// registered on `bus`.
@@ -205,6 +225,7 @@ impl BootPeripherals {
         let uart0 = Arc::new(Mutex::new(UartSink::default()));
         let timebase = Arc::new(Mutex::new(Timebase::new(DEFAULT_CYCLES_PER_US)));
         let cycles = CycleSink::new(Arc::clone(&timebase));
+        let clock_tree = ClockTree::new();
         let irq = IrqAssert::new();
         let system_writes = new_system_write_log();
         let timer = Timer0::new(Arc::clone(&timebase), irq.clone());
@@ -218,7 +239,11 @@ impl BootPeripherals {
         let core1_irq = IrqAssert::new();
         let pads = GpioPads::new();
         let sio = Sio::with_peer_irq_and_pads(irq.clone(), core1_irq, pads.clone());
-        let dma = Dma::new(irq.clone());
+        // DMA 与 BUSCTRL 共享同一计数器组，默认机器的 PERFCTR0/1 才会累加。
+        // DMA and BUSCTRL share one counter bank, so the default machine's
+        // PERFCTR0/1 actually count.
+        let busctrl = BusCtrl::with_perf(BusPerf::new());
+        let dma = Dma::with_perf(irq.clone(), busctrl.perf());
         let hstx = Hstx::new(irq.clone());
         let core1_release = Arc::new(AtomicBool::new(false));
         let core1_reset = Arc::new(AtomicBool::new(false));
@@ -226,7 +251,7 @@ impl BootPeripherals {
         let core1_launch_pending = Arc::new(AtomicBool::new(false));
 
         let mut apb = MmioRouter::new("APB", MmioWindow::new(map::APB_BASE, map::APB_SIZE));
-        apb.mount(Box::new(Clocks::new()))?;
+        apb.mount(Box::new(Clocks::with_tree(clock_tree.clone())))?;
         apb.mount(Box::new(Resets::new()))?;
         apb.mount(Box::new(Psm::with_core1_flags(
             Arc::clone(&core1_release),
@@ -240,9 +265,9 @@ impl BootPeripherals {
         apb.mount(Box::new(IoQspi::new()))?;
         apb.mount(Box::new(PadsBank0::with_pads(pads.clone())))?;
         apb.mount(Box::new(PadsQspi::new()))?;
-        apb.mount(Box::new(Xosc::new()))?;
-        apb.mount(Box::new(Pll::sys()))?;
-        apb.mount(Box::new(Pll::usb()))?;
+        apb.mount(Box::new(Xosc::with_tree(clock_tree.clone())))?;
+        apb.mount(Box::new(Pll::sys_with(clock_tree.clone())))?;
+        apb.mount(Box::new(Pll::usb_with(clock_tree.clone())))?;
         apb.mount(Box::new(Uart0::new(Arc::clone(&uart0))))?;
         apb.mount(Box::new(Adc::new()))?;
         apb.mount(Box::new(Pwm::new()))?;
@@ -255,8 +280,8 @@ impl BootPeripherals {
         apb.mount(Box::new(Watchdog::new()))?;
         apb.mount(Box::new(XipQmi::new()))?;
         apb.mount(Box::new(BootRam::new()))?;
-        apb.mount(Box::new(BusCtrl::new()))?;
-        apb.mount(Box::new(Rosc::new()))?;
+        apb.mount(Box::new(busctrl))?;
+        apb.mount(Box::new(Rosc::with_tree(clock_tree.clone())))?;
         apb.mount(Box::new(Trng::new()))?;
         apb.mount(Box::new(Sha256::new()))?;
         bus.register_region(Box::new(apb))?;
@@ -307,6 +332,7 @@ impl BootPeripherals {
         Ok(Self {
             uart0,
             cycles,
+            clock_tree,
             timer,
             timer1,
             sio,
@@ -322,6 +348,33 @@ impl BootPeripherals {
             core1_boot,
             core1_launch_pending,
         })
+    }
+
+    /// Mount the boot peripherals (alias of [`Self::mount`])
+    /// 挂载启动外设（[`Self::mount`] 的别名）
+    ///
+    /// # Errors
+    /// See [`Self::mount`]. / 见 [`Self::mount`]。
+    pub fn new(bus: &mut dyn AddressBus) -> BusResult<Self> {
+        Self::mount(bus)
+    }
+
+    /// Shared clock tree mounted on `CLOCKS`/`XOSC`/`PLL_SYS`/`PLL_USB`/`ROSC`
+    /// 挂载在 `CLOCKS`/`XOSC`/`PLL_SYS`/`PLL_USB`/`ROSC` 上的共享时钟树
+    #[must_use]
+    pub fn clock_tree(&self) -> &ClockTree {
+        &self.clock_tree
+    }
+
+    /// Live `CLK_SYS` frequency in Hz / 实时的 `CLK_SYS` 频率（Hz）
+    ///
+    /// Follows every guest write to `PLL_SYS` and `CLK_SYS_CTRL`/`CLK_SYS_DIV`
+    /// immediately, including runtime overclocking.
+    /// 立即跟随客户机对 `PLL_SYS` 与 `CLK_SYS_CTRL`/`CLK_SYS_DIV` 的每次写入，
+    /// 包括运行时超频/降频。
+    #[must_use]
+    pub fn sysclk_hz(&self) -> u32 {
+        self.clock_tree.sysclk_hz()
     }
 
     /// Emulate the resident core-1 boot ROM once per driver pump
@@ -1104,5 +1157,115 @@ mod tests {
         );
         assert_eq!(peripherals.dma().channel_state(0).expect("ch0").chain_to, 0);
         assert_eq!(peripherals.dma().busy_mask(), 0);
+    }
+
+    #[test]
+    fn default_machine_starts_in_the_post_bootrom_clock_state() {
+        // bootrom 之后：CLK_REF=XOSC（12 MHz），CLK_SYS=AUX/PLL_SYS（150 MHz）。
+        // After the bootrom: CLK_REF=XOSC (12 MHz), CLK_SYS=AUX/PLL_SYS (150 MHz).
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        assert_eq!(peripherals.sysclk_hz(), 150_000_000);
+        assert_eq!(peripherals.clock_tree().refclk_hz(), 12_000_000);
+        assert_eq!(peripherals.clock_tree().pll_sys_hz(), 150_000_000);
+        assert_eq!(peripherals.clock_tree().usbclk_hz(), 48_000_000);
+        let mut cycles = 0u64;
+        assert_eq!(
+            bus.read_u32(map::CLOCKS_BASE + 0x38, &mut cycles)
+                .expect("ref selected"),
+            0x4,
+            "CLK_REF selects XOSC"
+        );
+        assert_eq!(
+            bus.read_u32(map::CLOCKS_BASE + 0x44, &mut cycles)
+                .expect("sys selected"),
+            0x2,
+            "CLK_SYS selects the aux mux"
+        );
+        assert_eq!(
+            bus.read_u32(map::PLL_SYS_BASE + 0x08, &mut cycles)
+                .expect("fbdiv"),
+            125
+        );
+        assert_ne!(
+            bus.read_u32(map::PLL_SYS_BASE, &mut cycles).expect("cs") & (1 << 31),
+            0,
+            "PLL_SYS locked"
+        );
+    }
+
+    #[test]
+    fn bus_writes_retune_the_system_clock_to_252_mhz() {
+        // emerald 的 252 MHz：12 MHz × 126 / (6 × 1) = 252 MHz。
+        // emerald's 252 MHz: 12 MHz × 126 / (6 × 1) = 252 MHz.
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        bus.write_u32(map::PLL_SYS_BASE + 0x08, 126, &mut cycles)
+            .expect("fbdiv");
+        bus.write_u32(map::PLL_SYS_BASE + 0x0C, (6 << 16) | (1 << 12), &mut cycles)
+            .expect("prim");
+        assert_eq!(peripherals.sysclk_hz(), 252_000_000);
+        assert_eq!(
+            bus.read_u32(map::CLOCKS_BASE + 0x44, &mut cycles)
+                .expect("sys selected"),
+            0x2,
+            "CLK_SYS_SELECTED stays on AUX/PLL_SYS"
+        );
+        // CLK_SYS_DIV=2 → 126 MHz，写即生效。
+        bus.write_u32(map::CLOCKS_BASE + 0x40, 2 << 16, &mut cycles)
+            .expect("sys div");
+        assert_eq!(peripherals.sysclk_hz(), 126_000_000);
+    }
+
+    #[test]
+    fn default_machine_perfctr_counts_dma_activity() {
+        // 默认机器里 Dma 与 BusCtrl 共享计数器组：DMA 搬运后 PERFCTR0 累加。
+        // In the default machine Dma and BusCtrl share one bank, so PERFCTR0
+        // accumulates after a DMA transfer.
+        use rp2350_core::memory::RamRegion;
+
+        use crate::busctrl::{BusPort, PERF_EVENT_ACCESS, PERFCTR_EN, PERFCTR0, PERFSEL0};
+        use crate::dma::{
+            CTRL_DATA_SIZE_SHIFT, CTRL_EN, CTRL_INCR_READ, CTRL_INCR_WRITE, CTRL_TREQ_SEL_SHIFT,
+            TREQ_PERMANENT,
+        };
+        use crate::map;
+
+        let mut bus = SimpleBus::new();
+        bus.register_region(Box::new(RamRegion::new("ram", 0x2000_0000, 0x1000)))
+            .expect("ram region");
+        let mut peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        let mut cycles = 0u64;
+        let access = u32::from(BusPort::Sram(0).event_code(PERF_EVENT_ACCESS));
+        bus.write_u32(map::BUSCTRL_BASE + PERFSEL0, access, &mut cycles)
+            .expect("perfsel");
+        bus.write_u32(map::BUSCTRL_BASE + PERFCTR_EN, 1, &mut cycles)
+            .expect("perfctr_en");
+
+        let ctrl = CTRL_EN
+            | CTRL_INCR_READ
+            | CTRL_INCR_WRITE
+            | (2 << CTRL_DATA_SIZE_SHIFT)
+            | (u32::from(TREQ_PERMANENT) << CTRL_TREQ_SEL_SHIFT);
+        bus.write_u32(map::DMA_BASE, 0x2000_0000, &mut cycles)
+            .expect("read addr");
+        bus.write_u32(map::DMA_BASE + 0x04, 0x2000_0100, &mut cycles)
+            .expect("write addr");
+        bus.write_u32(map::DMA_BASE + 0x08, 4, &mut cycles)
+            .expect("count");
+        bus.write_u32(map::DMA_BASE + 0x0C, ctrl, &mut cycles)
+            .expect("ctrl");
+        assert_eq!(peripherals.dma_mut().run(&mut bus, 4), 4);
+        assert_eq!(
+            bus.read_u32(map::BUSCTRL_BASE + PERFCTR0, &mut cycles)
+                .expect("perfctr0"),
+            8,
+            "4 units = 4 reads + 4 writes in SRAM bank 0"
+        );
     }
 }

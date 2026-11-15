@@ -1661,6 +1661,175 @@ interrupt routing (`PROC0_*`/`PROC1_*`) is plain storage.
 
 ---
 
+## CLOCKS / clock tree / 时钟树
+
+`clocks::Clocks`, `pll::Pll`, `xosc::Xosc` and `rosc::Rosc` share one
+`clock_tree::ClockTree` (`BootPeripherals::clock_tree`). The tree decodes
+register fields into frequencies; the MMIO blocks only store the raw register
+image. Any accepted write to `PLL_CS`/`PLL_PWR`/`PLL_FBDIV_INT`/`PLL_PRIM`,
+`XOSC_CTRL`, `ROSC_CTRL`/`ROSC_DIV`, or `CLK_*_CTRL`/`CLK_*_DIV` takes effect
+immediately — runtime overclocking/underclocking needs no extra call.
+`clocks::Clocks`、`pll::Pll`、`xosc::Xosc` 与 `rosc::Rosc` 共享同一棵
+`clock_tree::ClockTree`（`BootPeripherals::clock_tree`）。频率换算由时钟树完成，
+MMIO 块只保存原始寄存器镜像。对 `PLL_CS`/`PLL_PWR`/`PLL_FBDIV_INT`/`PLL_PRIM`、
+`XOSC_CTRL`、`ROSC_CTRL`/`ROSC_DIV`、`CLK_*_CTRL`/`CLK_*_DIV` 的写入立即生效，
+运行时超频/降频无需额外调用。
+
+### Register map / 寄存器映射
+
+| Block | Base | Registers modelled |
+|-------|------|--------------------|
+| `CLOCKS` | `0x4001_0000` | `CLK_GPOUTn/REF/SYS/PERI/HSTX/USB/ADC_CTRL/DIV/SELECTED`; other registers are storage |
+| `XOSC` | `0x4004_8000` | `CTRL` (ENABLE `0xFAB`/`0xD1E`, `FREQ_RANGE 0xAA0..0xAA3`), `STATUS` (`STABLE`/`ENABLED`/`BADWRITE`/range) |
+| `PLL_SYS` | `0x4005_0000` | `CS` (REFDIV/BYPASS/LOCK), `PWR`, `FBDIV_INT`, `PRIM` |
+| `PLL_USB` | `0x4005_8000` | same / 同上 |
+| `ROSC` | `0x400E_8000` | `CTRL` (ENABLE/FREQ_RANGE), `DIV` (`0xAA00 + div`), `STATUS`, `RANDOMBIT` |
+
+`CLK_*_SELECTED` is derived live: `CLK_REF`/`CLK_SYS` report `1 << SRC`, every
+other slice reports `0x1` because it has no glitchless mux (per
+`hardware/regs/clocks.h`). Switching is instantaneous in the model; the
+datasheet's "may briefly show all-0s" window is not modelled.
+`CLK_*_SELECTED` 实时推导：`CLK_REF`/`CLK_SYS` 报告 `1 << SRC`，其余通道按
+`hardware/regs/clocks.h` 报告 `0x1`（没有无毛刺选择器）。模型切换瞬时完成，不建模
+数据手册所述「切换期间可能短暂全 0」。
+
+### Formulas / 公式
+
+```
+vco      = (xosc_hz / refdiv) * fbdiv          # PLL_CS.REFDIV, PLL_FBDIV_INT
+pll_out  = vco / postdiv1 / postdiv2           # PLL_PRIM.POSTDIV1/2
+clk      = source / (div_int + div_frac/65536) # CLK_*_CTRL.SRC/AUXSRC + CLK_*_DIV
+```
+
+`DIV.INT = 0` means `max + 1` of the field width: 65536 for `CLK_SYS`/
+`CLK_GPOUTn`, 256 for `CLK_REF`, 16 for `CLK_USB`/`CLK_ADC`, 4 for
+`CLK_PERI`/`CLK_HSTX`. Only `CLK_SYS` and `CLK_GPOUTn` have `DIV.FRAC`.
+`DIV.INT = 0` 表示字段宽度的 `max + 1`：`CLK_SYS`/`CLK_GPOUTn` 为 65536，
+`CLK_REF` 为 256，`CLK_USB`/`CLK_ADC` 为 16，`CLK_PERI`/`CLK_HSTX` 为 4。
+只有 `CLK_SYS` 与 `CLK_GPOUTn` 带 `DIV.FRAC`。
+
+Source tables follow the header exactly: `CLK_SYS` aux `0 = PLL_SYS`,
+`1 = PLL_USB`, `2 = ROSC`, `3 = XOSC`; `CLK_PERI` aux `0 = CLK_SYS`,
+`1 = PLL_SYS`, `2 = PLL_USB`, `3 = ROSC`, `4 = XOSC`; `CLK_USB`/`CLK_ADC` aux
+`0 = PLL_USB`, `1 = PLL_SYS`, `2 = ROSC`, `3 = XOSC`. GPIN0/1 and
+`OTP_CLK2FC` are not driven and read 0 Hz.
+源表与头文件完全一致：`CLK_SYS` 辅助源 `0 = PLL_SYS`、`1 = PLL_USB`、
+`2 = ROSC`、`3 = XOSC`；`CLK_PERI` 为 `0 = CLK_SYS`、`1 = PLL_SYS`、
+`2 = PLL_USB`、`3 = ROSC`、`4 = XOSC`；`CLK_USB`/`CLK_ADC` 为
+`0 = PLL_USB`、`1 = PLL_SYS`、`2 = ROSC`、`3 = XOSC`。GPIN0/1 与
+`OTP_CLK2FC` 未接线，读为 0 Hz。
+
+### Post-bootrom initial state / bootrom 之后的初始状态
+
+`BootPeripherals::mount` (and `Clocks::new`) start from the **bootrom-equivalent**
+state, not the power-on reset values:
+`BootPeripherals::mount`（以及 `Clocks::new`）从 **bootrom 等价**状态启动，而不是
+上电复位值：
+
+| Item | Value |
+|------|-------|
+| XOSC | 12 MHz, enabled, `STABLE` |
+| `PLL_SYS` | REFDIV 1, FBDIV 125, POSTDIV 5×2 → 150 MHz |
+| `PLL_USB` | REFDIV 1, FBDIV 100, POSTDIV 5×5 → 48 MHz |
+| `CLK_REF` | XOSC, DIV 1 → 12 MHz |
+| `CLK_SYS` | AUX/PLL_SYS, DIV 1 → 150 MHz |
+| `CLK_PERI`/`CLK_HSTX` | `CLK_SYS`, DIV 1 → 150 MHz |
+| `CLK_USB`/`CLK_ADC` | `PLL_USB`, DIV 1 → 48 MHz |
+
+`Clocks::reset()`, `Pll::reset()`, `Xosc::reset()` and `Rosc::reset()` restore
+this state. Consequently a `CLOCKS` reset readback shows `CLK_REF_CTRL = 2`,
+`CLK_SYS_CTRL = 0x01`, `PLL_SYS.FBDIV_INT = 125`, not the datasheet's power-on
+values.
+`Clocks::reset()`、`Pll::reset()`、`Xosc::reset()` 与 `Rosc::reset()` 都恢复该
+状态；因此 `CLOCKS` 复位后读回 `CLK_REF_CTRL = 2`、`CLK_SYS_CTRL = 0x01`、
+`PLL_SYS.FBDIV_INT = 125`，而非数据手册的上电值。
+
+### Overclocking example (252 MHz) / 超频示例（252 MHz）
+
+The emerald firmware runs at 252 MHz. `set_sys_clock_khz(252000, true)` searches
+`fbdiv` downwards from 320 and accepts the first in-range VCO that divides
+exactly, which is FBDIV 126 → VCO 1512 MHz and POSTDIV1 6 / POSTDIV2 1:
+emerald 固件运行在 252 MHz。`set_sys_clock_khz(252000, true)` 从 320 向下搜索
+`fbdiv`，取第一个落在 VCO 范围内且能整除的配置：FBDIV 126 → VCO 1512 MHz，
+POSTDIV1 6 / POSTDIV2 1：
+
+```text
+PLL_SYS.FBDIV_INT = 126
+PLL_SYS.PRIM      = (6 << 16) | (1 << 12)
+=> PLL_SYS = 12 MHz * 126 / (6 * 1) = 252 MHz
+=> CLK_SYS (AUX/PLL_SYS, DIV 1)   = 252 MHz
+```
+
+Measured on the emerald firmware at 300 M steps: `CLK_SYS_SELECTED = 0x2`,
+`PLL_SYS.FBDIV_INT = 126`, `PLL_SYS.PRIM = 0x0006_1000`,
+`sysclk_hz() = 252000000`, matching the guest's own `clk_sys 252000000 Hz`
+banner. The firmware later moves `CLK_PERI` to `PLL_USB` (48 MHz) and `CLK_HSTX`
+to `CLK_SYS / 2` (126 MHz), both visible through the same tree.
+在 emerald 固件 300 M 步时实测：`CLK_SYS_SELECTED = 0x2`、
+`PLL_SYS.FBDIV_INT = 126`、`PLL_SYS.PRIM = 0x0006_1000`、
+`sysclk_hz() = 252000000`，与客户机自己打印的 `clk_sys 252000000 Hz` 一致。
+固件随后把 `CLK_PERI` 切到 `PLL_USB`（48 MHz）、`CLK_HSTX` 切到
+`CLK_SYS / 2`（126 MHz），同样可通过时钟树观察。
+
+```rust
+let tree = peripherals.clock_tree();
+// Guest writes go through the bus; the host API is live as well.
+assert_eq!(peripherals.sysclk_hz(), 252_000_000);
+```
+
+### Invalid configurations / 非法配置
+
+`REFDIV = 0`, `POSTDIV1/2 = 0` and `FBDIV_INT` outside `16..=320` make the PLL
+output read 0 Hz and emit one `log::warn!` per class; a disabled XOSC makes
+every PLL read 0 Hz. Undefined `AUXSRC` codes (GPIN, `OTP_CLK2FC`, reserved
+values) read 0 Hz. No configuration panics.
+`REFDIV = 0`、`POSTDIV1/2 = 0`、`FBDIV_INT` 超出 `16..=320` 时 PLL 输出读
+0 Hz，每类错误只输出一次 `log::warn!`；XOSC 关闭时所有 PLL 读 0 Hz。未定义的
+`AUXSRC`（GPIN、`OTP_CLK2FC`、保留值）读 0 Hz。任何配置都不会 panic。
+
+### Generation counter / 世代计数器
+
+`ClockTree::generation()` increments on every accepted frequency-affecting
+write (`CLK_*_CTRL`/`CLK_*_DIV`, PLL `CS`/`PWR`/`FBDIV_INT`/`PRIM`,
+`XOSC_CTRL`, `ROSC_CTRL`/`ROSC_DIV`, host crystal/ring changes). Read-only
+`CLK_*_SELECTED`, PLL interrupt registers, `XOSC_STARTUP` and other unrelated
+writes leave it unchanged. P4-2 uses it to invalidate derived timing caches.
+`ClockTree::generation()` 在每次被接受的影响频率的写入后递增
+（`CLK_*_CTRL`/`CLK_*_DIV`、PLL `CS`/`PWR`/`FBDIV_INT`/`PRIM`、`XOSC_CTRL`、
+`ROSC_CTRL`/`ROSC_DIV`、宿主的晶振/环形频率设置）。只读的 `CLK_*_SELECTED`、
+PLL 中断寄存器、`XOSC_STARTUP` 等无关写入不改变它。P4-2 用它失效派生的时序缓存。
+
+### Host API / 宿主接口
+
+| API | Meaning |
+|-----|---------|
+| `ClockTree::sysclk_hz/refclk_hz/periclk_hz/hstxclk_hz/usbclk_hz/adcclk_hz` | live channel frequencies / 实时通道频率 |
+| `ClockTree::rtcclk_hz` | RTC source (`LPOSC`, 32.768 kHz nominal) / RTC 源 |
+| `ClockTree::pll_sys_hz/pll_usb_hz`, `pll_locked` | PLL outputs and lock / PLL 输出与锁定 |
+| `ClockTree::roscclk_hz`, `channel_hz(n)` | ROSC output and any channel / ROSC 输出与任意通道 |
+| `BootPeripherals::clock_tree`, `sysclk_hz` | mounted tree and `CLK_SYS` / 已挂载的树与 `CLK_SYS` |
+| `Xosc::set_frequency_hz`, `ClockTree::set_rosc_hz` | board-specific crystal/ring / 板级晶振/环形频率 |
+
+`SimulationClock` (`rp2350-core`) exposes `set_sysclk_hz`/`set_periphclk_hz`/
+`set_refclk_hz`; wiring the remaining timing consumers (`cycles → µs`,
+SysTick, TIMER, PIO `CLKDIV`, HSTX pixel clock, UART baud, ADC/RTC, DMA pacing)
+is P4-2.
+`SimulationClock`（`rp2350-core`）提供 `set_sysclk_hz`/`set_periphclk_hz`/
+`set_refclk_hz`；其余计时消费者（`cycles → µs`、SysTick、TIMER、PIO `CLKDIV`、
+HSTX 像素时钟、UART 波特率、ADC/RTC、DMA 节拍）的接入属于 P4-2。
+
+### Not modelled / 未建模
+
+XOSC/ROSC startup delay and counters, ROSC drive-strength recalibration
+(`FREQA/FREQB` do not rescale the nominal ring), glitchless-mux transition
+windows, `CLOCKS.FC0` frequency counter, `CLK_SYS_RESUS`, GPIN0/1 and DFTCLK
+muxing.
+XOSC/ROSC 启动延时与计数器、ROSC 驱动强度重标定（`FREQA/FREQB` 不改变标称环形
+频率）、无毛刺选择器切换窗口、`CLOCKS.FC0` 频率计数器、`CLK_SYS_RESUS`、
+GPIN0/1 与 DFTCLK 选择。
+
+---
+
 ## BUSCTRL
 
 `busctrl::BusCtrl` models the `BUSCTRL` block at `map::BUSCTRL_BASE`
