@@ -46,7 +46,7 @@ py example/gba/tools/hold_stdin.py 600 | rp2350-cli.exe repl --file emerald.uf2 
 PPU + HSTX + core1 + I2S audio up (clk_sys 252000000 Hz); entering AgbMain()...
 ```
 
-实测步数（该固件跑得比实时慢，双核与 PPU 全开时约 1.5–2 M 步/秒）：
+实测步数（双核与 PPU 全开；当前模拟器约 28–30 M 步/秒，见 `doc/performance.md`）：
 
 | 阶段 | 步数 | 说明 |
 |------|------|------|
@@ -54,6 +54,38 @@ PPU + HSTX + core1 + I2S audio up (clk_sys 252000000 Hz); entering AgbMain()...
 | 启动横幅 | ~375 M | 固件 `sleep_ms(1500)` + `stdio_init_all` |
 | 第一帧（Game Freak 标志） | ~1.2 G | `g_fb` 32 色、38 396/38 400 像素非零 |
 | 稳定验收 | 2 G | `underruns=0 wof=false unknown=0`，`frame_done=527` |
+
+## 游玩 / Playing
+
+固件把每帧画到 SRAM 里的 `g_fb`（`0x20063DF4`，240×160 RGB565），模拟器按
+「每帧固定步数」推进并抓这个缓冲区；按键通过 `GP0..GP9` 注入。
+
+```bash
+# 无 GUI：跑 20 帧，打印每帧与汇总（当前约 12 fps / 30 M steps/s）
+rp2350-cli play --file emerald.uf2 --fb 0x20063DF4:240x160 \
+    --steps-per-frame 2500000 --frames 20
+
+# 带音频台（默认 null 后端；要真的出声需编译 cpal 后端）
+cargo run -p rp2350-egui --features audio-playback --release
+# 「游戏 / Play」标签页 → 填固件路径与帧缓冲 → Start
+```
+
+GUI 按键（画面获焦后生效）：
+
+| 键 | GBA | GPIO | 键 | GBA | GPIO |
+|----|-----|------|----|-----|------|
+| `Z` | A | GP0 | `Enter` | Start | GP3 |
+| `X` | B | GP1 | `S` | R | GP8 |
+| `Backspace` | Select | GP2 | `A` | L | GP9 |
+| 方向键 | 十字键 | GP4..GP7 | | | |
+
+- 每游戏帧约 **2.5 M 步**（客户机以 60 fps 自我配速，300 M 步 = 2.0 s 客户机时间）。
+  因此「可玩帧率」直接取决于模拟器吞吐：30 M 步/秒 ≈ 12 fps，60 fps 需 ≥150 M 步/秒。
+  提升路线见 `doc/performance.md`。
+- 固件是**忙等**实现的（SDK 的 `tight_loop_contents()` 是空函数），双核大量时间花在
+  互相等待的短循环上；`WFI` 睡眠语义对该固件没有帮助。
+- 音频采样率：固件 I2S 为 13440 Hz 立体声（PIO2 + DMA）；`rp2350-audio` 播放时按
+  tap 的元数据与设备支持的采样率做最近邻重采样。
 
 ## 引脚配置 / Pin configuration
 

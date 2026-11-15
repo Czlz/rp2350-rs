@@ -21,7 +21,13 @@ keyboard/gamepad input, audio output, and no crashes.
 | 音频 / Audio | 固件 I2S（PIO2 + DMA）已运行，模拟器无采样出口 | 采样捕获 + 播放插件 |
 | 稳定性 / Stability | 2 G 步无崩溃（`underruns=0 wof=false unknown=0`） | 长时间游玩 |
 
-**结论**：性能是唯一的一级阻塞（≈50× 差距），必须先做；视频/输入/音频可并行推进。
+**结论**：性能是一级阻塞，必须先做；视频/输入/音频可并行推进。
+
+**2026-11-15 更新（四轮性能后）**：吞吐 **3.0 → 28.5–30.2 M steps/s（≈10×）**，
+`play` 实测 **12.4 fps**（每游戏帧 ≈2.5 M 步，客户机按 60 fps 自我配速）。60 fps 需
+≥150 M steps/s（缺口 5×）。已确认固件用**忙等**实现（SDK `tight_loop_contents()`
+是空函数），因此 `WFI` 睡眠语义（GAP-07）对该固件**没有帮助**；剩余成本 65–75 % 在
+`rp2350-arm` 逐指令取指/译码，路线是译码缓存（P0-3c）→ 必要时 JIT。
 
 ## 1. 组件与依赖 / Components and dependencies
 
@@ -52,8 +58,8 @@ keyboard/gamepad input, audio output, and no crashes.
 | P0-1 ✅ | 解释器热路径优化：区域桶缓存、Flash/RAM 原生宽读写、写监视门控、MMIO 页缓存、IRQ 位遍历 | `rp2350-core` + `rp2350-cli` | **实测 9.72 s / 5.14 M steps/s（3.36 → 5.14，1.5×）**；300M 计数器逐字段不变；未达 6 s，瓶颈定量在 `rp2350-arm`（详见 [performance.md](performance.md)） |
 | P0-2 ✅ | 第二轮：`Nvic` 位图优先级（−43 %）、ROM 桩窗口过滤（−20 %）、通知门控（−14 %）、Flash 取指缓存、PPB 写世代门控、定长 `record_step` | `rp2350-arm` + `rp2350-core` + `rp2350-cli` | **实测 3.39 s / 14.8 M steps/s**（子会话最小 3.21 s / 15.6 M）；300M 计数器逐字段不变；累计 **4.6×** |
 | P0-3a ✅ | 第三轮（`arm`+`core`）：纠正异常检查读数、UF2 装载 O(n²)→`HashSet`、批量 `load_bytes` | `rp2350-arm` + `rp2350-core` | **实测 2.45–2.51 s / 19.9–20.4 M/s**（启动 0.045 s）；300M 计数器逐字段不变；累计 **6.8×** |
-| P0-3b 🚧 | 第四轮（`cli`）：批量步进摊薄骨架、DMA/PIO 忙闲门控、`record_step` 门控；`play` 按键改每 4096 步、`read_block` 按字批量 | `rp2350-cli` | emerald 50M ≤1.8 s（≥28 M steps/s）；300M 计数器逐字段不变 |
-| P0-3c ⏳ | 决策点：记录 20/30/60 fps 可行性；若 <30 fps，评估块级 JIT / 帧级并行作为 P0-4 | 主会话 | `doc/performance.md` 结论 |
+| P0-3b ✅ | 第四轮（`cli`）：`run_steps` 批量步进（−27 %）、core1 门控（−11 %）、`record_sync_trap` 跳过；`play` 按键改每 4096 步、`read_block` 按字批量 | `rp2350-cli` | **实测 1.68–1.75 s / 28.5–29.8 M/s**（子会话最小 1.655 s / 30.2 M）；300M 15.8 s；`play` 12.4 fps |
+| P0-3c 🚧 | 第五轮（`arm`+`core`）：译码结果缓存 + 线程化分发（逐指令语义不变）；同时给出 JIT 可行性评估 | `rp2350-arm` + `rp2350-core` | emerald 50M ≤1.2 s（≥42 M steps/s）；300M 计数器逐字段不变 |
 
 ### P1 画面 / Video
 
@@ -85,8 +91,9 @@ keyboard/gamepad input, audio output, and no crashes.
 1. **Wave 1 ✅**：P0-1（core+cli）‖ P2-1（periph）——均已验收提交
 2. **Wave 2 ✅**：P0-2（arm+core+cli）‖ P2-2（`rp2350-audio` 新 crate）——均已验收提交
 3. **Wave 3 ✅**：P0-3a（arm+core）‖ P1-1（cli lib + `play` worker + headless `--frames`）
-4. **Wave 4 🚧**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2 ✅（egui PlayView 已接线到真实 `PlaySession`）
-5. **Wave 5**：P1-3（示例 profile）+ P3-1（GAP-08b PSRAM 挂载）+ P3-3（soak）；P0-3c 决策点
+4. **Wave 4 ✅**：P0-3b（cli 批量步进/门控 + play 输入粒度）‖ P1-2（egui PlayView 已接线到真实 `PlaySession`）
+5. **Wave 5 🚧**：P0-3c（arm 译码缓存）‖ P2-3（PlayView 接 `rp2350-audio` 输出）
+6. **Wave 6**：P1-3（示例 profile）+ P3-1（GAP-08b PSRAM 挂载）+ P3-2（存档/复位）+ P3-3（soak）
 
 ## 4. 风险 / Risks
 
