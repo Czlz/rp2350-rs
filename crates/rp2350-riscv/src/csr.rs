@@ -1,13 +1,103 @@
 //! Machine-mode CSRs and trap entry for Hazard3 / Hazard3 机器模式 CSR 与陷阱入口
 
+/// User interrupt enable in `mstatus` (N extension, storage only)
+/// `mstatus` 用户中断使能位（N 扩展，仅存储）
+pub(crate) const MSTATUS_UIE: u32 = 1 << 0;
+
+/// Supervisor interrupt enable in `mstatus` (storage only)
+/// `mstatus` 主管中断使能位（仅存储）
+pub(crate) const MSTATUS_SIE: u32 = 1 << 1;
+
 /// Global interrupt enable in `mstatus` / `mstatus` 全局中断使能位
 pub(crate) const MSTATUS_MIE: u32 = 1 << 3;
+
+/// User previous interrupt enable in `mstatus` (N extension, storage only)
+/// `mstatus` 用户前一中断使能位（N 扩展，仅存储）
+pub(crate) const MSTATUS_UPIE: u32 = 1 << 4;
+
+/// Supervisor previous interrupt enable in `mstatus` (storage only)
+/// `mstatus` 主管前一中断使能位（仅存储）
+pub(crate) const MSTATUS_SPIE: u32 = 1 << 5;
 
 /// Previous interrupt enable in `mstatus` / `mstatus` 前一中断使能位
 pub(crate) const MSTATUS_MPIE: u32 = 1 << 7;
 
+/// Supervisor previous privilege in `mstatus` (storage only)
+/// `mstatus` 主管前一特权位（仅存储）
+pub(crate) const MSTATUS_SPP: u32 = 1 << 8;
+
 /// Previous privilege mask in `mstatus` (bits 12:11) / `mstatus` 特权级掩码
 pub(crate) const MSTATUS_MPP: u32 = 0b11 << 11;
+
+/// Floating-point status mask in `mstatus` (bits 14:13, storage only)
+/// `mstatus` 浮点状态掩码（位 14:13，仅存储）
+pub(crate) const MSTATUS_FS: u32 = 0b11 << 13;
+
+/// Custom-extension status mask in `mstatus` (bits 16:15, storage only)
+/// `mstatus` 自定义扩展状态掩码（位 16:15，仅存储）
+pub(crate) const MSTATUS_XS: u32 = 0b11 << 15;
+
+/// Modify privilege for data accesses / 数据访问特权级修饰位
+pub(crate) const MSTATUS_MPRV: u32 = 1 << 17;
+
+/// Permit supervisor user-memory access (storage only)
+/// 允许主管访问用户内存（仅存储）
+pub(crate) const MSTATUS_SUM: u32 = 1 << 18;
+
+/// Make executable readable (storage only) / 可执行页可读（仅存储）
+pub(crate) const MSTATUS_MXR: u32 = 1 << 19;
+
+/// Trap on supervisor virtual-memory operations (storage only)
+/// 主管虚拟内存操作陷阱（仅存储）
+pub(crate) const MSTATUS_TVM: u32 = 1 << 20;
+
+/// Trap on `wfi` in lower privilege modes (storage only)
+/// 低特权级 `wfi` 陷阱（仅存储）
+pub(crate) const MSTATUS_TW: u32 = 1 << 21;
+
+/// Trap on `sret` in supervisor mode (storage only)
+/// 主管模式 `sret` 陷阱（仅存储）
+pub(crate) const MSTATUS_TSR: u32 = 1 << 22;
+
+/// Dirty state summary, read-only on RV32 / RV32 上的只读脏状态汇总位
+pub(crate) const MSTATUS_SD: u32 = 1 << 31;
+
+/// Writable `mstatus` bits of this model / 本模型可写的 `mstatus` 位
+///
+/// `SD` is read-only and derived from `FS`/`XS`; every other field listed in
+/// the privileged specification is storage. `MIE`/`MPIE`/`MPP` drive trap
+/// entry/return and `MPRV` selects the PMP privilege for data accesses.
+/// `SD` 只读，由 `FS`/`XS` 推导；特权规范列出的其余字段均为存储位。
+/// `MIE`/`MPIE`/`MPP` 驱动陷阱入口/返回，`MPRV` 选择数据访问的 PMP 特权级。
+const MSTATUS_WRITABLE: u32 = MSTATUS_UIE
+    | MSTATUS_SIE
+    | MSTATUS_MIE
+    | MSTATUS_UPIE
+    | MSTATUS_SPIE
+    | MSTATUS_MPIE
+    | MSTATUS_SPP
+    | MSTATUS_MPP
+    | MSTATUS_FS
+    | MSTATUS_XS
+    | MSTATUS_MPRV
+    | MSTATUS_SUM
+    | MSTATUS_MXR
+    | MSTATUS_TVM
+    | MSTATUS_TW
+    | MSTATUS_TSR;
+
+/// `mcountinhibit.CY`: stop `mcycle` / `mcountinhibit.CY`：停止 `mcycle`
+pub(crate) const MCOUNTINHIBIT_CY: u32 = 1 << 0;
+
+/// `mcountinhibit.IR`: stop `minstret` / `mcountinhibit.IR`：停止 `minstret`
+pub(crate) const MCOUNTINHIBIT_IR: u32 = 1 << 2;
+
+/// Writable `mcountinhibit` bits / 可写的 `mcountinhibit` 位
+///
+/// Bit 1 is reserved and the HPM bits (3..31) name counters this model does not
+/// implement, so both read as zero.
+/// 位 1 保留；HPM 位（3..31）对应该模型未实现的计数器，因此两者读出为 0。
+const MCOUNTINHIBIT_WRITABLE: u32 = MCOUNTINHIBIT_CY | MCOUNTINHIBIT_IR;
 
 /// Machine external interrupt enable in `mie` / `mie` 机器外部中断使能位
 pub(crate) const MIE_MEIE: u32 = 1 << 11;
@@ -324,9 +414,49 @@ impl CsrFile {
     }
 
     /// Advance the cycle and instruction counters by one / 周期与指令计数器加一
+    ///
+    /// `mcountinhibit.CY` freezes `mcycle`/`mcycleh` and `mcountinhibit.IR`
+    /// freezes `minstret`/`minstreth`; the counters keep their value while
+    /// frozen and resume from it when the inhibit bit is cleared.
+    /// `mcountinhibit.CY` 冻结 `mcycle`/`mcycleh`，`mcountinhibit.IR` 冻结
+    /// `minstret`/`minstreth`；冻结期间计数器保持原值，清除抑制位后从原值继续。
     pub(crate) fn tick(&mut self) {
-        self.mcycle = self.mcycle.wrapping_add(1);
-        self.minstret = self.minstret.wrapping_add(1);
+        if self.mcountinhibit & MCOUNTINHIBIT_CY == 0 {
+            self.mcycle = self.mcycle.wrapping_add(1);
+        }
+        if self.mcountinhibit & MCOUNTINHIBIT_IR == 0 {
+            self.minstret = self.minstret.wrapping_add(1);
+        }
+    }
+
+    /// Read `mstatus` with the read-only `SD` summary bit applied
+    /// 读取 `mstatus`，并应用只读 `SD` 汇总位
+    ///
+    /// The privileged specification defines `SD = (FS == 11) || (XS == 11)`;
+    /// software cannot write it, so it is derived on every read.
+    /// 特权规范定义 `SD = (FS == 11) || (XS == 11)`；软件不能写该位，因此每次读取
+    /// 时重新推导。
+    fn status_read(&self) -> u32 {
+        let dirty =
+            self.mstatus & MSTATUS_FS == MSTATUS_FS || self.mstatus & MSTATUS_XS == MSTATUS_XS;
+        if dirty {
+            self.mstatus | MSTATUS_SD
+        } else {
+            self.mstatus
+        }
+    }
+
+    /// Report whether data accesses run with machine privilege
+    /// 报告数据访问是否以机器特权级运行
+    ///
+    /// `mstatus.MPRV` redirects data accesses through `MPP`; instruction
+    /// fetches always use the current privilege mode.
+    /// `mstatus.MPRV` 让数据访问按 `MPP` 指定的特权级检查；取指始终使用当前特权级。
+    pub(crate) fn data_access_is_machine(&self) -> bool {
+        if self.mstatus & MSTATUS_MPRV == 0 {
+            return true;
+        }
+        self.mstatus & MSTATUS_MPP == MSTATUS_MPP
     }
 
     /// Read a CSR by address, or report that it is not implemented
@@ -341,7 +471,7 @@ impl CsrFile {
     /// 16 位数组选择窗口。
     pub(crate) fn try_read(&self, addr: u32, raw: u32) -> Option<u32> {
         let value = match addr {
-            0x300 => self.mstatus,
+            0x300 => self.status_read(),
             0x301 => MISA_RV32IMACB,
             0x304 => self.mie,
             0x305 => self.mtvec,
@@ -453,24 +583,26 @@ impl CsrFile {
     pub(crate) fn write_raw(&mut self, addr: u32, value: u32, raw: u32) {
         match addr {
             0x300 => {
-                self.mstatus = (self.mstatus & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP))
-                    | (value & (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP));
+                // `SD` is read-only and absent from the writable mask; all
+                // other modeled fields keep the written value.
+                // `SD` 只读且不在可写掩码中；其余建模字段保留写入值。
+                self.mstatus = (self.mstatus & !MSTATUS_WRITABLE) | (value & MSTATUS_WRITABLE);
             }
             0x304 => self.mie = value,
             0x305 => self.mtvec = value,
             0x306 => self.mcounteren = value,
             0x310 => self.mstatush = value,
-            0x320 => self.mcountinhibit = value & 0x7,
+            0x320 => self.mcountinhibit = value & MCOUNTINHIBIT_WRITABLE,
             0x340 => self.mscratch = value,
             0x341 => self.mepc = value & !1,
             0x342 => self.mcause = value,
             0x343 => self.mtval = value,
             0x344 => self.mip = value & MIP_MEIP,
             0x3A0 | 0x3A2 | 0x3A4 | 0x3A6 => {
-                self.pmpcfg[((addr - 0x3A0) >> 1) as usize] = value;
+                self.pmp_write_cfg(((addr - 0x3A0) >> 1) as usize, value);
             }
             addr if (0x3B0..=0x3EF).contains(&addr) => {
-                self.pmpaddr[((addr - 0x3B0) >> 2) as usize] = value;
+                self.pmp_write_addr(((addr - 0x3B0) >> 2) as usize, value);
             }
             0xB00 => self.mcycle = (self.mcycle & 0xFFFF_FFFF_0000_0000) | u64::from(value),
             0xB02 => self.minstret = (self.minstret & 0xFFFF_FFFF_0000_0000) | u64::from(value),
@@ -558,8 +690,13 @@ impl CsrFile {
         let mpie = self.mstatus & MSTATUS_MPIE;
         self.mstatus &= !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP);
         if mpie != 0 {
-            self.mstatus |= MSTATUS_MIE | MSTATUS_MPIE;
+            self.mstatus |= MSTATUS_MIE;
         }
+        // The specification sets MPIE=1 on every xRET, clears MPP and returns
+        // to the least-privileged supported mode (U, i.e. zero here).
+        // 规范规定每次 xRET 都把 MPIE 置 1、清空 MPP，并返回支持的最低特权级
+        // （此处为 U，即 0）。
+        self.mstatus |= MSTATUS_MPIE;
         // Hazard3's mret clears MRETEIRQ, restores the preemption stack and
         // refreshes the next-IRQ window.
         // Hazard3 的 mret 清除 MRETEIRQ、恢复抢占栈并刷新下一 IRQ 窗口。

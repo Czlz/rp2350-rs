@@ -45,6 +45,8 @@
 mod csr;
 mod execute;
 mod execute_c;
+mod mem;
+mod pmp;
 mod registers;
 
 pub use registers::Rv32Registers;
@@ -507,6 +509,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests_csr.rs"]
 mod tests_csr;
+
+#[cfg(test)]
+#[path = "tests_pmp.rs"]
+mod tests_pmp;
 
 #[cfg(test)]
 #[path = "tests_sleep.rs"]

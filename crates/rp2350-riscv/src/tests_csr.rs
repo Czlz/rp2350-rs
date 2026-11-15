@@ -72,6 +72,18 @@ fn assert_illegal_csr(core: &Hazard3Core, csr: u32, faulting_pc: u32, handler_pc
     );
 }
 
+/// Write `mstatus` with a `csrrw` and read it back with a `csrrs`
+/// 用 `csrrw` 写 `mstatus`，再用 `csrrs` 读回
+fn mstatus_round_trip(value: u32) -> u32 {
+    let code = [csr_type(0, 1, 1, 0x300), csr_type(2, 2, 0, 0x300)];
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    core.write_register(1, value);
+    core.step(&mut bus).unwrap();
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.csr.mcause, 0);
+    core.read_register(2)
+}
+
 #[test]
 fn illegal_csr_read_traps_with_the_csr_address() {
     // csrrs a0, 0x7C0, x0 — a pure read of an unimplemented CSR.
@@ -288,4 +300,177 @@ fn reserved_encoding_space_traps_on_read_and_write() {
     let (mut core, mut bus) = core_with(&code, MT_VEC);
     core.step(&mut bus).unwrap();
     assert_illegal_csr(&core, 0xC03, CODE_BASE, MT_VEC);
+}
+
+// ---- mcountinhibit / 计数器门控 ------------------------------------------
+
+#[test]
+fn mcountinhibit_cy_freezes_mcycle_only() {
+    // CY (bit 0) stops mcycle but leaves minstret running.
+    // CY（位 0）停止 mcycle，但 minstret 继续运行。
+    let code = [csr_type(0, 1, 1, 0x320), u_type(2, 0), u_type(3, 0)];
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    core.write_register(1, csr::MCOUNTINHIBIT_CY);
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.csr.mcountinhibit, csr::MCOUNTINHIBIT_CY);
+    let cycle = core.csr.mcycle;
+    let instret = core.csr.minstret;
+    core.step(&mut bus).unwrap();
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.csr.mcycle, cycle, "CY must freeze mcycle");
+    assert_eq!(core.csr.minstret, instret + 2, "IR clear keeps minstret");
+}
+
+#[test]
+fn mcountinhibit_ir_freezes_minstret_only() {
+    // IR (bit 2) stops minstret but leaves mcycle running.
+    // IR（位 2）停止 minstret，但 mcycle 继续运行。
+    let code = [csr_type(0, 1, 1, 0x320), u_type(2, 0), u_type(3, 0)];
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    core.write_register(1, csr::MCOUNTINHIBIT_IR);
+    core.step(&mut bus).unwrap();
+    let cycle = core.csr.mcycle;
+    let instret = core.csr.minstret;
+    core.step(&mut bus).unwrap();
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.csr.mcycle, cycle + 2, "CY clear keeps mcycle");
+    assert_eq!(core.csr.minstret, instret, "IR must freeze minstret");
+}
+
+#[test]
+fn mcountinhibit_both_freeze_and_resume() {
+    // Both bits stop both counters; clearing them resumes from the frozen value.
+    // 两位置位时两个计数器都停止；清除后从冻结值继续。
+    let code = [
+        csr_type(0, 1, 1, 0x320),
+        u_type(2, 0),
+        u_type(3, 0),
+        csr_type(0, 1, 1, 0x320),
+        u_type(4, 0),
+        u_type(5, 0),
+    ];
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    core.write_register(1, csr::MCOUNTINHIBIT_CY | csr::MCOUNTINHIBIT_IR);
+    for _ in 0..3 {
+        core.step(&mut bus).unwrap();
+    }
+    let cycle = core.csr.mcycle;
+    let instret = core.csr.minstret;
+    core.write_register(1, 0);
+    for _ in 0..3 {
+        core.step(&mut bus).unwrap();
+    }
+    // The clearing csrrw retires with counting enabled, then two more nops.
+    // 清除抑制的 csrrw 在计数恢复后退休，其后还有两条 nop。
+    assert_eq!(core.csr.mcycle, cycle + 3);
+    assert_eq!(core.csr.minstret, instret + 3);
+}
+
+#[test]
+fn mcountinhibit_keeps_only_cy_and_ir() {
+    // Reserved bit 1 and the HPM bits read as zero (no HPM counters modelled).
+    // 保留位 1 与 HPM 位读出为 0（未建模 HPM 计数器）。
+    let code = [csr_type(0, 1, 1, 0x320), csr_type(2, 2, 0, 0x320)];
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    core.write_register(1, 0xFFFF_FFFF);
+    core.step(&mut bus).unwrap();
+    core.step(&mut bus).unwrap();
+    assert_eq!(
+        core.csr.mcountinhibit,
+        csr::MCOUNTINHIBIT_CY | csr::MCOUNTINHIBIT_IR
+    );
+    assert_eq!(
+        core.read_register(2),
+        csr::MCOUNTINHIBIT_CY | csr::MCOUNTINHIBIT_IR
+    );
+}
+
+#[test]
+fn mcycle_high_half_carries_and_stops_with_cy() {
+    // mcycleh must observe the RV32 carry out of mcycle, and CY freezes both.
+    // mcycleh 必须看到 mcycle 的 RV32 进位，且 CY 同时冻结两者。
+    let code = [u_type(2, 0), u_type(3, 0)];
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    core.csr.mcycle = 0xFFFF_FFFF;
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.csr_read(0xB00), 0, "low half wrapped");
+    assert_eq!(core.csr_read(0xB80), 1, "carry reached mcycleh");
+    core.csr.mcountinhibit = csr::MCOUNTINHIBIT_CY;
+    core.step(&mut bus).unwrap();
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.csr.mcycle, 0x1_0000_0000, "CY freezes the carry");
+    assert_eq!(core.csr_read(0xB80), 1);
+}
+
+// ---- mstatus / 状态寄存器 ------------------------------------------------
+
+#[test]
+fn mstatus_stores_every_writable_field() {
+    // Every modeled field must survive a csrrw/csrrs round trip.
+    // 每个建模字段都必须经 csrrw/csrrs 往返保持。
+    let fields = csr::MSTATUS_UIE
+        | csr::MSTATUS_SIE
+        | csr::MSTATUS_MIE
+        | csr::MSTATUS_UPIE
+        | csr::MSTATUS_SPIE
+        | csr::MSTATUS_MPIE
+        | csr::MSTATUS_SPP
+        | csr::MSTATUS_MPP
+        | csr::MSTATUS_FS
+        | csr::MSTATUS_XS
+        | csr::MSTATUS_MPRV
+        | csr::MSTATUS_SUM
+        | csr::MSTATUS_MXR
+        | csr::MSTATUS_TVM
+        | csr::MSTATUS_TW
+        | csr::MSTATUS_TSR;
+    assert_eq!(
+        mstatus_round_trip(fields),
+        fields | csr::MSTATUS_SD,
+        "FS/XS dirty sets the read-only SD summary"
+    );
+}
+
+#[test]
+fn mstatus_sd_is_read_only_and_follows_fs() {
+    // FS=01 is clean, FS=11 is dirty, and software cannot write SD.
+    // FS=01 干净、FS=11 脏，且软件不能写 SD。
+    assert_eq!(mstatus_round_trip(1 << 13), 1 << 13, "FS=1 keeps SD clear");
+    assert_eq!(
+        mstatus_round_trip(csr::MSTATUS_FS),
+        csr::MSTATUS_FS | csr::MSTATUS_SD,
+        "FS=3 raises SD"
+    );
+    assert_eq!(mstatus_round_trip(csr::MSTATUS_SD), 0, "SD is read-only");
+}
+
+#[test]
+fn mstatus_mpp_and_mpie_survive_a_trap() {
+    // Trap entry saves MIE into MPIE and sets MPP=M; mret restores MIE and
+    // clears MPP while always setting MPIE. SPP/SUM stay untouched throughout.
+    // 陷阱入口把 MIE 存入 MPIE 并置 MPP=M；mret 恢复 MIE、清 MPP，同时总是置
+    // MPIE。SPP/SUM 全程保持不变。
+    let code = [0x0000_0073]; // ecall
+    let (mut core, mut bus) = core_with(&code, MT_VEC);
+    let mut cycles = 0u64;
+    bus.write_u32(MT_VEC, 0x3020_0073, &mut cycles).unwrap(); // mret
+    core.csr.mstatus = csr::MSTATUS_MIE | csr::MSTATUS_SPP | csr::MSTATUS_SUM;
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.pc(), MT_VEC);
+    assert_eq!(core.csr.mcause, 11);
+    assert_eq!(core.csr.mstatus & csr::MSTATUS_MIE, 0, "MIE cleared");
+    assert_ne!(core.csr.mstatus & csr::MSTATUS_MPIE, 0, "MIE saved to MPIE");
+    assert_eq!(
+        core.csr.mstatus & csr::MSTATUS_MPP,
+        csr::MSTATUS_MPP,
+        "MPP records machine mode"
+    );
+    assert_ne!(core.csr.mstatus & csr::MSTATUS_SPP, 0, "SPP is storage");
+    assert_ne!(core.csr.mstatus & csr::MSTATUS_SUM, 0, "SUM is storage");
+
+    core.step(&mut bus).unwrap();
+    assert_eq!(core.pc(), CODE_BASE);
+    assert_ne!(core.csr.mstatus & csr::MSTATUS_MIE, 0, "MIE restored");
+    assert_ne!(core.csr.mstatus & csr::MSTATUS_MPIE, 0, "mret sets MPIE");
+    assert_eq!(core.csr.mstatus & csr::MSTATUS_MPP, 0, "MPP returns to U");
 }

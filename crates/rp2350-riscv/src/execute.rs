@@ -1,8 +1,10 @@
 //! RV32IMAC instruction fetch, decode and execute / RV32IMAC 指令取指、译码与执行
 
 use super::Hazard3Core;
-use super::execute_c::{ZcmpOp, decompress, zcmp_op};
+use super::execute_c::{decompress, zcmp_op};
 use crate::SleepReason;
+use crate::mem::{Trap, load_value, load_word, store_value, store_word};
+use crate::pmp::PmpAccess;
 use rp2350_core::bus::AddressBus;
 use rp2350_core::error::CoreError;
 use rp2350_cpu::CpuState;
@@ -36,81 +38,6 @@ const OP_FENCE: u32 = 0x0F;
 /// Opcode: atomic memory operation / 原子内存操作
 const OP_AMO: u32 = 0x2F;
 
-/// Internal trap raised while executing one instruction / 单条指令执行期间产生的内部陷阱
-struct Trap {
-    /// `mcause` value / 异常原因
-    cause: u32,
-    /// `mtval` value / 陷阱值
-    tval: u32,
-    /// Whether the access is retryable instead of trapping / 该访问是否应重试而非触发陷阱
-    ///
-    /// A device that blocks (an empty FIFO read) reports a bus stall. The guest
-    /// must never observe an exception for it, so the flag makes
-    /// [`Hazard3Core::execute_one`] put the core to sleep with `PC` unchanged and
-    /// replay the same instruction later.
-    /// 阻塞设备（空 FIFO 读）会报告总线 stall。客户机绝不能因此看到异常，因此该标志让
-    /// [`Hazard3Core::execute_one`] 保持 `PC` 不变并把核心置为睡眠，稍后重放同一条指令。
-    retry: bool,
-}
-
-impl Trap {
-    /// Build an illegal-instruction trap / 构造非法指令陷阱
-    fn illegal(instr: u32) -> Self {
-        Self {
-            cause: 2,
-            tval: instr,
-            retry: false,
-        }
-    }
-
-    /// Build an illegal-CSR trap: `mtval` carries the CSR address
-    /// 构造非法 CSR 陷阱：`mtval` 携带 CSR 地址
-    ///
-    /// Both an unimplemented CSR and an illegal access (write to a read-only CSR)
-    /// raise cause 2. The faulting CSR address is far more useful in `mtval` than
-    /// the raw encoding, because the instruction is always a `csr*` form.
-    /// 未实现的 CSR 与非法访问（写只读 CSR）都触发 cause 2。出错指令必然是
-    /// `csr*` 形式，因此把 CSR 地址放进 `mtval` 比原始编码更有诊断价值。
-    fn illegal_csr(csr: u32) -> Self {
-        Self {
-            cause: 2,
-            tval: csr,
-            retry: false,
-        }
-    }
-
-    /// Build a retryable load trap / 构造可重试的加载陷阱
-    fn retry(addr: u32) -> Self {
-        Self {
-            cause: 5,
-            tval: addr,
-            retry: true,
-        }
-    }
-
-    /// Build a load access fault / 构造加载访问错误
-    fn load_fault(addr: u32, error: &CoreError) -> Self {
-        if error.is_stall() {
-            Self::retry(addr)
-        } else {
-            Self {
-                cause: 5,
-                tval: addr,
-                retry: false,
-            }
-        }
-    }
-
-    /// Build a store access fault / 构造存储访问错误
-    fn store_fault(addr: u32) -> Self {
-        Self {
-            cause: 7,
-            tval: addr,
-            retry: false,
-        }
-    }
-}
-
 /// Result of executing one instruction: next PC or a trap
 /// 单条指令执行结果：下一条 PC 或陷阱
 type ExecResult = Result<u32, Trap>;
@@ -120,6 +47,13 @@ impl Hazard3Core {
     /// 取指、译码并执行一条指令，同时更新 PC
     pub(crate) fn execute_one(&mut self, bus: &mut dyn AddressBus) -> Result<(), CoreError> {
         let pc = self.registers.pc;
+        // 取指检查使用当前特权级（M 模式），不受 `mstatus.MPRV` 影响。
+        // Fetch checks use the current privilege (M-mode), not `mstatus.MPRV`.
+        if !self.csr.pmp_permits(pc, 2, PmpAccess::Fetch, true) {
+            let trap = Trap::instruction_access_fault(pc);
+            self.registers.pc = self.enter_trap(trap.cause, trap.tval, pc);
+            return Ok(());
+        }
         let low = Self::fetch_u16(bus, pc)?;
         // Zcmp push/pop 宏是多条内存访问的组合，无法展开成单条 32 位指令，
         // 必须在压缩指令路径之前单独执行。
@@ -150,7 +84,13 @@ impl Hazard3Core {
             }
         }
         let (instr, length) = if low & 0b11 == 0b11 {
-            let high = Self::fetch_u16(bus, pc.wrapping_add(2))?;
+            let high_pc = pc.wrapping_add(2);
+            if !self.csr.pmp_permits(high_pc, 2, PmpAccess::Fetch, true) {
+                let trap = Trap::instruction_access_fault(high_pc);
+                self.registers.pc = self.enter_trap(trap.cause, trap.tval, pc);
+                return Ok(());
+            }
+            let high = Self::fetch_u16(bus, high_pc)?;
             (u32::from(low) | (u32::from(high) << 16), 4)
         } else if let Some(expanded) = decompress(low) {
             (expanded, 2)
@@ -177,50 +117,6 @@ impl Hazard3Core {
             Err(trap) => {
                 self.registers.pc = self.enter_trap(trap.cause, trap.tval, pc);
                 Ok(())
-            }
-        }
-    }
-
-    /// Execute a Zcmp push/pop macro / 执行 Zcmp push/pop 宏
-    ///
-    /// `cm.push` stores the register list just below the old stack pointer and
-    /// then allocates the frame; the pop forms load from the top of the frame
-    /// and release it. `cm.popret`/`cm.popretz` additionally return to `ra`.
-    /// `cm.push` 把寄存器列表保存在旧栈指针下方并分配栈帧；pop 形式从栈帧
-    /// 顶部恢复并释放栈帧。`cm.popret`/`cm.popretz` 还会返回到 `ra`。
-    fn execute_zcmp(&mut self, op: ZcmpOp, bus: &mut dyn AddressBus, next_pc: u32) -> ExecResult {
-        let sp = self.registers.read(2);
-        let stack_adj = op.stack_adj();
-        match op {
-            ZcmpOp::Push { .. } => {
-                let mut addr = sp.wrapping_sub(4);
-                for &reg in op.registers() {
-                    let mut cycles = 0u64;
-                    bus.write_u32(addr, self.registers.read(reg), &mut cycles)
-                        .map_err(|_| Trap::store_fault(addr))?;
-                    addr = addr.wrapping_sub(4);
-                }
-                self.registers.write(2, sp.wrapping_sub(stack_adj));
-                Ok(next_pc)
-            }
-            ZcmpOp::Pop { .. } | ZcmpOp::PopRet { .. } | ZcmpOp::PopRetZ { .. } => {
-                let mut addr = sp.wrapping_add(stack_adj).wrapping_sub(4);
-                for &reg in op.registers() {
-                    let mut cycles = 0u64;
-                    let value = bus
-                        .read_u32(addr, &mut cycles)
-                        .map_err(|error| Trap::load_fault(addr, &error))?;
-                    self.registers.write(reg, value);
-                    addr = addr.wrapping_sub(4);
-                }
-                self.registers.write(2, sp.wrapping_add(stack_adj));
-                if op.zeroes_a0() {
-                    self.registers.write(10, 0);
-                }
-                if op.returns() {
-                    return Ok(self.registers.read(1));
-                }
-                Ok(next_pc)
             }
         }
     }
@@ -285,13 +181,13 @@ impl Hazard3Core {
             }
             OP_LOAD => {
                 let addr = self.registers.read(rs1).wrapping_add(imm_i(instr) as u32);
-                let value = load_value(bus, addr, funct3)?;
+                let value = load_value(&self.csr, bus, addr, funct3)?;
                 self.registers.write(rd, value);
                 Ok(next_pc)
             }
             OP_STORE => {
                 let addr = self.registers.read(rs1).wrapping_add(imm_s(instr) as u32);
-                store_value(bus, addr, funct3, self.registers.read(rs2))?;
+                store_value(&self.csr, bus, addr, funct3, self.registers.read(rs2))?;
                 Ok(next_pc)
             }
             OP_IMM => {
@@ -474,18 +370,18 @@ impl Hazard3Core {
         match funct5 {
             0b00010 => {
                 self.reservation = Some(addr);
-                self.registers.write(rd, load_word(bus, addr)?);
+                self.registers.write(rd, load_word(&self.csr, bus, addr)?);
             }
             0b00011 => {
                 let success = self.reservation == Some(addr);
                 if success {
-                    store_word(bus, addr, self.registers.read(rs2))?;
+                    store_word(&self.csr, bus, addr, self.registers.read(rs2))?;
                 }
                 self.registers.write(rd, u32::from(!success));
                 self.reservation = None;
             }
             _ => {
-                let old = load_word(bus, addr)?;
+                let old = load_word(&self.csr, bus, addr)?;
                 let operand = self.registers.read(rs2);
                 let new = match funct5 {
                     0b00000 => old.wrapping_add(operand),
@@ -499,7 +395,7 @@ impl Hazard3Core {
                     0b11100 => old.max(operand),
                     _ => return Err(Trap::illegal(instr)),
                 };
-                store_word(bus, addr, new)?;
+                store_word(&self.csr, bus, addr, new)?;
                 self.registers.write(rd, old);
             }
         }
@@ -586,73 +482,6 @@ impl Hazard3Core {
         self.registers.write(rd, old);
         Ok(next_pc)
     }
-}
-
-/// Read a load value by `funct3` / 按 `funct3` 读取加载值
-fn load_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32) -> Result<u32, Trap> {
-    let mut cycles = 0u64;
-    match funct3 {
-        // LB/LH sign-extend to XLEN; LBU/LHU below zero-extend.
-        // LB/LH 符号扩展到 XLEN；下面的 LBU/LHU 做零扩展。
-        0 => bus
-            .read_u8(addr, &mut cycles)
-            .map(|v| v as i8 as u32)
-            .map_err(|error| Trap::load_fault(addr, &error)),
-        1 => bus
-            .read_u16(addr, &mut cycles)
-            .map(|v| v as i16 as u32)
-            .map_err(|error| Trap::load_fault(addr, &error)),
-        2 => bus
-            .read_u32(addr, &mut cycles)
-            .map_err(|error| Trap::load_fault(addr, &error)),
-        4 => bus
-            .read_u8(addr, &mut cycles)
-            .map(u32::from)
-            .map_err(|error| Trap::load_fault(addr, &error)),
-        5 => bus
-            .read_u16(addr, &mut cycles)
-            .map(u32::from)
-            .map_err(|error| Trap::load_fault(addr, &error)),
-        _ => Err(Trap {
-            cause: 2,
-            tval: funct3,
-            retry: false,
-        }),
-    }
-}
-
-/// Write a store value by `funct3` / 按 `funct3` 写入存储值
-fn store_value(bus: &mut dyn AddressBus, addr: u32, funct3: u32, value: u32) -> Result<(), Trap> {
-    let mut cycles = 0u64;
-    let fault = Trap::store_fault(addr);
-    match funct3 {
-        0 => bus
-            .write_u8(addr, value as u8, &mut cycles)
-            .map_err(|_| fault),
-        1 => bus
-            .write_u16(addr, value as u16, &mut cycles)
-            .map_err(|_| fault),
-        2 => bus.write_u32(addr, value, &mut cycles).map_err(|_| fault),
-        _ => Err(Trap {
-            cause: 2,
-            tval: funct3,
-            retry: false,
-        }),
-    }
-}
-
-/// Load a 32-bit word for atomics / 为原子操作加载 32 位字
-fn load_word(bus: &mut dyn AddressBus, addr: u32) -> Result<u32, Trap> {
-    let mut cycles = 0u64;
-    bus.read_u32(addr, &mut cycles)
-        .map_err(|error| Trap::load_fault(addr, &error))
-}
-
-/// Store a 32-bit word for atomics / 为原子操作存储 32 位字
-fn store_word(bus: &mut dyn AddressBus, addr: u32, value: u32) -> Result<(), Trap> {
-    let mut cycles = 0u64;
-    bus.write_u32(addr, value, &mut cycles)
-        .map_err(|_| Trap::store_fault(addr))
 }
 
 /// Arithmetic/logical right shift / 算术或逻辑右移

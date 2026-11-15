@@ -7,14 +7,18 @@
 > `CpuCore` trait，包含机器模式整数子集、压缩指令与最小的外部中断通路。
 >
 > **Status**: implemented — RV32I/M/A/C + Zb\* (Zba/Zbb/Zbs, advertised through
-> `misa.B`) + Zcb, machine CSRs with architectural illegal-CSR traps,
+> `misa.B`) + Zcb, machine CSRs with architectural illegal-CSR traps, 16-entry
+> PMP enforcement (`TOR`/`NA4`/`NAPOT`, R/W/X, lock), `mcountinhibit`
+> gating of `mcycle`/`minstret`, the RV32 `mstatus`/`mstatush` field set,
 > Xh3irq external interrupts, exception/interrupt trap entry, picobin
 > `IMAGE_DEF` boot, `lr.w`/`sc.w` reservation. Not implemented: F/D floating
-> point, PMP enforcement.
+> point, S/U privilege modes, HPM counters.
 > **状态**: 已实现 — RV32I/M/A/C + Zb\*（Zba/Zbb/Zbs，通过 `misa.B` 宣传）
-> + Zcb、带架构非法 CSR 陷阱的机器模式 CSR、Xh3irq 外部中断、
-> 异常/中断陷阱入口、picobin `IMAGE_DEF` 启动、`lr.w`/`sc.w` 保留区。
-> 未实现：F/D 浮点、PMP 强制访问检查。
+> + Zcb、带架构非法 CSR 陷阱的机器模式 CSR、16 条目 PMP 强制检查
+> （`TOR`/`NA4`/`NAPOT`、R/W/X、锁定）、`mcountinhibit` 对
+> `mcycle`/`minstret` 的门控、RV32 `mstatus`/`mstatush` 字段集、Xh3irq
+> 外部中断、异常/中断陷阱入口、picobin `IMAGE_DEF` 启动、`lr.w`/`sc.w`
+> 保留区。未实现：F/D 浮点、S/U 特权模式、HPM 计数器。
 
 ---
 
@@ -55,6 +59,8 @@ entirely with `set_boot_vectors`.
 | `lib` | `Hazard3Core`, boot constants, `CpuCore` implementation |
 | `registers` | `Rv32Registers` — x0..x31 with hard-wired zero, `pc` |
 | `csr` | `CsrFile` — machine-mode CSRs, `take_trap` / `mret` |
+| `mem` | `Trap`, PMP-checked load/store helpers / 陷阱与经 PMP 检查的访存辅助 |
+| `pmp` | `PmpAccess`, PMP descriptor decoding and access checking |
 | `execute` | RV32 fetch/decode/execute for the 32-bit encodings |
 | `execute_c` | `decompress` — RV32C compressed-instruction expansion |
 | `tests` | Instruction-level and boot tests (not part of the public API) |
@@ -179,31 +185,124 @@ illegal-instruction.
   **只读 CSR**（地址位 `[11:10] == 0b11`，即 `cycle`/`instret` 与识别寄存器）
   写入即陷阱；源为 `x0` 的 `csrrs`/`csrrc` 不执行写操作，因此不触发。`csrrw`
   总是写，即使源为 `x0` 也会触发。
-- `mstatush` (0x310) is storage only: writes are kept and reads return the stored
-  value, but no high-half `mstatus` bit is interpreted.
-  `mstatush`（0x310）仅作存储：写入被保留、读取返回存储值，但不解释任何
-  `mstatus` 高半部分语义。
-- `mstatus` only models the bits `MIE` (bit 3), `MPIE` (bit 7) and `MPP`
-  (bits 12:11); a write masks the value to those fields.
-  `mstatus` 只建模 `MIE`（位 3）、`MPIE`（位 7）与 `MPP`（位 12:11）；
-  写入会被掩码到这几个字段。
+
+### `mstatus` / `mstatush`
+
+`mstatus` stores every field in the table below. `MIE` (bit 3), `MPIE` (bit 7),
+`MPP` (bits 12:11) and `MPRV` (bit 17) are **effective**; the remaining fields
+are **storage only**:
+
+| Field | Bits | Behaviour / 行为 |
+|-------|------|------------------|
+| `UIE` / `SIE` / `UPIE` / `SPIE` | 0, 1, 4, 5 | Storage (N/S extensions) / 存储（N/S 扩展） |
+| `MIE` | 3 | Gates machine interrupts / 机器中断总开关 |
+| `MPIE` | 7 | Saved `MIE` across trap entry/return / 陷阱进出保存的 `MIE` |
+| `SPP` | 8 | Storage / 存储 |
+| `MPP` | 12:11 | Privilege saved on trap; `MRET` returns to U (0) / 陷阱保存的特权级；`MRET` 返回 U(0) |
+| `FS` / `XS` | 14:13, 16:15 | Storage; dirty value drives `SD` / 存储；脏值驱动 `SD` |
+| `MPRV` | 17 | Data accesses use `MPP` as effective privilege / 数据访问按 `MPP` 的有效特权级 |
+| `SUM` / `MXR` | 18, 19 | Storage / 存储 |
+| `TVM` / `TW` / `TSR` | 20, 21, 22 | Storage / 存储 |
+| `SD` | 31 | Read-only, `(FS == 11) || (XS == 11)` / 只读 |
+
+`mstatush` (0x310) keeps `MBE` (bit 3) and `SBE` (bit 4) as storage; the model
+performs little-endian accesses only, and the remaining bits are retained for
+software compatibility. `MBE`/`SBE` do not change bus byte order.
+`mstatush`（0x310）把 `MBE`（位 3）与 `SBE`（位 4）作为存储位；模型只执行小端
+访问，其余位为保证软件兼容而保留。`MBE`/`SBE` 不改变总线字节序。
+
+### CSR read/write semantics / CSR 读写语义
+
+- **Unimplemented CSR** addresses raise illegal-instruction (`mcause = 2`) on
+  both read and write; `mtval` carries the **CSR address** and `mepc` points at
+  the faulting `csr*` instruction. They are never silently read as zero.
+  **未实现的 CSR** 地址在读写时都触发非法指令（`mcause = 2`）；`mtval` 携带
+  **CSR 地址**，`mepc` 指向出错的 `csr*` 指令。绝不静默读 0。
+- **Read-only CSRs** (address bits `[11:10] == 0b11`, i.e. `cycle`/`instret` and
+  the identification registers) trap on write; a `csrrs`/`csrrc` whose source is
+  `x0` performs no write and therefore does not trap. `csrrw` always writes, so
+  it traps even with `x0` as the source.
+  **只读 CSR**（地址位 `[11:10] == 0b11`，即 `cycle`/`instret` 与识别寄存器）
+  写入即陷阱；源为 `x0` 的 `csrrs`/`csrrc` 不执行写操作，因此不触发。`csrrw`
+  总是写，即使源为 `x0` 也会触发。
 - `mepc` writes clear bit 0 (bit 1 stays writable because `C` allows 2-byte
-  alignment); `mip` writes only keep the `MEIP` bit; `mcountinhibit` keeps
-  bits 2:0. Writing `mip`'s read-only pending bits is ignored, not trapped,
-  matching Hazard3's writable-mask behaviour.
+  alignment); `mip` writes only keep the `MEIP` bit; `mcountinhibit` keeps `CY`
+  (bit 0) and `IR` (bit 2), while reserved bit 1 and the HPM bits read as zero
+  because no HPM counters are modelled. Writing `mip`'s read-only pending bits
+  is ignored, not trapped, matching Hazard3's writable-mask behaviour.
   写 `mepc` 清除位 0（因支持 `C`，位 1 保持可写）；写 `mip` 只保留 `MEIP` 位；
-  写 `mcountinhibit` 保留位 2:0。写 `mip` 的只读挂起位被忽略而非触发陷阱，
-  与 Hazard3 的可写掩码行为一致。
-- `mcycle`/`minstret` advance once per executed instruction, so firmware polling
-  them sees monotonic progress; the high halves read 0 on RV32 within any
-  realistic run. `mhartid` is 0 for both cores.
-  `mcycle`/`minstret` 每执行一条指令递增一次，固件轮询时看到单调增长；在任何
-  现实运行时长的 RV32 运行中高半部分读 0。两个核心的 `mhartid` 都是 0。
-- PMP registers (`pmpcfg0/2/4/6`, `pmpaddr0..15`) are storage only — no access
-  checking is enforced. Odd-numbered `pmpcfg` registers do not exist on RV32 and
-  raise illegal-instruction.
-  PMP 寄存器（`pmpcfg0/2/4/6`、`pmpaddr0..15`）仅作存储 —— 不实施访问检查。
-  RV32 上奇数编号的 `pmpcfg` 不存在，访问会触发非法指令陷阱。
+  写 `mcountinhibit` 保留 `CY`（位 0）与 `IR`（位 2），保留位 1 与 HPM 位因未
+  建模 HPM 计数器而读出为 0。写 `mip` 的只读挂起位被忽略而非触发陷阱，与
+  Hazard3 的可写掩码行为一致。
+
+### Counters and `mcountinhibit` / 计数器与抑制
+
+`mcycle`/`mcycleh` and `minstret`/`minstreth` advance once per retired
+instruction by default. `mcountinhibit.CY` freezes `mcycle`/`mcycleh` and
+`mcountinhibit.IR` freezes `minstret`/`minstreth`; the frozen counter keeps its
+value and resumes from it when the bit is cleared. The RV32 carry out of
+`mcycle`/`minstret` is visible in the high-half CSRs (`0xB80`/`0xB82`). A
+trapping instruction still books its tick, matching the pre-existing per-step
+model. `mhartid` is 0 for both cores.
+`mcycle`/`mcycleh` 与 `minstret`/`minstreth` 默认每退休一条指令递增一次。
+`mcountinhibit.CY` 冻结 `mcycle`/`mcycleh`，`mcountinhibit.IR` 冻结
+`minstret`/`minstreth`；冻结期间保持原值，清除该位后从原值继续。
+`mcycle`/`minstret` 的 RV32 进位可在高半 CSR（`0xB80`/`0xB82`）中看到。陷阱
+指令仍记一次 tick，与既有「每步一次」模型一致。两个核心的 `mhartid` 都是 0。
+
+### Physical memory protection / 物理内存保护
+
+Sixteen PMP entries are implemented. RV32 exposes them through the
+even-numbered `pmpcfg0/2/4/6` registers (four 8-bit descriptors each) and
+`pmpaddr0..15`; odd-numbered `pmpcfg` registers do not exist and raise
+illegal-instruction. Each descriptor decodes `R`/`W`/`X`, the `A` mode
+(`OFF`/`TOR`/`NA4`/`NAPOT`) and the `L` lock bit. The lowest-numbered entry
+covering the whole access decides; a partial overlap fails. `NAPOT` uses the
+trailing-ones encoding (`n` ones → `2^(n+3)` bytes), `NA4` covers exactly four
+bytes and `TOR` uses `pmpaddr[i-1]` (`0` for entry 0) as its inclusive lower
+bound and `pmpaddr[i]` as its exclusive upper bound.
+
+实现 16 个 PMP 条目。RV32 通过偶数编号的 `pmpcfg0/2/4/6`（每个含四个 8 位描述符）
+与 `pmpaddr0..15` 暴露它们；奇数编号 `pmpcfg` 不存在，访问触发非法指令。描述符
+解码 `R`/`W`/`X`、`A` 模式（`OFF`/`TOR`/`NA4`/`NAPOT`）与 `L` 锁定位。覆盖整个
+访问的最低编号条目起决定作用，部分重叠视为失败。`NAPOT` 使用尾部 1 编码
+（`n` 个 1 → `2^(n+3)` 字节），`NA4` 恰好覆盖 4 字节，`TOR` 以 `pmpaddr[i-1]`
+（条目 0 为 0）为闭下界、`pmpaddr[i]` 为开上界。
+
+Privilege rules / 特权级规则:
+
+- **M-mode**: an access with no matching entry succeeds; a matching **locked**
+  entry enforces `R`/`W`/`X`, while an **unlocked** matching entry is
+  transparent to M-mode (privileged spec 3.7.1.2).
+  **M 模式**：无匹配条目时允许；匹配到**锁定**条目时按 `R`/`W`/`X` 检查；
+  匹配到**未锁定**条目时对 M 模式透明（特权规范 3.7.1.2）。
+- **`mstatus.MPRV = 1`**: data accesses use `MPP` as their effective privilege.
+  With `MPP` = S/U there is no M-mode grant: an unmatched access is denied and a
+  matched access needs the permission bit. With `MPP = M` the data access keeps
+  M-mode rules. Instruction fetches always use the current privilege mode.
+  **`mstatus.MPRV = 1`**：数据访问按 `MPP` 的有效特权级检查。`MPP` 为 S/U 时
+  不享受 M 模式豁免：未匹配即拒绝，匹配时需具备权限位；`MPP = M` 时数据访问
+  仍按 M 模式规则。取指始终使用当前特权级。
+- **Locking**: a locked entry ignores writes to its descriptor byte and to
+  `pmpaddr_i`; a locked `TOR` entry also protects `pmpaddr_{i-1}`. Ignored
+  writes raise no exception, and `L` stays set until reset.
+  **锁定**：锁定条目忽略对其描述符字节与 `pmpaddr_i` 的写入；锁定的 `TOR` 条目
+  还保护 `pmpaddr_{i-1}`。被忽略的写入不触发异常，`L` 保持置位直到复位。
+- **Violations**: instruction fetch → cause 1, load → cause 5, store → cause 7,
+  with the faulting address in `mtval` and the instruction PC in `mepc`. AMOs
+  check load and store separately; a failed `SC.W` with no valid reservation
+  performs no access and is not checked.
+  **违规**：取指 → cause 1，加载 → cause 5，存储 → cause 7；`mtval` 为出错
+  地址，`mepc` 为指令 PC。AMO 分别检查加载与存储；无有效保留区的失败 `SC.W`
+  不产生访问，因此不做检查。
+
+Limitations: only M-mode execution is modelled, so U/S privilege state and
+`SUM`/`MXR`-driven page permissions do not exist; `pmpaddr` WARL granularity
+masking, PMP granularity probing and misaligned-access splitting are not
+modelled. `mstatush` endianness bits do not change bus byte order.
+限制：仅建模 M 模式执行，因此没有 U/S 特权状态与 `SUM`/`MXR` 驱动的页权限；
+`pmpaddr` 的 WARL 粒度掩码、PMP 粒度探测与非对齐访问拆分未建模。`mstatush`
+的端序位不改变总线字节序。
 
 ### Traps / 陷阱
 
@@ -212,27 +311,30 @@ take_trap(cause, tval, epc) -> handler PC   // machine-mode trap entry
 mret() -> restored PC                       // trap return
 ```
 
-`take_trap` saves `mepc = epc & !3`, `mcause`, `mtval`; moves `MIE` into
-`MPIE`, clears `MIE`, sets `MPP = Machine`, clears `mip.MEIP` and resolves the
+`take_trap` saves `mepc = epc & !1`, `mcause`, `mtval`; moves `MIE` into
+`MPIE`, clears `MIE`, sets `MPP = Machine` and resolves the
 handler address through `trap_pc`. Hazard3 vectors only **interrupts**: when
 `mtvec & 3 == 1` and the cause has bit 31 set, the handler is
 `mtvec + 4 * (cause & 0x7FFF_FFFF)`; synchronous exceptions always use the
-`mtvec` base. `mret` restores `PC = mepc & !3` and copies `MPIE` back into
-`MIE`/`MPIE`, clearing `MPP`.
-`take_trap` 保存 `mepc = epc & !3`、`mcause`、`mtval`；把 `MIE` 移入 `MPIE`、
-清零 `MIE`、置 `MPP = Machine`、清除 `mip.MEIP`，并通过 `trap_pc` 解析处理程序
-地址。Hazard3 只对**中断**做向量化：`mtvec & 3 == 1` 且 cause 的 bit 31 置位时
-处理程序为 `mtvec + 4 * (cause & 0x7FFF_FFFF)`；同步异常一律使用 `mtvec` 基址。
-`mret` 恢复 `PC = mepc & !3`，并把 `MPIE` 复制回 `MIE`/`MPIE`，同时清零 `MPP`。
+`mtvec` base. `mret` restores `PC = mepc & !1`, copies `MPIE` back into `MIE`,
+always sets `MPIE = 1` and sets `MPP` to the least-privileged supported mode
+(U, i.e. 0).
+`take_trap` 保存 `mepc = epc & !1`、`mcause`、`mtval`；把 `MIE` 移入 `MPIE`、
+清零 `MIE`、置 `MPP = Machine`，并通过 `trap_pc` 解析处理程序地址。Hazard3 只
+对**中断**做向量化：`mtvec & 3 == 1` 且 cause 的 bit 31 置位时处理程序为
+`mtvec + 4 * (cause & 0x7FFF_FFFF)`；同步异常一律使用 `mtvec` 基址。`mret` 恢复
+`PC = mepc & !1`，把 `MPIE` 复制回 `MIE`，总是置 `MPIE = 1`，并把 `MPP` 设为
+支持的最低特权级（U，即 0）。
 
 Typical `mcause` values produced by the core / 核心产生的典型 `mcause`：
 
 | Cause | Source / 来源 |
 |-------|--------------|
+| 1 | Instruction access fault (PMP fetch deny; `mtval` = address) / 取指访问错误（PMP 拒绝取指；`mtval` = 地址） |
 | 2 | Illegal instruction, or illegal/unimplemented CSR (`mtval` = opcode for a decode failure, **CSR address** for a CSR fault) / 非法指令，或非法/未实现 CSR（解码失败时 `mtval` 为操作码，CSR 故障时为 **CSR 地址**） |
 | 3 | `EBREAK` (`mtval` = 0) |
-| 5 | Load bus error (`mtval` = address) |
-| 7 | Store bus error (`mtval` = address) |
+| 5 | Load bus error or PMP load deny (`mtval` = address) / 加载总线错误或 PMP 拒绝（`mtval` = 地址） |
+| 7 | Store bus error or PMP store deny (`mtval` = address) / 存储总线错误或 PMP 拒绝（`mtval` = 地址） |
 | 11 | `ECALL` (`mtval` = 0) |
 | 0x8000_000B | External interrupt (`mtval` = 0) |
 
@@ -474,18 +576,26 @@ bit-count group, the immediate bit ops and `orc.b`/`rev8` during startup.
   检查通过 —— 但调用不做任何工作并返回 0。*未建模标签*没有表项，
   `rom_func_lookup`/`rom_data_lookup` 返回 `0`，即 ROM 自身的「未找到」结果。
   致命 RISC-V 异常另经 `0x7E00` 的合成向量表路由（cause 2/5 → `0x7F00`）。
-- **`mstatus`**: only `MIE`/`MPIE`/`MPP` are modeled; other status bits
-  (FS, VS, UXL …) do not exist.
-  **`mstatus`**：仅建模 `MIE`/`MPIE`/`MPP`；其他状态位（FS、VS、UXL 等）
-  不存在。
-- **PMP enforcement**: configuration and address registers are storage only.
-  **PMP 强制检查**：配置与地址寄存器仅作存储。
-- **`mstatush`/`mcountinhibit` semantics**: both keep written values, but the
-  high-half `mstatus` fields and the counter-inhibit mask (`CY`/`IR`/`HPM` gating
-  of `mcycle`/`minstret`) are not interpreted; the counters always advance.
-  **`mstatush`/`mcountinhibit` 语义**：两者保留写入值，但不解释 `mstatus`
-  高半字段与计数器抑制掩码（`CY`/`IR`/`HPM` 对 `mcycle`/`minstret` 的门控）；
-  计数器始终递增。
+- **`mstatus`**: every field listed above is stored, but only
+  `MIE`/`MPIE`/`MPP`/`MPRV` are effective. `FS`/`XS` drive the read-only `SD`
+  bit; `SUM`/`MXR`/`TVM`/`TW`/`TSR`/`SPP`/`SIE`/`SPIE`/`UIE`/`UPIE` have no
+  behaviour yet because U/S-mode execution and virtual memory do not exist.
+  **`mstatus`**：上表列出的字段均可存储，但只有 `MIE`/`MPIE`/`MPP`/`MPRV` 生效；
+  `FS`/`XS` 驱动只读 `SD` 位；由于不存在 U/S 模式执行与虚拟内存，
+  `SUM`/`MXR`/`TVM`/`TW`/`TSR`/`SPP`/`SIE`/`SPIE`/`UIE`/`UPIE` 暂无行为。
+- **PMP privilege modes**: only M-mode execution exists. U/S-mode access
+  checking is reachable only through `mstatus.MPRV` for data accesses; there is
+  no actual U/S trap entry, `SUM`/`MXR` permission interaction, PMP granularity
+  probing (`pmpaddr` WARL masking) or misaligned-access decomposition.
+  **PMP 特权模式**：仅存在 M 模式执行。U/S 模式访问检查只能通过 `mstatus.MPRV`
+  作用于数据访问；没有真正的 U/S 陷阱入口、`SUM`/`MXR` 权限交互、PMP 粒度探测
+  （`pmpaddr` WARL 掩码）或非对齐访问拆分。
+- **`mstatush` / HPM counters**: `MBE`/`SBE` and the other high-half bits are
+  storage only — the bus is always little-endian. No HPM counters (`mhpmcounter*`
+  / `mhpmevent*`) exist, so `mcountinhibit`'s HPM bits read as zero.
+  **`mstatush` / HPM 计数器**：`MBE`/`SBE` 与其余高半位仅作存储 —— 总线始终为
+  小端；不存在 HPM 计数器（`mhpmcounter*`/`mhpmevent*`），因此
+  `mcountinhibit` 的 HPM 位读出为 0。
 - **Misaligned accesses** and bus-side atomics/reservations are not modeled.
   **非对齐访问**与总线侧原子/保留机制未建模。
 

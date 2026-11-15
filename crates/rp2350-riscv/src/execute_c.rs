@@ -8,6 +8,10 @@
 //! 保证语义只有一份实现。Zcmp push/pop 宏单独译码，因为一条 16 位宏指令会执行
 //! 多次内存访问，无法表示为单条 32 位指令。
 
+use super::Hazard3Core;
+use crate::mem::{Trap, load_word, store_word};
+use rp2350_core::bus::AddressBus;
+
 /// Zcmp stack-adjustment base for each register-list index / Zcmp 每个寄存器列表的栈调整基准
 const ZCMP_STACK_ADJ: [u32; 16] = [0, 0, 0, 0, 16, 16, 16, 16, 32, 32, 32, 32, 48, 48, 48, 64];
 
@@ -452,4 +456,50 @@ fn encode_j(opcode: u32, rd: u32, immediate: i32) -> u32 {
         | (((value >> 11) & 1) << 20)
         | (((value >> 1) & 0x3FF) << 21)
         | (((value >> 20) & 1) << 31)
+}
+
+impl Hazard3Core {
+    /// Execute a Zcmp push/pop macro / 执行 Zcmp push/pop 宏
+    ///
+    /// `cm.push` stores the register list just below the old stack pointer and
+    /// then allocates the frame; the pop forms load from the top of the frame
+    /// and release it. `cm.popret`/`cm.popretz` additionally return to `ra`.
+    /// `cm.push` 把寄存器列表保存在旧栈指针下方并分配栈帧；pop 形式从栈帧
+    /// 顶部恢复并释放栈帧。`cm.popret`/`cm.popretz` 还会返回到 `ra`。
+    pub(crate) fn execute_zcmp(
+        &mut self,
+        op: ZcmpOp,
+        bus: &mut dyn AddressBus,
+        next_pc: u32,
+    ) -> Result<u32, Trap> {
+        let sp = self.registers.read(2);
+        let stack_adj = op.stack_adj();
+        match op {
+            ZcmpOp::Push { .. } => {
+                let mut addr = sp.wrapping_sub(4);
+                for &reg in op.registers() {
+                    store_word(&self.csr, bus, addr, self.registers.read(reg))?;
+                    addr = addr.wrapping_sub(4);
+                }
+                self.registers.write(2, sp.wrapping_sub(stack_adj));
+                Ok(next_pc)
+            }
+            ZcmpOp::Pop { .. } | ZcmpOp::PopRet { .. } | ZcmpOp::PopRetZ { .. } => {
+                let mut addr = sp.wrapping_add(stack_adj).wrapping_sub(4);
+                for &reg in op.registers() {
+                    let value = load_word(&self.csr, bus, addr)?;
+                    self.registers.write(reg, value);
+                    addr = addr.wrapping_sub(4);
+                }
+                self.registers.write(2, sp.wrapping_add(stack_adj));
+                if op.zeroes_a0() {
+                    self.registers.write(10, 0);
+                }
+                if op.returns() {
+                    return Ok(self.registers.read(1));
+                }
+                Ok(next_pc)
+            }
+        }
+    }
 }
