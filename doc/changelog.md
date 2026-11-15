@@ -8,6 +8,8 @@
 ## [Unreleased]
 
 ### Added / 新增
+- `rp2350-periph`: DMA transfer modes and data-path features — `TRANS_COUNT` `TRIGGER_SELF`/`ENDLESS`, `CTRL.BSWAP`, `SNIFF` (CRC-32/CRC-16/parity/checksum with `BSWAP`/`OUT_REV`/`OUT_INV` and seed-via-`SNIFF_DATA`), `HIGH_PRIORITY` arbitration and `(X/Y)*sys_clk` pacing timers with `Dma::advance`; 18 tests including the CRC-32/CRC-16 known vectors
+- `rp2350-gdb` / `rp2350-cli`: read and access watchpoints — `Z3`/`Z4` RSP packets with `T05rwatch:`/`T05awatch:` stop replies, an installable SRAM read watch in `rp2350-core` (`watch::set_read_watch`/`check_read`/`take_read_hit` behind an `AtomicBool` fast gate) and `MachineTarget` hit ordering; `qRcmd` reaches `monitor reset`/`info`/`halt`; ~30 new tests plus a real `arm-none-eabi-gdb` `rwatch`/`awatch` smoke test
 - `rp2350-periph` / `rp2350-cli`: dual-core execution — real Cortex-M33 core1 (`SIO_CPUID` per-core views, `{0,0,1,vtor,sp,entry}` launch handshake, PSM `FRCE_OFF.PROC1` reset/release, per-core PPB replay and IRQ routing), `Machine` steps both cores and reports `[run] core1 state=…`; pokeemerald's `core1_render` now runs and drives HSTX + PPU
 - `rp2350-periph`: `gpio_pads::GpioPads` shared pad electrical model — `PADS_BANK0` pulls drive `SIO_GPIO_IN` when a pin is an input, host-injected external levels win; `BootPeripherals::pads()`; fixes the "all buttons held" RFU soft reset in the GBA firmware
 - `rp2350-periph`: HSTX expander is now paced by the pixel clock — `2 * CSR.CLKDIV` `clk_sys` cycles per pixel, per-command word timing, a 256-word scanline block lasts 800 pixel periods; `output_words()`/`fifo_overrun()`/`fifo_not_full()`; removes the 20x over-draining that dropped words and desynchronised command/data phase
@@ -96,6 +98,11 @@
 - `doc/changelog.md`：更新「Planned」列表（双核/HSTX/egui 画布/DSP/GDB 已完成，改为 PIO FUNCSEL、WFI/WFE 调度、PSRAM XIP、MCP TLS、多核 GDB `vCont`、TMDS 串行化）
 
 ### Fixed / 修复
+- `rp2350-periph`: TIMER interrupt registers were at the RP2040-era offsets (`0x38/0x3C/0x40/0x44` instead of `0x3C/0x40/0x44/0x48`), `INTF` was treated as write-one-to-clear instead of a force mask, alarms never auto-disarmed and there was no `TIMER1`; all four are fixed, `INTS = (INTR | INTF) & INTE` drives the four lines and `TIMER1` at `0x400B_8000` shares the microsecond timebase with independent alarms/IRQs
+- `rp2350-arm`: `enter_exception` never wrote `xPSR[8:0]` (IPSR), so `MRS IPSR` returned 0 and pico-sdk's `alarm_pool_irq_handler` selected the wrong timer/alarm and crashed with `Bus error 0x00757C08`; the exception number is now latched on entry
+- **Reverted**: the `WFI`/`WFE`/`SEV` sleep semantics from `9a6b088` (kept in history) are not in the current tree. The architecture side is implemented, but emerald's core-1 launch handshake stalls when core 0 sleeps in `multicore_fifo_pop_blocking` (the SIO FIFO read is non-blocking in the model) and the fast-forward needed to make long sleeps cheap also races the USB host bridge. Re-landing needs blocking `FIFO_RD`/FIFO-IRQ semantics first; see the Planned list.
+- `rp2350-periph`: SIO hardware spinlocks were missing and `SPINLOCK_ST` read `0xFFFF_FFFF` (all free, the opposite of the reset value); `SPINLOCK0..31` at `0x100 + 4n` now claim on read, release on write, share state across cores and report the real bitmap; `Sio::spinlock_state()` diagnostics, 11 tests
+- `rp2350-arm`: the exclusive monitor was a `thread_local!`, so both cores stepped on one host thread shared it and core0's `LDREX` could satisfy core1's `STREX`; the monitor now lives in `CortexM33Registers` (per core), `CLREX` (`0xF3BF_8F2F`) is implemented instead of decoding as undefined, and 9 tests cover cross-core isolation and size mismatches
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
 - `rp2350-arm`: external interrupts used the IRQ number as the exception number and fetched the vector from `VTOR + irq * 4`; they now use exception number `16 + irq`
 - `rp2350-arm`: `SCB_VTOR` writes now reach the core (replayed from the PPB log) and the exception vector fetch uses the programmed offset
@@ -129,14 +136,13 @@
 
 ### Planned / 计划中
 - PIO pin function select (`IO_BANK0` `GPIOx_FUNC`) so PIO/UART pins share the pad matrix
-- `WFI`/`WFE`/`SEV` sleep and event semantics wired into the dual-core driver
-- SIO hardware spinlocks and per-core exclusive monitors (multicore correctness)
+- `WFI`/`WFE`/`SEV` sleep semantics (reverted from `9a6b088`): needs blocking `SIO_FIFO_RD`/FIFO-IRQ semantics so the core-1 launch handshake can sleep
 - HSTX TMDS serialiser and DVI bit timing; pixel-capture API for hosts
 - QSPI Flash XIP + PSRAM XIP
 - egui: wiring persistence and a device palette for the Virtual Lab
 - MCP TLS transport
-- GDB: read/access watchpoints (`rwatch`/`awatch`), `monitor` commands, multi-core `vCont`
-- DMA: `BSWAP`, `SNIFF`/checksum, timer DREQ pacing, high-priority arbitration
+- GDB: multi-core `vCont` and target-side `monitor` extensions beyond reset/info/halt
+- `TIMER`/`TIMER1`: remaining RP2350 timer semantics beyond alarms (`PAUSE`/`DBGPAUSE`, `LOCKED`)
 
 ---
 

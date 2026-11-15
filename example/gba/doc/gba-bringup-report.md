@@ -103,7 +103,21 @@ HSTX、USB CDC stdio、GPIO pad、时钟/复位与 Flash XIP。
    是忽略写入的掩膜 ROM，而模拟器的 ROM 区域拒绝写入，首次 SETUP 数据阶段即以
    `Bus error at 0x0` 失败。`repl` 在枚举前安装读透传/写丢弃的掩膜 ROM 视图，
    现在能读到固件 stdio 横幅。
-8. **Smaller gaps.** `MSPLIM`/`PSPLIM` (`msr msplim, r0` in the SDK crt0) were
+8. **`TIMER` register map and `IPSR`.** `sleep_ms` only forces the timer IRQ
+   (`hw_set_bits(&TIMER0->intf, 1<<3)`) and lets `alarm_pool_irq_handler` program
+   the hardware alarm. The model had the RP2040-era interrupt offsets
+   (`0x38/0x3C/0x40/0x44`), treated `INTF` as write-one-to-clear instead of a
+   force mask, never auto-disarmed a fired alarm and had no `TIMER1`; on top of
+   that `enter_exception` never wrote `xPSR[8:0]`, so `MRS IPSR` read 0 and the
+   handler picked the wrong timer/alarm and crashed at `0x00757C08`. All are
+   fixed (see `doc/changelog.md`), and emerald boots through `sleep_ms` again.
+   `sleep_ms` 只强制定时器中断（`hw_set_bits(&TIMER0->intf, 1<<3)`），再由
+   `alarm_pool_irq_handler` 编程硬件 alarm。模型原本用 RP2040 时代的中断偏移
+   （`0x38/0x3C/0x40/0x44`）、把 `INTF` 当作 W1C 而非强制位、alarm 到期不自动
+   解除武装，也没有 `TIMER1`；此外 `enter_exception` 从不写 `xPSR[8:0]`，导致
+   `MRS IPSR` 读到 0，处理程序选错 timer/alarm 并在 `0x00757C08` 崩溃。以上均已
+   修复（见 `doc/changelog.md`），emerald 重新能穿过 `sleep_ms`。
+9. **Smaller gaps.** `MSPLIM`/`PSPLIM` (`msr msplim, r0` in the SDK crt0) were
    undefined instructions; `BUSCTRL` (`0x4006_8000`) was unmapped and warned on
    every boot. Both are modelled now.
    `MSPLIM`/`PSPLIM`（SDK crt0 的 `msr msplim, r0`）曾是未定义指令；
@@ -197,7 +211,7 @@ pixels=38400 nonzero=38396 unique=32
 |-------------|----------------|
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic` | pass |
-| `cargo test --all-features` | pass (arm 371, periph 237, cli 79 + 1 ignored, egui 35, gdb 44, usb 44, usb-host 20, …) |
+| `cargo test --all-features` | pass (counts grow with each task; see `doc/changelog.md` — arm 380, periph 281, cli 87 + 1 ignored, gdb 66, core 65, usb 44, usb-host 20, egui 35, …) |
 | `cargo doc --no-deps` | pass, no warnings |
 | FV-1 (`RPI_PICO2-RISCV` `print(6 * 7)`) | `42` |
 | FV-2 (`RPI_PICO2` `print(6 * 7)`) | `42` |
@@ -224,7 +238,8 @@ pixels=38400 nonzero=38396 unique=32
 - HSTX has no dedicated interrupt on silicon; the model borrows `SPARE_IRQ_0`
   (46) for underrun/command-done reporting.
   芯片上 HSTX 没有专用中断；模型借用 `SPARE_IRQ_0`（46）报告断流/命令完成。
-- Core-1 SIO hardware spinlocks, `LDREX/STREX` monitors, `WFI/WFE/SEV`
-  scheduling, multi-core GDB `vCont` and PSRAM are still unmodelled.
-  core1 的 SIO 硬件自旋锁、`LDREX/STREX` 监视器、`WFI/WFE/SEV` 调度、多核 GDB
-  `vCont` 与 PSRAM 仍未建模。
+- `WFI`/`WFE`/`SEV` sleep and event scheduling, multi-core GDB `vCont`, PSRAM and
+  the `IO_BANK0` pin-function mux are still unmodelled. SIO hardware spinlocks and
+  the per-core `LDREX`/`STREX` exclusive monitors **are** modelled now.
+  `WFI`/`WFE`/`SEV` 睡眠与事件调度、多核 GDB `vCont`、PSRAM 与 `IO_BANK0` 引脚
+  功能复用仍未建模；SIO 硬件自旋锁与每核 `LDREX`/`STREX` 独占监视器**已建模**。

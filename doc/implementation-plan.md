@@ -21,14 +21,14 @@
 > | 领域 / Area | 状态 / Status | 已落地 / Landed | 待办 / Remaining |
 > |---|---|---|---|
 > | PIO | 🚧 | 3 blocks × 4 SMs 寄存器块、FIFO、指令存储；状态机执行（9 类指令、autopush/autopull、wrap、stall）；引脚映射、side-set、delay、CLKDIV、FIFO join、DBG_PADOUT/PADOE、共享句柄、IRQ 路由、主循环 tick、DMA DREQ 选择器 0..23 | PINCTRL FUNCSEL、跨块 IRQ 模式 1/3 |
-> | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`）、`Z2` 写监视点（SRAM 值变化检测）、`target.xml`（`qXfer:features:read`） | 读/访问监视点、多核 `vCont`、monitor 命令 |
+> | GDB | ✅ | RSP 协议层、TCP 会话循环、CLI `gdb` 接线（`MachineTarget`）、写/读/访问监视点（`Z2`/`Z3`/`Z4`，`T05watch/rwatch/awatch`）、`target.xml`、`qRcmd` → `monitor reset/info/halt` | 多核 `vCont`、扩展 monitor 命令 |
 > | MCP | ✅ | JSON-RPC 方法层（`initialize`/`tools/list`/`tools/call`）、HTTP 传输、CLI `mcp-serve`、Bearer 鉴权（`--auth-token`/环境变量） | TLS、插件热加载 |
 > | 插件 / Plugins | ✅ | ABI、`DeviceManager::scan_and_load`/`reload`、CLI `list-devices`/`wire`/`--reload`/`--watch`、LED 与 UART Terminal 插件 | GUI 调色板/连线、接线持久化 |
-> | DMA | 🚧 | 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ（含 PIO 0..23 与 `DREQ_HSTX=52`）、abort、IRQ、SET/CLR/XOR 别名、`TRANS_COUNT` 重载语义与 3 通道环形链（42,912 字三圈校验）、CLI `Machine` 每 64 步泵送 | BSWAP/sniff/优先级、定时器 DREQ 节拍、周期精确仲裁 |
+> | DMA | 🚧 | 16 通道模型、控制块、AL 触发、byte/half/word、RING、CHAIN_TO、DREQ（含 PIO 0..23 与 `DREQ_HSTX=52`）、abort、IRQ、别名窗口、`TRANS_COUNT` 重载/`TRIGGER_SELF`/`ENDLESS`、`BSWAP`、`SNIFF`（CRC-32/CRC-16/奇偶/求和 + `BSWAP`/`OUT_REV`/`OUT_INV`）、`HIGH_PRIORITY`、节拍定时器 `(X/Y)*sys_clk`、3 通道环形链校验、CLI 每 64 步泵送 | `SNIFF` 其余 `CALC` 模式、周期精确仲裁、`PERFCTR` |
 > | HSTX | 🚧 | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS/NOP 命令、像素时钟节拍（256 字行块 = 800 像素周期）、`DREQ_HSTX` FIFO 空间、宿主 drain/scanline、下溢 IRQ | DVI/TMDS 时序与编码、引脚/时钟、PIO 耦合 |
 > | ARM ISA | ✅ | Thumb-16/32、FPv5-SP、单精度算术/比较/转换/VSEL/VRINT、FPCCR/LSPACT 惰性压栈与扩展帧、DSP 并行 SIMD/GE 标志、饱和/打包、折半/双乘/宽乘、`MSPLIM`/`PSPLIM` | 双精度算术、FPSCR 陷阱模型、`SMLALxy` |
 > | 官方 perfbench | ✅ | `repl --stdio` + 本地 pyboard shim；Arm 与 RISC-V 各 24/24 通过 CPython 真值（[报告](perfbench-report.md)） | 可选：`-a 8` 方差、更大 N/M、外设类基准 |
-> | 双核 / Dual-core | ✅ | 真实 core1 执行：SIO 按核视图与 `{0,0,1,vtor,sp,entry}` 启动握手、PSM `FRCE_OFF.PROC1` 复位/释放、按核 PPB 回放与 IRQ 路由、`Machine` 双核步进；emerald 的 `core1_render` 驱动 HSTX/PPU | GDB 多核 `vCont`、SIO 硬件自旋锁、`LDREX/STREX` 监视器 |
+> | 双核 / Dual-core | ✅ | 真实 core1 执行：SIO 按核视图与 `{0,0,1,vtor,sp,entry}` 启动握手、PSM `FRCE_OFF.PROC1` 复位/释放、按核 PPB 回放与 IRQ 路由、`Machine` 双核步进；SIO 硬件自旋锁 `SPINLOCK0..31`（读即取/写即放/`SPINLOCK_ST`）、每核独占监视器 + `CLREX`；emerald 的 `core1_render` 驱动 HSTX/PPU | `WFI`/`WFE`/`SEV` 睡眠（需先实现阻塞式 `SIO_FIFO_RD`/FIFO IRQ，见 `9a6b088`）、GDB 多核 `vCont`、跨核总线监听 |
 >
 > 状态标记：✅ 完成（P1 范围） · 🚧 部分完成 · ⏳ 未开始。
 > Status markers: ✅ done for P1 scope · 🚧 partial · ⏳ not started.
