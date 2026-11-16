@@ -71,7 +71,9 @@ jobs:
           # `--plugin-dir dist` works out of the box.
           # 第一方虚拟设备插件与二进制同目录分发，`--plugin-dir dist` 即可使用。
           for plugin in rp2350_led_plugin rp2350_uart_terminal; do
-            for file in target/${{ matrix.target }}/release/*${plugin}*; do
+            for file in target/${{ matrix.target }}/release/*${plugin}.dll \
+                        target/${{ matrix.target }}/release/*${plugin}.so \
+                        target/${{ matrix.target }}/release/*${plugin}.dylib; do
               [ -f "$file" ] || continue
               ext="${file##*.}"
               stem="$(basename "$file" ".$ext")"
