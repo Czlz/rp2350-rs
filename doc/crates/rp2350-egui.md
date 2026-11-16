@@ -12,6 +12,8 @@
 > 标签页（`play_view.rs`）实时显示 RGB565 帧并映射键盘，已通过
 > `play_view/cli_source.rs` 接到真实 `PlaySession`（`main.rs` 默认挂载），
 > 并支持命令行直启（`cli.rs`：`--profile` 或显式参数，首帧前自动 Start）。
+> 「游戏」工具栏另有 `Threads / 线程` 开关与跨核窗口输入（默认 off，确定性；
+> on 为交互模式，窗口内非位可复现）。
 > 下文的 HSTX 视频解码面板、内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
 >
 > **Status** (EN): skeleton — `EmuApp` (`app.rs`), the register panel
@@ -25,9 +27,11 @@
 > the Play tab (`play_view.rs`) shows live RGB565 frames with keyboard input,
 > wired to the real `PlaySession` through `play_view/cli_source.rs` and attached
 > by `main.rs` by default. Command-line launch is available too (`cli.rs`:
-> `--profile` or explicit flags, automatic Start before the first frame). The
-> HSTX video decoder panel and the memory/GPIO/terminal/debugger panels below
-> remain target designs.
+> `--profile` or explicit flags, automatic Start before the first frame), and the
+> Play toolbar exposes a `Threads / 线程` switch plus a cross-core window (off by
+> default = deterministic; on = interactive, not bit-reproducible inside a
+> window). The HSTX video decoder panel and the
+> memory/GPIO/terminal/debugger panels below remain target designs.
 
 ---
 
@@ -44,6 +48,8 @@ rp2350-egui/
     ├── palette.rs        # 内置设备调色板模板（已落地 / landed）
     ├── canvas_io.rs      # 画布文本格式 to_text/from_text（已落地 / landed）
     ├── play_view.rs      # 游戏标签页：帧纹理、缩放、键盘映射、工具栏（已落地 / landed）
+    ├── play_view/core_mode.rs # 核执行器开关：Threads 复选框、窗口输入、运行中锁定（已落地 / landed）
+    ├── play_view/core_tests.rs # 核执行器开关测试（仅 test 构建 / test-only）
     ├── play_view/types.rs # 帧/统计/请求/PlaySource/PlayStarter（已落地 / landed）
     ├── play_view/fields.rs # 工具栏文本字段 → 数值 + profile 载入（已落地 / landed）
     ├── play_view/cli_source.rs # PlaySession → PlaySource 适配器（已接线 / wired）
@@ -54,6 +60,7 @@ rp2350-egui/
     ├── play_view/params_tests.rs # 字段与 profile 测试（仅 test 构建 / test-only）
     ├── canvas_tests.rs   # 调色板/持久化测试（仅 test 构建 / test-only）
     ├── cli.rs            # 命令行直启：clap 参数 → PlayFields → 自动 Start（已落地 / landed）
+    ├── cli/core_tests.rs # 核执行器命令行选项测试（仅 test 构建 / test-only）
     └── main.rs           # binary entry / 二进制入口
 
 Read-only peripheral panels landed in `panels.rs` + `app.rs`:
@@ -298,6 +305,12 @@ pub trait PlayStarter {
 }
 ```
 
+`PlayRequest` 还携带 `core_threads: bool` 与 `core_window: u32`，逐字段来自工具栏
+或 profile；`false` 是确定性单线程默认值。
+`PlayRequest` also carries `core_threads: bool` and `core_window: u32`, taken
+field by field from the toolbar or a profile; `false` is the deterministic
+single-threaded default.
+
 宿主侧适配现在就在本 crate 内（`play_view/cli_source.rs`，不再需要 CLI 的 `gui` 子命令）：
 
 ```rust
@@ -340,7 +353,13 @@ impl PlayStarter for CliPlayStarter {
             trace_steps: 0,
         };
         let options = MachineOptions { arch: None, max_cycles: u64::MAX, strict_decode: false };
-        PlaySession::start(request.image, options, config)
+        // 默认 `enabled = false` 与单线程路径一致；开启后 core0/core1 各用一条线程。
+        // `enabled = false` matches the single-threaded path; on uses two threads.
+        let threads = CoreThreadOptions {
+            enabled: request.core_threads,
+            window: request.core_window,
+        };
+        PlaySession::start_with_core_threads(request.image, options, threads, config)
             .map(|session| Box::new(CliPlaySource::new(session)) as Box<dyn PlaySource>)
     }
 }
@@ -398,8 +417,12 @@ appears once the fields are complete.
   默认值；`PlayFields::default()` 的音频 sink 元数据（48 kHz / 2 声道 / 48 000 样本）
   仍是唯一的通用默认；
 - 合并后立即调用 `PlayFields::inputs()`（Start 使用的同一个函数）校验。缺
-  `--file`/`--fb`/步数、`--audio` 缺 block/sm、坏 `--fb`、`--profile` 不可读或解析
-  失败都在开窗前打印双语错误并以**退出码 2** 结束，不 panic、不闪现窗口；
+  `--file`/`--fb`/步数、`--audio` 缺 block/sm、坏 `--fb`、`--core-window` 越界或
+  非数字、`--profile` 不可读或解析失败都在开窗前打印双语错误并以**退出码 2**
+  结束，不 panic、不闪现窗口；
+- 核执行器开关同样走这条路径：`--core-threads` 是布尔 flag，`--core-window <N>`
+  复用 `rp2350_cli::run::parse_core_window`（`1..=4096`），默认 `off` / `64`；
+  profile 可用 `core_threads = true|false` 与 `core_window = N` 提供它们；
 - 参数合法时，`main.rs` 构造
   `EmuApp::sample().with_play_starter(CliPlayStarter).with_play_fields(fields).with_play_auto_start(true)`。
   `eframe` 的窗口创建回调在原生窗口存在之后、**首帧之前**调用
@@ -426,12 +449,18 @@ appears once the fields are complete.
 | `--audio-rate <HZ>` | u32 | 音频 sink 采样率（通用默认 48 000） |
 | `--audio-channels <N>` | u8 | 声道数（通用默认 2） |
 | `--audio-capacity <N>` | usize | sink 保留样本数（通用默认 48 000） |
+| `--core-threads` | 开关 | core0/core1 各用一条宿主线程；默认 off（确定性） |
+| `--core-window <N>` | `1..=4096` | 跨核同步之间的机器步数（默认 64） |
 | `--no-auto-start` | 开关 | 只预填字段，不自动开始 |
 | `--help` / `--version` | — | 由 clap 处理，退出码 0 |
 
 ```bash
 # profile 直启（示例 profile 属于 example/，不是 crate 默认值）
 cargo run -p rp2350-egui --release -- --profile example/gba/profile.conf
+
+# 交互式双核线程模式（窗口内非位可复现，仅用于手动游玩）
+cargo run -p rp2350-egui --release -- \
+    --profile example/gba/profile.conf --core-threads --core-window 64
 
 # 等价显式参数（不使用 profile）
 cargo run -p rp2350-egui --release -- \
@@ -455,11 +484,13 @@ writes the status line and the window stays open. Auto-starts log one stable
 stderr line (`[rp2350-egui] auto-start profile=…` or `… file=… fb=…
 steps_per_frame=…`). `--no-auto-start` prefills without starting, `--help` /
 `--version` behave normally, and no play option at all keeps the historical empty
-fields plus manual flow.
+fields plus manual flow. `--core-threads` enables the two-thread core executor
+and `--core-window N` sets its window (1..=4096, default 64); both are off/64 by
+default, and a profile may supply `core_threads`/`core_window` (the CLI wins).
 
 ### Toolbar and fields / 工具栏与字段
 
-工具栏分四行输入 + 一行 Start/Stop/Reset + 一行状态。worker 运行中输入区整体置灰
+工具栏分五行输入 + 一行 Start/Stop/Reset + 一行状态。worker 运行中输入区整体置灰
 （会话只在启动时读取参数），Start 与 Stop 仍可点击；`Reset / 复位` 只在有可重建的
 会话时可用（运行中，或客户机请求 `AIRCR.SYSRESETREQ` 后停机，见下节）。
 
@@ -476,13 +507,16 @@ fields plus manual flow.
 | `audio_rate` | `48000` | 写入音频 sink 的采样率（宿主属性，故有通用默认） |
 | `audio_channels` | `2` | 写入音频 sink 的声道数 |
 | `audio_capacity` | `48000` | sink 保留的样本数（48 kHz 下 1 秒） |
+| `core_threads` | `false` | 勾选后 core0/core1 各用一条宿主线程；按会话固定，运行中置灰 |
+| `core_window` | `64` | 跨核同步窗口 `1..=4096`；非法值写状态行且不启动 |
 | `status` | `idle / 空闲` | `running` / `stopped` / `reset` / `start failed` / `reset failed` / `profile loaded` / `profile failed` |
 
 字段的解析与校验集中在 `play_view/fields.rs`（`PlayFields::inputs`）：
 
 - 先查 `firmware`、`frame`（为空 → `missing firmware` / `missing frame buffer`，双语）；
 - 再查 `steps_per_frame`（必须 > 0）、`frame` 几何（`FrameSpec::parse`）、`buttons`
-  （`parse_button_mask`）；
+  （`parse_button_mask`）、`core_window`（复用 CLI 的 `parse_core_window`，
+  `1..=4096`；空值报 `missing core window`）；
 - 最后在音频开启时解析 `audio_*`：块/状态机为空报 `missing audio PIO block`，
   非整数报 `bad audio … : expected an integer`，采样率/声道/容量为 0 报
   `… must be greater than zero`。
@@ -500,8 +534,12 @@ fields plus manual flow.
 | `buttons` | `buttons`，重建为 `0xNNN` |
 | `audio` | `audio` 复选框 |
 | `audio_block` / `audio_sm` / `audio_rate` / `audio_channels` / `audio_capacity` | 对应的音频输入框 |
+| `core_threads` | `Threads / 线程` 复选框（`true`/`false`，也接受 `on`/`off`、`1`/`0`） |
+| `core_window` | 窗口输入框（`1..=4096`） |
 
 - 只覆盖 profile 给出的键，其余字段保持用户当前输入；重复载入得到相同文本。
+- `core_threads`/`core_window` 由 GUI 自行从文本中摘出后解析（CLI 的 profile 模式
+  尚未包含这两个键）；被摘出的行替换为空行，因此其它键的 `profile line N` 行号不变。
 - **解析失败不 panic、不启动**：状态行显示 `profile failed / 载入失败 — profile line N: …`
   （行号来自解析器），字段保持不变。
 - 路径为空 → `profile path is empty / profile 路径为空`；读不到文件 →
@@ -536,6 +574,47 @@ the only way the GUI adopts guest-specific values other than typing them.
 Keys only apply while the picture region owns focus: click the picture to focus it
 (blue outline, hint disappears) and click elsewhere to release it; with no focus
 the mask is not written. Mapping is pure (`KeyState`, `mask_from_keys`).
+
+### CPU 线程模式 / Threaded core executor
+
+工具栏的 `Threads / 线程` 复选框与 `Window / 窗口` 输入框直接映射到
+`rp2350_cli::run::CoreThreadOptions`（`enabled` / `window`），由
+`CliPlayStarter` 调用 `PlaySession::start_with_core_threads` 传入；默认
+`threads=off win=64`，与 CLI 的 `--core-threads`/`--core-window` 一致。
+
+- **off（默认，确定性）**：仍是 MT-3a 的单线程批量步进，客户机指令、周期与内存
+  访问顺序逐字节复现历史路径。可复现性验收、性能对比、CI 与 FV 门禁都应使用它。
+- **on（交互模式，非确定性）**：core0/core1 各运行在一条宿主线程上，调用方线程在
+  **窗口边界**统一处理 DMA/PIO/HSTX/TIMER/SysTick/IRQ/SIO/SEV。窗口内两核内存访问
+  的先后由宿主调度决定，因此**窗口内不可位复现**；窗口为 64 步时跨核事件最多延迟
+  两个窗口（252 MHz 下约 0.5 µs）。默认 64 是吞吐与事件延迟的平衡点：更小的窗口
+  屏障更频繁、更慢但交错更细，更大的窗口更快但外设服务间隔变长（实测窗口 256 会
+  增加 HSTX 欠载）。
+- **适用范围**：只有 Arm 映像且 core1 已启动时才会真正启用双线程；RISC-V 与单核
+  固件仍走串行路径（开关可勾选，但 `Machine` 不会创建核线程）。需要逐位一致时保持
+  off；手动游玩、希望利用双核吞吐时再打开 on。
+- **运行中锁定**：模式与窗口按会话固定，worker 运行中复选框/输入框置灰，
+  `PlayView::set_core_threads` / `set_core_window` 也会忽略调用；状态栏固定显示
+  `threads=on|off win=N`，on 时追加
+  `non-deterministic within window / 窗口内非确定性`。
+
+English: the `Threads / 线程` checkbox and `Window / 窗口` input map onto
+`rp2350_cli::run::CoreThreadOptions` and are handed to
+`PlaySession::start_with_core_threads` by `CliPlayStarter`; the defaults are
+`threads=off win=64`, matching the CLI's `--core-threads`/`--core-window`.
+**Off** is MT-3a's deterministic single-threaded batch step (byte-for-byte
+reproducible; use it for acceptance, performance comparisons, CI and FV gates).
+**On** runs core0/core1 on two host threads while the caller coordinates
+DMA/PIO/HSTX/TIMER/SysTick/IRQ/SIO/SEV at window boundaries: the order of memory
+accesses inside a window depends on the host scheduler, so it is **not
+bit-reproducible within a window**; a 64-step window delays cross-core events by
+at most two windows (≈0.5 µs at 252 MHz). Smaller windows interleave more finely
+but add barriers; larger windows are faster but service peripherals less often
+(a 256-step window measured more HSTX underruns). Only Arm images with a live
+core1 actually start threads; RISC-V and single-core guests stay on the serial
+path. The mode is fixed per session (inputs grey out while running), and the
+status bar always shows `threads=on|off win=N`, with an explicit non-determinism
+marker when on.
 
 ### Texture and scaling / 纹理与缩放
 
@@ -694,9 +773,13 @@ lost and nothing can resume from the reset point.
 ```
 frame=<index> steps=<..> fps=<..> steps/s=<..> replaced=<..> · running|stopped
 buttons / 按键: A|Right
+threads=on|off win=<N> · non-deterministic within window / 窗口内非确定性（仅 on）
 audio=<backend> tap_samples=<n> dropped=<n> underruns=<n> produced=<n>/s need=<n>/s
 ```
 
+`threads=` 行来自工具栏/CLI 的核执行器开关（`format_core_threads`），默认
+`threads=off win=64`；on 时追加非确定性提示，窗口为空文本渲染为 `win=?`（校验不会
+让它进入运行中的会话）。
 `audio=` 是宿主输出后端（`cpal` / `null`），无输出时为
 `audio=off underruns=0 tap_samples=0 dropped=0`。`tap_samples` 是从 tap 实际取走的
 **交替**样本数，`dropped` 是 tap 溢出与内部队列丢样之和，`underruns` 每帧从输出线程
@@ -719,6 +802,11 @@ line ends with
 ` · audio: emulation slower than real time (underruns=…, produced=…/s, need=…/s)`;
 the silence is then **expected**: the playback side inserts silence and counts
 underruns, never looping stale samples.
+
+The `threads=` line comes from `format_core_threads` and mirrors the toolbar/CLI
+core switch (`threads=off win=64` by default); when on it appends the
+non-determinism marker, and an empty window text renders as `win=?` (validation
+never lets that reach a running session).
 
 ### 帧率说明 / Frame rate
 
@@ -749,8 +837,11 @@ but slow. See the P0 rows of the playability plan for the way forward.
 - **无手柄 / 无按键重绑**：键盘→GP 的映射是固定前端约定（下表），但 `buttons` 掩码
   决定哪些引脚真的被驱动，因此换固件时改掩码即可。
 - **无暂停 / 单步 / 截图**：只有 Start、Stop 与 Reset；帧率与步数由 `steps_per_frame` 决定。
+- **线程模式 on 不是可复现模式**：窗口内顺序由宿主调度决定，仅用于交互游玩；所有
+  逐位对比、性能基线与门禁必须保持 `Threads / 线程` 关闭（默认 off）。
 - **命令行直启同样不做示例猜测**：`--profile` / 显式参数都由用户提供，缺字段或
-  profile 非法时在开窗前以退出码 2 结束；`--no-auto-start` 只预填字段。
+  profile 非法时在开窗前以退出码 2 结束；`--no-auto-start` 只预填字段；
+  `--core-threads`/`--core-window` 与工具栏共用同一校验路径。
 - 依赖宿主挂载 `PlayStarter`：`PlayView::default()` 仍无 starter（便于测试注入假实现），
   但原生入口 `main.rs` 已默认挂载 `CliPlayStarter`，所以 `cargo run -p rp2350-egui`
   的「游戏」标签页可直接出画面（仍需填入固件与帧缓冲，或使用命令行直启）。
@@ -768,7 +859,10 @@ but slow. See the P0 rows of the playability plan for the way forward.
   the user, a missing/invalid request exits with code 2 before the window, and
   `--no-auto-start` only prefills. There are still no save states, no gamepad, no
   pause/step/screenshot; `Reset` rebuilds the session from the current fields but
-  cannot resume prior progress.
+  cannot resume prior progress. Threading **on** is not a reproducible mode
+  (within-window ordering follows the host scheduler); keep it off for bit-exact
+  comparisons, performance baselines and gates. Command-line launch uses the
+  same validation path for `--core-threads`/`--core-window` as the toolbar.
 
 ### Tests / 测试
 
@@ -781,6 +875,10 @@ but slow. See the P0 rows of the playability plan for the way forward.
 - `fit_size`：1280×720 → 4×（960×640）、320×240 → 1×（240×160）、80×60 → 小数
   缩小且保持 3:2、零尺寸/零帧返回 `Vec2::ZERO`；
 - `format_stats` 的进度行与 `halted` 后缀、`describe_mask` 的按键名；
+- `format_core_threads`（`play_view/core_tests.rs`）：off → `threads=off win=64`、
+  on → `threads=on win=32` 且带非确定性标记、空窗口 → `win=?`；开启线程的视图在
+  80×60 下无头渲染不 panic；运行中 `set_core_threads`/`set_core_window` 被忽略，
+  Stop 后才生效；
 - 无会话时只渲染「未运行」占位且不 panic；
 - 80×60 / 320×240 / 1280×720 三种尺寸无窗口渲染 `ui()`；
 - 同一帧不重复上传（`uploads` 计数与 `last_frame`）；
@@ -829,7 +927,13 @@ but slow. See the P0 rows of the playability plan for the way forward.
 - `format_frame` 对紧凑与带跨度规格往返稳定；
 - **真实 starter 的音频接线**：`audio: None` → `audio_source()` 为 `None`（未安装
   tap）；`Some{rate 13440, channels 2}` → tap 的 `format()` 报告同样的采样率与声道；
-  越界 PIO 块（`9`）被 `PlaySession::start` 拒绝。
+  越界 PIO 块（`9`）被 `PlaySession::start` 拒绝；
+- **核执行器字段**：默认 `false`/`64` 且 `PlayInputs` 报告 `64`；窗口 `0`、`-1`、
+  `abc`、空值都只写状态行（`核窗口大小非法` / `missing core window`）且不调用
+  starter；开启后 `PlayRequest.core_threads/core_window` 逐项透传，启动状态行含
+  `threads=on win=32`；profile 的 `core_threads`/`core_window` 被应用，非法
+  `core_window = 0` 报 `profile line 5` 且字段保持不变；真实 `CliPlayStarter` 以
+  `core_threads = true, window = 32` 启动合成 UF2 会话并在 shutdown 前保持运行。
 
 English: the field/profile suite pins the genericity rule (every text field starts
 empty; only host sink metadata has a generic default), the missing
@@ -839,6 +943,11 @@ for the real starter, through `audio_source()`/`AudioFormat`), the audio field
 validation messages, the `example/gba/profile.conf` round-trip which is skipped
 when the file is absent, the `profile line N` rejection that leaves fields
 untouched, `format_frame` round-trips, and the out-of-range PIO block rejection.
+The core-executor tests pin the `false`/`64` defaults, every invalid window
+(`0`, `-1`, text, empty) writing only the status line without a starter call, the
+field-by-field handover into `PlayRequest`, the profile keys (including the
+`profile line N` rejection that leaves fields untouched), and a real
+`CliPlayStarter` session started with `core_threads = true, window = 32`.
 
 `play_view/reset_tests.rs`（复位按钮，`#[cfg(test)] mod reset_tests`）：
 
@@ -868,7 +977,7 @@ status bar, the old audio output being joined before the new one is created, the
 starter-error path (old session stopped, no panic, no count), and a headless
 80×60 render plus a real pointer click on the Reset control.
 
-`cli.rs`（命令行直启，`#[cfg(test)] mod tests`，11 项）：
+`cli.rs`（命令行直启，`#[cfg(test)] mod tests` 11 项 + `cli/core_tests.rs` 7 项）：
 
 - **profile-only**：`--profile <临时 profile>` 的每个字段与 profile 一致、
   `auto_start == true`、日志行 `auto-start profile=<path>`；
@@ -884,6 +993,11 @@ starter-error path (old session stopped, no panic, no count), and a headless
   （防止示例常量回归）；单独 `--no-auto-start` 也不构成启动；
 - **示例 profile 逐项一致**：`example/gba/profile.conf` 经 CLI 解析后的每个字段与
   `rp2350_cli::play::profile::parse` 的结果逐项相等（文件不存在则跳过）。
+- **核执行器**（`cli/core_tests.rs`）：默认 `core_threads == false` 且
+  `core_window == "64"`；`--core-threads` 置 on；`--core-window 1/32/4096` 原样写入；
+  非法窗口 `0/4097/-1/abc` 被 clap 以退出码 2 拒绝，`parse_core_window` 同样拒绝
+  （含空值）；profile 的 `core_threads`/`core_window` 被载入；命令行覆盖 profile；
+  profile 中 `core_window = 0` 报 `profile line 5` + `核窗口大小非法`。
 
 `app.rs` 追加 3 项自动启动测试：假 starter 在 `auto_start = true` 时被调用**一次**
 （再次调用 `auto_start_play()` 不再启动）、`auto_start = false` 时一次都不调用且保持
@@ -894,7 +1008,10 @@ stderr log line), CLI-over-profile precedence, `--no-auto-start`, every rejectio
 path (missing `--fb`, audio without block/state machine, malformed `--fb`, missing
 profile), `--help`/`--version` exit code 0, the no-argument case still yielding
 empty fields, and a field-by-field comparison against the parsed
-`example/gba/profile.conf`. Three `app.rs` tests pin the automatic start: the fake
+`example/gba/profile.conf`. Seven `cli/core_tests.rs` cases cover the
+`false`/`64` default, `--core-threads`, `--core-window` (valid, boundary and
+invalid), profile loading, CLI-over-profile precedence and a bad profile window
+that names its line. Three `app.rs` tests pin the automatic start: the fake
 starter is called exactly once when requested (and not again on a second call),
 never when the flag is false (the view stays on Virtual Lab), and the auto-started
 view renders headlessly at 80×60 and 760×600 without panicking.

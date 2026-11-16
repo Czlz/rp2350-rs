@@ -79,6 +79,17 @@ pub struct PlayRequest {
     pub audio: Option<AudioRequest>,
     /// Button pin bitmap the worker drives / worker 驱动的按键引脚位图
     pub button_pins: u16,
+    /// Whether core0/core1 run on separate host threads
+    /// 是否让 core0/core1 运行在独立宿主线程上
+    ///
+    /// `false` (the default) is the deterministic single-threaded interleaving;
+    /// `true` is the interactive threaded executor and is not bit-reproducible
+    /// inside one cross-core window.
+    /// `false`（默认）是确定性的单线程交错；`true` 是交互式线程执行器，在单个跨核
+    /// 窗口内不可位复现。
+    pub core_threads: bool,
+    /// Machine steps per cross-core window / 每个跨核窗口的机器步数
+    pub core_window: u32,
 }
 
 /// Running play worker as seen by the GUI / GUI 视角的运行中 worker
@@ -160,6 +171,25 @@ pub fn format_stats(stats: &PlayStats, frame: u64, running: bool) -> String {
     if let Some(halted) = &stats.halted {
         text.push_str(" · halted / 停机: ");
         text.push_str(halted);
+    }
+    text
+}
+
+/// Status line of the core-executor switch / 核执行器开关的状态行
+///
+/// `threads=on` adds the non-determinism marker required by the interactive
+/// mode; `threads=off` keeps the deterministic default unadorned. An empty
+/// window text renders as `win=?` (validation rejects it before a start).
+/// `threads=on` 追加交互模式所必需的非确定性标记；`threads=off` 保持确定性默认且
+/// 不加标记。窗口文本为空时渲染为 `win=?`（启动前的校验会拒绝它）。
+#[must_use]
+pub fn format_core_threads(enabled: bool, window: &str) -> String {
+    let window = window.trim();
+    let window = if window.is_empty() { "?" } else { window };
+    let mode = if enabled { "on" } else { "off" };
+    let mut text = format!("threads={mode} win={window}");
+    if enabled {
+        text.push_str(" · non-deterministic within window / 窗口内非确定性");
     }
     text
 }

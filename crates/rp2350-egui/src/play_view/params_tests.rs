@@ -53,6 +53,8 @@ fn starter_request(audio: Option<AudioRequest>) -> PlayRequest {
         steps_per_frame: 200,
         audio,
         button_pins: 0,
+        core_threads: false,
+        core_window: 64,
     }
 }
 
@@ -378,4 +380,135 @@ fn cli_starter_rejects_an_out_of_range_audio_block() {
     })));
     let error = result.err().expect("an unknown PIO block must be rejected");
     assert!(error.contains("PIO block"), "{error}");
+}
+
+#[test]
+fn core_fields_default_to_the_deterministic_mode() {
+    let fields = PlayFields::default();
+    assert!(!fields.core_threads, "threading is opt-in");
+    assert_eq!(
+        fields.core_window, "64",
+        "the window default matches the CLI"
+    );
+
+    let fields = PlayFields {
+        firmware: String::from("unused.uf2"),
+        frame: String::from(FAKE_FRAME),
+        steps_per_frame: String::from("1"),
+        ..PlayFields::default()
+    };
+    let inputs = fields.inputs().expect("defaults validate");
+    assert!(!inputs.core_threads);
+    assert_eq!(inputs.core_window, 64);
+}
+
+#[test]
+fn core_window_rejects_invalid_values_without_starting() {
+    let shared = Arc::new(FakeShared::default());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (mut view, path) = ready_view(&shared, &requests, "params-core-window");
+    for window in ["0", "-1", "abc", ""] {
+        view.fields.core_window = window.to_owned();
+        view.start();
+        assert!(!view.is_running(), "window={window:?} must not boot");
+        let status = view.status();
+        if window.is_empty() {
+            assert!(status.contains("missing core window"), "status={status}");
+        } else {
+            assert!(
+                status.contains("核窗口大小非法"),
+                "window={window:?}: status={status}"
+            );
+        }
+    }
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "no starter call on an invalid window"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn core_settings_reach_the_starter() {
+    let shared = Arc::new(FakeShared::default());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (mut view, path) = ready_view(&shared, &requests, "params-core-pass");
+    view.fields.core_threads = true;
+    view.fields.core_window = String::from("32");
+    view.start();
+    assert!(view.is_running(), "status={}", view.status());
+    assert!(
+        view.status().contains("threads=on"),
+        "status={}",
+        view.status()
+    );
+    assert!(view.status().contains("win=32"), "status={}", view.status());
+
+    let recorded = requests.lock().unwrap();
+    assert!(
+        recorded[0].core_threads,
+        "the switch must reach PlayRequest"
+    );
+    assert_eq!(recorded[0].core_window, 32);
+    drop(recorded);
+    view.stop();
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn profile_applies_the_core_keys() {
+    let path = temp_profile(
+        "params-core-profile",
+        "firmware = demo.uf2\n\
+         frame = 0x20000000:240x160\n\
+         steps_per_frame = 10\n\
+         core_threads = true\n\
+         core_window = 32\n",
+    );
+    let mut view = PlayView::default();
+    view.fields.profile = path.display().to_string();
+    view.load_profile();
+    assert!(
+        view.status().contains("profile loaded"),
+        "status={}",
+        view.status()
+    );
+    assert!(view.fields.core_threads);
+    assert_eq!(view.fields.core_window, "32");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn profile_rejects_a_bad_core_window_without_changing_fields() {
+    let path = temp_profile(
+        "params-core-bad",
+        "# comment\n\
+         firmware = demo.uf2\n\
+         frame = 0x20000000:240x160\n\
+         steps_per_frame = 10\n\
+         core_window = 0\n",
+    );
+    let mut view = PlayView::default();
+    view.fields.profile = path.display().to_string();
+    view.load_profile();
+    let status = view.status();
+    assert!(status.contains("profile line 5"), "status={status}");
+    assert!(status.contains("profile failed"), "status={status}");
+    assert!(!view.fields.core_threads);
+    assert_eq!(view.fields.core_window, "64");
+    assert!(view.fields.firmware.is_empty(), "fields stay untouched");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn cli_starter_accepts_the_threaded_executor() {
+    let mut request = starter_request(None);
+    request.core_threads = true;
+    request.core_window = 32;
+    let source = CliPlayStarter.start(request).expect("threaded session");
+    assert!(
+        source.is_running(),
+        "the synthetic spin image keeps running"
+    );
+    let _ = source.shutdown();
 }

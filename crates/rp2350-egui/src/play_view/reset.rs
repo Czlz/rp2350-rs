@@ -17,7 +17,7 @@
 //! 复位**不是**存档：客户机 RAM、外设与时钟树都从固件映像重建，进度会丢失。字段、
 //! profile 与音频配置保留，因为它们描述的是宿主请求而不是客户机状态。
 
-use super::{PlayRequest, PlayStats, PlayView};
+use super::{PlayRequest, PlayStats, PlayView, format_core_threads};
 
 /// Status line when no [`PlayStarter`](super::PlayStarter) is attached
 /// 未挂载 [`PlayStarter`](super::PlayStarter) 时的状态行文本
@@ -89,13 +89,15 @@ impl PlayView {
         };
         let frame = request.frame.clone();
         let steps = request.steps_per_frame;
+        let threads = format_core_threads(request.core_threads, &request.core_window.to_string());
         match starter.start(request) {
             Ok(session) => {
                 // 状态行先就位，`attach` 里的音频静默提示才不会被覆盖。
                 // Set the status line first so the audio notice from `attach`
                 // is not overwritten.
-                self.status =
-                    format!("running / 运行中 · {frame} · steps/frame / 每帧步数 {steps}");
+                self.status = format!(
+                    "running / 运行中 · {frame} · steps/frame / 每帧步数 {steps} · {threads}"
+                );
                 self.attach(session);
             }
             Err(message) => self.status = format!("start failed / 启动失败: {message}"),
@@ -134,6 +136,7 @@ impl PlayView {
         }
         let frame = request.frame.clone();
         let steps = request.steps_per_frame;
+        let threads = format_core_threads(request.core_threads, &request.core_window.to_string());
         // 先停音频（join），再关旧会话（join）：与 stop/Drop 的顺序一致。
         // Stop audio (join) first, then the old worker (join), like stop/Drop.
         self.stop_audio();
@@ -148,7 +151,7 @@ impl PlayView {
             Ok(session) => {
                 self.reset_count = self.reset_count.saturating_add(1);
                 self.status = format!(
-                    "reset / 已复位 · reset count={} · {frame} · steps/frame / 每帧步数 {steps}",
+                    "reset / 已复位 · reset count={} · {frame} · steps/frame / 每帧步数 {steps} · {threads}",
                     self.reset_count
                 );
                 self.attach(session);
@@ -185,6 +188,8 @@ impl PlayView {
             steps_per_frame: inputs.steps_per_frame,
             audio: inputs.audio,
             button_pins: inputs.buttons,
+            core_threads: inputs.core_threads,
+            core_window: inputs.core_window,
         })
     }
 }

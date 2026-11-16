@@ -23,8 +23,22 @@ use rp2350_cli::play::options::{
 };
 use rp2350_cli::play::parse_button_mask;
 use rp2350_cli::play::profile;
+use rp2350_cli::run::{parse_core_threads, parse_core_window};
 
 use super::AudioRequest;
+
+/// Profile key of the threaded core executor / 线程化核执行器的 profile 键
+///
+/// `rp2350_cli::play::profile` predates this switch, so the GUI removes the two
+/// core lines before parsing the rest and applies them to [`PlayFields`] itself.
+/// The removed lines become blank, which keeps `profile line N` numbers stable.
+/// `rp2350_cli::play::profile` 尚未包含该开关，因此 GUI 先摘出这两行再解析其余
+/// 内容，并自行写入 [`PlayFields`]。被摘出的行替换为空行，保持 `profile line N`
+/// 行号不变。
+const CORE_THREADS_KEY: &str = "core_threads";
+
+/// Profile key of the cross-core window / 跨核窗口的 profile 键
+const CORE_WINDOW_KEY: &str = "core_window";
 
 /// Editable text of every Play toolbar field / 「游戏」工具栏所有字段的文本
 ///
@@ -57,6 +71,11 @@ pub struct PlayFields {
     pub audio_channels: String,
     /// Samples the audio sink retains / 音频 sink 保留的样本数
     pub audio_capacity: String,
+    /// Whether core0/core1 run on separate host threads
+    /// 是否让 core0/core1 运行在独立宿主线程上
+    pub core_threads: bool,
+    /// Machine steps per cross-core window (`1..=4096`) / 每个跨核窗口的机器步数
+    pub core_window: String,
 }
 
 impl Default for PlayFields {
@@ -76,6 +95,11 @@ impl Default for PlayFields {
             audio_rate: DEFAULT_AUDIO_RATE_HZ.to_string(),
             audio_channels: DEFAULT_AUDIO_CHANNELS.to_string(),
             audio_capacity: DEFAULT_AUDIO_CAPACITY.to_string(),
+            // 默认关闭：单线程交错是确定性的；窗口默认值必须与 CLI 一致。
+            // Off by default: the single-threaded interleaving is deterministic;
+            // the window default matches the CLI.
+            core_threads: false,
+            core_window: "64".to_owned(),
         }
     }
 }
@@ -91,6 +115,11 @@ pub struct PlayInputs {
     pub steps_per_frame: u64,
     /// Button pin bitmap (`0` drives nothing) / 按键引脚位图（`0` 不驱动任何引脚）
     pub buttons: u16,
+    /// Whether core0/core1 run on separate host threads
+    /// 是否让 core0/core1 运行在独立宿主线程上
+    pub core_threads: bool,
+    /// Machine steps per cross-core window / 每个跨核窗口的机器步数
+    pub core_window: u32,
     /// Audio wiring, `None` when capture is off / 音频接线；不捕获时为 `None`
     pub audio: Option<AudioRequest>,
 }
@@ -100,9 +129,10 @@ impl PlayFields {
     ///
     /// # Errors
     /// Returns a bilingual message naming the first missing or malformed field:
-    /// `firmware`, `frame`, `steps per frame`, `buttons` or the audio wiring.
-    /// 返回指出第一个缺失或非法字段（`firmware`、`frame`、每帧步数、按键掩码或音频
-    /// 接线）的双语消息。
+    /// `firmware`, `frame`, `steps per frame`, `buttons`, `core window` or the
+    /// audio wiring.
+    /// 返回指出第一个缺失或非法字段（`firmware`、`frame`、每帧步数、按键掩码、
+    /// 核窗口或音频接线）的双语消息。
     pub fn inputs(&self) -> Result<PlayInputs, String> {
         let firmware = self.firmware.trim();
         if firmware.is_empty() {
@@ -133,12 +163,24 @@ impl PlayFields {
             parse_button_mask(self.buttons.trim())
                 .map_err(|reason| format!("buttons / 按键掩码: {reason}"))?
         };
+        // 窗口必须始终合法（即使线程模式关闭），与 CLI 的 `--core-window` 一致。
+        // The window must always be valid (even with threading off), matching the
+        // CLI's `--core-window`.
+        let core_window_text = self.core_window.trim();
+        if core_window_text.is_empty() {
+            return Err("missing core window: fill the field or load a profile / \
+                 缺少核窗口：请填写输入框或载入 profile"
+                .to_owned());
+        }
+        let core_window = parse_core_window(core_window_text)?;
         let audio = self.audio.then(|| self.audio_request()).transpose()?;
         Ok(PlayInputs {
             firmware: firmware.to_owned(),
             frame: frame.to_owned(),
             steps_per_frame,
             buttons,
+            core_threads: self.core_threads,
+            core_window,
             audio,
         })
     }
@@ -148,19 +190,23 @@ impl PlayFields {
     ///
     /// Only the keys the profile sets are overwritten. The frame text is rebuilt
     /// as `0xADDR:WxH[:STRIDE]` and the button mask as `0xNNN`, so a reload
-    /// produces the same text. Keys without a toolbar field (`max_frames`,
+    /// produces the same text. The two core-executor keys (`core_threads`,
+    /// `core_window`) are read by this method itself because the CLI profile
+    /// schema predates them. Keys without a toolbar field (`max_frames`,
     /// `arch`, `strict_decode`, `max_cycles`) are ignored: the GUI worker always
     /// runs unbudgeted with the architecture of the image.
     /// 只覆盖 profile 给出的键。帧文本重建为 `0xADDR:WxH[:STRIDE]`、按键掩码重建为
-    /// `0xNNN`，因此重复载入得到相同文本。没有对应输入框的键（`max_frames`、
-    /// `arch`、`strict_decode`、`max_cycles`）被忽略：GUI worker 始终不设预算，并按
-    /// 映像自身选择架构。
+    /// `0xNNN`，因此重复载入得到相同文本。两个核执行器键（`core_threads`、
+    /// `core_window`）由本方法自行读取，因为 CLI 的 profile 模式尚早于它们。没有
+    /// 对应输入框的键（`max_frames`、`arch`、`strict_decode`、`max_cycles`）被
+    /// 忽略：GUI worker 始终不设预算，并按映像自身选择架构。
     ///
     /// # Errors
-    /// Returns a message when the path is empty, the file cannot be read, or the
-    /// profile is malformed (the parser message already carries `profile line N`).
-    /// 路径为空、文件无法读取或 profile 非法时返回消息（解析器消息已带
-    /// `profile line N`）。
+    /// Returns a message when the path is empty, the file cannot be read, the
+    /// profile is malformed (the parser message already carries `profile line N`),
+    /// or a core-executor value is invalid.
+    /// 路径为空、文件无法读取、profile 非法（解析器消息已带 `profile line N`）或
+    /// 核执行器值非法时返回消息。
     pub fn load_profile(&mut self) -> Result<usize, String> {
         let path = self.profile.trim();
         if path.is_empty() {
@@ -168,6 +214,10 @@ impl PlayFields {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("cannot read profile / 无法读取 profile {path}: {error}"))?;
+        // 先摘出 GUI 自己解析的核执行器键，其余内容仍交给 CLI 的 profile 解析器。
+        // Remove the core-executor keys this GUI parses itself; the rest still
+        // goes through the CLI profile parser.
+        let (text, core_threads, core_window) = extract_core_keys(&text)?;
         // 解析器的 `Display` 已是 `profile line N: ...` 形式，直接作为状态消息。
         // The parser's `Display` already reads `profile line N: ...`, which is the
         // status message we want.
@@ -211,6 +261,14 @@ impl PlayFields {
         }
         if let Some(capacity) = profile.audio_capacity {
             self.audio_capacity = capacity.to_string();
+            applied += 1;
+        }
+        if let Some(enabled) = core_threads {
+            self.core_threads = enabled;
+            applied += 1;
+        }
+        if let Some(window) = core_window {
+            self.core_window = window.to_string();
             applied += 1;
         }
         Ok(applied)
@@ -261,6 +319,80 @@ impl PlayFields {
             format!("bad {what} `{text}`: expected an integer / {what} 非法：需要整数")
         })
     }
+}
+
+/// Split the core-executor keys out of a profile document
+/// 从 profile 文本中摘出核执行器键
+///
+/// Returns the remaining text (with the two keys blanked so line numbers stay
+/// stable) plus the parsed values. Duplicate, empty or invalid values are
+/// reported with the same `profile line N` shape as the CLI parser.
+/// 返回剩余文本（两个键被置空以保持行号稳定）与解析结果。重复、空值或非法值都按
+/// CLI 解析器相同的 `profile line N` 形式报告。
+fn extract_core_keys(text: &str) -> Result<(String, Option<bool>, Option<u32>), String> {
+    let mut core_threads = None;
+    let mut core_window = None;
+    let mut rest = String::with_capacity(text.len());
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        let mut keep = true;
+        let pair = (!line.is_empty() && !line.starts_with('#'))
+            .then(|| line.split_once('='))
+            .flatten();
+        if let Some((key, value)) = pair {
+            let key = key.trim();
+            if key == CORE_THREADS_KEY || key == CORE_WINDOW_KEY {
+                keep = false;
+                let number = index + 1;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(profile_error(
+                        number,
+                        &format!("empty value for `{key}` / 值为空"),
+                    ));
+                }
+                if key == CORE_THREADS_KEY {
+                    if core_threads.is_some() {
+                        return Err(profile_error(
+                            number,
+                            &format!("duplicate key `{key}` / 重复的键"),
+                        ));
+                    }
+                    core_threads = Some(
+                        parse_core_threads(value)
+                            .map_err(|message| profile_error(number, &message))?,
+                    );
+                } else {
+                    if core_window.is_some() {
+                        return Err(profile_error(
+                            number,
+                            &format!("duplicate key `{key}` / 重复的键"),
+                        ));
+                    }
+                    core_window = Some(
+                        parse_core_window(value)
+                            .map_err(|message| profile_error(number, &message))?,
+                    );
+                }
+            }
+        }
+        if keep {
+            rest.push_str(raw);
+        }
+        // 被摘出的行留空，保持后续行的行号。 / Blank removed lines to keep numbers.
+        rest.push('\n');
+    }
+    Ok((rest, core_threads, core_window))
+}
+
+/// Render a profile error exactly like `rp2350_cli`'s parser does
+/// 按 `rp2350_cli` 解析器的格式渲染 profile 错误
+fn profile_error(line: usize, message: &str) -> String {
+    profile::ProfileError {
+        line,
+        message: message.to_owned(),
+    }
+    .to_string()
 }
 
 /// Render a frame specification as `0xADDR:WxH[:STRIDE]`

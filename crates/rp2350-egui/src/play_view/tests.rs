@@ -21,7 +21,7 @@ use super::*;
 #[derive(Default)]
 pub(super) struct FakeShared {
     /// Frame handed to the view / 交给视图的帧
-    frame: Mutex<Option<Arc<PlayFrame>>>,
+    pub(super) frame: Mutex<Option<Arc<PlayFrame>>>,
     /// Mask written by the view / 视图写入的掩码
     buttons: AtomicU16,
     /// Statistics handed to the view / 交给视图的统计
@@ -91,7 +91,7 @@ pub(super) fn view_with_fake(
 }
 
 /// View already attached to a [`FakeSource`] / 已挂载 [`FakeSource`] 的视图
-fn view_with_source(shared: &Arc<FakeShared>) -> PlayView {
+pub(super) fn view_with_source(shared: &Arc<FakeShared>) -> PlayView {
     shared.running.store(true, Ordering::Relaxed);
     let mut view = PlayView::default();
     view.attach(Box::new(FakeSource {
@@ -101,7 +101,7 @@ fn view_with_source(shared: &Arc<FakeShared>) -> PlayView {
 }
 
 /// Sample frame of `width × height` with `index` / 指定序号与尺寸的示例帧
-fn frame(index: u64, width: u16, height: u16) -> Arc<PlayFrame> {
+pub(super) fn frame(index: u64, width: u16, height: u16) -> Arc<PlayFrame> {
     Arc::new(PlayFrame {
         index,
         steps: index * 1000,
@@ -114,7 +114,7 @@ fn frame(index: u64, width: u16, height: u16) -> Arc<PlayFrame> {
 
 /// Render `view` into a headless context and return the shape count
 /// 在无窗口上下文中渲染 `view` 并返回图元数量
-fn run(
+pub(super) fn run(
     context: &egui::Context,
     view: &mut PlayView,
     size: Vec2,
@@ -519,6 +519,10 @@ fn request(frame: &str) -> PlayRequest {
         steps_per_frame: 200,
         audio: None,
         button_pins: GBA_BUTTONS,
+        // 适配器测试默认走确定性单线程路径。
+        // Adapter tests use the deterministic single-threaded path by default.
+        core_threads: false,
+        core_window: 64,
     }
 }
 

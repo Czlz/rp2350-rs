@@ -11,14 +11,14 @@
 //! 客户机宽高比居中绘制，并把键盘映射为按键位图。
 //!
 //! The toolbar is **profile driven**: the firmware path, frame buffer, steps per
-//! frame, button mask and the I2S wiring are typed by the user or loaded from a
-//! `key = value` profile (`profile` field + `Load profile`), so no example
-//! constant lives in this crate. See [`fields`] for the text/typed split and
-//! [`types`] for the shared types.
-//! 工具栏由 **profile 驱动**：固件路径、帧缓冲、每帧步数、按键掩码与 I2S 接线都由
-//! 用户输入或从 `key = value` profile 载入（`profile` 输入框 + `Load profile`），
-//! 因此 crate 内没有示例常量。文本与数值的拆分见 [`fields`]，共享类型见
-//! [`types`]。
+//! frame, button mask, the optional threaded core executor and the I2S wiring are
+//! typed by the user or loaded from a `key = value` profile (`profile` field +
+//! `Load profile`), so no example constant lives in this crate. See [`fields`]
+//! for the text/typed split and [`types`] for the shared types.
+//! 工具栏由 **profile 驱动**：固件路径、帧缓冲、每帧步数、按键掩码、可选的线程化
+//! 核执行器与 I2S 接线都由用户输入或从 `key = value` profile 载入（`profile`
+//! 输入框 + `Load profile`），因此 crate 内没有示例常量。文本与数值的拆分见
+//! [`fields`]，共享类型见 [`types`]。
 //!
 //! The view itself only talks to the [`PlaySource`] / [`PlayStarter`] traits, so
 //! tests and alternate hosts can inject a fake worker. The concrete worker is
@@ -61,6 +61,9 @@ pub mod audio;
 #[cfg(test)]
 mod audio_tests;
 pub mod cli_source;
+mod core_mode;
+#[cfg(test)]
+mod core_tests;
 pub mod fields;
 #[cfg(test)]
 mod params_tests;
@@ -78,7 +81,8 @@ pub use audio::{
 pub use cli_source::{CliPlaySource, CliPlayStarter};
 pub use fields::{PlayFields, PlayInputs, format_frame};
 pub use types::{
-    AudioRequest, PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats, format_stats,
+    AudioRequest, PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats, format_core_threads,
+    format_stats,
 };
 
 use std::time::Duration;
@@ -89,10 +93,10 @@ use egui::{
 };
 use rp2350_audio::{AudioOutput, AudioReport};
 
-/// Height reserved for the three-line status bar; the audio line may wrap once
+/// Height reserved for the four-line status bar; the audio line may wrap once
 /// when it carries the slow-emulation notice
-/// 三行状态栏保留的高度；音频行带「慢于实时」提示时可能换行一次
-const STATUS_HEIGHT: f32 = 80.0;
+/// 四行状态栏保留的高度；音频行带「慢于实时」提示时可能换行一次
+const STATUS_HEIGHT: f32 = 100.0;
 
 /// Screen background behind the guest picture / 客户机画面背后的底色
 const BACKDROP: Color32 = Color32::from_rgb(0x12, 0x14, 0x18);
@@ -640,8 +644,8 @@ impl PlayView {
         self.status_bar(ui);
     }
 
-    /// Four input rows plus the start/stop row and the status line
-    /// 四行输入框，加启动/停止行与状态行
+    /// Five input rows plus the start/stop row and the status line
+    /// 五行输入框，加启动/停止行与状态行
     ///
     /// Every parameter is a user field, so the view has no example defaults: the
     /// profile row can fill them all at once. While a worker runs the whole input
@@ -678,6 +682,7 @@ impl PlayView {
                 ui.add(egui::TextEdit::singleline(&mut self.fields.buttons).desired_width(70.0));
                 ui.checkbox(&mut self.fields.audio, "Audio / 音频");
             });
+            self.core_controls(ui);
             ui.horizontal(|ui| {
                 ui.label("Audio PIO block / 块");
                 ui.add(
@@ -825,11 +830,15 @@ impl PlayView {
         }
     }
 
-    /// Three-line status bar / 三行状态栏
+    /// Four-line status bar / 四行状态栏
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let running = self.is_running();
         ui.monospace(format_stats(&self.stats, self.last_frame, running));
         ui.monospace(format!("buttons / 按键: {}", describe_mask(self.buttons)));
+        ui.monospace(format_core_threads(
+            self.fields.core_threads,
+            &self.fields.core_window,
+        ));
         // 音频行每帧重读输出线程的计数：欠载数实时增长，无需缓存。
         // Reread the output counters every frame so underruns stay live.
         ui.monospace(self.audio_status_line());

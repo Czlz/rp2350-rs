@@ -99,6 +99,16 @@ struct Cli {
     #[arg(long, value_name = "N")]
     audio_capacity: Option<String>,
 
+    /// Run core0/core1 on separate host threads (interactive, non-deterministic)
+    /// 在独立宿主线程上运行 core0/core1（交互式、非确定性）
+    #[arg(long)]
+    core_threads: bool,
+
+    /// Machine steps between cross-core synchronisations (1..=4096)
+    /// 跨核同步之间的机器步数（1..=4096）
+    #[arg(long, value_name = "N", value_parser = rp2350_cli::run::parse_core_window)]
+    core_window: Option<u32>,
+
     /// Pre-fill the toolbar fields but do not start the game
     /// 只预填工具栏字段，不自动开始游戏
     #[arg(long)]
@@ -171,6 +181,8 @@ impl Cli {
             || self.audio_rate.is_some()
             || self.audio_channels.is_some()
             || self.audio_capacity.is_some()
+            || self.core_threads
+            || self.core_window.is_some()
     }
 
     /// Merge the command line, the profile and the empty defaults
@@ -246,6 +258,12 @@ impl Cli {
         }
         if let Some(capacity) = &self.audio_capacity {
             fields.audio_capacity.clone_from(capacity);
+        }
+        if self.core_threads {
+            fields.core_threads = true;
+        }
+        if let Some(window) = self.core_window {
+            fields.core_window = window.to_string();
         }
     }
 
@@ -618,3 +636,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod core_tests;

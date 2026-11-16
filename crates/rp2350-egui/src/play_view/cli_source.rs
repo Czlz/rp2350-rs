@@ -14,10 +14,14 @@
 //! [`CliPlayStarter`] parses the toolbar's frame text with [`FrameSpec::parse`],
 //! boots a [`PlaySession`] with default [`MachineOptions`] (`arch: None` so the
 //! image format picks the core, `max_cycles = u64::MAX` so the game runs until the
-//! user stops it) and wraps it in [`CliPlaySource`].
+//! user stops it) and wraps it in [`CliPlaySource`]. The optional threaded core
+//! executor is passed through as `CoreThreadOptions`; `enabled = false` is the
+//! deterministic default.
 //! [`CliPlayStarter`] 用 [`FrameSpec::parse`] 解析工具栏的帧文本，以默认
 //! [`MachineOptions`]（`arch: None` 由映像格式选核，`max_cycles = u64::MAX`
 //! 使游戏运行到用户停止）启动 [`PlaySession`]，再用 [`CliPlaySource`] 包装。
+//! 可选的线程化核执行器以 `CoreThreadOptions` 原样传入；`enabled = false` 是
+//! 确定性默认值。
 //!
 //! Audio wiring is passed straight through: [`PlayRequest::audio`] becomes
 //! `PlayConfig::audio` (`None` leaves the PIO FIFOs untouched), so the GUI never
@@ -28,7 +32,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rp2350_cli::play::{FrameSpec, PlayAudioConfig, PlayConfig, PlaySession};
-use rp2350_cli::run::MachineOptions;
+use rp2350_cli::run::{CoreThreadOptions, MachineOptions};
 
 use super::{PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats};
 
@@ -178,7 +182,20 @@ impl PlayStarter for CliPlayStarter {
             // The GUI mounts no PSRAM, matching the CLI without `--psram`.
             psram: None,
         };
-        let session = PlaySession::start(request.image, options, config)?;
+        let session = PlaySession::start_with_core_threads(
+            request.image,
+            options,
+            // 默认 `enabled = false` 与单线程路径逐字节一致；开启后 core0/core1
+            // 各用一条宿主线程，窗口内不可位复现。
+            // The default `enabled = false` matches the single-threaded path byte
+            // for byte; when on, core0/core1 use separate host threads and the
+            // inside of a window is not bit-reproducible.
+            CoreThreadOptions {
+                enabled: request.core_threads,
+                window: request.core_window,
+            },
+            config,
+        )?;
         Ok(Box::new(CliPlaySource::new(session)))
     }
 }
