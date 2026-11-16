@@ -38,6 +38,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Install Linux audio dependencies
+        if: runner.os == 'Linux'
+        run: |
+          # `--all-features` enables the cpal/ALSA backend; alsa-sys needs the
+          # development headers at build-script time.
+          # `--all-features` 会启用 cpal/ALSA 后端，alsa-sys 构建脚本需要开发头文件。
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
       - name: Check format
         run: cargo fmt --all -- --check
 

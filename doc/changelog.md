@@ -97,6 +97,7 @@
 - `plugins/uart-terminal`: second-party UART terminal plugin — `TX` (input) is sampled at the configured baud to decode start/data/stop bits LSB-first, `RX` (output) shifts bytes out with the same bit timing; `baud`/`data_bits`/`stop_bits`/`rx_line`/`clock_hz` configuration, framing-error accounting and a state snapshot (11 tests)
 
 ### Changed / 变更
+- CI/Release：Ubuntu 作业安装 `libasound2-dev`/`pkg-config`（`--all-features` 的 cpal/ALSA 后端需要）；Release 产物名包含目标三元组（避免两个 macOS 构建重名），工作流声明 `contents: write` 以创建 GitHub Release。
 - 仓库卫生：`.trae/`、`.opencode/` 等本地 agent/IDE 目录不再随仓库发布（规则迁移到根 `AGENTS.md`，固件验证手册迁移到 `doc/firmware-verification.md`）；删除重复的示例截图与空目录，README/示例文档同步更新。
 - `rp2350-arm`: `check_pending_exceptions` now also honours `FAULTMASK` and `BASEPRI` (the same gate decides whether a sleep wake-up enters an interrupt); `CpuCore::step` on a sleeping core advances `SysTick`/`total_cycles` instead of returning immediately; `StepResult::Sleep` became `Sleep(SleepKind)` and `SEV`/`SEVL` report `SendEvent { local }`
 - `rp2350-riscv`: `wfi` is a real wait instead of a `NOP`; `signal_interrupt` no longer forces `CpuState::Running` (the step's own wake rule decides), and a retryable load stall never enters a guest trap

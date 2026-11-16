@@ -62,14 +62,22 @@ jobs:
         run: |
           mkdir -p dist
           # Workspace binaries: CLI (headless) + GUI.
-          # 工作区二进制：CLI（无界面）与 GUI。
-          cp target/${{ matrix.target }}/release/rp2350-cli${{ matrix.ext }} dist/
-          cp target/${{ matrix.target }}/release/rp2350-egui${{ matrix.ext }} dist/
+          # Asset names carry the target triple so the two macOS builds do not
+          # collide on the release (GitHub asset names are flat).
+          # 工作区二进制：CLI 与 GUI；文件名带目标三元组，避免两个 macOS 产物重名。
+          cp target/${{ matrix.target }}/release/rp2350-cli${{ matrix.ext }} dist/rp2350-cli-${{ matrix.target }}${{ matrix.ext }}
+          cp target/${{ matrix.target }}/release/rp2350-egui${{ matrix.ext }} dist/rp2350-egui-${{ matrix.target }}${{ matrix.ext }}
           # First-party virtual device plugins ship next to the binaries so
           # `--plugin-dir dist` works out of the box.
           # 第一方虚拟设备插件与二进制同目录分发，`--plugin-dir dist` 即可使用。
-          cp target/${{ matrix.target }}/release/*led_plugin* dist/ 2>/dev/null || true
-          cp target/${{ matrix.target }}/release/*uart_terminal* dist/ 2>/dev/null || true
+          for plugin in rp2350_led_plugin rp2350_uart_terminal; do
+            for file in target/${{ matrix.target }}/release/*${plugin}*; do
+              [ -f "$file" ] || continue
+              ext="${file##*.}"
+              stem="$(basename "$file" ".$ext")"
+              cp "$file" "dist/${stem}-${{ matrix.target }}.${ext}"
+            done
+          done
           ls -l dist
 
       - name: Upload artifact
