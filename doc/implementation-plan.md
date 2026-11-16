@@ -57,7 +57,8 @@
 
 ### R4 执行清单
 
-- [ ] 3 OS CI 重新跑绿（CI 最近未在本会话验证；工作流已存在；需推送后确认）
+- [x] 3 OS CI 重新跑绿：CI #9（rustc/clippy 1.100）Windows / Linux / macOS 全部成功
+- 注：Release 的 `aarch64-apple-darwin` 作业曾因 GitHub macOS 容量不足排队 15 分钟后被取消（非代码失败），重试发布。
 - [x] `cargo test --all-features` 默认并行连跑 30 次无 flake（30/30 通过）；最终代码再补 10/10 通过
 - [x] 最终二进制 soak：2 G 步 + 30 分钟采样（241 s，工作集恒定 42.6 MB、句柄 65；
       `hstx words=128386654 underruns=0`、`dma=52359254`）
