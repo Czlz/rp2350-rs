@@ -505,6 +505,18 @@ impl BootPeripherals {
         self.core1_reset.load(Ordering::Relaxed)
     }
 
+    /// Whether a released `PSM_FRCE_OFF.PROC1` still owes the mailbox ack
+    /// 是否还有一次已释放的 `PSM_FRCE_OFF.PROC1` 确认等待投递
+    ///
+    /// [`Self::service_core1_peer`] consumes the flag and posts the `0` ack on
+    /// its next pump, so a host that batches time must not skip that pump.
+    /// [`Self::service_core1_peer`] 会在下一次泵送时消费该标志并投递 `0` 确认，
+    /// 因此批量推进时间的宿主不得跳过该泵送点。
+    #[must_use]
+    pub fn core1_release_pending(&self) -> bool {
+        self.core1_release.load(Ordering::Relaxed)
+    }
+
     /// Forget the launch state and re-arm the boot-ROM echo stub
     /// 清除启动状态并重新启用 boot ROM 回显桩
     pub fn reset_core1_boot(&self) {
@@ -650,6 +662,18 @@ impl BootPeripherals {
     /// 用于取走输出字的可变 HSTX 句柄
     pub fn hstx_mut(&mut self) -> &mut Hstx {
         &mut self.hstx
+    }
+
+    /// Shared ADC handle / 共享 ADC 句柄
+    ///
+    /// A conversion in flight has per-conversion side effects (result, FIFO,
+    /// `CS.READY`), so a host that batches simulated time must observe it step by
+    /// step instead of advancing across it.
+    /// 进行中的转换会带来逐次副作用（结果、FIFO、`CS.READY`），因此批量推进
+    /// 模拟时间的宿主必须逐步观察，而不能跨越转换。
+    #[must_use]
+    pub fn adc(&self) -> &Adc {
+        &self.adc
     }
 
     /// Shared PIO block handle (`index` `0..=2`) / 共享 PIO 块句柄（`index` `0..=2`）
@@ -897,6 +921,19 @@ impl BootPeripherals {
         self.systick.lock().take_pending()
     }
 
+    /// Whether a SysTick expiry latch is waiting for the next pump
+    /// 是否有 SysTick 到期锁存等待下一次泵送
+    ///
+    /// Non-consuming counterpart of [`Self::take_systick_pending`], so a host
+    /// that decides whether to batch time can check the latch without changing
+    /// what the next pump will deliver.
+    /// [`Self::take_systick_pending`] 的非消费版本，供批量推进时间的宿主在不改变
+    /// 下一次泵送投递内容的前提下检查锁存。
+    #[must_use]
+    pub fn systick_pending(&self) -> bool {
+        self.systick.lock().interrupt_pending()
+    }
+
     /// Shared SysTick counter handle / 共享 SysTick 计数器句柄
     #[must_use]
     pub fn systick(&self) -> SysTickHandle {
@@ -951,6 +988,71 @@ mod tests {
             0,
             "core-1 ack"
         );
+    }
+
+    #[test]
+    fn core1_release_pending_tracks_the_ack_owed_to_the_mailbox() {
+        // 释放 `PROC1` 后、`service_core1_peer` 投递 `0` 之前，标志必须为真；
+        // 泵送一次后必须清零，供批量推进时间的宿主判断是否可跳过泵送点。
+        // While `PROC1` is released and before `service_core1_peer` posts the `0`,
+        // the flag must read true; one pump clears it so a host that batches time
+        // knows whether the pump can be skipped.
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        assert!(!peripherals.core1_release_pending());
+        let mut cycles = 0u64;
+        // 置位 PROC1 只锁存硬复位；清除时才欠下 `0` 确认。
+        // Setting PROC1 only latches the hard reset; clearing it owes the `0` ack.
+        bus.write_u32(0x4001_A004, 0x0100_0000, &mut cycles)
+            .expect("set alias");
+        assert!(!peripherals.core1_release_pending());
+        bus.write_u32(0x4001_B004, 0x0100_0000, &mut cycles)
+            .expect("clr alias");
+        assert!(peripherals.core1_release_pending());
+        peripherals.service_core1_peer();
+        assert!(!peripherals.core1_release_pending());
+    }
+
+    #[test]
+    fn the_adc_handle_reports_a_conversion_in_flight() {
+        // START_ONCE 置位后转换进行中：句柄必须报告 busy，批量时间推进据此退出。
+        // With START_ONCE set a conversion is in flight: the handle must report
+        // busy so a batched time advance backs off.
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        assert!(!peripherals.adc().busy());
+        let mut cycles = 0u64;
+        bus.write_u32(0x400A_0000, 0x0000_0005, &mut cycles)
+            .expect("CS = EN | START_ONCE");
+        assert!(peripherals.adc().busy());
+        peripherals.advance(peripherals.adc().conversion_cycles().max(1));
+        assert!(!peripherals.adc().busy(), "the conversion completed");
+    }
+
+    #[test]
+    fn systick_pending_peeks_without_consuming_the_latch() {
+        // `systick_pending` 只读；`take_systick_pending` 仍然是一次性消费。
+        // `systick_pending` is read-only; `take_systick_pending` stays one-shot.
+        let mut bus = SimpleBus::new();
+        let peripherals = BootPeripherals::mount(&mut bus).expect("mount");
+        assert!(!peripherals.systick_pending());
+        let counter = peripherals.systick();
+        {
+            let mut counter = counter.lock();
+            counter.write_csr(
+                crate::systick::CSR_ENABLE
+                    | crate::systick::CSR_TICKINT
+                    | crate::systick::CSR_CLKSOURCE,
+            );
+            counter.write_rvr(9);
+            counter.write_cvr(10);
+        }
+        // 10 个源周期后到期。 / Expiry after ten source cycles.
+        peripherals.advance(10);
+        assert!(peripherals.systick_pending());
+        assert!(peripherals.systick_pending(), "peek is non-consuming");
+        assert!(peripherals.take_systick_pending());
+        assert!(!peripherals.systick_pending());
     }
 
     #[test]

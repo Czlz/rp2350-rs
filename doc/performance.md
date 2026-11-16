@@ -1015,3 +1015,80 @@ counters" baseline is no longer meaningful: 300 M steps cover ~1.19 s at 252 MHz
 
 **结论**：在当前构建下，2 G 步（≈8.5 s 客户机时间、约 6 分钟墙钟）与 30 分钟墙钟采样均
 未观察到内存/句柄增长；长时间运行的内存曲线平坦。
+
+---
+
+## 11. MT-3a 睡眠快进 / Sleep fast-forward（2026-11-16）
+
+### 11.1 机制 / Mechanism
+
+`rp2350-cli` 在批量路径（`run`、`repl`、`play`、`perfbench` 的 `run_steps`）中新增睡眠
+快进：当**所有可运行核都睡眠**且守卫证明没有事件能触发时，直接跳到下一次时基推进边界
+（`ADVANCE_INTERVAL` = 10 000 步）之前，由正常循环执行该边界步；DMA/PIO/IRQ 节流计数按
+整 64 步周期折叠，睡眠步、睡眠计数与「双核睡眠」通知按逐步执行精确记账。判定规则、
+事件边界与开关见 `doc/crates/rp2350-cli.md`「Sleep fast-forward / 睡眠快进」。
+
+The batched paths now fast-forward sleeping cores: when every runnable core sleeps and
+the guard proves no event can fire, the machine jumps to just before the next timebase
+advance (every 10 000 steps) and lets the normal loop execute the boundary step. Pump
+throttle counters fold by whole 64-step periods; sleep steps, counters and the
+double-sleep notice are credited exactly. The guard and event boundaries are documented
+in `doc/crates/rp2350-cli.md`.
+
+### 11.2 测量方法 / Method
+
+```powershell
+target\release\rp2350-cli.exe run --file "<emerald.uf2>" --max-cycles <225M|300M> `
+  --trace-steps 0 --sleep-fast-forward <on|off>
+```
+
+Windows/x86-64、release 构建。每种配置连跑 3 次，报告**最小墙钟**与**最小进程 CPU 时间**
+（CPU 时间对并行会话负载不敏感，作为主口径）。`off` 复现快进之前的批量路径（开关关闭时
+守卫立即返回，代码路径与旧实现相同）。
+
+### 11.3 结果 / Results
+
+| 窗口 / Window | FF off 墙钟 / CPU | FF on 墙钟 / CPU | 加速比 / Speedup |
+|---|---|---|---|
+| 0–225 M 步（启动睡眠）/ startup sleep | **4.204 s / 4.078 s** | **0.075 s / 0.062 s** | **56× 墙钟 / 66× CPU** |
+| 0–300 M 步（整跑）/ whole run | **20.105 s / 18.734 s** | **13.674 s / 12.578 s** | **1.47× 墙钟 / 1.49× CPU** |
+| 225–300 M（游戏段，派生）/ game segment | 14.656 s CPU | 12.516 s CPU | 设计上不变（差值属测量漂移） |
+
+- 启动阶段 224 994 790 个睡眠步被批量跳过：宿主只执行约 22.5 K 个 10 000 步边界步与
+  6 个唤醒窗口，而不是逐步空转 2.25 亿次。表为同轮交错测量的 3 次最小值；多轮测量中
+  启动加速比稳定在 **51–66×**，整跑在 **1.33–1.49×**。
+- **Amdahl 上限随宿主状态变化**：MT-1 测得 phase 0 占 300 M 墙钟 **30.7 %**（上限
+  `1/(1−0.307)=1.44×`）；本轮 off 运行的启动份额为 **21–22 %**（CPU 4.078/18.734），
+  因为游戏段在本机更慢，按此份额上限约 1.27×。实测同轮比值 1.33–1.49× 略高于该上限，
+  说明绝对时间受宿主热/负载漂移影响（phase 1 两种模式本应逐指令相同）。**判据以同轮
+  比值与逐字节计数器一致为准**；300 M 窗口的「整跑 ≥1.5×」不能由睡眠快进单独保证，
+  需要 MT-3 的 phase 1 提速。
+- 游戏段（phase 1）**不进入快进分支**：只要有一核可运行，守卫就返回 `None`，执行路径与
+  快进前逐指令相同。表中 225–300 M 的 15 % 差值来自两次独立长跑之间的热/负载漂移
+  （同一配置 3 次墙钟跨度可达 10 %–35 %），不是本改动的收益或退化；应在静置机上复测。
+- 测量方差：并行任务占满机器时，300 M 的绝对值可在 9.6–20.1 s（FF on）与 13.1–20.1 s
+  （FF off）间波动；因此上表使用**同轮交错**的最小墙钟/CPU 时间，比值比绝对值稳定。
+  早先一轮静置窗口的对照为 13.066 s（off）→ 9.607 s（on）= 1.36×，与上表一致。
+
+### 11.4 计数器一致性 / Counter identity
+
+同一 `emerald.uf2`、300 M 步，FF on/off 的 `[run]` 计数器逐字段相同：
+
+| 字段 | 值（两种模式相同） |
+|---|---|
+| `executed` / `time_us` | 300 000 000 / **1 798 617** |
+| `dma` / `busy` | **2 199 378** / `0x0009` |
+| `hstx` | `words=5 401 204 underruns=0 fifo=8 enabled=true wof=false unknown=0` |
+| `sleep` | `core0 steps=224 994 790 wakes=6 core1 steps=0 wakes=0` |
+| `core1` | `Running pc=0x1000035C sp=0x2003D680 launches=1` |
+| `[irq]` | 8 条（core0/core1 交替，IRQ 10） |
+| final PC | `0x1000B3AC` |
+
+225 M 步窗口同样一致（`time_us=1 500 000`、`sleep core0 steps=224 894 568 wakes=0`、
+`core1 Reset`、final PC `0x1000B262`）。FF on/off 的 300 M `run` **stdout 56 行完全相同**
+（`Compare-Object` 差异为 0），`--dump 0x20000000:0x82000` 的 SRAM 520 KiB
+SHA-256 也相同（`23CC9CAA…0D6CD6`），说明快进没有改变任何客户机可见状态。
+`crates/rp2350-cli/src/run/fast_forward_tests.rs` 的 12 个 A/B 测试在指令级比较
+steps/time_us/PC/寄存器/SRAM/SysTick/TIMER/DMA/HSTX/`[irq]` 日志/回溯环形缓冲/宿主
+通知，覆盖单核睡、双核睡、另一核运行、DMA/PIO 活动、睡眠中改频、睡眠中置位中断、
+阻塞 FIFO 读与关闭开关。

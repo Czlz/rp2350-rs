@@ -70,7 +70,8 @@ rp2350 run --file firmware.uf2 --psram 8388608
 
 ```text
 rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
-           [--trace-steps N] [--strict-decode] [--psram SIZE]
+           [--trace-steps N] [--strict-decode] [--sleep-fast-forward on|off]
+           [--psram SIZE]
 ```
 
 | Option / 选项 | Default / 默认 | Meaning / 含义 |
@@ -80,6 +81,7 @@ rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
 | `--max-cycles` | `20_000_000` | Instruction budget / 指令预算 |
 | `--trace-steps` | `16` | Boot-trace steps printed / 打印的启动轨迹步数 |
 | `--strict-decode` | off | Halt on undefined instructions instead of delivering HardFault / 未定义指令停机，而不是投递 HardFault |
+| `--sleep-fast-forward` | `on` | Batch sleeping steps between events; `off` restores the pre-fast-forward path for A/B runs / 在事件之间批量推进睡眠步；`off` 恢复快进前的路径供 A/B 对照 |
 | `--psram` | off (unmapped) | Mount an external PSRAM window at `0x1100_0000`; see “PSRAM window and size syntax” below / 在 `0x1100_0000` 挂载外部 PSRAM 窗口，见下文「PSRAM 窗口与大小语法」 |
 | `--dump` | none | `ADDR:LEN:PATH` memory dump written when the run stops (repeatable, decimal or `0x` hex) / 停机时写入的内存导出，可重复，支持十进制或 `0x` 十六进制 |
 
@@ -960,7 +962,8 @@ impl Machine {
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
     // dma_transfers, dma_state, hstx_words, hstx_state, pio_busy_mask,
-    // sleep_counters, sleep_state,
+    // sleep_counters, sleep_state, sleep_fast_forward, set_sleep_fast_forward,
+    // sleep_fast_forward_steps,
     // pio_pc (test hook), core1_state, core1_pc, core1_sp, core1_launch_count,
     // core1_halt_reason, take_uart_output, take_notices, notices_pending,
     // recent_steps, register, dump_memory
@@ -973,6 +976,8 @@ pub struct RunOptions {
     pub max_cycles: u64,
     pub trace_steps: usize,
     pub strict_decode: bool,
+    pub sleep_fast_forward: Option<bool>, // None = env/default (`on`)
+    pub psram: Option<PsramOptions>,
     pub dumps: Vec<MemoryDump>,       // --dump ADDR:LEN:PATH (repeatable)
 }
 
@@ -1511,6 +1516,149 @@ Arm 映像的 `Machine` 还持有一个 Cortex-M33（`CpuId::Core1`）；RISC-V 
   之后打印为 `[run] sleep …`。若所有核心都睡眠且没有事件到达，机器只能推进时钟，
   因此在 `SLEEP_STALL_STEPS`（1 000 000）个连续双核睡眠步之后排队一条
   `[run] sleep stall: …` 通知，而不是静默耗尽预算。
+
+#### Sleep fast-forward / 睡眠快进
+
+`Machine::sleep_fast_forward_skip` (`crates/rp2350-cli/src/run/fast_forward.rs`)
+batches the clock steps of a sleeping machine while keeping every boundary the
+step-by-step path would have observed.
+
+`Machine::sleep_fast_forward_skip`（`crates/rp2350-cli/src/run/fast_forward.rs`）
+在保留逐步路径会观察到的每个边界的前提下，批量推进睡眠机器的时钟步。
+
+**Switch / 开关**
+
+* `run --sleep-fast-forward on|off` — `on` is the default; `true`/`false` and
+  `1`/`0` are accepted aliases.
+* `RP2350_NO_SLEEP_FF=1` (or `true`) disables it for every frontend (`run`,
+  `repl`, `play`, `gdb`, `perfbench`); an explicit `--sleep-fast-forward` value
+  wins over the environment.
+* `Machine::set_sleep_fast_forward(bool)`, `Machine::sleep_fast_forward()` and
+  `Machine::sleep_fast_forward_steps()` expose the state to hosts and tests.
+  With it off, the batched path performs exactly the pre-fast-forward work and
+  `sleep_fast_forward_steps()` stays `0`.
+
+* `run --sleep-fast-forward on|off`：默认 `on`，也接受 `true`/`false`、`1`/`0`。
+* `RP2350_NO_SLEEP_FF=1`（或 `true`）对全部前端（`run`、`repl`、`play`、`gdb`、
+  `perfbench`）关闭快进；显式 `--sleep-fast-forward` 优先于环境变量。
+* `Machine::set_sleep_fast_forward(bool)`、`Machine::sleep_fast_forward()` 与
+  `Machine::sleep_fast_forward_steps()` 向宿主/测试暴露同一状态。关闭时批量路径
+  执行与快进前完全相同的工作，`sleep_fast_forward_steps()` 恒为 `0`。
+
+**When it applies / 判定规则**
+
+The skip is attempted at the top of a `run_steps` iteration only when every
+"no event can fire" proof holds:
+
+1. core 0 is `Sleeping` and not in a `BlockedRead` retry;
+2. core 1 is absent/`Reset`/`Sleeping`; a sleeping core 1 must also not be in a
+   blocked load and must not have a pending event (`WFE`) or exception;
+3. **neither core has a pending exception**: `NVIC.ISER & NVIC.ISPR` is empty
+   for both enable/pending words and `SCB_ICSR.NMIPENDSET/PENDSVSET/PENDSTSET`
+   plus `SHCSR.SVCALLPENDED` are clear. This is the `WFI` wake condition, and it
+   also catches a SysTick latch that `deliver_irqs` already forwarded into the
+   core (a peripheral-side check cannot see it);
+4. no interrupt line is asserted (`BootPeripherals::irq_mask`,
+   `core1_irq_mask`, `USBCTRL.INTS`) and no SysTick latch waits for forwarding;
+5. no DMA channel is busy, no PIO state machine is enabled, HSTX is disabled and
+   the ADC has no conversion in flight;
+6. no core-1 handshake/mailbox work is pending: `core1_reset_pending`,
+   `core1_launch_pending`, `core1_release_pending` and
+   `Sio::fifo_rx_ready(Core1)` are all false.
+
+Any failed check falls back to the normal step-by-step loop for this iteration.
+A sleeping core alone is not enough: a runnable peer always blocks the skip.
+
+每次 `run_steps` 迭代开始时，只有以下「不可能有事件触发」的证明全部成立才尝试跳过：
+
+1. core0 处于 `Sleeping` 且不是 `BlockedRead` 重试；
+2. core1 为「不存在/`Reset`/`Sleeping`」；睡眠中的 core1 也不得处于阻塞载入、
+   不得有 `WFE` 待处理事件或挂起异常；
+3. **两个核心都没有挂起异常**：两个字（enable/pending）的 `NVIC.ISER & NVIC.ISPR`
+   均为空，且 `SCB_ICSR.NMIPENDSET/PENDSVSET/PENDSTSET` 与
+   `SHCSR.SVCALLPENDED` 均清零。这正是 `WFI` 的唤醒条件，也能捕获
+   `deliver_irqs` 已转发进核内的 SysTick 锁存（外设侧检查看不到它）；
+4. 没有中断线断言（`BootPeripherals::irq_mask`、`core1_irq_mask`、
+   `USBCTRL.INTS`），也没有等待转发的 SysTick 锁存；
+5. 没有忙碌 DMA 通道、没有使能的 PIO 状态机、HSTX 关闭、ADC 没有进行中的转换；
+6. 没有待处理的 core1 握手/信箱工作：`core1_reset_pending`、
+   `core1_launch_pending`、`core1_release_pending` 与
+   `Sio::fifo_rx_ready(Core1)` 全为假。
+
+任何一条失败，该轮直接回退到逐步路径。仅「core0 在睡」不够：只要另一核可运行，
+就绝不快进。
+
+**Event boundary / 事件边界**
+
+The observation boundary is the next `ADVANCE_INTERVAL` (10 000) step timebase
+advance. TIMER alarms and `SysTick` are sampled only when `advance()` runs, the
+ADC/POWMAN and clock-tree `generation` take effect there, and interrupt delivery
+happens on the 64-step pump. The skip therefore lands on `boundary - 1` and lets
+the normal loop execute the boundary step itself: the timebase sees exactly the
+same cycle counts as the step-by-step path, and a newly latched alarm/SysTick is
+observed by the next guard (which then refuses to skip and lets the 64-step pump
+wake the core). A frequency change written while the guest sleeps is likewise
+settled on that boundary with the old rate, exactly as before.
+
+观察边界是下一次 `ADVANCE_INTERVAL`（10 000）步的时基推进。TIMER alarm 与
+`SysTick` 只在 `advance()` 运行时被采样，ADC/POWMAN 与时钟树 `generation` 也在该
+边界生效，中断投递则在 64 步泵送点。因此快进停在 `boundary - 1`，由正常循环亲自
+执行该边界步：时基看到的周期数与逐步路径完全相同，新锁存的 alarm/SysTick 会被下一次
+守卫观察到（随后拒绝快进，让 64 步泵送唤醒核心）。客户机睡眠期间写入的频率同样在该
+边界按旧频率结算，与快进前一致。
+
+**Pump consistency / 泵送一致性**
+
+Inside the skipped interval the DMA/PIO/IRQ pumps provably have no effect, so the
+loop is not run per 64 steps. Instead `pumped`, `dma_pumped` and `pio_pumped` are
+folded forward by whole `PUMP_INTERVAL` periods, which preserves the phase of
+every later pump (the first DMA/PIO batch and IRQ delivery after the wake happen
+on exactly the same steps). Sleep steps are credited in bulk to `steps`,
+`sleep_steps` and the double-sleep stall notice, while the recent-step ring, the
+spin detector and the wake counters stay untouched because a sleeping step never
+touches them.
+
+跳过区间内 DMA/PIO/IRQ 泵送已被证明没有作用，因此不按 64 步逐次执行，而是把
+`pumped`、`dma_pumped`、`pio_pumped` 按整 `PUMP_INTERVAL` 周期折叠，精确保留之后
+每次泵送的相位（唤醒后的第一批 DMA/PIO 与中断投递步号完全相同）。睡眠步按批量记入
+`steps`、`sleep_steps` 与「双核睡眠」通知；最近步数环形缓冲、自旋检测与唤醒计数
+保持不变，因为睡眠步从不触碰它们。
+
+**Relation to `steps`/`time_us` / 与 `steps`、`time_us` 的关系**
+
+A skipped step is still one simulated clock cycle: `steps` grows by the same
+amount, `time_us` is identical, `[run] sleep core0 steps=…` is unchanged, and no
+instruction is skipped (a sleeping core retires none). `sleep_fast_forward_steps()`
+is a host-only diagnostic counting skipped clock steps; it is not printed in the
+stable `[run]` report.
+
+跳过的每一步仍是一个模拟时钟周期：`steps` 增量相同、`time_us` 相同、
+`[run] sleep core0 steps=…` 不变，也不跳过任何指令（睡眠核本来不退役指令）。
+`sleep_fast_forward_steps()` 只是宿主诊断计数，不出现在稳定的 `[run]` 报告中。
+
+**Architecture scope / 架构范围**
+
+Arm Cortex-M33 only. Hazard3's `mcycle`/`minstret` advance once per sleep step and
+are guest-visible CSRs, so RISC-V machines keep the step-by-step sleep loop until
+`rp2350-riscv` exposes a batched cycle-accounting entry point. This is an
+architecture capability check, not a firmware special case: any Arm image gets
+the same treatment.
+
+仅支持 Arm Cortex-M33。Hazard3 的 `mcycle`/`minstret` 每个睡眠步前进一次且是
+客户机可见 CSR，因此在 `rp2350-riscv` 提供批量周期记账入口之前，RISC-V 机器保持
+逐步睡眠循环。这是架构能力判断，与具体固件无关：任意 Arm 映像都得到相同处理。
+
+One host-only caveat: `CpuCore::total_cycles()` advances only when the core retires
+or executes a step, so the sleep steps skipped by the fast-forward are not folded
+into that per-core diagnostic counter (`rp2350-arm` has no batched accounting entry
+point). It is not a guest-visible register — no DWT `CYCCNT` is modelled — and it is
+not printed in the `[run]` report; `steps`, `time_us` and every peripheral counter are
+unchanged.
+
+一个仅限宿主诊断的注意点：`CpuCore::total_cycles()` 只在核心执行（或退役）一步时
+前进，因此快进跳过的睡眠步不会折叠进该每核诊断计数（`rp2350-arm` 没有批量记账
+入口）。它不是客户机可见寄存器（未建模 DWT `CYCCNT`），也不出现在 `[run]` 报告
+中；`steps`、`time_us` 与全部外设计数保持不变。
 
 ### DMA pump / DMA 泵送
 

@@ -173,6 +173,9 @@ pub struct RunOptions {
     pub trace_steps: usize,
     /// Halt on undefined instructions instead of skipping / 遇到未定义指令即停机
     pub strict_decode: bool,
+    /// Explicit sleep fast-forward switch (`None` = environment default)
+    /// 显式睡眠快进开关（`None` 表示按环境变量默认）
+    pub sleep_fast_forward: Option<bool>,
     /// PSRAM window to mount behind XIP chip select 1 / 在 XIP 片选 1 后挂载的 PSRAM 窗口
     pub psram: Option<PsramOptions>,
     /// Memory ranges written to disk after the run / 运行结束后写入磁盘的内存区间
@@ -305,6 +308,47 @@ fn strip_unit<'a>(text: &'a str, units: &[&str]) -> Option<&'a str> {
     units.iter().find_map(|unit| text.strip_suffix(unit))
 }
 
+/// Default sleep fast-forward switch / 睡眠快进的默认开关
+///
+/// Fast-forward is on unless `RP2350_NO_SLEEP_FF` is set to `1`/`true`
+/// (case-insensitive). The environment switch exists for A/B runs and
+/// diagnostics; the CLI flag overrides it.
+/// 除非 `RP2350_NO_SLEEP_FF` 被设为 `1`/`true`（不区分大小写），否则快进默认
+/// 开启。环境变量用于 A/B 与诊断；CLI 开关优先于它。
+#[must_use]
+pub fn sleep_fast_forward_default() -> bool {
+    match std::env::var("RP2350_NO_SLEEP_FF") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value == "1" || value.eq_ignore_ascii_case("true"))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Parse `on`/`off` (also `true`/`false`, `1`/`0`) for `--sleep-fast-forward`
+/// 为 `--sleep-fast-forward` 解析 `on`/`off`（也接受 `true`/`false`、`1`/`0`）
+///
+/// # Errors
+/// Returns a message naming the accepted spellings.
+/// 返回列出可接受写法的错误消息。
+pub fn parse_sleep_fast_forward(value: &str) -> Result<bool, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") || value == "1" {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("false")
+        || value == "0"
+    {
+        Ok(false)
+    } else {
+        Err(format!(
+            "bad sleep fast-forward switch `{value}` (expected on|off) / \
+             睡眠快进开关非法，应为 on|off"
+        ))
+    }
+}
+
 /// Construction options shared by `run`, `repl`, `play` and `gdb`
 /// `run`、`repl`、`play` 与 `gdb` 共用的机器构造选项
 #[derive(Debug, Clone, Copy)]
@@ -398,6 +442,88 @@ impl CoreHandle {
     /// Whether this core reports the sleeping state / 该核心是否报告睡眠状态
     fn is_sleeping(&self) -> bool {
         self.state() == CpuState::Sleeping
+    }
+
+    /// Whether the sleep is a retried blocked load instead of a real hardware wait
+    /// 该睡眠是重试阻塞载入，而不是真正的硬件等待
+    ///
+    /// A blocked load must be replayed as soon as the device can serve it, so a
+    /// batched time advance is never allowed to skip those steps.
+    /// 阻塞载入必须在设备可服务时立即重放，因此批量推进时间绝不能跳过这些步。
+    fn sleep_blocks_on_read(&self) -> bool {
+        match self {
+            Self::Arm(core) => matches!(
+                core.sleep_reason(),
+                Some(rp2350_arm::SleepReason::BlockedRead)
+            ),
+            Self::RiscV(core) => matches!(
+                core.sleep_reason(),
+                Some(rp2350_riscv::SleepReason::BlockedRead)
+            ),
+        }
+    }
+
+    /// Whether an ARM/RISC-V event is pending on this core / 该核心是否有待处理事件
+    fn sleep_event_pending(&self) -> bool {
+        match self {
+            Self::Arm(core) => core.event_register(),
+            Self::RiscV(core) => core.event_pending(),
+        }
+    }
+
+    /// Whether this core's sleep waits for an event (`WFE` semantics)
+    /// 该核心的睡眠是否等待事件（`WFE` 语义）
+    ///
+    /// A pending event wakes a `WFE` sleeper on the next step, so the
+    /// fast-forward guard must refuse to skip while one is latched. `WFI`
+    /// sleepers ignore the event register entirely.
+    /// 挂起事件会在下一步唤醒 `WFE` 睡眠者，因此快进守卫必须在事件锁存期间拒绝
+    /// 跳过。`WFI` 睡眠者完全不看事件寄存器。
+    fn sleep_waits_for_event(&self) -> bool {
+        match self {
+            Self::Arm(core) => matches!(
+                core.sleep_reason(),
+                Some(
+                    rp2350_arm::SleepReason::WaitForEvent
+                        | rp2350_arm::SleepReason::SleepDeep {
+                            wait_for_event: true
+                        }
+                )
+            ),
+            // Hazard3 的 `wfi` 同时充当 pico-sdk 的 `__wfe()`，事件会唤醒它。
+            // Hazard3's `wfi` doubles as pico-sdk's `__wfe()`, so events wake it.
+            Self::RiscV(_) => true,
+        }
+    }
+
+    /// Whether this core has a pending exception that wakes it on the next step
+    /// 该核心是否有会在下一步唤醒它的挂起异常
+    ///
+    /// Mirrors the ARMv8-M `WFI` wake condition: an enabled NVIC line or one of
+    /// the four SCB system-exception latches. The fast-forward guard needs it
+    /// because a forwarded `SysTick` latch lives inside the core, not in a
+    /// peripheral the guard already inspects.
+    /// 对应 ARMv8-M 的 `WFI` 唤醒条件：已使能的 NVIC 线或四个 SCB 系统异常锁存之一。
+    /// 快进守卫需要它，因为转发后的 `SysTick` 锁存位于核内，而不是守卫已检查的外设。
+    fn sleep_has_pending_exception(&mut self) -> bool {
+        match self {
+            Self::Arm(core) => fast_forward::arm_core_has_pending_exception(core),
+            // Hazard3 is never fast-forwarded; report pending to stay safe.
+            // Hazard3 从不参与快进；保守地报告有挂起。
+            Self::RiscV(_) => true,
+        }
+    }
+
+    /// Whether this architecture can skip sleeping steps in bulk
+    /// 该架构是否允许批量跳过睡眠步
+    ///
+    /// Hazard3's `mcycle`/`minstret` advance once per sleep step and are
+    /// guest-visible CSRs, so its sleep loop must keep running step by step
+    /// until `rp2350-riscv` exposes a batched cycle-accounting entry point.
+    /// Hazard3 的 `mcycle`/`minstret` 每个睡眠步前进一次，且是客户机可见的 CSR；
+    /// 在 `rp2350-riscv` 提供批量周期记账入口之前，它的睡眠循环必须逐步执行。
+    fn supports_sleep_fast_forward(&self) -> bool {
+        matches!(self, Self::Arm(_))
     }
 }
 
@@ -616,8 +742,31 @@ pub struct Machine {
     sleep_wakes: [u64; 2],
     /// Whether each core was asleep after the previous step / 上一步之后各核是否在睡眠
     was_sleeping: [bool; 2],
+    /// Whether sleeping cores may be fast-forwarded / 睡眠核是否允许快进
+    ///
+    /// Disabled by `RP2350_NO_SLEEP_FF=1` or `--sleep-fast-forward off`; when it
+    /// is off the batched path performs exactly the pre-fast-forward work.
+    /// 由 `RP2350_NO_SLEEP_FF=1` 或 `--sleep-fast-forward off` 关闭；关闭时批量
+    /// 路径执行与快进前完全相同的工作。
+    sleep_fast_forward: bool,
+    /// Simulated steps skipped by the sleep fast-forward / 睡眠快进跳过的模拟步数
+    ///
+    /// Host diagnostic used by tests and A/B reports; it counts skipped clock
+    /// steps, not retired instructions (a sleeping core retires nothing).
+    /// 供测试与 A/B 报告使用的宿主诊断计数；统计的是跳过的时钟步，而不是退役
+    /// 指令（睡眠核不退役指令）。
+    sleep_fast_forward_steps: u64,
     /// Last SIO event generation delivered to the cores / 上次送达核心的 SIO 事件世代
     sio_events_seen: u32,
+    /// Clock-tree generation observed by the last timebase advance
+    /// 上次时基推进观察到的时钟树世代
+    ///
+    /// A frequency write changes the generation; the fast-forward then backs off
+    /// until the next advance settles the new rate, making the advance boundary
+    /// the frequency-change boundary.
+    /// 改频写入会改变世代；快进随后退避到下一次时基推进按新频率结算，使推进边界同时
+    /// 成为改频边界。
+    clock_generation_seen: u32,
     /// Consecutive steps with both cores asleep / 双核同时睡眠的连续步数
     both_sleeping_steps: u64,
     /// Latched `AIRCR.SYSRESETREQ` not yet taken by the frontend
@@ -742,6 +891,7 @@ impl Machine {
         };
 
         let spin_base = core.pc();
+        let clock_generation_seen = peripherals.clock_generation();
         Ok(Self {
             bus,
             bootrom,
@@ -787,7 +937,10 @@ impl Machine {
             sleep_steps: [0; 2],
             sleep_wakes: [0; 2],
             was_sleeping: [false; 2],
+            sleep_fast_forward: sleep_fast_forward_default(),
+            sleep_fast_forward_steps: 0,
             sio_events_seen: 0,
+            clock_generation_seen,
             both_sleeping_steps: 0,
             system_reset_pending: false,
         })
@@ -889,6 +1042,31 @@ impl Machine {
             "sleep core0 steps={} wakes={} core1 steps={} wakes={}",
             self.sleep_steps[0], self.sleep_wakes[0], self.sleep_steps[1], self.sleep_wakes[1]
         )
+    }
+
+    /// Whether sleep fast-forward is enabled / 睡眠快进是否已启用
+    #[must_use]
+    pub fn sleep_fast_forward(&self) -> bool {
+        self.sleep_fast_forward
+    }
+
+    /// Enable or disable sleep fast-forward / 启用或关闭睡眠快进
+    ///
+    /// Disabling it restores the exact pre-fast-forward batched path, which is
+    /// what the A/B acceptance runs compare against.
+    /// 关闭后恢复快进之前的批量路径，A/B 验收即以此为对照。
+    pub fn set_sleep_fast_forward(&mut self, enabled: bool) {
+        self.sleep_fast_forward = enabled;
+    }
+
+    /// Simulated sleep steps skipped by the fast-forward / 快进跳过的模拟睡眠步数
+    ///
+    /// Host diagnostic: a value above zero proves the batched path took the
+    /// fast-forward branch instead of spinning through every sleeping step.
+    /// 宿主诊断：大于零即证明批量路径走了快进分支，而不是逐步空转每个睡眠步。
+    #[must_use]
+    pub fn sleep_fast_forward_steps(&self) -> u64 {
+        self.sleep_fast_forward_steps
     }
 
     /// Record that `index` slept for one step / 记录 `index` 睡眠了一步
@@ -2085,6 +2263,11 @@ impl Machine {
         if self.steps > self.advanced {
             self.peripherals.advance(self.steps - self.advanced);
             self.advanced = self.steps;
+            // 本轮推进已按实时频率结算；记录世代，使快进可以把「改频」退避到下一个
+            // 推进边界。
+            // This advance settled at the live rates; remember the generation so the
+            // fast-forward can back off until the next advance after a retune.
+            self.clock_generation_seen = self.peripherals.clock_generation();
             self.uart.extend(self.peripherals.take_uart_output());
         }
     }
@@ -2485,6 +2668,9 @@ fn log_irq(irq_log: &mut IrqLog, core: &str, irq: u16, pc: u32) {
 }
 
 mod batch;
+mod fast_forward;
+#[cfg(test)]
+mod fast_forward_tests;
 #[cfg(test)]
 mod psram_tests;
 mod reset;

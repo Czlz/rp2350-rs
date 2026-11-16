@@ -79,6 +79,19 @@ impl Machine {
         let mut core1_live = core1_running(self);
 
         while steps < end {
+            // 睡眠快进：全部可运行核都在睡且没有可触发事件时，直接跳到下一个时基
+            // 边界之前，再由本轮正常循环亲自执行该边界步。任何可运行核、待处理
+            // 中断或进行中的 DMA/PIO/HSTX/ADC 活动都会让守卫返回 `None`，
+            // 回退到逐步路径。
+            // Sleep fast-forward: with every runnable core asleep and no event
+            // able to fire, jump to just before the next timebase boundary and let
+            // the normal loop execute that boundary step itself. A runnable core,
+            // a pending interrupt or in-flight DMA/PIO/HSTX/ADC activity makes the
+            // guard return `None` and falls back to the step-by-step path.
+            if let Some(landing) = self.sleep_fast_forward_skip(steps, end) {
+                steps = landing;
+                continue;
+            }
             // 下一个共享边界（DMA/PIO 泵、中断投递、时基）的步号。这些工作都按
             // 绝对步数节流，因此内层循环可以直接跑到该边界，再一次性执行。
             // Step number of the next shared boundary (DMA/PIO pump, IRQ delivery,

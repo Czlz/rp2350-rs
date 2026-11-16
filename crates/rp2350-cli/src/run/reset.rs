@@ -91,6 +91,9 @@ pub(crate) fn execute(bytes: &[u8], options: &RunOptions, stdout: &mut impl Writ
         psram: options.psram,
     };
     let mut machine = Machine::new(bytes, &machine_options)?;
+    if let Some(enabled) = options.sleep_fast_forward {
+        machine.set_sleep_fast_forward(enabled);
+    }
     let mut policy = SystemResetPolicy::new();
 
     writeln!(stdout, "[run] {}", machine.image_description())?;
@@ -133,6 +136,9 @@ pub(crate) fn execute(bytes: &[u8], options: &RunOptions, stdout: &mut impl Writ
         writeln!(stdout, "[run] {SYSTEM_RESET_MESSAGE}")?;
         let restart = policy.record()?;
         machine.reboot(bytes, &machine_options)?;
+        if let Some(enabled) = options.sleep_fast_forward {
+            machine.set_sleep_fast_forward(enabled);
+        }
         writeln!(
             stdout,
             "[run] reboot {restart}/{MAX_SYSTEM_RESETS}: PC={:#010X} SP={:#010X}",

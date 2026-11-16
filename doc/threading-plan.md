@@ -81,7 +81,7 @@ determinism. No JIT and no firmware-specific tuning.
 | MT-2b | **迁移与仲裁**：把 bootrom/usb/usb-host/periph 的区域改为 `SharedRegion`，CLI 组装 `SharedBus`，按 (cycle, master) 批量定序 | `rp2350-core` + `rp2350-periph` + 上述 crate | 单线程 300 M 计数器不变；双核原型接 `SharedBus` |
 | MT-3 | **双核线程化**：`Machine` 拆为两台核线程 + 仲裁器；中断/事件跨线程投递；睡眠核不占调度 | `rp2350-cli` + `rp2350-arm` | FV-1/2/3 与 emerald 300 M 计数器一致；默认并行运行 30 次无 flake；吞吐报告 |
 | MT-4 | **外设线程**：DMA/PIO/HSTX/TIMER 独立推进与 MMIO 邮箱；事件定序 | `rp2350-periph` + `rp2350-core` | 与单线程逐周期对照（同一时间点状态一致）；emerald HSTX `underruns=0` |
-| MT-5 | **插件线程**：`virt-periph` 邮箱 + 固定延迟；超时/崩溃降级 | `rp2350-virt-periph` + `rp2350-plugin` | 与同步路径逐 pin 对照；重载/删除不崩溃；虚拟实验室示例 |
+| MT-5 | **插件线程**：`virt-periph` 邮箱 + 固定延迟；超时/崩溃降级 | `rp2350-virt-periph` + `rp2350-plugin` | ✅ 已交付（见 §8）：与同步路径逐 pin 对照；重载/删除不崩溃 |
 | MT-6 | **性能与回归收口**：长跑 soak、文档、`doc/performance.md` 新口径 | 主会话 | 数据 + 结论 |
 
 依赖：MT-1 → MT-2 → MT-3 ∥ MT-4，MT-5 可与 MT-3 并行（crate 不相交）。
@@ -93,6 +93,10 @@ determinism. No JIT and no firmware-specific tuning.
 > **MT-2a 已交付**：可共享总线层（不含线程），见 §7；原 MT-2 拆分后的迁移与仲裁
 > 定序为 MT-2b。 / MT-2a delivered the shareable bus layer (no threads) in §7; the
 > migration and arbitration half of the original MT-2 is now MT-2b.
+>
+> **MT-5 已交付**：每设备插件线程 + 固定延迟邮箱，默认仍为同步路径，见 §8。
+> / MT-5 delivered the per-device plugin thread with a fixed-latency mailbox;
+> the synchronous path stays the default (see §8).
 
 ## 4. 风险与回退 / Risks
 
@@ -504,4 +508,269 @@ core in the same tree reproduces them.
    用于实际读。单线程路径已用 `read_would_stall_mut` 完全避开加锁；若 MT-3 的
    profiling 显示共享路径的 MMIO 轮询成为瓶颈，可让 `SharedBus` 在同一把设备锁内
    完成 stall 检查与读（需要给 `SharedRegion` 增加一个“带门控的读”入口）。
+
+---
+
+## 8. MT-3a 交付记录：睡眠快进（2026-11-16）
+
+## 8. MT-3a delivery: sleep fast-forward (2026-11-16)
+
+本节记录 MT-3a（把「全睡且无事件」的时钟步批量推进）的实现、不变量、开关、测试与
+实测。**不引入线程**，也不跳过任何客户机指令或周期：睡眠步仍计入 `steps`/`time_us`，
+只是宿主不再为每个睡眠步执行一次机器循环。
+This section records MT-3a (batching clock-only steps while every runnable core sleeps)
+including invariants, the switch, tests and measurements. **No thread is introduced**
+and no guest instruction or cycle is skipped: sleeping steps still advance
+`steps`/`time_us`; the host simply stops running one machine-loop iteration per step.
+
+### 8.1 判定与边界 / Guard and boundaries
+
+| 条件 / Condition | 检查 / Check |
+|---|---|
+| core0 睡眠且非阻塞载入 | `CpuState::Sleeping` 且 `SleepReason != BlockedRead` |
+| core1 不可运行 | 无 / `Reset` / `Sleeping`；睡眠时也须非阻塞载入、无待处理事件、无挂起异常 |
+| 核内挂起异常 | `NVIC.ISER & NVIC.ISPR`（两个 enable/pending 字）、`SCB_ICSR` 的 NMI/PendSV/SysTick 锁存、`SHCSR.SVCALLPENDED` 全空 |
+| 外设中断 | `BootPeripherals::irq_mask`、`core1_irq_mask`、`USBCTRL.INTS` 全 0，且无待转发 SysTick 锁存 |
+| 外设活动 | `Dma::busy_mask()==0`、`pio_busy_mask()==0`、HSTX 关闭、ADC 未转换 |
+| core1 握手 | `core1_reset_pending`/`core1_launch_pending`/`core1_release_pending`/`fifo_rx_ready(Core1)` 全假 |
+
+事件观察边界是下一次 `ADVANCE_INTERVAL`（10 000 步）时基推进：TIMER alarm、SysTick、
+ADC/POWMAN 与时钟树 `generation` 都只在该边界被采样。快进停在 `boundary - 1`，正常
+循环亲自执行边界步；边界后新锁存的 alarm/SysTick 由下一次守卫看到并回退到逐步路径，
+再由 64 步泵送在**同一步**唤醒。DMA/PIO/IRQ 节流计数按整 64 步折叠，保留之后每次
+泵送的相位；睡眠步、`sleep_steps`、「双核睡眠」通知按逐步执行记账。
+
+The observation boundary is the next 10 000-step timebase advance (TIMER alarms,
+SysTick, ADC/POWMAN and clock-tree generation are sampled there). The skip lands on
+`boundary - 1`; the normal loop executes the boundary step, the next guard sees any
+newly latched alarm/SysTick and falls back, and the 64-step pump wakes on the same step
+as before. Pump counters fold by whole 64-step periods; sleep steps and the double-sleep
+notice are credited exactly.
+
+### 8.2 开关 / Switch
+
+- `run --sleep-fast-forward on|off`（默认 `on`，接受 `true/false`、`1/0`）。
+- `RP2350_NO_SLEEP_FF=1|true` 对全部前端关闭；显式 CLI 值优先。
+- `Machine::set_sleep_fast_forward`/`sleep_fast_forward`/`sleep_fast_forward_steps`。
+  `off` 时 `run_steps` 的守卫立即返回，行为与 MT-3a 之前逐字节一致。
+
+### 8.3 测试 / Tests
+
+`run/fast_forward_tests.rs` 新增 12 个 A/B 测试（每例同固件、FF on vs off，比较
+steps/time_us/PC/16 寄存器/SRAM 64 KiB/SysTick/TIMER/睡眠计数/DMA/HSTX/`[irq]`/
+`[tail]`/通知）：
+
+| 测试 / Test | 覆盖 / Property |
+|---|---|
+| `timer_alarm_sleep_is_fast_forwarded_and_matches_step_by_step` | WFI + TIMER alarm；跳过 >10 K 步且状态一致 |
+| `repeated_segments_never_drift_from_the_step_by_step_path` | 12 段分段推进逐段一致 |
+| `a_running_peer_blocks_fast_forward` | core1 运行 ⇒ 跳过 0 步 |
+| `both_sleeping_cores_are_fast_forwarded_with_identical_state` | 双核睡 + 1 M 步睡眠通知逐字节相同 |
+| `a_systick_expiry_wakes_at_the_same_step` | SysTick 到期在同一步唤醒 |
+| `a_clock_change_while_sleeping_does_not_cross_the_boundary` | 睡眠中改 `CLK_SYS_DIV`，时基边界结算一致 |
+| `dma_activity_blocks_fast_forward` | 忙 DMA ⇒ 跳过 0 步且传输计数一致 |
+| `pio_activity_blocks_fast_forward` | 使能 PIO SM ⇒ 跳过 0 步 |
+| `an_irq_asserted_between_segments_wakes_on_the_same_boundary` | 睡眠中置位中断 ⇒ 同一 64 步泵送唤醒 |
+| `the_disabled_switch_never_skips_and_is_deterministic` | 关闭时跳过 0 步且两次运行一致，并与开启结果相同 |
+| `a_blocking_fifo_read_is_never_fast_forwarded` | `BlockedRead` 逐步重试，帧到达后只消费一次 |
+| `the_wake_step_never_crosses_the_next_event` | 32 步粒度扫描唤醒点，两机同段醒来且睡眠计数相同 |
+
+### 8.4 计数器与性能 / Counters and performance
+
+emerald 300 M（FF on 与 off 逐字段相同）：`time_us=1 798 617`、`dma=2 199 378`、
+`hstx words=5 401 204 underruns=0 fifo=8`、`sleep core0 steps=224 994 790 wakes=6`、
+`core1 Running pc=0x1000035C`、8 条 `[irq]`、final PC `0x1000B3AC`。
+225 M：`time_us=1 500 000`、`sleep core0 steps=224 894 568 wakes=0`、`core1 Reset`、
+final PC `0x1000B262`。FF on/off 的 300 M `run` stdout（56 行）逐字节相同，SRAM
+520 KiB 的 SHA-256 相同，证明快进不改变客户机可见状态。
+
+| 窗口 / Window | FF off（最小墙钟 / CPU） | FF on（最小墙钟 / CPU） | 加速比 |
+|---|---|---|---|
+| 0–225 M（启动睡眠） | 4.204 s / 4.078 s | **0.075 s / 0.062 s** | **≈56× / 66×** |
+| 0–300 M（整跑） | 20.105 s / 18.734 s | **13.674 s / 12.578 s** | **1.47× / 1.49×** |
+
+- 启动加速比在多轮测量中稳定在 51–66×；整跑在 1.33–1.49×（同轮交错最小值）。
+- 启动阶段 224 994 790 个睡眠步中约 99.99 % 被跳过。MT-1 的 phase 0 占墙钟 30.7 %
+  （上限 1.44×），本轮 off 运行的启动份额为 21–22 %（游戏段在本机更慢）；实测同轮
+  比值 1.33–1.49× 说明绝对时间受宿主热/负载漂移影响。判据以同轮比值 + 逐字节计数器
+  一致为准；300 M 窗口的 1.5× 需要 phase 1 同时提速（MT-3 双核线程化）。
+- 游戏段不进入快进分支（有核可运行即回退），路径与 MT-3a 之前逐指令相同；分段
+  差值在长跑热/负载漂移范围内，需静置机复测。
+- 完整数据与口径见 `doc/performance.md` §11。
+
+### 8.5 局限与后续 / Limits
+
+- **仅 Arm Cortex-M33**：Hazard3 的 `mcycle`/`minstret` 每个睡眠步前进且是客户机可见
+  CSR，`rp2350-riscv` 未提供批量记账入口，因此 RISC-V 保持逐步睡眠（FV-1 的步数/
+  模拟时间与改动前完全相同）。
+- **宿主诊断 `CpuCore::total_cycles()`** 只随真正执行的核步前进：快进跳过的睡眠步没有
+  折叠进该核内计数（`rp2350-arm` 没有批量入口）。该值不是客户机可见寄存器（无 DWT
+  CYCCNT 模型），也不出现在 `[run]` 报告中；`steps`、`time_us` 与全部外设计数不受影响。
+- 若将来引入外设线程（MT-4），本模块的守卫即为「外设活动 ⇒ 退出快进」的现成契约。
+- 通用性：判定基于架构状态（NVIC/SCB/外设忙闲），不依赖固件哈希、地址或固定步数；
+  MicroPython（FV-2）、CircuitPython（FV-3）的 USB 启动路径已复跑 `stdout: 42`。
+
+---
+
+## 9. MT-5 交付记录：插件线程（2026-11-16）
+
+## 9. MT-5 delivery: plugin threads (2026-11-16)
+
+### 8.1 交付内容 / Delivered
+
+| 内容 | 位置 |
+|---|---|
+| 邮箱协议 `Command` / `Response`、`WorkerContext`、工作线程循环（panic 隔离） | `crates/rp2350-virt-periph/src/executor_worker.rs` |
+| 每设备执行器 `DeviceExecutor`（超时、高阻锁定、限期 join、分离诊断） | `crates/rp2350-virt-periph/src/executor_host.rs` |
+| 内联/线程化双宿主 `DeviceHost`、绑定表与方向投递 | `crates/rp2350-virt-periph/src/executor_device.rs` |
+| `PinSnapshot` / `PortBinding` / `ExecutorConfig` / `PublishSchedule` / `StepReport` / `StepError` | `crates/rp2350-virt-periph/src/executor.rs` |
+| `DeviceManager::with_executor` / `with_latency` / `step` / `step_gpio` / `shutdown_threads` / 线程诊断 | `crates/rp2350-virt-periph/src/executor_manager.rs` |
+| 管理器的内联/线程化查询、`ports_of`、`ConfigApplyError::Executor` | `manager.rs`、`reload.rs` |
+| 19 项确定性/故障/性能测试（51 → 70） | `src/tests/executor.rs`、`executor_faults.rs`、`fixtures.rs` |
+
+### 8.2 与任务书的差异 / Deviations
+
+1. **没有 `DevicePlugin::step`**：现有 ABI 只有 `RpPlugin::tick` + `DevicePlugin::on_gpio_change`
+   + `ports()`。MT-5 把「插件步进」定义为
+   `deliver_inputs → tick(cycles) → collect_outputs` 三步，未改动 ABI。
+   There is no `DevicePlugin::step`; the ABI only has `tick` + `on_gpio_change` +
+   `ports()`. MT-5 defines a device step as `deliver_inputs → tick → collect_outputs`
+   and leaves the ABI untouched.
+2. **每个设备一个执行器**（任务书允许二选一）：卡死/panic 只影响该设备，3 台设备
+   各自按 epoch 推进；管理器分两阶段（先派发、再收集），因此多设备是**真并行**，
+   而不是串行等待每个邮箱。
+   One executor per device (allowed by the task): a hung or panicking device only
+   affects itself, and the manager dispatches to all devices before collecting, so
+   multiple devices really run in parallel.
+3. **`--plugin-threads` 未加**：`rp2350-cli` / `rp2350-egui` 不在本任务白名单内，
+   开关以 `DeviceManager::with_executor` 形式提供；宿主接线留待后续任务。
+   No `--plugin-threads`: the CLI and egui crates are outside this task's whitelist;
+   the switch is `DeviceManager::with_executor` and host wiring is a follow-up.
+4. **`mcp_query_all` / `mcp_query_device` 改为 `&mut self`**：线程化设备必须经邮箱
+   查询；`devices()` 迭代器移除，替换为 `ports_of()`（内联与线程化都可用）。
+   The MCP queries take `&mut self` and `devices()` was replaced by `ports_of()`,
+   because worker-hosted plugins are only reachable through the mailbox.
+5. **`BTreeMap` 取代 `HashMap` 存设备**：迭代顺序按 ID，`step` / `tick_all` /
+   `mcp_query_all` 的输出顺序不再依赖哈希种子。
+   Devices moved from `HashMap` to `BTreeMap` so iteration, stepping and MCP output
+   are ID-ordered instead of hash-order dependent.
+
+### 8.3 延迟语义 / Latency semantics
+
+- 设备在 `epoch` 看到输入快照；其输出在 `epoch + latency_ticks` 生效
+  （默认 1 个外设 tick，可配置，最小 1）。延迟队列 `PublishSchedule` 在**模拟线程**
+  上以 epoch 计量，不使用宿主时间。
+- `StepReport::produced` 是各设备本 epoch 产生的输出（可逐设备断言互不串扰）；
+  `StepReport::effective` 是已成熟输出的线或，`step_gpio` 只把 `driven_pins`
+  覆盖的引脚写回 GPIO。
+- 被跳过的 epoch 在下次调用时一并释放（线或），不合并输入、不丢失输出。
+- 确定性对照：同一输入序列，同步与线程化路径在 latency 1 与 3 下逐 pin 相同
+  （`sync_and_threaded_paths_match_pin_for_pin`、`latency_three_shifts_outputs_on_both_paths`），
+  且真实 LED `cdylib` 两条路径状态一致（`led_plugin_matches_between_paths`）。
+
+### 8.4 超时 / panic 降级 / Degradation
+
+| 情况 | 行为 |
+|---|---|
+| `step_timeout` 内无响应 | 设备锁定高阻，`StepReport::degraded` + 稳定诊断行；后续步进不再等待 |
+| 插件 `tick`/`apply_config`/`state_snapshot` panic | 工作线程按命令 `catch_unwind`，标记中毒，设备高阻；其它设备不受影响 |
+| 关闭期限内不响应 | 工作线程分离（`is_detached()`），库句柄**有意泄漏**保持 vtable 映射（Rust 无法 kill 线程） |
+| 关闭正常 | 先 `Shutdown` 取回插件 box 并 join，再释放库（Windows DLL 锁） |
+
+跨 `cdylib` 的 panic 限制保持不变：`panic = "abort"` 或展开穿越 `extern "C"` 帧
+仍会终止进程。诊断可通过 `thread_count()` / `degraded_devices()` /
+`degraded_reasons()` / `DeviceExecutor::timeouts()` 获取。
+
+### 8.5 对照测试与性能 / Comparison and performance
+
+测试（`cargo test -p rp2350-virt-periph --all-features`，**74 passed**，新增 4/替换 1）：
+
+| 类别 | 测试 |
+|---|---|
+| 编码/延迟 | `pin_snapshot_encodes_gpio_levels`、`publish_schedule_holds_fixed_latency`、`default_executor_config_is_a_stall_bound` |
+| 同步 vs 线程化 | `sync_and_threaded_paths_match_pin_for_pin`、`latency_three_shifts_outputs_on_both_paths`、`led_plugin_matches_between_paths` |
+| 多设备独立 | `three_devices_keep_independent_outputs`、`unregister_stops_only_its_worker`、`unregister_joins_before_returning` |
+| 方向/接线 | `port_direction_controls_delivery_and_publish`、`step_gpio_only_drives_wired_outputs`、`unwired_device_still_advances` |
+| 协议 | `non_monotonic_epoch_is_rejected`、`synchronous_default_spawns_no_threads` |
+| 故障 | `timeout_latches_device_high_z_without_stopping_simulation`、`panic_is_isolated_to_the_failing_device` |
+| 重载/关闭 | `reload_swaps_worker_hosted_device_and_keeps_wiring`、`shutdown_threads_reclaims_all_workers`、`dropping_threaded_manager_stops_workers` |
+| 配置 | `configure_reaches_the_worker_thread` |
+| 并行/负载 | `parallel_dispatch_is_proven_by_rendezvous_plugins`、`sixteen_host_threads_do_not_starve_device_workers`、`heavy_plugins_match_sequential_state` |
+
+性能（debug 构建、3 台重插件、每 tick 400 000 次整数运算、10 epoch、16 核）：
+同步 ~112 ms、线程化 ~44 ms（比值为**信息性**输出，不再设硬断言）。宿主时间比值
+度量的是机器负载而非执行器，`cargo test` 与并行构建会污染它；真正的并行派发由
+`parallel_dispatch_is_proven_by_rendezvous_plugins` 用三方屏障确定性证明（串行派发
+会死锁并触发超时），重插件用例只断言两条路径状态一致且无设备降级。
+Debug build, 3 heavy plugins (400 000 integer ops per tick), 10 epochs, 16 cores:
+~112 ms vs ~44 ms. The wall-clock ratio is **informational** and no longer asserted,
+because it measures machine load rather than the executor; parallel dispatch is
+proven deterministically by the rendezvous-barrier test, and the heavy case only
+asserts identical final state with no degraded device.
+
+### 8.6 门禁 / Gates
+
+```
+cargo test -p rp2350-virt-periph --all-features     74 passed
+cargo fmt -p rp2350-virt-periph -- --check          clean
+cargo clippy -p rp2350-virt-periph --all-targets --all-features -- -D warnings -W clippy::pedantic  clean
+cargo doc -p rp2350-virt-periph --no-deps           clean
+list-devices --plugin-dir target/debug              com.rp2350-rs.led / LED / has_ui=false / ports=[LED]
+FV-1 / FV-2 / FV-3                                  [repl] stdout: 42
+```
+
+`cargo test --all-features`：**40 个 target 全绿**（含 `rp2350-periph` 的
+`boot::tests::core1_release_pending_tracks_the_ack_owed_to_the_mailbox`；此前那次
+失败来自并行任务的未提交 `boot.rs` 改动，现已在对方工作区修复）。
+The workspace run is **green across all 40 targets**, including the
+`rp2350-periph` boot test that previously failed due to a concurrent task's
+uncommitted change.
+
+### 8.7 并行测试 flake 根因与修复（2026-11-16）
+
+**症状 / Symptom.** 默认并行 `cargo test -p rp2350-virt-periph --all-features`
+偶发 69/70：`tests::executor_faults::unregister_stops_only_its_worker` 在
+`report.produced.len()` 处 **left: 1, right: 2**；单独运行或低负载全绿。
+
+**复现 / Reproduction.** 空闲 30/30 全绿；用 20 个自旋进程压满 16 个逻辑核后
+跑 10 轮，出现 2 次失败（`heavy_plugins_*`：`heavy-c.ticks` 为 `Null`，即设备已
+降级；另一轮是宿主时间比值断言）。修复前失败输出：
+`left: Number(11) / right: Null` 与 `parallel < sequential` 断言失败。
+
+**根因 / Root cause.** `ExecutorConfig::default().step_timeout` 原为 **500 ms**。
+它是**宿主调度上限**而不是卡死上限：并行测试/构建让一个健康 worker 超过 500 ms
+拿不到 CPU，执行器按设计把设备锁为高阻，`StepReport.produced` 又只收录成功设备，
+于是输出少一台。测量排除了其它猜测：
+
+- `unregister` **已同步 join**：`DeviceExecutor::shutdown` 收到 `Shutdown` 后
+  `join` 再返回；`tracked` 存活计数在 `unregister` 返回时已从 3 减到 2。
+- 派发/收集没有竞态：`step` 在 `&mut self` 上先派发当前 `BTreeMap` 的全部设备，
+  再按 ID 收集；`unregister` 同步移除条目，不会向已注销设备派发。
+- `PublishSchedule` 以 epoch 计量，epoch 0 不跳过任何设备。
+- 真正失败标志来自 `degraded_reasons()`：`... timed out after 500 ms ... high-Z`。
+
+**修复 / Fix.**
+
+1. 默认 `step_timeout` 提高到 **5 s**（`DEFAULT_STEP_TIMEOUT`），只用于检测真正
+   卡死；降级用例 `timeout_latches_device_high_z_...` 在接线完成后用
+   `set_step_timeout("slow", 400 ms)` 只收紧卡死设备，健康设备仍享 5 s 余量
+   （此前把 400 ms 套在整个管理器上，连健康设备的 `set_bindings` 都会被误判）。
+2. `StepReport.produced` 改为**每台已注册设备一个条目**：高阻设备携带
+   `PinSnapshot::empty()`（不驱动任何引脚）并同时出现在 `degraded`，不再静默消失。
+3. 测试改用生产默认配置；新增 `parallel_dispatch_is_proven_by_rendezvous_plugins`
+   （三方屏障确定性证明先派发后收集）、`sixteen_host_threads_do_not_starve_device_workers`
+   （16 宿主线程压力下 8 设备全部产出）、`unregister_joins_before_returning`
+   （返回即 join 并释放插件）、`default_executor_config_is_a_stall_bound`。
+4. 删除宿主时间比值硬断言（它度量机器负载而非执行器）；重插件用例只保留状态一致性
+   与「无降级」断言，墙钟比值仅打印。
+
+**验证 / Verification.** 默认并行连跑 30/30 全绿；`--test-threads=1` 全绿、
+`--test-threads=4` 5/5 全绿；20 个自旋进程压力下共 15 轮全绿。
+
+### 8.8 剩余卡点 / Remaining
+
+1. 宿主接线：CLI `--plugin-threads` 与虚拟实验室（多设备）尚未启用线程化。
+2. 长时间运行（soak）与真实重插件（如 uart-terminal）的线程化吞吐未测。
+3. 无法终止卡死线程 → 分离 + 泄漏库句柄；若需要硬隔离必须进程外执行。
+4. 工作线程 panic 隔离仅覆盖 Rust 展开；`panic = "abort"` / 跨 `extern "C"` 不支持。
 

@@ -150,6 +150,7 @@ fn run_options(max_cycles: u64) -> RunOptions {
         max_cycles,
         trace_steps: 0,
         strict_decode: false,
+        sleep_fast_forward: None,
         psram: None,
         dumps: Vec::new(),
     }

@@ -1852,7 +1852,16 @@ PLL 中断寄存器、`XOSC_STARTUP` 等无关写入不改变它。P4-2 用它�
 | `ClockTree::roscclk_hz`, `channel_hz(n)` | ROSC output and any channel / ROSC 输出与任意通道 |
 | `BootPeripherals::clock_tree`, `sysclk_hz` | mounted tree and `CLK_SYS` / 已挂载的树与 `CLK_SYS` |
 | `BootPeripherals::refclk_hz/periclk_hz/hstxclk_hz/usbclk_hz/adcclk_hz/rtcclk_hz` | live frequencies for consumers / 消费者使用的实时频率 |
+| `BootPeripherals::adc` | shared ADC handle; `Adc::busy()` marks a conversion in flight / 共享 ADC 句柄；`Adc::busy()` 表示转换进行中 |
+| `BootPeripherals::systick_pending` | non-consuming peek at the SysTick expiry latch / 只读窥视 SysTick 到期锁存 |
+| `BootPeripherals::core1_release_pending` | `PSM_FRCE_OFF.PROC1` release ack still owed by `service_core1_peer` / 尚待 `service_core1_peer` 投递的 core1 释放确认 |
 | `Xosc::set_frequency_hz`, `ClockTree::set_rosc_hz` | board-specific crystal/ring / 板级晶振/环形频率 |
+
+The last three exist for hosts that batch simulated time (for example the CLI's
+sleep fast-forward): a conversion in flight, an undelivered SysTick expiry or a
+pending core-1 mailbox ack all have per-step side effects and must not be skipped.
+最后三项供批量推进模拟时间的宿主使用（例如 CLI 的睡眠快进）：进行中的 ADC 转换、
+未转发的 SysTick 到期或待投递的 core1 信箱确认都有逐步骤副作用，不能被跳过。
 
 ### Unified time base and consumers (P4-2) / 统一时间基与消费者（P4-2）
 

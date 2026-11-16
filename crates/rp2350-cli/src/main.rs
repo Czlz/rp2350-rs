@@ -62,6 +62,11 @@ enum Commands {
         #[arg(long)]
         strict_decode: bool,
 
+        /// Fast-forward sleeping cores between events (`on`/`off`, default on)
+        /// 在事件之间快进睡眠核（`on`/`off`，默认开启）
+        #[arg(long, value_name = "on|off", value_parser = run::parse_sleep_fast_forward)]
+        sleep_fast_forward: Option<bool>,
+
         /// Dump memory when the run stops: ADDR:LEN:PATH (repeatable)
         /// 停止时导出内存：ADDR:LEN:PATH（可重复）
         #[arg(long = "dump", value_name = "ADDR:LEN:PATH", value_parser = run::MemoryDump::parse)]
@@ -329,6 +334,7 @@ fn main() {
             max_cycles,
             trace_steps,
             strict_decode,
+            sleep_fast_forward,
             dump,
             psram,
         } => {
@@ -338,6 +344,7 @@ fn main() {
                 max_cycles,
                 trace_steps,
                 strict_decode,
+                sleep_fast_forward,
                 psram,
                 dumps: dump,
             };
@@ -674,6 +681,38 @@ mod tests {
             Some(run::PsramOptions {
                 size_bytes: 1024 * 1024
             })
+        );
+    }
+
+    #[test]
+    fn run_parses_the_sleep_fast_forward_switch() {
+        // `--sleep-fast-forward on|off` 只接受两种写法；缺省时保持 `None`，
+        // 由环境变量/默认策略决定。
+        // `--sleep-fast-forward on|off` accepts two spellings; omitted it stays
+        // `None` so the environment default decides.
+        let cli =
+            parse(&["run", "--file", "fw.uf2", "--sleep-fast-forward", "off"]).expect("parse run");
+        let Commands::Run {
+            sleep_fast_forward, ..
+        } = cli.command
+        else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(sleep_fast_forward, Some(false));
+
+        let cli =
+            parse(&["run", "--file", "fw.uf2", "--sleep-fast-forward", "on"]).expect("parse run");
+        let Commands::Run {
+            sleep_fast_forward, ..
+        } = cli.command
+        else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(sleep_fast_forward, Some(true));
+
+        assert!(
+            parse(&["run", "--file", "fw.uf2", "--sleep-fast-forward", "maybe"]).is_err(),
+            "unknown spellings are rejected"
         );
     }
 
