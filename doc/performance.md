@@ -1246,3 +1246,89 @@ runs completed without a crash or hang.
 2. 窗口 >64 会合并 64 步泵送，HSTX 可能欠载；需要严格节拍时用默认 64。
 3. GDB 监视点是线程局部的，`on` 模式不支持；调试请用 `off`。
 
+---
+
+## 14. PIO 时钟计时与 I2S 字速率（2026-11-16）
+
+### 14.1 口径 / Method
+
+`SharedPio::tick` 的参数是**经过的 `clk_sys` 周期数**，不是 PIO 时钟数：块内每台
+状态机用 `CLKDIV = INT + FRAC/256` 把这些周期换成机器周期（`clk_sys / CLKDIV`），
+小数余数在 1/256 单位累加器中跨批次保留。CLI 的 `pump_pio_batch` 把「上一批以来
+退役的步数」（CPU 模型里 1 步 = 1 个 `clk_sys` 周期）原样交给块，因此批次内经过的
+时间如实换算，不存在「每批只推 1 个 tick」。
+
+`SharedPio::tick` takes elapsed **`clk_sys` cycles**, not PIO clocks: each machine
+divides them with `CLKDIV = INT + FRAC/256`, keeping the fractional remainder in
+a 1/256 accumulator across batches. `pump_pio_batch` hands over the retired steps
+since the last batch (one step = one `clk_sys` cycle in the CPU model), so no
+cycle is lost or duplicated at a batch boundary.
+
+测量使用 release 构建、默认单线程路径，外部临时宿主程序（`rp2350_cli::run::Machine`
++ `AudioTap`，装在 PIO2 SM0，容量足够大所以不丢样；程序不在仓库内）在 300 M 与
+400 M 步各取一次快照。PIO 计数来自新增的 `clk_sys_cycles()` /
+`instructions_retired()`。字速率按**客户机时间**（`time_us`）计算。
+
+### 14.2 结果 / Results
+
+| 窗口 | steps | `time_us` | PIO `clk_sys` | PIO 指令 | tap 字 | 说明 |
+|---|---|---|---|---|---|---|
+| 0–300 M | 300 000 000 | 1 798 617 | 74 620 928 | 254 706 | 3 988 | 前 225.4 M 步 PIO2 未使能 |
+| **300–400 M** | **100 000 000** | **+396 825** | **+100 000 000** | **+341 333** | **+5 334** | **全部 252 MHz** |
+
+- 批次比值：300–400 M 窗口内 **PIO `clk_sys` : 客户机步数 = 1.000000**；整跑
+  0.2487 只是因为 225.4 M 步启动阶段块未使能（`SharedPio::tick` 的空闲快速路径），
+  不是时钟被截断。
+- 指令速率：341 333 / 0.396825 s = **860 159 条/秒**；`clk_sys/CLKDIV` =
+  252 000 000 / 292.96875 = **860 160 条/秒**，差 0.0001 %。
+- 字速率：5 334 / 0.396825 s = **13 441.7 字/秒**（固件配置 13 440，+0.01 %；
+  63.99 指令/字，串行程序理论值 64）。PIO2 SM0 的 `SMx_CLKDIV = 0x0124_F800`
+  = 292.96875，正是 `252e6 / (13440 × 64)`。
+- 合成向量（`pio/timing_tests.rs::serializer_word_rate_is_13440_at_252_mhz`）：
+  1/128 s（1 968 750 个 `clk_sys`）产出 105 字 = 13 440 字/秒，误差 ≤1 字。
+
+**2.7k 的来源**：`AudioSink::len()` 以 **i16 样本**计数（一个 32 位字压入 2 个样本），
+29 844 正好是 14 922 个字；音频启动后的 275 M 步窗口在 252 MHz 下是 1.091 s 客户机
+时间，因此字速率是 **13 676 字/秒**。若把这 29 844 个样本除以「模拟 275 M 步所需
+墙钟」（本机 15–25 M 步/秒 → 11–18 s），得到 **1.6k–2.7k/秒**：这是墙钟产出，不是
+客户机时间速率。两处口径误差叠加：把样本当字使其偏大 2×，用墙钟代替客户机时间使
+其偏小约 10×，净效果正好约 5× 偏小。
+
+The 29 844 figure is the number of **samples** `AudioSink::len()` reports (two
+`i16` samples per 32-bit word) = 14 922 words. A 275 M-step window after the
+audio SM starts is 1.091 s of guest time at 252 MHz, i.e. 13 676 words/s.
+Dividing the same 29 844 by the *wall-clock* time needed to emulate 275 M steps
+(11–18 s at 15–25 M steps/s) gives 1.6k–2.7k/s: that is host wall-clock
+production, not guest time. The two unit errors roughly cancel to a 5×
+underestimate: samples counted as words (2× too high) divided by wall time
+instead of guest time (~10× too low).
+
+### 14.3 基线 / Baseline
+
+PIO 时钟模型本来就是「按经过的 `clk_sys` 周期分频」，本轮只补齐了精度缺口，因此
+emerald 300 M 的客户机可见计数器**逐字段不变**：
+
+| 字段 | 值 |
+|---|---|
+| `time_us` | **1 798 617** |
+| `dma` / `busy` | **2 199 378** / `0x0009` |
+| `hstx` | `words=5 401 204 underruns=0 fifo=8 enabled=true wof=false unknown=0` |
+| `sleep` | `core0 steps=224 994 790 wakes=6 core1 steps=0 wakes=0` |
+| `core1` | `Running`、`launches=1` |
+| `[irq]` | 8 条（core0/core1，IRQ 10） |
+
+本轮实际改动（`rp2350-periph`）：`CLKDIV` 写入不再清零相位累加器（小数余数保留，
+`CTRL.CLKDIV_RESTART` 才重启）；分频器在状态机禁用期间继续自由运行；`SMx_CLKDIV`
+的位 31 不再被当作重启脉冲（它是 `INT` 的高位，数据手册无重启位）；新增
+`clk_sys_cycles`/`machine_cycles`/`instructions_retired` 诊断计数。emerald 只在
+初始化（禁用状态下）写一次 `CLKDIV` 并随后 `SM_RESTART`，所以上述改动不影响它的
+可见行为。CPU 的「1 条退休指令 = 1 个周期」近似（MT-1：`steps == cycles`）保持不变。
+
+### 14.4 墙钟产出 / Wall-clock production
+
+同一 300–400 M 窗口在本机跑 26.7 s（420 M 全程）/ 100 M 步约 6.4 s，对应
+**15.7–25 M 步/秒**，即客户机时间只跑到实时的 6–10 %。因此同一条 13 440 字/秒的
+I2S 流每秒墙钟只产出 **336–1 000 字**；`rp2350-egui` 的 `produced=/s` 是墙钟口径，
+低于 `need=13440/s` 是宿主吞吐不足，不能用它判定 PIO 计时。要达到实时音频需要
+≥252 M 步/秒（见 §9 的 JIT 结论），本轮不改变该结论。
+

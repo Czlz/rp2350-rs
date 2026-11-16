@@ -29,6 +29,14 @@ keyboard/gamepad input, audio output, and no crashes.
 ≥150 M steps/s（缺口 5×）。剩余成本 65–75 % 在 `rp2350-arm` 逐指令取指/译码，路线是
 译码缓存（P0-3c）→ 必要时 JIT。
 
+**2026-11-16 更新（play 批量帧步进）**：`play` worker 过去把一帧拆成 4096 步的
+`run_steps`，每个切片都要启动两条核线程，线程化执行器因此几乎没有收益。现在每帧是
+**一个** `run_steps(steps_per_frame)`，按键/停止采样移入机器（`Machine::set_host_input`，
+仍是每 4096 步一次）。emerald 130 帧背靠背实测 **off 41.7 s → on 20.9 s（2.00×）**，
+重复成对测量墙钟比 1.5–2.2×（取决于宿主调度对每批两条工作线程的放置）；最后十帧
+off 1.74–3.30 fps / 7.3–13.8 M steps/s、on 3.55–6.53 fps / 14.9–27.4 M steps/s。
+两次运行都恰好执行 546 M 步（130 × 4.2 M）。默认 `off` 仍确定性、与旧路径逐字节一致。
+
 **关于 `WFI`（更正）**：emerald 用忙等实现（SDK `tight_loop_contents()` 是空函数），
 这只说明该固件不走睡眠路径，**不构成「不需要睡眠语义」的理由**。本项目是通用 RP2350
 模拟器（见 `.trae/rules/project.md` 的「通用性与指令精确」），`WFI`/`WFE`/`SEV` 与阻塞式
@@ -73,6 +81,8 @@ UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 
 | P0-3a ✅ | 第三轮（`arm`+`core`）：纠正异常检查读数、UF2 装载 O(n²)→`HashSet`、批量 `load_bytes` | `rp2350-arm` + `rp2350-core` | **实测 2.45–2.51 s / 19.9–20.4 M/s**（启动 0.045 s）；300M 计数器逐字段不变；累计 **6.8×** |
 | P0-3b ✅ | 第四轮（`cli`）：`run_steps` 批量步进（−27 %）、core1 门控（−11 %）、`record_sync_trap` 跳过；`play` 按键改每 4096 步、`read_block` 按字批量 | `rp2350-cli` | **实测 1.68–1.75 s / 28.5–29.8 M/s**（子会话最小 1.655 s / 30.2 M）；300M 15.8 s；`play` 12.4 fps |
 | P0-3c ✅ | 第五轮（`arm`+`core`）：1024 条译码缓存（只缓存 Flash 窗口、`content_generation` 失效）+ 线程化分发；SRAM 仍走解释器 | `rp2350-arm` + `rp2350-core` | **实测 1.60–1.70 s / 29.5–31.2 M/s**（子会话 11 样本最小 **1.470 s / 34.0 M**；目标 1.2 s 未达，差 1.24×）；300M 16.3 s、计数器逐字段不变；10 项两核差分测试 |
+| P0-4 ✅ | **GUI 暴露 MT-3b 双核线程开关（含命令行直启）**：PlayView 工具栏 `Threads / 线程` 复选框 + `Window / 窗口` 输入（运行中锁定，状态行 `threads=on/off win=N`）；`CliPlayStarter` 经 `start_with_core_threads` 透传；命令行 `--core-threads`/`--core-window`，profile `core_threads`/`core_window`（命令行覆盖 profile）；默认 off = 确定性，on = 交互模式（窗口内非位可复现，仅 Arm + core1 生效） | `rp2350-egui` | `cargo test -p rp2350-egui` **141 passed**（+16：默认 off/窗口 64、CLI flag/窗口/非法值、profile 载入与覆盖、字段透传、状态行、80×60 无头渲染、运行中锁定、真实线程会话）；fmt/clippy(pedantic)/doc 零警告；`--profile example/gba/profile.conf --core-threads` 冒烟 |
+| P0-5 ✅ | **`play` 批量帧步进**：每帧一个 `run_steps(steps_per_frame)`（首帧 `[trace]` 前缀仍逐条 `trace_step`）；按键/停止采样移入 `Machine::set_host_input`（4096 步硬边界，串行切片与线程化窗口都不跨过；宿主停止返回 `Halted` 但不锁存 halt）；`play` profile 新增 `core_threads`/`core_window` 键，`PlaySession` 回读 `core_threads_enabled`/`core_window` | `rp2350-cli` | **emerald 130 帧：off 41.7 s → on 20.9 s（2.00×）**；最后十帧 on 3.55–6.53 fps / 14.9–27.4 M steps/s；每帧精确 4.2 M 步；`cargo test -p rp2350-cli` **179 passed + 2 ignored / 89**（+11）；fmt/clippy(pedantic)/doc 零警告；FV-1/2/3 `stdout: 42`；emerald off 300M `time_us=1798617`、`dma=2199378`、`hstx 5401204/0`、`sleep 224994790/6`、PC `0x1000B3AC` 逐字段不变 |
 
 ### P1 画面 / Video
 
@@ -89,7 +99,7 @@ UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 
 | P2-1 ✅ | I2S 采样捕获：`AudioSink`/`AudioTap`，唯一接线点 `Pio::push_tx`（CPU 与 DMA 共用），`BootPeripherals::set_audio_tap` | `rp2350-periph` | periph 347 测试；CPU/DMA 两路径 + 端到端；未安装 tap 零开销 |
 | P2-2 ✅ | 宿主输出 crate `rp2350-audio`（`cpal` 可选 feature，null 后端静默降级，有界队列 + 墙钟节奏，最近邻重采样） | `crates/rp2350-audio`（新） | 12/13 测试（`--all-features` 实测 backend=cpal）；`shutdown` 毫秒级；无设备不 panic |
 | P2-3 ✅ | **GUI 已接线**：`PlayView` 勾选音频时用 `PlaySource::audio_source()` 取 worker 的 `AudioTap` 并启动 `AudioOutput`（容量 1 s / 96k 样本）；`stop`/`Drop` **先** join 音频线程再关会话；`audio-playback` feature 转发 `rp2350-audio/playback`；状态栏 `audio=<backend> tap_samples=<n> dropped=<n> underruns=<n> produced=<n>/s need=<n>/s`，慢于实时时追加明确提示，null 后端打印原因并提示一次；运行中音频复选框置灰 | `rp2350-egui` | `cargo test -p rp2350-egui` **124 passed**（+4 音频状态/诊断）；`--features audio-playback` 124 passed；`backend ∈ {cpal, null}`；5 s/15 s stderr 诊断行；`stop()` 2 s 内 join；`Drop` 不 panic |
-| P2-4 🚧 | **音频链路的两个根因**：① **已修**——HSTX FIFO 满时 `enabled_selects_dreq` 仍把整批 DMA 预算置 0，导致 HSTX 高优先级通道饿死 PIO2 TX0 的 I2S TX DMA，tap 永远为空；现在只有 DREQ 断言的通道才限制预算，修复后 tap 开始收到样本。② **未解（实时率）**——`AudioOutput` 在持续欠载时保持静音、只累加 `underruns`，不循环旧样本；GUI 状态行/stderr 给出 `produced=/s` 与 `need=13440/s`。当前 emerald 约 2 fps，生产约 90–450 帧/秒，而 I2S 需要 13 440 帧/秒，因此即使 tap 有数据也仍然欠载、听起来无声；解决依赖多线程/解释器吞吐（P0），不得伪造样本或把 underrun 归零 | `rp2350-periph`（DMA 节拍修复）+ `rp2350-audio` + `rp2350-egui`（诊断） | periph 449 测试（含 HSTX 满 FIFO 不饿死 PIO 通道）；audio 20 测试；egui 125 测试；5 s/15 s stderr 诊断行与 `first-sample` 行；达到实时后再复测出声 |
+| P2-4 🚧 | **音频链路的两个根因**：① **已修**——HSTX FIFO 满时 `enabled_selects_dreq` 仍把整批 DMA 预算置 0，导致 HSTX 高优先级通道饿死 PIO2 TX0 的 I2S TX DMA，tap 永远为空；现在只有 DREQ 断言的通道才限制预算，修复后 tap 开始收到样本。② **未解（实时率）**——`AudioOutput` 在持续欠载时保持静音、只累加 `underruns`，不循环旧样本；GUI 状态行/stderr 给出 `produced=/s` 与 `need=13440/s`。**口径说明**：`produced=/s` 是**墙钟**产出；客户机时间口径下 PIO2 SM0 在 252 MHz、`CLKDIV=292.96875`、64 指令/字时实测 **13 441.7 字/秒**（见 `doc/performance.md` §14，300–400 M 窗口 PIO `clk_sys` 与步数比 1.000000、341 333 条指令 / 5 334 字）。墙钟只有 336–1 000 字/秒是因为 emerald 仅跑到实时 6–10 %（约 2 fps），不是 PIO 时钟缺陷；解决依赖多线程/解释器吞吐（P0），不得伪造样本或把 underrun 归零。此前「2.7k 帧/秒」是 29 844 个**样本**（=14 922 字）除以 11–18 s 墙钟的结果，混用了样本/字与墙钟/客户机时间两种口径 | `rp2350-periph`（DMA 节拍修复 + PIO 时钟精度）+ `rp2350-audio` + `rp2350-egui`（诊断） | periph 483 测试（含 HSTX 满 FIFO 不饿死 PIO 通道、PIO 整数/小数分频与 13 440 字/秒向量）；audio 20 测试；egui 125 测试；5 s/15 s stderr 诊断行与 `first-sample` 行；达到实时后再复测出声 |
 
 ### P3 完善 / Polish
 
