@@ -77,7 +77,20 @@
 > | P4-3 | 时钟频率回归矩阵（150/252/降频/源切换）+ 文档 | 主会话 | ⏳ |
 > | GAP-19 | MCP TLS（可选安全加固） | mcp | ⏳ |
 > | GAP-20 | SysTick 投递时延收紧（10 064 步 → 逐周期） | periph + cli | ⏸ 可选（已知限制，~67 µs @150 MHz） |
+> | MT-1 | 多线程测量与原型（逐核/锁成本/加速比） | core + cli | ✅ |
+> | MT-2a | 线程安全总线（10 bank、Flash 免锁、MMIO 每设备锁） | core | ✅ |
+> | MT-2b | TIMER 原子快照 | periph | ✅ |
+> | MT-3a | 睡眠核快进（启动 56–66×） | cli + periph | ✅ |
+> | MT-3b | 双核线程可选模式（整跑 1.97×） | cli + core + arm | ✅ |
+> | MT-5 | 插件执行器线程化（+ 并行 flake 修复） | virt-periph | ✅ |
+> | MTV-6 | 插件宿主接线（CLI/GUI 真正 step 插件 + `--plugin-threads`） | cli + egui | ⏳ 下一会话 T1 |
+> | T2 | CPU 每指令周期成本（当前 steps==cycles 近似） | arm + cli | ⏳ 下一会话 T2（先设计/测量） |
+> | T3 | 存档/状态保存与 flash 路径 | cli + egui | ⏳ 下一会话 T3 |
+> | T4 | 长跑 soak 与静置机 A/B 复测 | 主会话 | ⏳ 下一会话 T4 |
 >
+> **交接 / Handoff**：下一会话请先读 [`handoff.md`](handoff.md)（自包含的定位、基线、代码地图、
+> 验收命令、T1–T6 任务与经验教训）。
+
 > **验收记录 / Acceptance（2026-11-16）**
 >
 > 全仓 `cargo fmt --check` / `clippy --all-targets --all-features -D warnings -W pedantic` /
