@@ -24,11 +24,27 @@
 //!
 //! 两个域都来自同一晶振，因此在所有有效配置下微秒数一致；而当 `clk_sys` 改频时，
 //! 参考域仍保持精确。
+//!
+//! # Lock-free publication / 无锁发布
+//!
+//! Every `clk_ref`-domain advance ([`Timebase::advance`], [`Timebase::push_ref_cycles`])
+//! republishes the exact microsecond count into the shared [`TimerSnapshot`] while
+//! the timebase mutex is still held. TIMER register reads then serve
+//! `TIMELR`/`TIMEHR` from that atomic instead of locking the timebase, without
+//! changing the value a locked observer sees at the same simulated instant.
+//! 每次 `clk_ref` 域推进（[`Timebase::advance`]、[`Timebase::push_ref_cycles`]）都会
+//! 在仍持有时基互斥锁时把精确微秒数重新发布到共享 [`TimerSnapshot`]。TIMER 寄存器
+//! 读取随后从该原子量服务 `TIMELR`/`TIMEHR`，不再锁时基，同时不会改变加锁观察者在
+//! 同一仿真时刻看到的值。
+
+use std::sync::Arc;
 
 use rp2350_core::TimeBase;
 
+use super::timer_snapshot::TimerSnapshot;
+
 /// Unified CPU + reference-domain time base / 统一的 CPU + 参考域时基
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Timebase {
     /// Executed `clk_sys` cycles to uptime microseconds / 已执行 `clk_sys` 周期到运行时间微秒
     cpu: TimeBase,
@@ -41,19 +57,37 @@ pub struct Timebase {
     refclk_hz: u32,
     /// Clock-tree generation observed by the last advance / 上次推进观察到的时钟树世代
     generation: u32,
+    /// Lock-free mirror of the reference-domain counter / 参考域计数器的无锁镜像
+    ///
+    /// Clones share this handle, so a cloned time base still publishes into the
+    /// snapshot the TIMER blocks were built from.
+    /// 克隆共享该句柄，因此克隆出的时基仍会发布到 TIMER 块构建时使用的快照中。
+    snapshot: Arc<TimerSnapshot>,
 }
 
 impl Timebase {
     /// Create a time base from the live frequencies / 以实时频率创建时基
     #[must_use]
-    pub const fn new(sysclk_hz: u32, refclk_hz: u32) -> Self {
+    pub fn new(sysclk_hz: u32, refclk_hz: u32) -> Self {
         Self {
             cpu: TimeBase::new(sysclk_hz),
             reference: TimeBase::new(refclk_hz),
             ref_acc: 0,
             refclk_hz,
             generation: 0,
+            snapshot: Arc::new(TimerSnapshot::new()),
         }
+    }
+
+    /// Lock-free mirror of the TIMER microsecond counter / TIMER 微秒计数器的无锁镜像
+    ///
+    /// The TIMER blocks clone this handle at construction; hosts may keep one as
+    /// well to observe the counter without taking the timebase mutex.
+    /// TIMER 块在构造时克隆该句柄；宿主也可以保留一个，以便在不获取时基互斥锁的
+    /// 情况下观察计数器。
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<TimerSnapshot> {
+        Arc::clone(&self.snapshot)
     }
 
     /// Advance both domains by executed `clk_sys` cycles
@@ -77,6 +111,7 @@ impl Timebase {
         if sysclk_hz == 0 || refclk_hz == 0 {
             // 时钟停止时不会产生参考节拍，剩余小数保留到恢复后。
             // A stopped clock produces no reference ticks; the fraction is kept.
+            self.publish_timer();
             return;
         }
         let total = self.ref_acc + u128::from(cycles) * u128::from(refclk_hz);
@@ -84,6 +119,7 @@ impl Timebase {
         let ticks = u64::try_from(total / rate).unwrap_or(u64::MAX);
         self.ref_acc = total % rate;
         self.reference.advance(ticks, refclk_hz);
+        self.publish_timer();
     }
 
     /// Push `clk_ref` cycles directly (TICKS `CYCLES` writes)
@@ -95,6 +131,19 @@ impl Timebase {
     /// 再次换算。
     pub fn push_ref_cycles(&mut self, cycles: u64) {
         self.reference.advance(cycles, self.refclk_hz);
+        self.publish_timer();
+    }
+
+    /// Republish the exact reference-domain count into the shared snapshot
+    /// 把精确的参考域计数重新发布到共享快照
+    ///
+    /// Called after every `clk_ref`-domain advance (including the stopped-clock
+    /// case, where the count simply does not move) so the atomic mirror is never
+    /// behind the authoritative integrator.
+    /// 每次 `clk_ref` 域推进后调用（包括时钟停止、计数不变的情况），使原子镜像
+    /// 永不落后于权威积分器。
+    fn publish_timer(&self) {
+        self.snapshot.publish_now(self.reference.time_us());
     }
 
     /// Elapsed uptime microseconds (`clk_sys` domain) / 已运行的微秒数（`clk_sys` 域）
@@ -201,5 +250,46 @@ mod tests {
         time.advance(75, 150_000_000, 12_000_000, 1);
         assert_eq!(time.project_time_us(75, 150_000_000), 1);
         assert_eq!(time.time_us(), 0);
+    }
+
+    #[test]
+    fn every_reference_advance_republishes_the_exact_counter() {
+        // 快照必须与加锁读在同一时刻给出相同的微秒数，包括 TICKS 的 `CYCLES`
+        // 推入与批量边界推进。
+        // The snapshot must equal the locked read at every instant, including a
+        // TICKS `CYCLES` push and a batched boundary advance.
+        let mut time = Timebase::new(252_000_000, 12_000_000);
+        let snapshot = time.snapshot();
+        assert_eq!(snapshot.now_us(), 0);
+        // 252 MHz 下 252 周期 = 1 µs。
+        // 252 cycles at 252 MHz are 1 µs.
+        time.advance(252, 252_000_000, 12_000_000, 1);
+        assert_eq!(snapshot.now_us(), time.timer_us());
+        assert_eq!(snapshot.now_us(), 1);
+        // TICKS 的 `CYCLES` 推入只移动参考域。
+        // A TICKS `CYCLES` push only moves the reference domain.
+        time.push_ref_cycles(24);
+        assert_eq!(snapshot.now_us(), time.timer_us());
+        assert_eq!(snapshot.now_us(), 3);
+        // 一次推进 10 000 步（驱动器的 ADVANCE_INTERVAL 边界，也是 MT-3a 睡眠
+        // 快进后结算的批量边界）。
+        // A 10 000-step advance: the driver's ADVANCE_INTERVAL boundary, which is
+        // also the batch boundary MT-3a settles after a sleep fast-forward.
+        time.advance(2_520_000, 252_000_000, 12_000_000, 2);
+        assert_eq!(snapshot.now_us(), time.timer_us());
+        assert_eq!(snapshot.now_us(), 10_003);
+    }
+
+    #[test]
+    fn a_stopped_clock_republishes_the_unchanged_counter() {
+        // 时钟停止时不产生参考节拍，快照保持在推进前的值而不是被清零。
+        // A stopped clock produces no reference ticks: the snapshot stays at the
+        // pre-stop value instead of being cleared.
+        let mut time = Timebase::new(150_000_000, 12_000_000);
+        let snapshot = time.snapshot();
+        time.advance(150, 150_000_000, 12_000_000, 1);
+        time.advance(1_000, 0, 0, 2);
+        assert_eq!(snapshot.now_us(), 1);
+        assert_eq!(snapshot.now_us(), time.timer_us());
     }
 }

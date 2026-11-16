@@ -1354,6 +1354,84 @@ waiting on a future deadline wakes on time.
 alarm 线，`BootPeripherals::advance` / `irq_mask` 在每次泵送时执行该操作，使
 等待未来截止值的 `WFI` 按时唤醒。
 
+### Lock-free counter snapshot / 无锁计数器快照
+
+`TIMER0/1` share one `TimerSnapshot` (`timer_snapshot.rs`) with the time base:
+
+```rust
+pub struct TimerSnapshot { /* atomic fields only, no mutex / 只有原子字段，无互斥锁 */ }
+impl TimerSnapshot {
+    pub fn now_us(&self) -> u64;            // AtomicU64, Acquire load
+    pub fn timer0_alarm_hits(&self) -> u32;  // bits latched by the last sample
+    pub fn timer1_alarm_hits(&self) -> u32;
+}
+```
+
+* **Update point.** `Timebase::advance` and `Timebase::push_ref_cycles` republish
+  `reference.time_us()` with a `Release` store **while the timebase mutex is
+  still held**. These are exactly the points where the reference-domain
+  integrator moves: executed `clk_sys` cycles (including the driver's batched
+  `ADVANCE_INTERVAL` boundary that MT-3a's sleep fast-forward also settles at),
+  TICKS `CYCLES` pushes, and a stopped clock (where the value simply does not
+  change). Nothing else can move the timer counter, so the atomic mirror is never
+  behind the authoritative integrator.
+* **Read path.** `TIMELR`/`TIMEHR`/`TIMERAWL`/`TIMERAWH` each perform one
+  `Acquire` load; they take neither the timebase mutex nor any block register
+  lock. Each read is still an independent sample, so reading the two halves
+  separately can straddle a microsecond tick exactly as before.
+* **Consistency.** Because the store happens under the same mutex that guards the
+  timebase, a single-threaded read returns bit-for-bit the same value as
+  `Timebase::timer_us()` at that instant (tested at random instants, at 150/252
+  MHz, across the 64-bit wrap and across batched boundaries). Concurrently, a
+  reader may observe the previous published value while the writer is inside
+  `advance`; that is the same window in which a locked reader would block.
+* **Alarm state.** The owning block republishes its derived state at the existing
+  sample points (register writes, `read32(ARMED/INTR/INTS)` and `refresh`):
+  `next_deadline` (the armed deadline that becomes due first, `0` when nothing is
+  armed), `alarm_hits` (bits latched by the most recent sample; `INTR` writes
+  acknowledge them, alarm writes start a new set) and `ints`
+  (`(INTR | INTF) & INTE`). `refresh()` uses `next_deadline` as its gate: with no
+  due deadline it only loads two atomics and writes the lines whose level
+  changed, so the interrupt pump (every 64 steps) takes no timer lock at all.
+  Timing is unchanged — an alarm can only fire once its deadline is due, and the
+  sample points are the old ones.
+* **Relation to the device lock.** Guest accesses still pass through
+  `MmioRouter`'s per-device mutex (owned by `rp2350-core`); the snapshot removes
+  the *timebase* mutex and the block's register locks from a counter read, so a
+  guest poll costs one atomic load inside the device. Hosts can bypass the bus
+  entirely: `peripherals.timer().snapshot().now_us()` is lock-free. Wiring the
+  snapshot into a lock-free `SharedRegion` for the threaded bus is MT-3 work.
+* **`IrqAssert`.** The shared interrupt mask is now one `AtomicU64` (`fetch_or` /
+  `fetch_and` / load), so republishing a line or polling the mask is lock-free
+  too. Level semantics are unchanged (an asserted line stays asserted until the
+  owner clears it).
+* **Host-side only.** No guest-visible rule changed: the snapshot is derived
+  state, `INTR`/`INTE`/`INTF`/`INTS`/`ARMED`/`ALARM` remain authoritative, and
+  interrupt ordering is untouched.
+* **更新点**：`Timebase::advance` / `push_ref_cycles` 在**仍持有时基互斥锁**时以
+  `Release` 存储发布 `reference.time_us()`；这正是参考域积分器移动的全部时机
+  （执行周期，含 MT-3a 睡眠快进结算的 `ADVANCE_INTERVAL` 批量边界、TICKS 的
+  `CYCLES` 推入、以及时钟停止但计数不变的情形），因此原子镜像永不落后。
+* **读路径**：四个计数别名各一次 `Acquire` 加载，不取时基锁、也不取块寄存器锁；
+  每次读仍是一次独立采样，分两次读高低半字仍可能跨过 1 µs 刻度（与之前相同）。
+* **一致性**：存储与加锁路径使用同一把时基锁，因此单线程读取与
+  `Timebase::timer_us()` 逐位相同（已在随机时刻、150/252 MHz、64 位回绕与批量
+  边界上测试）。并发时读者可能看到上一发布值，这正是加锁读者会阻塞的窗口。
+* **alarm 状态**：所属块在既有采样点（寄存器写、`read32(ARMED/INTR/INTS)`、
+  `refresh`）重新发布 `next_deadline`（最先到期的已武装截止值，未武装为 0）、
+  `alarm_hits`（最近一次采样锁存的位；`INTR` 写 1 确认、alarm 写入开启新集合）
+  与 `ints`（`(INTR | INTF) & INTE`）。`refresh()` 以 `next_deadline` 为门控：
+  没有到期项时只读两个原子量并仅写入电平变化的线，因此每 64 步的中断泵完全不取
+  TIMER 锁；触发时刻不变（只有到期才会命中，采样点与旧实现相同）。
+* **与设备锁的关系**：客户机访问仍经过 `rp2350-core` 的 `MmioRouter` 每设备互斥
+  锁；快照移除的是**时基锁**与块寄存器锁，因此一次客户机轮询在设备内只剩一次原子
+  加载。宿主可完全绕过总线：`peripherals.timer().snapshot().now_us()` 无锁。
+  把快照接入线程化总线的无锁 `SharedRegion` 属于 MT-3。
+* **`IrqAssert`**：共享中断掩码改为一个 `AtomicU64`（`fetch_or`/`fetch_and`/加载），
+  发布线与轮询掩码同样无锁；电平语义不变。
+* **仅宿主侧**：未改变任何客户机可见规则；快照是派生状态，`INTR`/`INTE`/`INTF`/
+  `INTS`/`ARMED`/`ALARM` 仍是权威值，中断顺序不变。
+
 ---
 
 ## XIP (QMI + Flash + PSRAM backend)

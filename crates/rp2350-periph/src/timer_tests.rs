@@ -1,6 +1,9 @@
 //! TIMER0/TIMER1 model tests / TIMER0/TIMER1 模型测试
 
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rp2350_core::mmio::MmioDevice;
@@ -9,7 +12,8 @@ use crate::boot::Timebase;
 use crate::irq::IrqAssert;
 use crate::map;
 use crate::timer::{
-    ALARM0_OFFSET, ARMED, INTE, INTF, INTR, INTS, TIMEHR, TIMELR, TIMERAWL, Timer0, Timer1,
+    ALARM0_OFFSET, ARMED, INTE, INTF, INTR, INTS, TIMEHR, TIMELR, TIMERAWH, TIMERAWL, Timer0,
+    Timer1,
 };
 
 /// Offset of `ALARM0` / `ALARM0` 偏移
@@ -55,6 +59,19 @@ impl Rig {
         self.timebase
             .lock()
             .advance(u64::from(CYCLES_PER_US) * micros, SYSCLK_HZ, REFCLK_HZ, 1);
+    }
+
+    /// Advance simulated time by executed `clk_sys` cycles
+    /// 按已执行的 `clk_sys` 周期推进模拟时间
+    fn advance_cycles(&self, cycles: u64) {
+        self.timebase
+            .lock()
+            .advance(cycles, SYSCLK_HZ, REFCLK_HZ, 1);
+    }
+
+    /// Authoritative microsecond count (locked path) / 权威微秒数（加锁路径）
+    fn now(&self) -> u64 {
+        self.timebase.lock().timer_us()
     }
 }
 
@@ -327,4 +344,238 @@ fn the_timer_alarm_hits_the_same_microsecond_at_150_and_252_mhz() {
         assert_eq!(timer.read32(TIMERAWL), Some(1_000));
         assert_eq!(timer.read32(INTR), Some(1), "{sysclk} Hz");
     }
+}
+
+#[test]
+fn the_snapshot_matches_locked_reads_at_random_instants() {
+    // 单线程随机推进：快照路径与设备锁路径（`Timebase::timer_us`）必须逐位一致，
+    // 64 位两半与各别名同样一致。
+    // Random single-threaded advances: the snapshot path and the locked path
+    // (`Timebase::timer_us`) must agree bit for bit, including both halves and
+    // every alias.
+    let mut rig = Rig::new();
+    let mut state = 0x1234_5678u32;
+    for _ in 0..256 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        rig.advance_cycles(u64::from(state % 5_000));
+        let locked = rig.now();
+        assert_eq!(rig.timer.snapshot().now_us(), locked);
+        assert_eq!(
+            u64::from(rig.timer.read32(TIMELR).unwrap()),
+            locked & 0xFFFF_FFFF
+        );
+        assert_eq!(
+            u64::from(rig.timer.read32(TIMERAWL).unwrap()),
+            locked & 0xFFFF_FFFF
+        );
+        assert_eq!(u64::from(rig.timer.read32(TIMEHR).unwrap()), locked >> 32);
+        assert_eq!(
+            u64::from(rig.timer1.read32(TIMERAWH).unwrap()),
+            locked >> 32
+        );
+    }
+}
+
+#[test]
+fn the_snapshot_follows_batched_and_ticks_driven_boundaries() {
+    // 驱动器的 ADVANCE_INTERVAL 边界（10 000 步一次）与 TICKS 的 `CYCLES` 推入
+    // 都必须刷新快照；MT-3a 的睡眠快进也在同一批边界结算。
+    // The driver's ADVANCE_INTERVAL boundary (one advance per 10 000 steps) and
+    // TICKS `CYCLES` pushes must both refresh the snapshot; MT-3a's sleep
+    // fast-forward settles at the same batched boundary.
+    let mut rig = Rig::new();
+    for boundary in 0..64u32 {
+        rig.advance_cycles(10_000);
+        if boundary % 16 == 15 {
+            rig.timebase.lock().push_ref_cycles(12);
+        }
+        rig.timer.refresh();
+        rig.timer1.refresh();
+        let locked = rig.now();
+        assert_eq!(rig.timer.snapshot().now_us(), locked, "boundary {boundary}");
+        assert_eq!(
+            u64::from(rig.timer.read32(TIMERAWL).unwrap()),
+            locked & 0xFFFF_FFFF
+        );
+        assert_eq!(u64::from(rig.timer.read32(TIMEHR).unwrap()), locked >> 32);
+    }
+    assert!(rig.now() > 4_000, "64 boundaries are more than 4 ms");
+}
+
+#[test]
+fn timerawh_aliases_timehr_and_timerawl_aliases_timelr() {
+    // 别名来自同一次快照读；高低半字必须属于同一个 64 位值。
+    // The aliases come from the same snapshot read; the two halves must belong
+    // to one 64-bit value.
+    let mut rig = Rig::new();
+    rig.advance_us(0x1_0000_0005);
+    assert_eq!(rig.timer.read32(TIMERAWL), rig.timer.read32(TIMELR));
+    assert_eq!(rig.timer.read32(TIMERAWH), rig.timer.read32(TIMEHR));
+    assert_eq!(rig.timer.read32(TIMELR), Some(5));
+    assert_eq!(rig.timer.read32(TIMEHR), Some(1));
+    // TIMER1 共享同一计数器，因此别名值相同。
+    // TIMER1 shares the counter, so its aliases read the same value.
+    assert_eq!(rig.timer1.read32(TIMERAWL), Some(5));
+    assert_eq!(rig.timer1.read32(TIMERAWH), Some(1));
+}
+
+#[test]
+fn snapshot_alarm_hits_follow_arming_firing_and_acknowledgement() {
+    let mut rig = Rig::new();
+    // 武装但未到期：没有命中位。Armed but not due: no hit bit.
+    assert!(rig.timer.write32(ALARM0, 10));
+    assert_eq!(rig.timer.alarm_hits(), 0);
+    rig.advance_us(20);
+    rig.timer.refresh();
+    assert_eq!(rig.timer.alarm_hits(), 1);
+    assert_eq!(rig.timer.snapshot().timer0_alarm_hits(), 1);
+    // 写 1 到 INTR 确认后快照同步清除。Acknowledging with a 1 clears the snapshot.
+    assert!(rig.timer.write32(INTR, 1));
+    assert_eq!(rig.timer.alarm_hits(), 0);
+    // 重新武装到未来再解除武装：命中位保持为零。
+    // Re-arming into the future and disarming keeps the hit bits clear.
+    assert!(rig.timer.write32(ALARM0, 1_000));
+    assert_eq!(rig.timer.alarm_hits(), 0);
+    assert!(rig.timer.write32(ALARM0, 0));
+    assert_eq!(rig.timer.alarm_hits(), 0);
+    assert_eq!(rig.timer.read32(ARMED), Some(0));
+}
+
+#[test]
+fn timer1_shares_the_counter_but_keeps_its_own_alarm_hits() {
+    let mut rig = Rig::new();
+    assert!(rig.timer1.write32(ALARM0, 10));
+    rig.advance_us(20);
+    rig.timer.refresh();
+    rig.timer1.refresh();
+    assert_eq!(rig.timer.alarm_hits(), 0, "TIMER0 has no armed alarm");
+    assert_eq!(rig.timer1.alarm_hits(), 1);
+    assert_eq!(rig.timer.read32(INTR), Some(0));
+    assert_eq!(rig.timer1.read32(INTR), Some(1));
+    assert_eq!(
+        rig.timer.snapshot().now_us(),
+        rig.timer1.snapshot().now_us()
+    );
+    assert_eq!(
+        rig.timer.snapshot().now_us(),
+        rig.timebase.lock().timer_us()
+    );
+}
+
+#[test]
+fn the_refresh_gate_samples_only_when_a_deadline_is_due() {
+    // 中断泵在 64 步节拍上运行；没有到期截止时间时不得进入慢路径（不加块锁），
+    // 到期后恰好采样一次，触发时刻与旧实现相同。
+    // The interrupt pump runs on the 64-step tick; it must not enter the slow
+    // path while no deadline is due, and samples exactly once when one is.
+    let mut rig = Rig::new();
+    assert!(rig.timer.write32(ALARM0, 1_000_000));
+    let before = rig.timer.sample_count();
+    let before1 = rig.timer1.sample_count();
+    for _ in 0..1_000 {
+        rig.timer.refresh();
+        rig.timer1.refresh();
+    }
+    assert_eq!(rig.timer.sample_count(), before, "gate skips the slow path");
+    assert_eq!(rig.timer1.sample_count(), before1);
+    rig.advance_us(999_999);
+    rig.timer.refresh();
+    assert_eq!(
+        rig.timer.sample_count(),
+        before,
+        "still one microsecond early"
+    );
+    assert_eq!(rig.timer.alarm_hits(), 0);
+    rig.advance_us(1);
+    rig.timer.refresh();
+    assert_eq!(rig.timer.sample_count(), before + 1);
+    assert_eq!(rig.timer.alarm_hits(), 1);
+    // 已触发并解除武装，后续刷新不再采样。
+    // Fired and disarmed: later refreshes sample no more.
+    rig.advance_us(1_000);
+    rig.timer.refresh();
+    assert_eq!(rig.timer.sample_count(), before + 1);
+    assert_eq!(rig.timer1.sample_count(), before1);
+}
+
+#[test]
+fn an_alarm_armed_in_the_past_fires_on_the_write() {
+    // 写入一个已经过去的截止时间必须立即命中（与旧实现相同），门槛不得吞掉它。
+    // Arming a deadline that already passed must fire immediately (as before);
+    // the gate must not swallow it.
+    let mut rig = Rig::new();
+    rig.advance_us(100);
+    assert!(rig.timer.write32(INTE, 1));
+    assert!(rig.timer.write32(ALARM0, 50));
+    assert_eq!(rig.timer.alarm_hits(), 1);
+    assert_eq!(rig.timer.read32(INTR), Some(1));
+    assert_eq!(rig.timer.armed(), 0);
+    assert_eq!(rig.irq.mask(), 1 << map::TIMER0_IRQ_0);
+}
+
+#[test]
+fn reset_clears_the_snapshot_alarm_state() {
+    let mut rig = Rig::new();
+    assert!(rig.timer.write32(ALARM0, 10));
+    rig.advance_us(20);
+    rig.timer.refresh();
+    assert_eq!(rig.timer.alarm_hits(), 1);
+    rig.timer.reset();
+    assert_eq!(rig.timer.alarm_hits(), 0);
+    assert_eq!(rig.timer.read32(INTR), Some(0));
+    assert_eq!(rig.timer.read32(ARMED), Some(0));
+    assert_eq!(rig.irq.mask(), 0);
+    // 复位后时间仍在前进：快照与加锁路径保持一致。
+    // Time still advances after reset: the snapshot keeps matching the locked path.
+    rig.advance_us(5);
+    assert_eq!(rig.timer.snapshot().now_us(), rig.now());
+}
+
+#[test]
+fn the_sixty_four_bit_counter_wraps_through_the_high_word() {
+    // 越过 2^32 µs：低字回绕为 0、高字变成 1，快照与四个别名一致。
+    // Crossing 2^32 µs: the low word wraps to zero, the high word becomes one,
+    // and the snapshot agrees with all four aliases.
+    let mut rig = Rig::new();
+    rig.advance_us(4_294_967_296);
+    let locked = rig.now();
+    assert_eq!(locked, 0x1_0000_0000);
+    assert_eq!(rig.timer.snapshot().now_us(), locked);
+    assert_eq!(rig.timer.read32(TIMELR), Some(0));
+    assert_eq!(rig.timer.read32(TIMEHR), Some(1));
+    assert_eq!(rig.timer.read32(TIMERAWL), Some(0));
+    assert_eq!(rig.timer.read32(TIMERAWH), Some(1));
+}
+
+#[test]
+fn concurrent_timer_reads_never_take_the_timebase_lock() {
+    // 主线程持有时间基互斥锁（计数器来源的“设备锁”）时，两个线程仍必须能读取
+    // 计数器：读取只做原子加载。超时即视为失败，避免回归时挂死。
+    // With the timebase mutex (the counter source's device lock) held by the
+    // main thread, two threads must still read the counter: reads are atomic
+    // loads only. A timeout is reported as a failure instead of hanging.
+    let rig = Rig::new();
+    rig.advance_us(1_234_567);
+    let frozen = rig.now();
+    let guard = rig.timebase.lock();
+    let (sender, receiver) = mpsc::channel();
+    for _ in 0..2 {
+        let mut timer = rig.timer.clone();
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let mut values = Vec::with_capacity(100_000);
+            for _ in 0..100_000 {
+                let low = u64::from(timer.read32(TIMERAWL).unwrap());
+                let high = u64::from(timer.read32(TIMERAWH).unwrap());
+                values.push((high << 32) | low);
+            }
+            sender.send(values).expect("main thread is listening");
+        });
+    }
+    drop(sender);
+    let outcome = receiver.recv_timeout(Duration::from_secs(10));
+    drop(guard);
+    let values = outcome.expect("counter reads must not wait for the timebase lock");
+    assert_eq!(values.len(), 100_000);
+    assert!(values.iter().all(|&value| value == frozen));
 }

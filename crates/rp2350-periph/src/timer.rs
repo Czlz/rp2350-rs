@@ -28,8 +28,27 @@
 //! `TIMER1_IRQ_0..3` (`4..=7`).
 //! TIMER0 挂载在 [`map::TIMER0_BASE`]，产生 `TIMER0_IRQ_0..3`（`0..=3`）；
 //! TIMER1 挂载在 [`map::TIMER1_BASE`]，产生 `TIMER1_IRQ_0..3`（`4..=7`）。
+//!
+//! # Lock-free counter reads / 无锁计数器读取
+//!
+//! `TIMELR`/`TIMEHR`/`TIMERAWL`/`TIMERAWH` are served from the shared
+//! [`TimerSnapshot`] with one atomic load each. The snapshot is republished by
+//! [`crate::clock_time::Timebase`] at every `clk_ref`-domain advance (executed
+//! cycles, TICKS `CYCLES` pushes and the driver's batched tick boundary), while
+//! the timebase mutex is held, so a read returns exactly the microsecond count
+//! the locked path would return at the same instant. Register writes and alarm
+//! bookkeeping still take the block's own locks; the alarm sample points are
+//! unchanged, and the interrupt pump uses the atomic `next_deadline` gate plus
+//! the cached masked status instead of locking when no deadline is due.
+//! `TIMELR`/`TIMEHR`/`TIMERAWL`/`TIMERAWH` 由共享 [`TimerSnapshot`] 各用一次原子读
+//! 服务。快照由 [`crate::clock_time::Timebase`] 在每次 `clk_ref` 域推进（执行周期、
+//! TICKS 的 `CYCLES` 推入与驱动器的批量节拍边界）且仍持有时基互斥锁时重新发布，
+//! 因此一次读取返回的正是加锁路径在同一时刻会返回的微秒数。寄存器写入与 alarm
+//! 记账仍取块自身的锁；alarm 采样点保持不变，中断泵在没有到期截止时间时使用原子
+//! `next_deadline` 门控与缓存的屏蔽状态，而不是加锁。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use rp2350_core::mmio::{MmioDevice, MmioWindow, RegisterFile};
@@ -38,6 +57,7 @@ use rp2350_core::types::Address;
 use super::clock_time::Timebase;
 use super::irq::IrqAssert;
 use super::map;
+use super::timer_snapshot::{TIMER0_SLOT, TIMER1_SLOT, TimerSnapshot};
 
 /// Number of alarm channels / 闹钟通道数量
 const ALARMS: usize = 4;
@@ -103,6 +123,41 @@ fn reached(deadline: u32, now: u32) -> bool {
     now.wrapping_sub(deadline) < 0x8000_0000
 }
 
+/// Deadline that will be reached first, or `0` when nothing is armed
+/// 最先到期的截止时间；没有武装项时返回 `0`
+///
+/// The choice maximizes the wrapping signed distance `now - deadline`, which is
+/// exactly the ordering [`reached`] uses. All distances shift by the same amount
+/// as time advances, so the selected deadline stays the first one to become due
+/// until an arming write or a firing sample changes the set. The interrupt pump
+/// therefore only needs `reached(next_deadline, now)` to know whether any slow
+/// path can possibly have work to do.
+/// 该选择最大化回绕有符号差值 `now - deadline`，正是 [`reached`] 使用的顺序。所有
+/// 差值随时间同步平移，因此选中的截止时间在下次武装写入或采样触发之前始终保持
+/// 「最先到期」。中断泵因此只需 `reached(next_deadline, now)` 就能判断慢路径是否
+/// 可能有工作。
+/// 「最先到期」的选择需要把回绕差值按位重解释为有符号数，这正是 [`reached`]
+/// 使用的硬件语义。
+/// The "first to become due" selection reinterprets the wrapping difference as a
+/// signed value by bit, which is exactly the hardware semantics [`reached`] uses.
+#[allow(clippy::cast_possible_wrap)]
+#[must_use]
+fn nearest_deadline(deadlines: &[u32; ALARMS], armed: u32, now: u32) -> u32 {
+    let mut next = 0u32;
+    let mut best = i32::MIN;
+    for (index, &deadline) in deadlines.iter().enumerate() {
+        if armed & (1 << index) == 0 || deadline == 0 {
+            continue;
+        }
+        let distance = now.wrapping_sub(deadline) as i32;
+        if distance > best {
+            best = distance;
+            next = deadline;
+        }
+    }
+    next
+}
+
 /// State shared by one timer block and its clones / 一个定时器块及其克隆共享的状态
 #[derive(Debug, Clone)]
 struct TimerBlock {
@@ -112,8 +167,11 @@ struct TimerBlock {
     base: Address,
     /// First interrupt line (`TIMERx_IRQ_0`) / 首条中断线（`TIMERx_IRQ_0`）
     irq_0: u16,
-    /// Shared 64-bit timebase / 共享的 64 位时基
-    timebase: Arc<Mutex<Timebase>>,
+    /// Slot inside the shared snapshot (`0` = TIMER0, `1` = TIMER1)
+    /// 共享快照内的槽位（`0` = TIMER0，`1` = TIMER1）
+    slot: usize,
+    /// Lock-free mirror of the shared microsecond counter / 共享微秒计数器的无锁镜像
+    snapshot: Arc<TimerSnapshot>,
     /// Flat register file (`ALARM0..3`, `INTE`, `INTF`, `PAUSE`, ...) / 扁平寄存器文件
     regs: Arc<Mutex<RegisterFile>>,
     /// Latched raw status bits / 锁存的原始状态位
@@ -122,35 +180,56 @@ struct TimerBlock {
     armed: Arc<Mutex<u32>>,
     /// `LOCKED` value, kept apart from its 16-bit neighbour `PAUSE` / `LOCKED` 值，与 16 位邻居 `PAUSE` 分开保存
     locked: Arc<Mutex<u16>>,
+    /// Lines this block last republished (`INTS` mirror) / 本块上次发布的中断线（`INTS` 镜像）
+    published: Arc<AtomicU32>,
+    /// Number of slow-path samples (tests prove the gate skips them)
+    /// 慢路径采样次数（测试用其证明门控会跳过采样）
+    #[cfg(test)]
+    samples: Arc<AtomicU32>,
     /// Shared interrupt lines / 共享中断线
     irq: IrqAssert,
 }
 
 impl TimerBlock {
     /// Build one block / 构建一个块
+    // 公共构造函数保持「拥有 `Arc`」的签名（boot 与测试都传自己的克隆），块只取
+    // 快照句柄，之后不再持有该 `Arc`。
+    // The public constructors keep the owned-`Arc` signature (boot and tests pass
+    // their own clones); the block only extracts the snapshot handle.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(
         name: &'static str,
         base: Address,
         irq_0: u16,
+        slot: usize,
         timebase: Arc<Mutex<Timebase>>,
         irq: IrqAssert,
     ) -> Self {
+        // 快照由时基拥有；构造时取一次句柄，此后计数读取不再碰时基锁。
+        // The time base owns the snapshot; take the handle once so counter reads
+        // never touch the timebase lock again.
+        let snapshot = timebase.lock().snapshot();
         Self {
             name,
             base,
             irq_0,
-            timebase,
+            slot,
+            snapshot,
             regs: Arc::new(Mutex::new(RegisterFile::new(map::DEVICE_WINDOW_SIZE))),
             intr: Arc::new(Mutex::new(0)),
             armed: Arc::new(Mutex::new(0)),
             locked: Arc::new(Mutex::new(0)),
+            published: Arc::new(AtomicU32::new(0)),
+            #[cfg(test)]
+            samples: Arc::new(AtomicU32::new(0)),
             irq,
         }
     }
 
-    /// Current 64-bit microsecond counter / 当前 64 位微秒计数器
+    /// Current 64-bit microsecond counter (lock-free)
+    /// 当前 64 位微秒计数器（无锁）
     fn now_us(&self) -> u64 {
-        self.timebase.lock().timer_us()
+        self.snapshot.now_us()
     }
 
     /// Current counter as compared with the alarm registers / 与 alarm 寄存器比较用的当前计数
@@ -163,9 +242,14 @@ impl TimerBlock {
     ///
     /// A firing alarm sets its `INTR` bit and clears its `ARMED` bit, so the
     /// alarm is delivered exactly once per arming — firmware must write a one to
-    /// `INTR` to acknowledge it. / 到期的 alarm 置位 `INTR` 并清掉 `ARMED`，因此
-    /// 每次武装只投递一次；固件需要向 `INTR` 写 1 来确认。
+    /// `INTR` to acknowledge it. The fired bits are also published to the
+    /// snapshot (`alarm_hits`) so hosts can observe the latch without locks.
+    /// 到期的 alarm 置位 `INTR` 并清掉 `ARMED`，因此每次武装只投递一次；固件需要
+    /// 向 `INTR` 写 1 来确认。命中的位同时发布到快照（`alarm_hits`），宿主因此
+    /// 可以无锁观察该锁存。
     fn sample(&self) {
+        #[cfg(test)]
+        self.samples.fetch_add(1, Ordering::Relaxed);
         let now = self.now_low();
         let deadlines = {
             let regs = self.regs.lock();
@@ -175,18 +259,43 @@ impl TimerBlock {
             }
             deadlines
         };
-        let mut armed = self.armed.lock();
-        let mut fired = 0u32;
-        for (index, &deadline) in deadlines.iter().enumerate() {
-            let bit = 1u32 << index;
-            if *armed & bit != 0 && deadline != 0 && reached(deadline, now) {
-                fired |= bit;
+        let fired = {
+            let mut armed = self.armed.lock();
+            let mut fired = 0u32;
+            for (index, &deadline) in deadlines.iter().enumerate() {
+                let bit = 1u32 << index;
+                if *armed & bit != 0 && deadline != 0 && reached(deadline, now) {
+                    fired |= bit;
+                }
             }
-        }
-        if fired != 0 {
-            *armed &= !fired;
-            *self.intr.lock() |= fired;
-        }
+            if fired != 0 {
+                *armed &= !fired;
+                *self.intr.lock() |= fired;
+            }
+            fired
+        };
+        self.snapshot.publish_alarm_hits(self.slot, fired);
+        self.publish_derived();
+    }
+
+    /// Republish the nearest armed deadline and masked status
+    /// 重新发布最近的已武装截止时间与屏蔽状态
+    fn publish_derived(&self) {
+        let now = self.now_low();
+        let mut deadlines = [0u32; ALARMS];
+        let (enable, force) = {
+            let regs = self.regs.lock();
+            for (index, slot) in deadlines.iter_mut().enumerate() {
+                *slot = regs.read(ALARM0_OFFSET + (index as u32) * 4).unwrap_or(0);
+            }
+            (regs.read(INTE).unwrap_or(0), regs.read(INTF).unwrap_or(0))
+        };
+        let armed = *self.armed.lock();
+        let raw = *self.intr.lock();
+        self.snapshot
+            .publish_next_deadline(self.slot, nearest_deadline(&deadlines, armed, now));
+        self.snapshot
+            .publish_ints(self.slot, (raw | force) & enable);
     }
 
     /// Masked status: `(INTR | INTF) & INTE` / 屏蔽后的状态：`(INTR | INTF) & INTE`
@@ -200,10 +309,27 @@ impl TimerBlock {
     }
 
     /// Recompute the asserted IRQ lines / 重新计算断言的中断线
+    ///
+    /// The fast path is lock-free: the snapshot says whether any armed deadline
+    /// can be due (`next_deadline`) and what the masked status is (`ints`). Only
+    /// a due deadline enters [`Self::sample`], and only lines whose level
+    /// changed are written to the shared [`IrqAssert`]. Alarm firing instants are
+    /// exactly the old ones, because a deadline can only fire once it is due.
+    /// 快路径无锁：快照给出门控值 `next_deadline`（是否有已武装截止时间可能到期）
+    /// 与屏蔽状态 `ints`。只有真的到期才进入 [`Self::sample`]，并且只把电平发生
+    /// 变化的中断线写入共享 [`IrqAssert`]。alarm 的触发时刻与旧实现完全相同，
+    /// 因为截止时间只有在到期之后才可能触发。
     fn refresh(&self) {
-        self.sample();
-        let ints = self.ints();
-        for index in 0..ALARMS {
+        let next = self.snapshot.next_deadline(self.slot);
+        if next != 0 && reached(next, self.now_low()) {
+            self.sample();
+        }
+        let ints = self.snapshot.ints(self.slot);
+        let previous = self.published.swap(ints, Ordering::AcqRel);
+        let mut changed = previous ^ ints;
+        while changed != 0 {
+            let index = changed.trailing_zeros();
+            changed &= changed - 1;
             let line = self.irq_0 + index as u16;
             self.irq.set(line, ints & (1 << index) != 0);
         }
@@ -215,6 +341,9 @@ impl TimerBlock {
             // TIMEHW/TIMELW are write-only and read as zero.
             // TIMEHW/TIMELW 只写，读回为零。
             TIMEHW | TIMELW => Some(0),
+            // 计数器四个别名都走无锁快照，每次读仍是一次独立采样。
+            // All four counter aliases come from the lock-free snapshot; each
+            // read is still one independent sample.
             TIMEHR | TIMERAWH => Some((self.now_us() >> 32) as u32),
             TIMELR | TIMERAWL => Some(self.now_us() as u32),
             ARMED => {
@@ -244,7 +373,10 @@ impl TimerBlock {
             // 本模型以周期驱动的时基为准。
             TIMEHW | TIMELW => return true,
             // INTR is write-one-to-clear. / INTR 写 1 清零。
-            INTR => *self.intr.lock() &= !value,
+            INTR => {
+                *self.intr.lock() &= !value;
+                self.snapshot.acknowledge_alarm_hits(self.slot, value);
+            }
             LOCKED => *self.locked.lock() = value as u16,
             ALARM0_OFFSET..=0x1F => {
                 let _ = self.regs.lock().write(offset, value);
@@ -254,6 +386,9 @@ impl TimerBlock {
                 } else {
                     *self.armed.lock() |= bit;
                 }
+                // 新的武装集合：上一次命中的锁存位不再适用。
+                // New arming set: hits latched by the previous one no longer apply.
+                self.snapshot.clear_alarm_hits(self.slot);
             }
             // INTF is a plain read/write force register, not W1C. / INTF 是普通
             // 读写强制位寄存器，不是 W1C。
@@ -261,8 +396,11 @@ impl TimerBlock {
                 let _ = self.regs.lock().write(offset, value);
             }
         }
-        // Any register write can change the alarm set or the mask; refresh.
-        // 任何寄存器写都可能改变闹钟集合或屏蔽，因此刷新中断线。
+        // The write may have changed the alarm set or the mask: republish the
+        // derived atomics first so `refresh` sees the new state, then refresh.
+        // 写入可能改变闹钟集合或屏蔽，因此先重新发布派生原子量使 `refresh` 看到
+        // 新状态，然后再刷新中断线。
+        self.publish_derived();
         self.refresh();
         true
     }
@@ -273,6 +411,8 @@ impl TimerBlock {
         *self.intr.lock() = 0;
         *self.armed.lock() = 0;
         *self.locked.lock() = 0;
+        self.snapshot.clear_alarm_hits(self.slot);
+        self.publish_derived();
         self.refresh();
     }
 }
@@ -304,20 +444,42 @@ pub struct Timer1 {
 
 /// Define the public surface of one timer instance / 定义一个定时器实例的公共接口
 macro_rules! timer_instance {
-    ($ty:ty, $name:literal, $base:expr, $irq0:expr) => {
+    ($ty:ty, $name:literal, $base:expr, $irq0:expr, $slot:expr) => {
         impl $ty {
             /// Create the timer connected to `timebase` and `irq`
             /// 创建连接到 `timebase` 与 `irq` 的定时器
+            ///
+            /// The block takes the time base's lock-free snapshot handle once,
+            /// at construction; every later counter read is one atomic load.
+            /// 该块在构造时取一次时基的无锁快照句柄；此后每次计数器读取都是一次
+            /// 原子加载。
             #[must_use]
             pub fn new(timebase: Arc<Mutex<Timebase>>, irq: IrqAssert) -> Self {
                 Self {
-                    inner: TimerBlock::new($name, $base, $irq0, timebase, irq),
+                    inner: TimerBlock::new($name, $base, $irq0, $slot, timebase, irq),
                 }
             }
 
             /// Recompute the asserted alarm lines / 重新计算断言的 alarm 线
             pub fn refresh(&self) {
                 self.inner.refresh();
+            }
+
+            /// Lock-free snapshot shared with the time base / 与时基共享的无锁快照
+            ///
+            /// Hosts can read `now_us` and the per-block derived state without
+            /// taking the timebase mutex or the register locks.
+            /// 宿主可以读取 `now_us` 与每块派生状态，而无需获取时基互斥锁或寄存器锁。
+            #[must_use]
+            pub fn snapshot(&self) -> &TimerSnapshot {
+                self.inner.snapshot.as_ref()
+            }
+
+            /// Alarm bits latched by this block's most recent sample
+            /// 本块最近一次采样锁存的 alarm 位
+            #[must_use]
+            pub fn alarm_hits(&self) -> u32 {
+                self.inner.snapshot.alarm_hits($slot)
             }
 
             /// Latched raw status bits (`INTR`) / 锁存的原始状态位（`INTR`）
@@ -330,6 +492,13 @@ macro_rules! timer_instance {
             #[must_use]
             pub fn armed(&self) -> u32 {
                 *self.inner.armed.lock()
+            }
+
+            /// Slow-path samples taken so far (tests prove the gate skips them)
+            /// 目前执行的慢路径采样次数（测试用其证明门控会跳过采样）
+            #[cfg(test)]
+            pub(crate) fn sample_count(&self) -> u32 {
+                self.inner.samples.load(Ordering::Relaxed)
             }
         }
 
@@ -361,5 +530,17 @@ macro_rules! timer_instance {
     };
 }
 
-timer_instance!(Timer0, "TIMER0", map::TIMER0_BASE, map::TIMER0_IRQ_0);
-timer_instance!(Timer1, "TIMER1", map::TIMER1_BASE, map::TIMER1_IRQ_0);
+timer_instance!(
+    Timer0,
+    "TIMER0",
+    map::TIMER0_BASE,
+    map::TIMER0_IRQ_0,
+    TIMER0_SLOT
+);
+timer_instance!(
+    Timer1,
+    "TIMER1",
+    map::TIMER1_BASE,
+    map::TIMER1_IRQ_0,
+    TIMER1_SLOT
+);

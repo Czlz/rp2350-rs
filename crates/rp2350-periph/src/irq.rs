@@ -9,10 +9,17 @@
 //! 断言的中断线并转发给 CPU。该集合覆盖 IRQ `0..=63`，宽于 Stage 5 的所有
 //! 中断线（TIMER0 `0..=3`、DMA `10..=13`、USBCTRL `14`、PIO0..2 `15..=20`、
 //! SIO `25/26`、UART0 `33`）。
+//!
+//! The mask is one `AtomicU64`: asserting is `fetch_or`, releasing is
+//! `fetch_and`, and polling is a plain load. The interrupt pump runs at every
+//! peripheral pump (every 64 steps in the stock driver), so a mutex here would
+//! be a per-pump lock on a value that only has racy-by-design level semantics.
+//! 掩码是一个 `AtomicU64`：断言用 `fetch_or`，释放用 `fetch_and`，轮询是一次
+//! 普通加载。中断泵在每个外设泵送点运行（默认驱动器为每 64 步），因此在此处用
+//! 互斥锁等于对一个本身只具有电平语义的值每次泵送都加锁。
 
 use std::sync::Arc;
-
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Highest IRQ number representable in the shared mask / 共享掩码可表示的最大 IRQ 号
 pub const MAX_IRQ: u16 = 63;
@@ -54,7 +61,7 @@ pub const PIO_IRQ_LINES: [[u16; 2]; 3] = [
 #[derive(Debug, Clone, Default)]
 pub struct IrqAssert {
     /// Bit `n` is set when IRQ `n` is asserted. 第 `n` 位置位表示 IRQ `n` 已断言。
-    mask: Arc<Mutex<u64>>,
+    mask: Arc<AtomicU64>,
 }
 
 impl IrqAssert {
@@ -75,16 +82,16 @@ impl IrqAssert {
         }
         let bit = 1u64 << irq;
         if asserted {
-            *self.mask.lock() |= bit;
+            self.mask.fetch_or(bit, Ordering::AcqRel);
         } else {
-            *self.mask.lock() &= !bit;
+            self.mask.fetch_and(!bit, Ordering::AcqRel);
         }
     }
 
     /// Current assertion mask / 当前的断言掩码
     #[must_use]
     pub fn mask(&self) -> u64 {
-        *self.mask.lock()
+        self.mask.load(Ordering::Acquire)
     }
 }
 
@@ -107,6 +114,27 @@ mod tests {
         let irq = IrqAssert::new();
         irq.set(64, true);
         assert_eq!(irq.mask(), 0);
+    }
+
+    #[test]
+    fn concurrent_assertions_are_never_lost() {
+        // 四个线程各断言自己的两条线：原子读改写保证并集完整，且读取无需锁。
+        // Four threads assert their own two lines: the atomic RMW keeps the
+        // union complete, and polling never locks.
+        let irq = IrqAssert::new();
+        std::thread::scope(|scope| {
+            for line in 0..4u16 {
+                let handle = irq.clone();
+                scope.spawn(move || {
+                    for _ in 0..10_000 {
+                        handle.set(line, true);
+                        handle.set(line + 8, true);
+                        assert_eq!(handle.mask() & (1 << line), 1 << line);
+                    }
+                });
+            }
+        });
+        assert_eq!(irq.mask() & 0xF0F, 0xF0F);
     }
 
     #[test]

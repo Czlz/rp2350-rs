@@ -53,6 +53,7 @@ pub mod sio;
 pub mod systick;
 pub mod ticks;
 pub mod timer;
+pub mod timer_snapshot;
 pub mod traits;
 pub mod trng;
 pub mod uart;
@@ -70,6 +71,7 @@ pub use hstx::Hstx;
 pub use irq::IrqAssert;
 pub use pio::{Pio, SharedPio};
 pub use systick::SysTickCounter;
+pub use timer_snapshot::TimerSnapshot;
 pub use traits::Peripheral;
 pub use uart::UartSink;
 

@@ -536,11 +536,15 @@ impl BootPeripherals {
     /// time and the POWMAN RTC run in the same call, keeping every timing
     /// consumer on one clock source. The HSTX command expander is pumped with
     /// the same cycle budget from the host's DMA batch; it does no work while
-    /// `CSR.EN` is clear.
+    /// `CSR.EN` is clear. [`Timebase::advance`] also republishes the TIMER
+    /// microsecond snapshot while it holds the timebase mutex, so the TIMER
+    /// blocks and the interrupt pump can serve counter reads without that lock.
     /// 把实时 `clk_sys`/`clk_ref` 与时钟树世代交给 [`Timebase::advance`]，因此
     /// 客户机自上次调用以来写入的频率会先按旧频率结算。SysTick、ADC 转换时间与
     /// POWMAN RTC 在同一次调用中推进，所有计时消费者共享一个时钟源。HSTX 命令
     /// 扩展器由宿主按 DMA 批次用同一周期预算泵送；`CSR.EN` 清零时不做任何事。
+    /// [`Timebase::advance`] 还会在持有时基互斥锁时重新发布 TIMER 微秒快照，因此
+    /// TIMER 块与中断泵无需该锁即可服务计数读取。
     pub fn advance(&self, cycles: u64) {
         let sysclk = self.clock_tree.sysclk_hz();
         let refclk = self.clock_tree.refclk_hz();
@@ -558,6 +562,13 @@ impl BootPeripherals {
 
     /// Currently asserted interrupt lines, refreshed for the new time
     /// 当前断言的中断线，已按新时间刷新
+    ///
+    /// [`Timer0::refresh`]/[`Timer1::refresh`] take their fast path when the
+    /// snapshot's next deadline is not due yet: two atomic loads and no timer
+    /// lock, so the 64-step interrupt pump stays lock-free while nothing fires.
+    /// 快照的最近截止时间尚未到期时，[`Timer0::refresh`]/[`Timer1::refresh`] 走
+    /// 快路径：两次原子加载、不取 TIMER 锁，因此没有 alarm 触发时每 64 步的中断泵
+    /// 保持无锁。
     #[must_use]
     pub fn irq_mask(&self) -> u64 {
         self.timer.refresh();
