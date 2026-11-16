@@ -63,6 +63,22 @@ pub trait MemoryRegion: Send + Sync {
         false
     }
 
+    /// Exclusive variant of [`Self::read_would_stall`]
+    /// [`Self::read_would_stall`] 的独占变体
+    ///
+    /// A bus that already holds `&mut self` for the access calls this before the
+    /// region is touched. It exists so a region whose shared implementation must
+    /// take a lock can answer the stall question from an exclusive borrow
+    /// instead, keeping the single-threaded poll path free of atomics. The
+    /// default forwards to [`Self::read_would_stall`], so every existing region
+    /// keeps exactly its previous behaviour.
+    /// 已持有 `&mut self` 的总线会在触碰区域之前调用它。它的存在使得「共享实现必须
+    /// 加锁」的区域可以用独占借用回答 stall 问题，从而让单线程轮询路径不付原子操作。
+    /// 默认转发到 [`Self::read_would_stall`]，因此所有既有区域的行为完全不变。
+    fn read_would_stall_mut(&mut self, addr: Address) -> bool {
+        self.read_would_stall(addr)
+    }
+
     /// Read a single byte / 读取一个字节
     ///
     /// # Errors
@@ -200,7 +216,7 @@ pub trait AddressBus: Send + Sync {
             addr,
             kind: BusErrorKind::NoDevice,
         })?;
-        if region.read_would_stall(addr) {
+        if region.read_would_stall_mut(addr) {
             return Err(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::Stall,

@@ -20,6 +20,11 @@
 //! 本模拟器不建模 XIP 缓存，因此接受写入但视为空操作，读取返回 0。拒绝这些访问
 //! 会让执行合法维护的固件故障；而把字节存下来又会凭空造出硬件并不保留的状态。
 
+// 窗口大小常量按构造可放进 32 位地址空间，比较时需做 usize→u32 换算。
+// The window size constant fits the 32-bit address space by construction, so the
+// comparison needs a usize→u32 conversion.
+#![allow(clippy::cast_possible_truncation)]
+
 use super::bus::{BusResult, MemoryRegion};
 use super::error::{BusErrorKind, CoreError};
 use super::types::Address;
@@ -46,6 +51,15 @@ impl XipMaintenanceRegion {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
+
+    /// Whether `addr` is inside the maintenance window / 地址是否在维护窗口内
+    ///
+    /// An inherent helper so the two region traits in scope cannot make
+    /// `contains` ambiguous.
+    /// 固有辅助函数，避免作用域内两个区域 trait 让 `contains` 产生歧义。
+    fn in_window(addr: Address) -> bool {
+        addr.wrapping_sub(XIP_MAINTENANCE_BASE) < XIP_MAINTENANCE_SIZE as Address
+    }
 }
 
 impl MemoryRegion for XipMaintenanceRegion {
@@ -62,7 +76,7 @@ impl MemoryRegion for XipMaintenanceRegion {
     }
 
     fn read_u8(&mut self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
-        if !self.contains(addr) {
+        if !Self::in_window(addr) {
             return Err(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
@@ -73,7 +87,46 @@ impl MemoryRegion for XipMaintenanceRegion {
     }
 
     fn write_u8(&mut self, addr: Address, _value: u8, cycles: &mut u64) -> BusResult<()> {
-        if !self.contains(addr) {
+        if !Self::in_window(addr) {
+            return Err(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            });
+        }
+        *cycles += 1;
+        Ok(())
+    }
+}
+
+/// The maintenance window is stateless, so its shared implementation is the same
+/// body as the exclusive one: accepted writes are discarded, reads return zero.
+/// 维护窗口无状态，因此共享实现与独占实现同体：接受的写被丢弃，读取返回零。
+impl crate::shared::SharedRegion for XipMaintenanceRegion {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base(&self) -> Address {
+        XIP_MAINTENANCE_BASE
+    }
+
+    fn size(&self) -> usize {
+        XIP_MAINTENANCE_SIZE
+    }
+
+    fn read_u8(&self, addr: Address, cycles: &mut u64) -> BusResult<u8> {
+        if !Self::in_window(addr) {
+            return Err(CoreError::BusError {
+                addr,
+                kind: BusErrorKind::NoDevice,
+            });
+        }
+        *cycles += 1;
+        Ok(0)
+    }
+
+    fn write_u8(&self, addr: Address, _value: u8, cycles: &mut u64) -> BusResult<()> {
+        if !Self::in_window(addr) {
             return Err(CoreError::BusError {
                 addr,
                 kind: BusErrorKind::NoDevice,
@@ -89,7 +142,6 @@ mod tests {
     use super::*;
     use crate::bus::AddressBus;
     use crate::memory::SimpleBus;
-
     #[test]
     fn maintenance_write_is_accepted_and_reads_zero() {
         let mut window = XipMaintenanceRegion::new("xip-maintenance");

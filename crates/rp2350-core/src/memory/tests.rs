@@ -4,7 +4,15 @@
 //! code budget; the assertions are unchanged.
 //! 从 `memory.rs` 拆出，使两个文件都落在项目的单文件代码预算内；断言内容不变。
 
+// 测试按 `usize` 遍历缓冲并把偏移换算回地址，这是区域测试的固有写法。
+// The tests iterate a buffer as `usize` and convert offsets back to addresses,
+// which is inherent to region tests.
+#![allow(clippy::cast_possible_truncation)]
+
 use super::*;
+
+use crate::bus::{AddressBus, MemoryRegion};
+use crate::error::{BusErrorKind, CoreError};
 
 #[test]
 fn ram_round_trip_byte() {

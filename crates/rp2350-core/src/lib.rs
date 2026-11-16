@@ -22,6 +22,7 @@ pub mod gpio;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
+pub mod shared;
 pub mod types;
 pub mod uf2;
 pub mod watch;
@@ -36,10 +37,11 @@ pub use firmware::{FirmwareImage, FirmwareSegment};
 pub use flash::{FLASH_XIP_BASE, FLASH_XIP_NOCACHE_BASE, FLASH_XIP_SIZE, FlashHandle, FlashRegion};
 pub use gpio::{GpioPin, PinDirection, PinFunction};
 pub use irq::IrqMatrix;
-pub use memory::{RamRegion, SimpleBus};
+pub use memory::{RAM_BANKS, RamRegion, SimpleBus};
 pub use mmio::{
     MMIO_REGISTER_SIZE, MmioDevice, MmioRegion, MmioRouter, MmioWindow, RegisterFile, mount_device,
 };
+pub use shared::{LockedRegion, SharedAddressBus, SharedBus, SharedRegion};
 pub use types::{Address, CpuId, CycleCount, GpioNumber, IrqNumber, PinNumber};
 pub use uf2::{Uf2Arch, Uf2Block, Uf2Family, Uf2Image, Uf2LoadReport, Uf2Region};
 pub use xip_maintenance::{XIP_MAINTENANCE_BASE, XIP_MAINTENANCE_SIZE, XipMaintenanceRegion};

@@ -77,6 +77,8 @@ determinism. No JIT and no firmware-specific tuning.
 |----|------|------|------|
 | MT-1 | **测量与原型（spike）**：逐核耗时、共享总线访问占比、SIO/IRQ 频率；用 2 线程 + 周期定序仲裁器做最小原型，测端到端加速与确定性（300 M 计数器逐字段） | `rp2350-core` + `rp2350-cli`（临时插桩，交付前删除） | `doc/threading-plan.md` 增补实测表；原型加速比与 300 M 一致性证据；给出 go/no-go |
 | MT-2 | **`SharedBus` 与仲裁器**：按 (cycle, master) 线性化 SRAM/Flash/MMIO；SIO/自旋锁/事件接入；单线程回归全绿 | `rp2350-core` + `rp2350-periph` | 单线程下 300 M 计数器不变；并发单元测试；无 `unsafe` 数据竞争 |
+| MT-2a | **可共享总线层**：`SharedRegion`/`SharedAddressBus`/`SharedBus`、10 bank SRAM、Flash 免锁读、每设备 MMIO 锁、并发测试 | `rp2350-core` | ✅ 已交付（见 §7）：core 122 测试、12 个并发/契约测试、300 M 计数器不变 |
+| MT-2b | **迁移与仲裁**：把 bootrom/usb/usb-host/periph 的区域改为 `SharedRegion`，CLI 组装 `SharedBus`，按 (cycle, master) 批量定序 | `rp2350-core` + `rp2350-periph` + 上述 crate | 单线程 300 M 计数器不变；双核原型接 `SharedBus` |
 | MT-3 | **双核线程化**：`Machine` 拆为两台核线程 + 仲裁器；中断/事件跨线程投递；睡眠核不占调度 | `rp2350-cli` + `rp2350-arm` | FV-1/2/3 与 emerald 300 M 计数器一致；默认并行运行 30 次无 flake；吞吐报告 |
 | MT-4 | **外设线程**：DMA/PIO/HSTX/TIMER 独立推进与 MMIO 邮箱；事件定序 | `rp2350-periph` + `rp2350-core` | 与单线程逐周期对照（同一时间点状态一致）；emerald HSTX `underruns=0` |
 | MT-5 | **插件线程**：`virt-periph` 邮箱 + 固定延迟；超时/崩溃降级 | `rp2350-virt-periph` + `rp2350-plugin` | 与同步路径逐 pin 对照；重载/删除不崩溃；虚拟实验室示例 |
@@ -87,6 +89,10 @@ determinism. No JIT and no firmware-specific tuning.
 > **MT-1 已交付**：逐核/逐区域实测、锁微基准、双线程原型与 go/no-go 见 §6。
 > MT-1 delivered: per-core/per-region measurements, lock microbenchmarks, the
 > two-thread spike and the go/no-go decision are in §6.
+>
+> **MT-2a 已交付**：可共享总线层（不含线程），见 §7；原 MT-2 拆分后的迁移与仲裁
+> 定序为 MT-2b。 / MT-2a delivered the shareable bus layer (no threads) in §7; the
+> migration and arbitration half of the original MT-2 is now MT-2b.
 
 ## 4. 风险与回退 / Risks
 
@@ -325,3 +331,177 @@ show each case's best sample. Global-lock variance comes from host scheduling.)
   （分片、批量窗口、MMIO 低开销）是通用设计约束，但加速比数字只对 emerald 成立。
 - **未测**：真实跨线程 IRQ 投递延迟、SIO FIFO 阻塞语义、WFE/WFI 睡眠的线程化唤醒；
   这些属于 MT-3/MT-4 的验收项。
+
+---
+
+## 7. MT-2a 交付记录：可共享总线层（2026-11-16）
+## 7. MT-2a delivery: shareable bus layer (2026-11-16)
+
+本节记录 MT-2a（“把总线层改为线程安全、可并发的形态”）的交付内容、与原始任务书的
+偏差、实测数据与 MT-3 注意事项。**本轮没有引入任何线程**：默认 `run`/`repl` 路径
+仍然是单线程独占总线，新增的并发层是附加类型。
+This section records what MT-2a delivered, where it deviates from the original task
+list, the measurements, and the MT-3 follow-ups. **No thread is introduced yet**:
+the default `run`/`repl` path still uses the single-threaded exclusive bus; the
+concurrent layer is additive.
+
+### 7.1 交付内容 / Delivered
+
+| 项 / Item | 实现 / Implementation |
+|---|---|
+| 共享区域契约 | `shared::SharedRegion`（`&self` 访问器 + `read_would_stall` + `load_u8/load_bytes`），`Send + Sync` |
+| 共享总线路由 | `shared::SharedAddressBus`（只要求 `find_region` + `ppb_write_epoch`，其余为默认实现） |
+| 可共享句柄 | `shared::SharedBus`（`Vec<Arc<dyn SharedRegion>>` + 256 个 `AtomicU16` 桶标签 + `AtomicU64` PPB 世代）；经 `Arc<SharedBus>` 跨线程共享 |
+| 旧区域迁移桥 | `shared::LockedRegion`（`Mutex<Box<dyn MemoryRegion>>`，每区域一把锁） |
+| SRAM 分 bank | `RamRegion` 改为 10 个 `parking_lot::Mutex<Vec<u8>>`，`bank = ((addr-base)>>2) % 10`；独占路径用 `Mutex::get_mut`（零原子操作） |
+| Flash 免锁读 | `FlashRegion` 底层改为 `Arc<FlashStore>`（`Vec<AtomicU32>`，relaxed）；读者只做一次普通加载；宿主写用 CAS/整字 store，并发布 `content_generation` |
+| MMIO 每设备锁 | `MmioRouter` 改为 `Vec<Mutex<MmioRegion>>` + 只读 `Vec<MmioWindow>`；页缓存改为打包的 `AtomicU64` 标签 |
+| 单线程零开销钩子 | `MemoryRegion::read_would_stall_mut`（默认转发 `read_would_stall`），让路由器用 `get_mut` 回答 stall，不给轮询路径加锁 |
+| 并发测试 | `shared/concurrency.rs`（10 个线程测试）、`shared/tests.rs`（6 个单元测试） |
+
+### 7.2 与任务书的偏差（重要）/ Deviation (important)
+
+任务书第 1 条要求把 `MemoryRegion` / `AddressBus` 的读写方法从 `&mut self` 改成
+`&self`。**本轮没有这样做**，因为这两个 trait 的实现者分布在白名单之外的 crate：
+
+- `MemoryRegion`：`rp2350-bootrom/src/region.rs`、`rp2350-usb/src/regions.rs`(3 处)、
+  `rp2350-usb-host/src/mask_rom.rs`、`rp2350-periph/src/psram.rs`；
+- `AddressBus`：`rp2350-arm/src/execute_thumb32/test_support.rs`。
+
+改动 trait 签名会让这 4 个 crate 直接编译失败，与本轮“不得修改其它 crate、四道门禁
+全绿”的硬约束冲突。因此本轮改为**附加**一层 `SharedRegion` / `SharedAddressBus`：
+调用点（`&mut dyn AddressBus`）零改动，独占路径零成本，并发路径由新类型承担。
+迁移这些实现属于 MT-2b（新增任务），完成后再考虑是否把两个 trait 合一。
+The task list asked for `&mut self` → `&self` on `MemoryRegion` / `AddressBus`. That
+was **not** done: implementors live in four crates outside this task's whitelist
+(`bootrom`, `usb`, `usb-host`, `periph` for `MemoryRegion`; `rp2350-arm` for
+`AddressBus`). Changing the signatures would break those crates and the "all gates
+green, no other crate touched" constraint. This round therefore adds a parallel
+`SharedRegion` / `SharedAddressBus` layer: call sites and the exclusive path are
+unchanged, and the concurrent path lives in the new types. Migrating those
+implementors is MT-2b.
+
+### 7.3 锁模型与不变量 / Locking model and invariants
+
+- 每区域自带锁粒度：SRAM = 每 bank 一把；Flash = 无锁；MMIO 路由器 = 每子设备一把；
+  `LockedRegion` = 每区域一把；`SharedBus` 自身无锁（只有原子桶标签）。
+- **锁顺序**：bank 锁始终按 bank 下标升序获取；一次访问最多同时持有两把 bank 锁，
+  且持锁期间不再获取其它锁。MMIO 访问最多持有**一把**设备锁；路由器的警告集合
+  只在未建模访问时单独加锁，且绝不跨设备锁持有。
+- **跨 bank 语义**：单次宽访问在它所触及的全部 bank 锁内完成，因此相对其它**总线
+  访问**是原子的；但两次独立访问（例如先读低半字再读高半字）可能看到不同时刻的两个
+  半字——与真实总线「每个字一次传输」一致。文档写在 `doc/crates/rp2350-core.md`。
+- **写监视**：已安装 `RP2350_WATCH` 时，共享路径仍逐字节上报，但整段写入在同一把
+  bank 锁内完成（不放松诊断语义，也不产生可观察的撕裂）。
+- **Flash**：单字访问原子；跨字跨度可能混合世代，批量快照（`bytes`/`slice`/
+  `FlashHandle::read`）在 `content_generation` 变化时重试。
+- **MMIO 别名**：SET/CLR/XOR 的读-改-写在同一把设备锁内完成，并发别名写不丢位。
+- **挂载**：所有 `register_region` / `mount` 都取 `&mut self`，即发生在总线被
+  `Arc` 共享之前；`SharedBus` 的桶标签与路由器页标签都在挂载时整体失效。
+
+### 7.4 并发测试 / Concurrency tests
+
+默认并行测试下连跑 20 次全绿（`cargo test -p rp2350-core --all-features`）。
+Green 20× under the default parallel runner. `shared/concurrency.rs` holds the ten
+threaded tests; the two bus-contract tests at the end of the table live in
+`shared/tests.rs`.
+默认并行测试下连跑 20 次全绿；十个线程测试在 `shared/concurrency.rs`，表中最后两个
+总线契约测试在 `shared/tests.rs`。
+
+| 测试 / Test | 断言 / Property |
+|---|---|
+| `two_threads_write_different_banks_without_losing_updates` | 不同 bank 并发写，各自最后一个值完整保留 |
+| `two_threads_write_different_banks_into_different_buses` | 同一条 `SharedBus` 的两个区域并发写，路由无竞争 |
+| `same_bank_writes_are_serialised_and_never_tear` | 同一 bank 同一字屏障交替写/读，读到的永远是完整图案 |
+| `cross_bank_word_access_is_atomic_within_one_access` | 跨 bank 非对齐字单次读不撕裂 |
+| `cross_bank_halves_can_be_observed_separately` | 两次独立半字读只能看到两个合法图案的半字 |
+| `flash_reads_stay_consistent_while_the_host_writes` | Flash 并发读 + `FlashHandle` 擦/写：字不撕裂、世代推进 |
+| `flash_bulk_snapshot_is_consistent_per_word` | 批量快照每 4 字节组来自同一世代 |
+| `two_mmio_devices_run_concurrently` | 两个设备各自并发写，互不等待、结果正确 |
+| `one_mmio_device_serialises_concurrent_alias_writes` | 同设备并发 SET 别名写，最终位并集完整 |
+| `ppb_epoch_counts_every_write_across_threads` | 跨线程 PPB 写世代按次计数 |
+| `shared_bus_keeps_the_stall_gate` | 共享总线保留 stall 门控（区域未被触碰、不记周期） |
+| `locked_region_bridges_an_exclusive_region` | `LockedRegion` 转发读写与只读拒绝 |
+
+另有一个**并发环境**下的既有语义测试：`memory/tests.rs` 的写监视/宽写语义测试会
+全局安装写监视，并发测试必须在其同时运行时仍然成立（已修复共享 `write_u16/u32`
+在监视开启时的原子性，见 7.3）。
+
+### 7.5 性能 / Performance
+
+**微基准（`crates/rp2350-core/examples/bus_bench.rs`，交付前删除）**：同一进程内
+模拟 emerald phase 1 的访问混合（30 M RAM 读写 + 18 M MMIO 轮询 + 10 M Flash 取指），
+同机交替运行、取 8 次最小值：
+
+| 场景 / Case | MT-2a 前 | MT-2a 后 | 变化 |
+|---|---|---|---|
+| `ram-mixed`（4 读 : 1 写，随机字） | 5.41 ns/op | **5.19 ns/op** | −4.1 % |
+| `mmio-poll`（15 设备路由器轮询一个寄存器） | 28.26 ns/op | **27.29 ns/op** | −3.4 % |
+| `flash-fetch`（半字取指） | 5.36 ns/op | **5.29 ns/op** | −1.3 % |
+
+**端到端（emerald，release，CPU 时间，同机交替）**：
+
+| 场景 | 前 / Before | 后 / After |
+|---|---|---|
+| 50 M 步墙钟最小值（3 次，验收口径） | 0.786 s | 0.803 s（+2.2 %） |
+| 50 M 步 CPU 时间最小值（20 次交替） | 0.781 s | 0.828 s（+6 %） |
+| 50 M 步 p25 / 中位数（CPU） | 0.828 / 0.859 s | 0.875 / 0.906 s |
+| 300 M 步 CPU 时间最小值（噪声大） | 15.88–16.56 s | 17.7–18.2 s |
+
+**结论与局限**：50 M 步窗口是**纯睡眠**（`sleep steps=49 894 568`、0 条指令退役），
+本轮改动没有任何代码在该路径上执行。作为对照，只给**旧**核心加一个从未调用的
+`pub fn`（纯代码布局扰动）就使同一指标从 0.781 s 变成 0.828 s（+6 %）——说明该窗口
+的差异来自二进制布局/对齐噪声，而不是总线语义；微基准（真正测总线）显示 −3～−4 %。
+300 M 的绝对时间在本机被并行会话负载拉到 15.9–22.7 s 区间，无法分辨 <5 % 的差异，
+因此只作为“无数量级退化”的证据。**建议主会话在静置机上复测 50 M×3 与 300 M**。
+The 50 M window is pure sleep (zero retired instructions), and nothing this round runs
+on that path. As a control, adding a never-called `pub fn` to the **old** core (pure
+code-layout perturbation) moved the same metric from 0.781 s to 0.828 s (+6 %), so the
+end-to-end delta is layout noise; the bus microbenchmark (which actually exercises the
+changed code) is 3–4 % faster. The 300 M wall clock on this host varied 15.9–22.7 s
+because of concurrent sessions, so it only rules out an order-of-magnitude regression.
+
+### 7.6 计数器与固件回归 / Counters and firmware regression
+
+emerald 300 M（同一 UF2、同一宿主）：
+
+| 字段 | 值 |
+|---|---|
+| `time_us` | **1 798 617** |
+| `dma` / `busy` | **2 199 378** / `0x0009` |
+| `hstx` | **words=5 401 204 underruns=0 fifo=8** |
+| `core1` | `Running pc=0x1000035C sp=0x2003D680 launches=1` |
+| `[irq]` | 8 条（core0/core1 交替，IRQ 10） |
+| final PC | `0x1000B3AC` |
+
+与**改动前的同一工作树**逐字段一致。与 §6.1 记录的基线有两点差异，均非本轮引入：
+`dma` 2 195 390 → 2 199 378、final PC `0x1000B3AA` → `0x1000B3AC`。并行任务修改了
+`crates/rp2350-periph/src/dma.rs`（`enabled_selects_dreq` 现在要求 DREQ 已断言），
+用改动前的核心源码在同一工作树重建后同样得到 `dma=2 199 378`、PC `0x1000B3AC`，因此
+该差异来自外设侧改动。验收时应以本节数值为准（或等该并行任务合并后重定基线）。
+Identical to the pre-change working tree field by field. The two differences against
+§6.1 (`dma` 2 195 390 → 2 199 378, final PC `0x1000B3AA` → `0x1000B3AC`) come from the
+concurrent `rp2350-periph/src/dma.rs` change, not from this round: rebuilding the old
+core in the same tree reproduces them.
+
+### 7.7 对 MT-3 的注意事项 / Notes for MT-3
+
+1. **先建 `SharedBus`，再拆线程**：CLI 需要把 SRAM/Flash/APB 注册为
+   `Arc<RamRegion>` / `Arc<FlashRegion>` / `Arc<MmioRouter>`；尚未迁移的区域
+   （PSRAM、USB、bootrom ROM）用 `SharedBus::register_locked`，它们各自仍是一把锁。
+   注意 `RamRegion::bytes()` 现在是复制（分 bank 存储没有连续切片）。
+2. **不要逐周期/逐步加锁**：MT-1 已证明逐步屏障 ≈484 ns/轮。批量窗口 64–256 步
+   （`PUMP_INTERVAL=64` 是现成边界）仍是唯一可行路径。
+3. **跨 bank 非原子是文档化的语义**：定序器不需要为两次独立访问之间的 bank 混合
+   做额外工作；但任何“用两次窄读拼一个宽值”的宿主诊断代码必须在共享总线上改为
+   宽访问。
+4. **睡眠核**仍是最大收益（phase 0 占 30.7 %）；`SharedRegion` 不改变睡眠路径。
+5. **`read_would_stall` 与 `read_would_stall_mut` 必须同时正确**：新区域若在共享
+   实现里加锁，应同时覆盖独占变体，否则单线程轮询路径会多一次虚调用或一次锁。
+6. **迁移旧 trait**（可选）：若 MT-3 决定统一到 `&self`，先把 4 个外部实现改成
+   `SharedRegion`，再删除 `MemoryRegion`，避免一次性改 5 个 crate。
+7. **共享路径的 MMIO 读当前取两次设备锁**：一次用于 `read_would_stall` 门控、一次
+   用于实际读。单线程路径已用 `read_would_stall_mut` 完全避开加锁；若 MT-3 的
+   profiling 显示共享路径的 MMIO 轮询成为瓶颈，可让 `SharedBus` 在同一把设备锁内
+   完成 stall 检查与读（需要给 `SharedRegion` 增加一个“带门控的读”入口）。
+

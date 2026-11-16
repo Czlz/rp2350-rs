@@ -16,9 +16,10 @@
 | Module | Description / 描述 |
 |--------|-------------------|
 | `bus` | `AddressBus` / `MemoryRegion` dyn-safe traits, `AccessWidth`, `BusResult` |
-| `memory` | `SimpleBus` (flat router), `RamRegion` (writable / ROM); tests live in `memory/tests.rs` |
-| `flash` | `FlashRegion` (XIP + nocache alias), `FlashHandle` (host-only) |
-| `mmio` | `MmioDevice` / `MmioWindow` / `MmioRegion` / `MmioRouter`, `mount_device` |
+| `memory` | `SimpleBus` (flat router), `RamRegion` (ten banked SRAM buffers / ROM); tests live in `memory/tests.rs` |
+| `shared` | Concurrent layer: `SharedRegion`, `SharedAddressBus`, `SharedBus`, `LockedRegion` |
+| `flash` | `FlashRegion` (XIP + nocache alias), `FlashHandle` (host-only), lock-free atomic word store |
+| `mmio` | `MmioDevice` / `MmioWindow` / `MmioRegion` / `MmioRouter` (per-device mutexes), `mount_device` |
 | `xip_maintenance` | Write-only XIP_MAINTENANCE window (`0x1800_0000`, 64 MB) |
 | `watch` | `RP2350_WATCH` / `RP2350_WATCHV` write-watchpoint diagnostic |
 | `chip` | `RP2350Chip` — GPIO pins + IRQ matrix + clock |
@@ -157,16 +158,33 @@ impl SimpleBus { pub fn new() -> Self; pub fn region_count(&self) -> usize; }
 // AddressBus impl: rejects overlapping regions (BusErrorKind::Overlap) and
 // routes accesses through a region cache (see below).
 
-pub struct RamRegion { /* name, base, writable, data: Vec<u8> */ }
+pub const RAM_BANKS: usize = 10;                 // RP2350 word interleave
+pub struct RamRegion { /* name, base, writable, size, banks: [Mutex<Vec<u8>>; 10] */ }
 impl RamRegion {
     pub fn new(name: impl Into<String>, base: Address, size: usize) -> Self;      // writable
     pub fn new_rom(name: impl Into<String>, base: Address, size: usize) -> Self;  // read-only
-    pub fn bytes(&self) -> &[u8];
+    pub fn bytes(&self) -> Vec<u8>;          // copy, assembled in address order
     pub fn is_writable(&self) -> bool;
+    pub fn bank_of(&self, addr: Address) -> Option<usize>;  // (addr-base)>>2 % 10
 }
 // ROM writes from the guest return BusErrorKind::AccessDenied.
 // 客户机写 ROM 返回 BusErrorKind::AccessDenied。
 ```
+
+`RamRegion` stores SRAM the way the chip does: word `k` (bytes `4k..4k+4`) lives in
+bank `k % 10`, each bank behind its own `parking_lot::Mutex`. The exclusive
+`MemoryRegion` path reaches the buffers through `Mutex::get_mut`, which is a plain
+pointer dereference, so the single-threaded interpreter pays **no** atomic
+operation for the banking; the shared path locks one bank per access (two, in
+ascending bank order, for a span that crosses a word boundary). `bytes()` copies
+the banks out in address order, so the byte layout is identical to the previous
+flat buffer. See “Concurrent bus” below for the full locking model.
+`RamRegion` 按芯片的方式存放 SRAM：第 `k` 个字（字节 `4k..4k+4`）位于 bank `k % 10`，
+每个 bank 各有一把 `parking_lot::Mutex`。独占的 `MemoryRegion` 路径经
+`Mutex::get_mut` 直接访问缓冲（普通指针解引用），因此单线程解释器不为分 bank 付
+任何原子操作；共享路径每次访问锁一个 bank（跨字边界的跨度按 bank 升序锁两个）。
+`bytes()` 按地址顺序复制各 bank，因此字节布局与先前的扁平缓冲完全一致。完整锁模型
+见下文「并发总线」。
 
 #### Region cache / 区域缓存
 
@@ -189,6 +207,8 @@ natively: one bounds check and one slice copy instead of one `Vec::get` per
 byte. An access whose span leaves the buffer, a read-only region, and every
 store taken while a write watch is armed fall back to the byte-wise path, so
 per-byte error, cycle and diagnostic semantics are unchanged.
+The banked layout keeps that fast path: a span that stays inside one 4-byte word
+never leaves its bank, so it is one contiguous slice of one bank buffer.
 
 每次取指与每次数据访问都要把地址解析到区域，因此该查找是解释器最热的操作。
 `SimpleBus` 按地址最高字节索引 256 个桶直接映射缓存：命中只需一次表读取加两次
@@ -208,7 +228,7 @@ pub const FLASH_XIP_BASE: Address = 0x1000_0000;
 pub const FLASH_XIP_NOCACHE_BASE: Address = 0x1400_0000;  // XIP_NOCACHE_NOALLOC alias
 pub const FLASH_XIP_SIZE: usize = 16 * 1024 * 1024;
 
-pub struct FlashRegion { /* shared Arc<RwLock<Vec<u8>>> backing store */ }
+pub struct FlashRegion { /* shared Arc<FlashStore>: relaxed AtomicU32 words */ }
 impl FlashRegion {
     pub fn new(name: impl Into<String>, base: Address, size: usize) -> Self;
     pub fn rp2350_xip() -> Self;                        // standard 16 MB window
@@ -237,6 +257,20 @@ always agree.
 `FlashHandle` 能编程。克隆与 `alias` 窗口共享底层存储，因此 `0x1000_0000` 与
 `0x1400_0000` 始终一致。
 
+The backing store is an array of relaxed `AtomicU32` words, so a guest read is one
+plain load and **takes no lock**; two cores fetching code never serialise. Guest
+writes are rejected, so the only writer is the host (loader, `FlashHandle`,
+debugger), and every host mutation publishes a generation number. A single access
+inside one word is atomic. A span crossing a word boundary can observe the two
+words from different generations, so the bulk snapshot helpers (`bytes`, `slice`,
+`FlashHandle::read`) retry while the generation changes and otherwise return a
+buffer that is at least per-word consistent.
+底层存储是 relaxed `AtomicU32` 字数组，因此客户机读就是一次普通加载、**不取锁**；
+两核取指永不串行。客户机写被拒绝，唯一写入方是宿主（加载器、`FlashHandle`、
+调试器），每次宿主变更都会发布世代号。落在同一个字内的单次访问是原子的；跨字
+边界的跨度可能看到属于不同世代的两个字，因此批量快照辅助函数（`bytes`、`slice`、
+`FlashHandle::read`）在世代变化时重试，否则返回至少逐字一致的缓冲区。
+
 Every host-side mutation publishes a generation number:
 
 ```rust
@@ -245,9 +279,10 @@ pub fn content_generation() -> u32;
 ```
 
 `FlashRegion::new`, `FlashRegion::load_bytes`, the `MemoryRegion::load_u8` path,
-`FlashHandle::write` and `FlashHandle::erase` each bump it (relaxed atomic
-`fetch_add`). Readers can therefore cache flash bytes and revalidate with one
-relaxed load instead of taking the shared-store lock per access;
+`FlashHandle::write` and `FlashHandle::erase` each bump it (`Release` fetch-add;
+readers use an `Acquire` load, so a revalidation that observes a new generation
+cannot see stale bytes). Readers can therefore cache flash bytes and revalidate
+with one atomic load;
 `rp2350-arm`'s flash instruction fetch cache and its decoded-instruction cache
 are the consumers today. The counter is monotonic and process-wide, so a
 mismatch simply discards the cache. Because the counter is global, two machines
@@ -296,6 +331,158 @@ return 0. Out-of-window addresses report `NoDevice`.
 
 ---
 
+## Concurrent bus / 并发总线
+
+`rp2350-core` has two bus layers. The default path is the exclusive one
+(`AddressBus` / `MemoryRegion`, `&mut self`); it is what `run`, `repl` and every
+core currently uses and it pays nothing for sharing. The concurrent layer is an
+additive set of types for the future two-core-thread machine (see
+`doc/threading-plan.md`, MT-2/MT-3).
+
+本 crate 有两层总线。默认路径是独占层（`AddressBus` / `MemoryRegion`，`&mut self`），
+也就是 `run`、`repl` 与所有内核当前使用的路径，它不为共享付任何代价。并发层是新增
+的一组类型，供未来的双核线程机器使用（见 `doc/threading-plan.md` 的 MT-2/MT-3）。
+
+```rust
+// Same region contract, `&self` accessors. / 相同的区域契约，访问器取 `&self`。
+pub trait SharedRegion: Send + Sync {
+    fn name(&self) -> &str;
+    fn base(&self) -> Address;
+    fn size(&self) -> usize;
+    fn end(&self) -> Address;                       // provided
+    fn contains(&self, addr: Address) -> bool;      // provided
+    fn read_would_stall(&self, addr: Address) -> bool;             // provided
+    fn read_u8(&self, addr: Address, cycles: &mut u64) -> BusResult<u8>;
+    fn write_u8(&self, addr: Address, value: u8, cycles: &mut u64) -> BusResult<()>;
+    // read_u16/u32, write_u16/u32, load_u8, load_bytes: provided defaults
+}
+
+// Routing through `&self`; only routing + the PPB epoch are required.
+pub trait SharedAddressBus: Send + Sync {
+    fn find_region(&self, addr: Address) -> Option<&dyn SharedRegion>;
+    fn ppb_write_epoch(&self) -> u64;
+    fn resolve_readable(&self, addr: Address) -> BusResult<&dyn SharedRegion>;  // provided
+    // read_u8/u16/u32, write_u8/u16/u32, load_u8, load_bytes: provided
+}
+
+pub struct SharedBus { /* Vec<Arc<dyn SharedRegion>>, [AtomicU16; 256], AtomicU64 */ }
+impl SharedBus {
+    pub fn new() -> Self;
+    pub fn region_count(&self) -> usize;
+    pub fn register_region(&mut self, region: Arc<dyn SharedRegion>) -> BusResult<()>;
+    pub fn register_locked(&mut self, region: Box<dyn MemoryRegion>) -> BusResult<()>;
+    pub fn unregister_region(&mut self, name: &str);
+}
+
+pub struct LockedRegion { /* name, base, size, Mutex<Box<dyn MemoryRegion>> */ }
+impl LockedRegion { pub fn new(inner: Box<dyn MemoryRegion>) -> Self; }
+```
+
+**No global bus lock.** `SharedBus` hands every access to a region, and each
+region owns its own locking granularity. `LockedRegion` is the migration bridge
+for regions that have not been converted yet: exactly one mutex per region,
+never one for the whole bus.
+
+**没有全局总线锁。** `SharedBus` 把每次访问交给区域，每个区域自带锁粒度。
+`LockedRegion` 是尚未转换区域的迁移桥：每个区域恰好一把互斥锁，绝不是整条总线
+一把。
+
+### SRAM bank mapping and lock order / SRAM bank 映射与锁顺序
+
+```text
+bank  = ((addr - base) >> 2) % 10        // word-interleaved, 10 banks
+local = (((addr - base) >> 2) / 10) * 4 + ((addr - base) & 3)
+```
+
+* A byte, halfword or word access that stays inside one 4-byte word touches one
+  bank and takes one lock; the whole transfer happens under it, so another bus
+  access never observes a half-written value **inside that bank**.
+* An access that crosses a word boundary touches two banks. Both locks are taken
+  **in ascending bank index order** and held for the whole access, so a single
+  access is still atomic with respect to other bus accesses.
+* Two *separate* accesses (for example a `read_u16` of the low half followed by a
+  `read_u16` of the high half) can observe the two halves at different times,
+  which matches a real bus where each word is its own transfer. Firmware that
+  needs a consistent 32-bit view of a bank-crossing word must perform one wide
+  access, not two narrow ones.
+* No region lock is ever held while entering another region, and the only nested
+  lock case is the ascending bank pair above, so the lock graph is acyclic. The
+  MMIO router adds one lock per child device and never holds two device locks.
+  `LockedRegion` holds exactly one lock and never calls into another region.
+* 落在同一个 4 字节字内的字节/半字/字访问只涉及一个 bank、只取一把锁，整个传输在
+  锁内完成，因此另一次总线访问绝不会看到**该 bank 内**写了一半的值。
+* 跨字边界的访问涉及两个 bank，两把锁按 **bank 下标升序**获取并在整个访问期间持有，
+  因此单次访问相对其它总线访问仍是原子的。
+* 两次**独立**访问（例如先读低半字、再读高半字）可能在不同时刻看到两个半字，这与
+  真实总线「每个字一次传输」一致。需要对跨 bank 字保持一致的 32 位视图的固件必须
+  做一次宽访问，而不是两次窄访问。
+* 任何区域锁都不会在进入另一个区域时继续持有；唯一的嵌套是上面的升序 bank 对，
+  因此锁图无环。MMIO 路由器额外使用每子设备一把锁，且绝不持有两把设备锁。
+  `LockedRegion` 只持一把锁，且绝不调用其它区域。
+
+### Flash, MMIO and the route cache / Flash、MMIO 与路由缓存
+
+* **Flash**: guest reads are relaxed atomic loads (see the Flash section); there is
+  no mutex at all. Host writes publish a generation number and the bulk snapshot
+  helpers retry while it changes.
+* **MMIO**: `MmioRouter` keeps each child in its own `Mutex`, so a core polling
+  `TIMER0` never waits for a core touching `UART0`. The 4 KiB page cache is an
+  array of packed `AtomicU64` tags (`tag | first | last | page`); a hit is one
+  relaxed load plus two comparisons and a bounds-validated tag, so a racing fill
+  can only force a scan, never a wrong route. Mounting takes `&mut self`, i.e. it
+  happens before the bus is shared. Alias writes fold the read-modify-write inside
+  **one** device lock, so concurrent SET/CLR/XOR writes cannot lose bits.
+* **Route cache**: `SharedBus` mirrors `SimpleBus`'s 256 buckets with atomic tags.
+  A hit is revalidated against the region window, so a stale or racing tag only
+  costs a linear scan.
+* **Flash**：客户机读是 relaxed 原子加载（见 Flash 一节），完全没有互斥锁。宿主写入
+  发布世代号，批量快照辅助函数在世代变化时重试。
+* **MMIO**：`MmioRouter` 让每个子设备各占一把 `Mutex`，因此轮询 `TIMER0` 的核绝不
+  等待访问 `UART0` 的核。4 KiB 页缓存是打包的 `AtomicU64` 标签数组
+  （`tag | first | last | page`）；命中只需一次 relaxed 加载、两次比较与边界校验过的
+  标签，因此竞争中的填充最多多一次扫描，绝不会错误路由。挂载取 `&mut self`，即发生
+  在总线被共享之前。别名写把读-改-写放在**同一把**设备锁内，因此并发 SET/CLR/XOR
+  写不会丢位。
+* **路由缓存**：`SharedBus` 用原子标签镜像 `SimpleBus` 的 256 个桶。命中会用区域
+  窗口重新校验，因此过期或竞争中的标签只会多一次线性扫描。
+
+### Single-threaded cost / 单线程代价
+
+The exclusive path never takes a lock: `RamRegion` uses `Mutex::get_mut` (plain
+pointer dereference), `FlashRegion` reads atomics directly, `MmioRouter` uses
+`get_mut` for its children, and `SimpleBus` keeps its non-atomic bucket table.
+The only shape change on the hot path is the bank index arithmetic, plus one
+provided `MemoryRegion::read_would_stall_mut` hook (defaults to
+`read_would_stall`) so the router can answer the stall question from an exclusive
+borrow instead of locking its children. A 30 M-access microbenchmark of the
+emerald phase-1 mix measures `ram-mixed 5.41 → 5.19 ns/op`,
+`mmio-poll 28.26 → 27.29 ns/op`, `flash-fetch 5.36 → 5.29 ns/op`.
+独占路径从不加锁：`RamRegion` 用 `Mutex::get_mut`（普通指针解引用），`FlashRegion`
+直接读原子量，`MmioRouter` 用 `get_mut` 访问子设备，`SimpleBus` 保留非原子桶表。
+热路径上唯一的形态变化是 bank 下标计算，外加一个提供的
+`MemoryRegion::read_would_stall_mut` 钩子（默认转发 `read_would_stall`），使路由器
+可以用独占借用回答 stall 问题而不必锁子设备。30 M 次访问的 emerald phase-1 混合
+微基准实测 `ram-mixed 5.41 → 5.19 ns/op`、`mmio-poll 28.26 → 27.29 ns/op`、
+`flash-fetch 5.36 → 5.29 ns/op`。
+
+### Concurrency tests / 并发测试
+
+`shared/tests.rs` and `shared/concurrency.rs` cover: two threads writing different
+banks (no lost updates, also through two regions of one `SharedBus`), two threads
+alternating on the same bank (no torn word), a bank-crossing wide access (atomic
+within one access, halves observable separately), flash reads racing a host writer
+(no torn word, generation advances), flash bulk snapshots (per-word consistency),
+two MMIO devices in parallel, concurrent alias writes on one device (no lost
+bits), and the PPB write epoch across threads. Every assertion holds for any
+interleaving; barriers only increase the chance of real overlap.
+`shared/tests.rs` 与 `shared/concurrency.rs` 覆盖：两线程写不同 bank（无丢失更新，
+也覆盖同一条 `SharedBus` 的两个区域）、两线程在同一 bank 交替（字不撕裂）、跨 bank
+宽访问（单次访问原子、两半可分别观察）、Flash 读与宿主写竞争（字不撕裂、世代推进）、
+Flash 批量快照（逐字一致）、两个 MMIO 设备并行、同设备并发别名写（不丢位）、跨线程
+PPB 写世代。所有断言对任意交错都成立；屏障只提高真实重叠的概率。
+
+---
+
 ## MMIO framework / MMIO 框架
 
 A device implements [`MmioDevice`] with a fixed window; `mount_device` wraps it
@@ -338,12 +525,13 @@ pub struct MmioRegion { /* wraps Box<dyn MmioDevice> + one-shot warn set */ }
 // one 32-bit access is one register access. Unmodelled offsets read 0 / ignore
 // writes and log a one-shot warning per address.
 
-pub struct MmioRouter { /* name + window + child regions */ }
+pub struct MmioRouter { /* name + window + Vec<Mutex<MmioRegion>> + windows + atomic page tags */ }
 // new(name, window) | window() | device_count()
 // mount(device) -> BusResult<MmioWindow>: child window must sit inside the
 // router window, must not overlap another child or any alias span, and may only
 // use the first 0x1000 bytes of its own block. Unmodelled router offsets read 0
-// / ignore writes with a one-shot warning.
+// / ignore writes with a one-shot warning. Each child sits behind its own mutex;
+// `MemoryRegion` uses `Mutex::get_mut` and never locks.
 
 pub fn mount_device(bus: &mut dyn AddressBus, device: Box<dyn MmioDevice>)
     -> BusResult<MmioWindow>;
@@ -360,23 +548,24 @@ read-modify-write on the child, which never sees an alias offset.
 #### Device page cache / 设备页缓存
 
 ```text
-slot  = (addr >> 12) & 63                 // 64 directly-mapped slots
-slot[s] = { start, end, index + 1 }       // validated child span, 0 = empty
+slot  = (addr >> 12) & 63                          // 64 directly-mapped slots
+tag   = atomic u64: index+1 | first | last | page  // 0 = empty
 ```
 
 `MmioRouter::resolve` used to scan every mounted child, which is what firmware
-polling one register pays on every access. Direct (non-alias) hits are now
-cached per 4 KiB page: a hit is one tag compare plus two range checks. The tag
-stores the child's window span, so a slot that is reused by another page can
-only miss and re-scan — it can never return the wrong device. Alias accesses
-still take the scan and are never cached, because they must fold an operation
-into the child. `mount` drops every slot.
+polling one register pays on every access. Direct (non-alias) hits are cached per
+4 KiB page: a hit is one relaxed atomic load, one page compare and two in-page
+offset comparisons. The tag packs the child index, its in-page first/last byte and
+the page number, so a slot reused by another page can only miss and re-scan — it
+can never return the wrong device. Alias accesses still take the scan and are
+never cached, because they must fold an operation into the child. `mount` drops
+every slot.
 
 `MmioRouter::resolve` 原先要遍历所有已挂载子设备，固件轮询单个寄存器时每次访问
-都要付这个代价。现在直接（非别名）命中会按 4 KiB 页缓存：命中只需一次标签比较
-加两次范围检查。标签保存子设备的窗口跨度，因此被其他页复用的槽只会未命中并
-重新扫描，绝不会返回错误设备。别名访问仍走扫描且不进缓存，因为它们必须把操作
-折叠到子设备上。`mount` 会丢弃全部槽。
+都要付这个代价。现在直接（非别名）命中会按 4 KiB 页缓存：命中只需一次 relaxed
+原子加载、一次页号比较与两次页内偏移比较。标签打包了子设备下标、其页内首尾字节与
+页号，因此被其他页复用的槽只会未命中并重新扫描，绝不会返回错误设备。别名访问仍走
+扫描且不进缓存，因为它们必须把操作折叠到子设备上。`mount` 会丢弃全部槽。
 
 ---
 
