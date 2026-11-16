@@ -18,6 +18,7 @@ default = []
 audio-playback = ["rp2350-audio/playback"]
 
 [dependencies]
+clap = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_plot = { workspace = true }

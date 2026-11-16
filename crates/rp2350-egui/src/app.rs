@@ -30,7 +30,7 @@ use crate::panels::{
     format_dma_count, format_hstx_fifo, format_hstx_row, format_hstx_scanline, format_pio_block,
     format_pio_row,
 };
-use crate::play_view::{PlayStarter, PlayView};
+use crate::play_view::{PlayFields, PlayStarter, PlayView};
 
 /// Top-level view selected by the tab bar / 标签栏选中的顶层视图
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,6 +95,9 @@ pub struct EmuApp {
     /// Play tab: live frames, keyboard and status bar, preserved across tabs
     /// 游戏标签页：实时画面、键盘与状态栏，切换标签页时保留
     play: PlayView,
+    /// Whether the first frame should start the prefilled play session
+    /// 首帧是否应启动已预填的游玩会话
+    play_auto_start: bool,
     /// Active top-level view / 当前顶层视图
     view: ActiveView,
 }
@@ -112,6 +115,7 @@ impl EmuApp {
             canvas_snapshot: String::new(),
             canvas_status: String::from("snapshot: none / 快照：无"),
             play: PlayView::default(),
+            play_auto_start: false,
             view: ActiveView::default(),
         }
     }
@@ -156,6 +160,60 @@ impl EmuApp {
     pub fn with_play_starter(mut self, starter: Box<dyn PlayStarter>) -> Self {
         self.play.set_starter(starter);
         self
+    }
+
+    /// Pre-fill the Play toolbar fields / 预填「游戏」工具栏字段
+    ///
+    /// The command-line frontend resolves the profile and the flags into the same
+    /// [`PlayFields`] the toolbar edits, so the GUI shows exactly the values that
+    /// Start would use. No session is created here.
+    /// 命令行前端把 profile 与参数解析为工具栏同一套 [`PlayFields`]，因此 GUI 显示的
+    /// 就是 Start 会使用的值。这里不创建会话。
+    #[must_use]
+    pub fn with_play_fields(mut self, fields: PlayFields) -> Self {
+        *self.play.fields_mut() = fields;
+        self
+    }
+
+    /// Request an automatic play start before the first frame
+    /// 请求在首帧之前自动启动游玩
+    ///
+    /// Set by the native entry point when the command line resolved a launch
+    /// request; [`EmuApp::auto_start_play`] consumes the request. False (the
+    /// default) keeps the historical manual "Load profile → Start" flow.
+    /// 命令行解析出启动请求时由原生入口设置；[`EmuApp::auto_start_play`] 消费该请求。
+    /// 默认 `false`，保持既有的手动「载入配置 → Start」流程。
+    #[must_use]
+    pub fn with_play_auto_start(mut self, auto_start: bool) -> Self {
+        self.play_auto_start = auto_start;
+        self
+    }
+
+    /// Start the prefilled play session once, before the first frame
+    /// 在首帧之前启动一次已预填的游玩会话
+    ///
+    /// The window creator calls this after the native window exists and before
+    /// the first frame, which is exactly "Load profile + Start" without the two
+    /// clicks. The request is consumed, so repeated calls are no-ops. The Play tab
+    /// becomes active so the picture is visible, and a failed start (unreadable
+    /// firmware, bad request, starter error) only writes the status line: the
+    /// window stays open.
+    /// 窗口创建回调在原生窗口存在之后、首帧之前调用它，等价于「载入配置 + Start」而
+    /// 无需两次点击。请求会被消费，重复调用是空操作。视图切到「游戏」标签页以便看到
+    /// 画面；启动失败（固件不可读、请求非法、starter 报错）只写状态行，窗口保持打开。
+    ///
+    /// Returns `true` when an automatic start was attempted, `false` when the
+    /// request was absent or already consumed.
+    /// 尝试了自动启动时返回 `true`；请求不存在或已消费时返回 `false`。
+    #[must_use]
+    pub fn auto_start_play(&mut self) -> bool {
+        if !self.play_auto_start {
+            return false;
+        }
+        self.play_auto_start = false;
+        self.view = ActiveView::Play;
+        self.play.start();
+        true
     }
 
     /// Switch the active top-level view / 切换当前顶层视图
@@ -256,8 +314,20 @@ impl EmuApp {
             ..eframe::NativeOptions::default()
         };
         let app_name = self.title.clone();
+        let mut app = self;
 
-        eframe::run_native(&app_name, options, Box::new(|_cc| Ok(Box::new(self))))
+        eframe::run_native(
+            &app_name,
+            options,
+            Box::new(move |_cc| {
+                // 窗口已创建、首帧之前：命令行直启在这里启动 worker，失败只写状态行。
+                // The window exists and the first frame has not been drawn yet: the
+                // command-line launch starts the worker here; a failure only writes
+                // the status line.
+                let _ = app.auto_start_play();
+                Ok(Box::new(app))
+            }),
+        )
     }
 
     /// Render every panel into `ui` / 将所有面板渲染到 `ui`
@@ -410,8 +480,13 @@ impl Default for EmuApp {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::panels::{DmaChannelView, PioBlockView, PioMachineView, format_pio_irq};
+    use crate::play_view::{PlayFrame, PlayRequest, PlaySource, PlayStats};
 
     /// Source that returns sample snapshots / 返回示例快照的来源
     struct MockSource {
@@ -689,5 +764,115 @@ mod tests {
         app.set_active_view(ActiveView::Play);
         assert_eq!(app.play().status(), "idle / 空闲");
         render_view(&mut app, egui::vec2(760.0, 600.0));
+    }
+
+    /// Fake worker that reports "running" and publishes no frame
+    /// 报告「运行中」且不发布帧的假 worker
+    struct IdleSource;
+
+    impl PlaySource for IdleSource {
+        fn latest_frame(&self) -> Option<Arc<PlayFrame>> {
+            None
+        }
+
+        fn set_buttons(&self, _mask: u16) {}
+
+        fn stats(&self) -> PlayStats {
+            PlayStats::default()
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn button_pins(&self) -> u16 {
+            0
+        }
+
+        fn shutdown(self: Box<Self>) -> PlayStats {
+            PlayStats::default()
+        }
+    }
+
+    /// Temporary firmware path with dummy bytes / 带占位字节的临时固件路径
+    fn temp_firmware(tag: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("rp2350-egui-{tag}-{}.uf2", std::process::id()));
+        std::fs::write(&path, b"not a real uf2").expect("temp firmware write");
+        path
+    }
+
+    /// App with resolved fields, a counting starter and the given auto-start flag
+    /// 带已解析字段、计数 starter 与指定自动启动标记的应用
+    fn launch_app(auto_start: bool, calls: &Arc<AtomicUsize>, tag: &str) -> (EmuApp, PathBuf) {
+        let path = temp_firmware(tag);
+        let counter = Arc::clone(calls);
+        let starter = move |_request: PlayRequest| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(IdleSource) as Box<dyn PlaySource>)
+        };
+        let fields = PlayFields {
+            firmware: path.display().to_string(),
+            frame: String::from("0x20000000:4x4"),
+            steps_per_frame: String::from("100"),
+            ..PlayFields::default()
+        };
+        let app = EmuApp::sample()
+            .with_play_starter(Box::new(starter))
+            .with_play_fields(fields)
+            .with_play_auto_start(auto_start);
+        (app, path)
+    }
+
+    #[test]
+    fn auto_start_play_calls_the_starter_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, path) = launch_app(true, &calls, "auto-on");
+
+        assert!(app.auto_start_play(), "the request must be attempted");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "starter call count");
+        assert_eq!(app.active_view(), ActiveView::Play);
+        assert!(app.play().is_running());
+        assert!(
+            app.play().status().starts_with("running / 运行中"),
+            "status={}",
+            app.play().status()
+        );
+
+        // 请求只消费一次：第二帧（或测试里第二次调用）不得再次启动。
+        // The request is consumed once: the second frame (or a second test call)
+        // must not start again.
+        assert!(!app.auto_start_play());
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "still one starter call");
+
+        app.play_mut().stop();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_start_play_without_request_calls_no_starter() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, path) = launch_app(false, &calls, "auto-off");
+
+        assert!(!app.auto_start_play());
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "no starter call");
+        assert_eq!(app.active_view(), ActiveView::VirtualLab);
+        assert!(!app.play().is_running());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_started_play_renders_headlessly_in_a_tiny_window() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, path) = launch_app(true, &calls, "auto-render");
+
+        assert!(app.auto_start_play());
+        render_view(&mut app, egui::vec2(80.0, 60.0));
+        render_view(&mut app, egui::vec2(760.0, 600.0));
+        assert!(app.play().is_running());
+
+        app.play_mut().stop();
+        let _ = std::fs::remove_file(path);
     }
 }

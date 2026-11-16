@@ -10,7 +10,8 @@
 > （`palette.rs`）与文本持久化（`canvas_io.rs`）。应用顶部标签栏可在「虚拟实验室」
 > 「游戏」与「寄存器与外设」之间切换；虚拟实验室标签页带保存/加载工具栏，游戏
 > 标签页（`play_view.rs`）实时显示 RGB565 帧并映射键盘，已通过
-> `play_view/cli_source.rs` 接到真实 `PlaySession`（`main.rs` 默认挂载）。
+> `play_view/cli_source.rs` 接到真实 `PlaySession`（`main.rs` 默认挂载），
+> 并支持命令行直启（`cli.rs`：`--profile` 或显式参数，首帧前自动 Start）。
 > 下文的 HSTX 视频解码面板、内存/GPIO/终端/调试器面板等均为目标设计，尚未实现。
 >
 > **Status** (EN): skeleton — `EmuApp` (`app.rs`), the register panel
@@ -23,8 +24,10 @@
 > register/peripheral panels; the Virtual Lab tab carries a save/load toolbar and
 > the Play tab (`play_view.rs`) shows live RGB565 frames with keyboard input,
 > wired to the real `PlaySession` through `play_view/cli_source.rs` and attached
-> by `main.rs` by default. The HSTX video decoder panel and the
-> memory/GPIO/terminal/debugger panels below remain target designs.
+> by `main.rs` by default. Command-line launch is available too (`cli.rs`:
+> `--profile` or explicit flags, automatic Start before the first frame). The
+> HSTX video decoder panel and the memory/GPIO/terminal/debugger panels below
+> remain target designs.
 
 ---
 
@@ -50,6 +53,7 @@ rp2350-egui/
     ├── play_view/reset_tests.rs # 复位测试（仅 test 构建 / test-only）
     ├── play_view/params_tests.rs # 字段与 profile 测试（仅 test 构建 / test-only）
     ├── canvas_tests.rs   # 调色板/持久化测试（仅 test 构建 / test-only）
+    ├── cli.rs            # 命令行直启：clap 参数 → PlayFields → 自动 Start（已落地 / landed）
     └── main.rs           # binary entry / 二进制入口
 
 Read-only peripheral panels landed in `panels.rs` + `app.rs`:
@@ -131,6 +135,12 @@ impl EmuApp {
     pub fn play_mut(&mut self) -> &mut PlayView;
     /// Attach the play worker factory (host side) / 挂载游玩 worker 工厂（宿主侧）
     pub fn with_play_starter(self, starter: Box<dyn PlayStarter>) -> Self;
+    /// Pre-fill the Play toolbar fields / 预填「游戏」工具栏字段
+    pub fn with_play_fields(self, fields: PlayFields) -> Self;
+    /// Request an automatic start before the first frame / 请求首帧前自动启动
+    pub fn with_play_auto_start(self, auto_start: bool) -> Self;
+    /// Consume the request and start once (window creator) / 消费请求并启动一次（窗口回调）
+    pub fn auto_start_play(&mut self) -> bool;
     /// Canvas model accessors / 画布模型访问器
     pub fn canvas(&self) -> &CanvasState;
     pub fn canvas_mut(&mut self) -> &mut CanvasState;
@@ -377,6 +387,76 @@ and nothing panics. Start validates in the order "fields → firmware read →
 starter", so a missing field is named first and `no play source attached` only
 appears once the fields are complete.
 
+### Command-line launch / 命令行直启
+
+`crates/rp2350-egui/src/cli.rs`（clap derive）让原生入口在**任何窗口创建之前**解析
+参数，并复用工具栏同一条字段/校验路径：
+
+- `--profile <PATH>` 或显式 `--file/--fb/--steps-per-frame/...` 都会解析成
+  `PlayFields`（与工具栏输入框完全同一套文本字段）；
+- 合并优先级 **命令行 > profile > 空**（与 `rp2350-cli play` 一致），不引入任何示例
+  默认值；`PlayFields::default()` 的音频 sink 元数据（48 kHz / 2 声道 / 48 000 样本）
+  仍是唯一的通用默认；
+- 合并后立即调用 `PlayFields::inputs()`（Start 使用的同一个函数）校验。缺
+  `--file`/`--fb`/步数、`--audio` 缺 block/sm、坏 `--fb`、`--profile` 不可读或解析
+  失败都在开窗前打印双语错误并以**退出码 2** 结束，不 panic、不闪现窗口；
+- 参数合法时，`main.rs` 构造
+  `EmuApp::sample().with_play_starter(CliPlayStarter).with_play_fields(fields).with_play_auto_start(true)`。
+  `eframe` 的窗口创建回调在原生窗口存在之后、**首帧之前**调用
+  `EmuApp::auto_start_play()`，等价于用户点「Load profile / 载入配置」+
+  「Start / 启动」，并自动切到「游戏」标签页；
+- 自动启动失败（固件不可读、starter 报错等）只写工具栏状态行，窗口保持打开；请求只
+  消费一次，后续帧不会重复启动；
+- 自动启动时向 **stderr** 打印一行稳定日志，便于脚本/验收判断：
+  `[rp2350-egui] auto-start profile=<path>`（有 `--profile`）或
+  `[rp2350-egui] auto-start file=<path> fb=<spec> steps_per_frame=<n>`（显式模式）；
+- `--no-auto-start` 只预填字段、保持窗口手动操作（便于先检查参数）；
+- 完全没有任何游玩选项时行为与以前**完全一致**：字段全空、默认「虚拟实验室」标签页、
+  手动「Load profile → Start」。
+
+| 选项 / Option | 值 / Value | 说明 / Notes |
+|---------------|-----------|--------------|
+| `--profile <PATH>` | 文件路径 | `key = value` profile；载入后自动开始 |
+| `--file <PATH>` | 文件路径 | 固件（UF2/ELF）；无 profile 时必填 |
+| `--fb <ADDR:WxH[:STRIDE]>` | 帧缓冲规格 | 由 `FrameSpec::parse` 校验；无 profile 时必填 |
+| `--steps-per-frame <N>` | 正整数 | 每发布一帧执行的客户机步数 |
+| `--buttons <MASK>` | `0x` 十六进制或十进制 | 按键引脚位图；默认不驱动任何引脚 |
+| `--audio` | 开关 | 捕获 I2S；需要 `--audio-block`/`--audio-sm` |
+| `--audio-block <N>` / `--audio-sm <N>` | usize | 推送 I2S 字的 PIO 块 / 状态机 |
+| `--audio-rate <HZ>` | u32 | 音频 sink 采样率（通用默认 48 000） |
+| `--audio-channels <N>` | u8 | 声道数（通用默认 2） |
+| `--audio-capacity <N>` | usize | sink 保留样本数（通用默认 48 000） |
+| `--no-auto-start` | 开关 | 只预填字段，不自动开始 |
+| `--help` / `--version` | — | 由 clap 处理，退出码 0 |
+
+```bash
+# profile 直启（示例 profile 属于 example/，不是 crate 默认值）
+cargo run -p rp2350-egui --release -- --profile example/gba/profile.conf
+
+# 等价显式参数（不使用 profile）
+cargo run -p rp2350-egui --release -- \
+    --file firmware.uf2 --fb 0x20000000:240x160 --steps-per-frame 1000000 \
+    --buttons 0x3FF --audio --audio-block 2 --audio-sm 0 --audio-rate 48000
+
+# 只预填、先检查参数
+cargo run -p rp2350-egui --release -- --profile example/gba/profile.conf --no-auto-start
+```
+
+English: `cli.rs` (clap derive) parses the command line before any window exists
+and resolves it into the same `PlayFields` the toolbar edits. Precedence is
+**command line > profile > empty** with no example defaults; the merged text is
+validated through `PlayFields::inputs()` (the Start path), and any semantic error
+prints a bilingual message and exits with code 2 before a window appears.
+`EmuApp::with_play_fields` shows the resolved values, and the eframe window
+creator calls `EmuApp::auto_start_play()` after the native window exists but
+before the first frame, which is "Load profile + Start" without the clicks; it
+also activates the Play tab and consumes the request once, so a failed start only
+writes the status line and the window stays open. Auto-starts log one stable
+stderr line (`[rp2350-egui] auto-start profile=…` or `… file=… fb=…
+steps_per_frame=…`). `--no-auto-start` prefills without starting, `--help` /
+`--version` behave normally, and no play option at all keeps the historical empty
+fields plus manual flow.
+
 ### Toolbar and fields / 工具栏与字段
 
 工具栏分四行输入 + 一行 Start/Stop/Reset + 一行状态。worker 运行中输入区整体置灰
@@ -613,9 +693,11 @@ but slow. See the P0 rows of the playability plan for the way forward.
 - **无手柄 / 无按键重绑**：键盘→GP 的映射是固定前端约定（下表），但 `buttons` 掩码
   决定哪些引脚真的被驱动，因此换固件时改掩码即可。
 - **无暂停 / 单步 / 截图**：只有 Start、Stop 与 Reset；帧率与步数由 `steps_per_frame` 决定。
+- **命令行直启同样不做示例猜测**：`--profile` / 显式参数都由用户提供，缺字段或
+  profile 非法时在开窗前以退出码 2 结束；`--no-auto-start` 只预填字段。
 - 依赖宿主挂载 `PlayStarter`：`PlayView::default()` 仍无 starter（便于测试注入假实现），
   但原生入口 `main.rs` 已默认挂载 `CliPlayStarter`，所以 `cargo run -p rp2350-egui`
-  的「游戏」标签页可直接出画面（仍需填入固件与帧缓冲）。
+  的「游戏」标签页可直接出画面（仍需填入固件与帧缓冲，或使用命令行直启）。
 - There are no example defaults: firmware path, frame buffer, steps per frame,
   button mask and I2S wiring all come from user input or a profile, and Start only
   writes the status line while a required field is missing. Profile keys without a
@@ -626,8 +708,11 @@ but slow. See the P0 rows of the playability plan for the way forward.
   fixed frontend convention, but the `buttons` mask decides which pins are really
   driven. The starter is still injectable (`PlayView::default()` has none, for
   tests and alternate hosts), and the native `main.rs` attaches `CliPlayStarter`.
-  There are still no save states, no gamepad, no pause/step/screenshot; `Reset`
-  rebuilds the session from the current fields but cannot resume prior progress.
+  Command-line launch follows the same rule: the profile and flags are supplied by
+  the user, a missing/invalid request exits with code 2 before the window, and
+  `--no-auto-start` only prefills. There are still no save states, no gamepad, no
+  pause/step/screenshot; `Reset` rebuilds the session from the current fields but
+  cannot resume prior progress.
 
 ### Tests / 测试
 
@@ -722,6 +807,37 @@ with frame numbering restarting at 1 and the new session's `fps`/`steps` in the
 status bar, the old audio output being joined before the new one is created, the
 starter-error path (old session stopped, no panic, no count), and a headless
 80×60 render plus a real pointer click on the Reset control.
+
+`cli.rs`（命令行直启，`#[cfg(test)] mod tests`，11 项）：
+
+- **profile-only**：`--profile <临时 profile>` 的每个字段与 profile 一致、
+  `auto_start == true`、日志行 `auto-start profile=<path>`；
+- **显式模式**：`--file/--fb/--steps-per-frame/--buttons/--audio/--audio-*` 全量填充，
+  日志行 `auto-start file=… fb=… steps_per_frame=…`；
+- **混合优先级**：命令行覆盖 profile 的 firmware/frame/steps/buttons/audio-rate，
+  profile 继续提供未覆盖的 audio_block/sm/channels；
+- **`--no-auto-start`**：字段预填、`auto_start == false`、没有日志行；
+- **拒绝路径**（开窗前错误）：缺 `--fb`、`--audio` 缺 block、`--audio` 缺 sm、
+  坏 `--fb`、`--profile` 不存在，错误消息分别点名缺失项/`帧缓冲非法`/`cannot read profile`；
+- **`--help` / `--version`**：clap `ErrorKind::DisplayHelp` / `DisplayVersion` 且退出码 0；
+- **无参数**：解析为 `None`，`PlayFields` 与 `EmuApp::sample().play().fields()` 仍全空
+  （防止示例常量回归）；单独 `--no-auto-start` 也不构成启动；
+- **示例 profile 逐项一致**：`example/gba/profile.conf` 经 CLI 解析后的每个字段与
+  `rp2350_cli::play::profile::parse` 的结果逐项相等（文件不存在则跳过）。
+
+`app.rs` 追加 3 项自动启动测试：假 starter 在 `auto_start = true` 时被调用**一次**
+（再次调用 `auto_start_play()` 不再启动）、`auto_start = false` 时一次都不调用且保持
+虚拟实验室标签页、自动启动后 80×60 与 760×600 无头渲染不 panic。
+
+English: `cli.rs` covers profile-only and explicit launches (fields plus the exact
+stderr log line), CLI-over-profile precedence, `--no-auto-start`, every rejection
+path (missing `--fb`, audio without block/state machine, malformed `--fb`, missing
+profile), `--help`/`--version` exit code 0, the no-argument case still yielding
+empty fields, and a field-by-field comparison against the parsed
+`example/gba/profile.conf`. Three `app.rs` tests pin the automatic start: the fake
+starter is called exactly once when requested (and not again on a second call),
+never when the flag is false (the view stays on Virtual Lab), and the auto-started
+view renders headlessly at 80×60 and 760×600 without panicking.
 
 ---
 

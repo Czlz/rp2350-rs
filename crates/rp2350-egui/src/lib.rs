@@ -29,6 +29,8 @@ pub mod app;
 pub mod canvas;
 pub mod canvas_io;
 mod canvas_view;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cli;
 pub mod palette;
 pub mod panels;
 pub mod play_view;

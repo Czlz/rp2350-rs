@@ -71,9 +71,16 @@ rp2350-cli play --file emerald.uf2 --fb 0x20063DF4:240x160 \
     --steps-per-frame 2500000 --buttons 0x3FF \
     --audio --audio-block 2 --audio-sm 0 --audio-rate 13440 --frames 20
 
-# 带音频台（默认 null 后端；要真的出声需编译 cpal 后端）
-cargo run -p rp2350-egui --features audio-playback --release
-# 「游戏 / Play」标签页 → 填固件路径与帧缓冲 → Start
+# GUI 直启：打开窗口后自动载入 profile 并开始游玩（首帧前 Start）
+cargo run -p rp2350-egui --release -- --profile example/gba/profile.conf
+
+# 只预填字段、不自动开始（先检查参数）
+cargo run -p rp2350-egui --release -- --profile example/gba/profile.conf --no-auto-start
+
+# 带音频台（默认 null 后端；要真的出声需编译 cpal 后端），配合上面的直启命令
+cargo run -p rp2350-egui --release --features audio-playback -- \
+    --profile example/gba/profile.conf
+# 无参数时仍是手动模式：「游戏 / Play」标签页 → 填固件路径与帧缓冲 → Start
 ```
 
 profile 是逐行 `key = value`（`#` 为注释），命令行同名参数覆盖 profile：
@@ -92,6 +99,12 @@ profile 是逐行 `key = value`（`#` 为注释），命令行同名参数覆盖
 
 没有 `--profile` 时 `--file`、`--fb`、`--steps-per-frame` 都必须显式给出，
 否则命令直接报错退出。
+
+GUI 命令行直启与 `rp2350-cli play` 使用同一套优先级（**命令行 > profile > 空**）：
+`--profile` 或显式参数会在窗口打开后、首帧之前自动 Start；参数非法时在开窗前以
+退出码 2 结束并打印双语错误。自动启动的稳定日志（stderr）为
+`[rp2350-egui] auto-start profile=example/gba/profile.conf`（显式模式则记录
+`file=… fb=… steps_per_frame=…`）。`--no-auto-start` 只预填字段。
 
 GUI 按键（画面获焦后生效）：
 
