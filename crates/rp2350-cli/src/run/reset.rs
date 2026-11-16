@@ -90,7 +90,8 @@ pub(crate) fn execute(bytes: &[u8], options: &RunOptions, stdout: &mut impl Writ
         strict_decode: options.strict_decode,
         psram: options.psram,
     };
-    let mut machine = Machine::new(bytes, &machine_options)?;
+    let mut machine =
+        Machine::new_with_core_threads(bytes, &machine_options, options.core_threads)?;
     if let Some(enabled) = options.sleep_fast_forward {
         machine.set_sleep_fast_forward(enabled);
     }

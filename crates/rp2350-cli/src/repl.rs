@@ -23,7 +23,8 @@ use rp2350_usb_host::{
 };
 
 use crate::run::{
-    ArchArg, Machine, MachineOptions, PsramOptions, SYSTEM_RESET_MESSAGE, fault_tail_lines,
+    ArchArg, CoreThreadOptions, Machine, MachineOptions, PsramOptions, SYSTEM_RESET_MESSAGE,
+    fault_tail_lines,
 };
 
 /// Default total instruction budget for `repl` / `repl` 的默认总指令预算
@@ -77,6 +78,8 @@ pub struct ReplOptions {
     /// Halt on undefined instructions instead of skipping them
     /// 遇到未定义指令时停机而不是跳过
     pub strict_decode: bool,
+    /// Optional two-thread core executor / 可选双核线程执行器
+    pub core_threads: CoreThreadOptions,
     /// PSRAM window to mount behind XIP chip select 1 / 在 XIP 片选 1 后挂载的 PSRAM 窗口
     pub psram: Option<PsramOptions>,
 }
@@ -525,7 +528,8 @@ pub fn run(options: &ReplOptions) -> Result<()> {
         strict_decode: options.strict_decode,
         psram: options.psram,
     };
-    let mut machine = Machine::new(&bytes, &machine_options)?;
+    let mut machine =
+        Machine::new_with_core_threads(&bytes, &machine_options, options.core_threads)?;
     // TinyUSB 的 EP0 没有端点控制寄存器，`hw_endpoint_start_next_buffer()` 每次
     // 控制传输都会写 `*ep->endpoint_control`（EP0 为 NULL）。真实 RP2350 的掩膜
     // ROM 会忽略地址 0 的写入；合成 boot ROM 区域默认拒绝写入，会让客户机在首个

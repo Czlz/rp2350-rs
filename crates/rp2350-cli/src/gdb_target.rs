@@ -17,8 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rp2350_core::SimpleBus;
-use rp2350_core::bus::AddressBus;
+use rp2350_core::AddressBus;
 use rp2350_core::watch;
 use rp2350_cpu::CpuState;
 use rp2350_gdb::target::regs;
@@ -69,7 +68,11 @@ fn watchable(address: u32, length: usize) -> bool {
 /// reads never change [`Machine::steps`] or the peripheral timebase.
 /// 局部 `cycles` 计数器吸收总线延迟记账，因此快照读取不会改变
 /// [`Machine::steps`] 或外设时基。
-fn read_watch_bytes(bus: &mut SimpleBus, address: u32, length: usize) -> Result<Vec<u8>, GdbError> {
+fn read_watch_bytes(
+    bus: &mut dyn AddressBus,
+    address: u32,
+    length: usize,
+) -> Result<Vec<u8>, GdbError> {
     let mut cycles = 0u64;
     let mut bytes = Vec::with_capacity(length);
     for offset in 0..length {

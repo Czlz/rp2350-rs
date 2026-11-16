@@ -151,6 +151,7 @@ fn run_options(max_cycles: u64) -> RunOptions {
         trace_steps: 0,
         strict_decode: false,
         sleep_fast_forward: None,
+        core_threads: CoreThreadOptions::default(),
         psram: None,
         dumps: Vec::new(),
     }

@@ -71,6 +71,7 @@ rp2350 run --file firmware.uf2 --psram 8388608
 ```text
 rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
            [--trace-steps N] [--strict-decode] [--sleep-fast-forward on|off]
+           [--core-threads on|off] [--core-window N]
            [--psram SIZE]
 ```
 
@@ -82,6 +83,8 @@ rp2350 run --file <FIRMWARE> [--arch arm|riscv] [--max-cycles N]
 | `--trace-steps` | `16` | Boot-trace steps printed / 打印的启动轨迹步数 |
 | `--strict-decode` | off | Halt on undefined instructions instead of delivering HardFault / 未定义指令停机，而不是投递 HardFault |
 | `--sleep-fast-forward` | `on` | Batch sleeping steps between events; `off` restores the pre-fast-forward path for A/B runs / 在事件之间批量推进睡眠步；`off` 恢复快进前的路径供 A/B 对照 |
+| `--core-threads` | `off` | Run core0/core1 on two host threads; see “Optional two-thread cores” below / 在两条宿主线程上运行 core0/core1，见下文「可选双核线程」 |
+| `--core-window` | `64` | Machine steps between cross-core synchronisations; accepted range `1..=4096` / 跨核同步之间的机器步数，可接受范围 `1..=4096` |
 | `--psram` | off (unmapped) | Mount an external PSRAM window at `0x1100_0000`; see “PSRAM window and size syntax” below / 在 `0x1100_0000` 挂载外部 PSRAM 窗口，见下文「PSRAM 窗口与大小语法」 |
 | `--dump` | none | `ADDR:LEN:PATH` memory dump written when the run stops (repeatable, decimal or `0x` hex) / 停机时写入的内存导出，可重复，支持十进制或 `0x` 十六进制 |
 
@@ -163,11 +166,123 @@ target's framebuffer belongs to that example's README (see
 帧缓冲的最快方式；具体目标帧缓冲地址属于该示例的 README（`emerald.uf2` 见
 `example/gba/README.md`）。
 
+### Optional two-thread cores / 可选双核线程
+
+`--core-threads on` runs core0 and core1 on two host threads. The default
+`off` path is unchanged and remains the deterministic acceptance baseline.
+`--core-threads on` 让 core0/core1 运行在两条宿主线程上；默认 `off` 路径不变，
+仍是确定性验收基准。
+
+```text
+# emerald: threaded cores with the default 64-step window
+target\release\rp2350-cli.exe run --file "<emerald.uf2>" \
+    --max-cycles 300000000 --trace-steps 0 --core-threads on
+```
+
+**Window model / 窗口模型.** A window is `--core-window N` machine steps
+(default 64, range `1..=4096`). Inside a window both cores execute freely; each
+instruction is really executed, nothing is skipped. At the boundary the caller
+waits for both workers, settles the completed window (step/ sleep accounting,
+halt/reset latches) and hands the next window to the workers. The boundary work
+of a completed window — DMA/PIO/HSTX pumps, core-1 mailbox handshakes, IRQ
+delivery, SIO/SEV forwarding and the 10 000-step timebase advance — then runs
+**while the next window executes**, so it overlaps core execution. The device
+handles and the shared bus are thread-safe; IRQ/event commands produced there
+take effect two windows later. Cross-core events therefore have a latency of at
+most two windows. The 64-step pump cadence is preserved for `--core-window`
+values up to 64; larger windows coalesce two or more pump periods into one
+boundary (see the measured table below).
+**窗口模型.** 窗口为 `--core-window N` 个机器步（默认 64，范围 `1..=4096`）。
+窗口内两核自由执行，每条指令都真实执行、绝不跳过。边界处调用方等待两个工作线程，
+结算刚完成的窗口（步数/睡眠记账、停机/复位锁存），并把下一个窗口交给工作线程。
+已完成窗口的边界工作——DMA/PIO/HSTX 泵送、core1 信箱握手、中断投递、SIO/SEV 转发
+与 10 000 步时基推进——随后在**下一个窗口执行期间**运行，与核执行重叠。设备句柄与
+共享总线是线程安全的；这里产生的中断/事件命令在两个窗口后生效。因此跨核事件延迟
+最多两个窗口。窗口 ≤64 时保持 64 步泵送节奏；更大窗口会把两个或更多泵送周期合并到
+一个边界（见下表实测）。
+
+**Determinism boundary / 确定性边界.** Window boundaries are fixed by the
+machine step counter, but the order of memory accesses **inside** a window is
+decided by the host scheduler. `on` mode is therefore **not bit-reproducible**;
+this is the explicit trade-off for interactive speed. The `off` path remains
+deterministic and byte-identical to the historical baseline. For the same
+reason the cache-line-level watchpoint state used by GDB is thread-local: use
+`--core-threads off` when debugging watchpoints.
+**确定性边界.** 窗口边界由机器步数固定，但窗口**内部**的内存访问顺序取决于宿主
+调度。因此 `on` 模式**不是位可复现的**；这是为交互速度做的显式取舍。`off` 路径
+保持确定性，并与历史基线逐字节一致。同样，GDB 使用的监视点状态是线程局部的：
+调试监视点时请使用 `--core-threads off`。
+
+**Execution and lifecycle / 执行与生命周期.** The two worker threads belong to
+one `run_steps`/`run_cycles` batch: they are started when at least one core can
+make progress in parallel, and joined before the call returns. Boot, a
+not-yet-launched core1, and double sleep stay on the serial batch path, which
+also keeps the sleep fast-forward. `reboot` preserves the mode and window.
+`Machine::active_core_threads()` reports `0` outside a batch (per machine).
+RISC-V images always use the serial path even when the flag is on.
+**执行与生命周期.** 两个工作线程属于一次 `run_steps`/`run_cycles` 批次：当至少
+一个核可并行推进时启动，并在调用返回前 join。启动阶段、core1 尚未启动以及双核睡眠
+保持在串行批量路径（睡眠快进也继续生效）。`reboot` 保留模式与窗口。
+`Machine::active_core_threads()` 在批次之外返回 `0`（按机器隔离）。RISC-V 映像
+即使开关为 on 也走串行路径。
+
+**Sharing / 共享.** The bus is built on `SharedBus`: 10-bank SRAM (`(addr>>2)%10`),
+lock-free Flash reads and one mutex per other region (never a global bus lock).
+PPB writes are captured per core and replayed into the writing core, so core0's
+and core1's NVIC/VTOR/CPACR stay independent; SIO register accesses take a
+dedicated view lock around `Sio::select_core`, so `FIFO_WR`/`FIFO_RD`/spinlocks
+follow the correct core. The host-side peripheral pumps run only while both
+workers are parked at a boundary.
+**共享.** 总线基于 `SharedBus`：10 bank SRAM（`(addr>>2)%10`）、Flash 免锁读、
+其余区域每区域一把互斥锁（绝不使用全局总线锁）。PPB 写入按核捕获并回放到写入核，
+因此 core0/core1 的 NVIC/VTOR/CPACR 相互独立；SIO 寄存器访问在
+`Sio::select_core` 外持有一把专用视图锁，使 `FIFO_WR`/`FIFO_RD`/自旋锁跟随正确
+的核。宿主侧外设泵送只在两个工作线程都停在边界时执行。
+
+Set `RP2350_THREAD_STATS=1` to print one host-side line per threaded batch
+(`windows=… total=… wait=… boundary=…`) on stderr. It is diagnostic only and
+never changes guest state.
+设置 `RP2350_THREAD_STATS=1` 可在 stderr 上每个线程化批次打印一行宿主诊断
+（`windows=… total=… wait=… boundary=…`），只影响诊断，不改变客户机状态。
+
+Measured on the acceptance host (see `doc/performance.md` §12 for the full
+table). “Counters” compares the emerald 300 M `time_us`/DMA/HSTX/sleep fields
+with the serial run; `=` means identical.
+验收机实测（完整表见 `doc/performance.md` §12）。“计数器”把 emerald 300 M 的
+`time_us`/DMA/HSTX/睡眠字段与串行运行比较，`=` 表示完全一致。
+
+| Window | Wall / 墙钟 | vs `off` | Counters / 计数器 |
+|---|---|---|---|
+| `off` (baseline) | 9.35 s | 1.00× | — |
+| 32 | 5.56 s | 1.68× | `=` |
+| 64 (default) | 5.15 s | 1.82× | `=` |
+| 128 | 4.51 s | 2.07× | `=` |
+| 256 | 4.16 s | 2.25× | DMA/HSTX under-fed |
+
+- 窗口 64 的客户机计数器与 `off` **逐字段一致**（`time_us`、`dma`、`hstx`、
+  睡眠步数；最终 PC 与 core1 PC 因窗口相位不同而不同，允许）。
+- 窗口 32 的屏障/协调次数翻倍，仍比 `off` 快；窗口 128 更快，且 emerald 的
+  DMA/HSTX 计数器仍一致；窗口 256 开始让 HSTX 欠载，因此不作为推荐值。
+- phase 1（225–300 M）单独对比：`off` 约 7.4 s，`on`(64) 约 4.2 s，**≈1.8×**；
+  整跑 1.82×。启动阶段（0–225 M）由 MT-3a 快进覆盖，`on` 与 `off` 都在 0.1 s 量级。
+- Window 64 is the default because it keeps every 64-step pump boundary and the
+  measured counters identical to the serial path. Window 128 is faster but
+  doubles the event/pump latency; choose it for interactive play when
+  throughput matters more than event latency.
+- 窗口 64 作为默认值，因为它保留每个 64 步泵送边界、计数器与串行路径完全一致。
+  窗口 128 更快，但事件/泵送延迟翻倍；交互游玩更看重吞吐时可选 128。
+- Cross-core event latency is at most two windows: ~0.25 µs at window 32,
+  ~0.5 µs at 64 and ~1 µs at 128 (252 MHz). All are far below host-visible
+  interaction latency.
+- 跨核事件延迟最多两个窗口：窗口 32 约 0.25 µs、64 约 0.5 µs、128 约 1 µs
+  （252 MHz），都远低于宿主可感知的交互延迟。
+
 ### `repl` — USB CDC raw REPL / USB CDC raw REPL
 
 ```text
 rp2350 repl --file <FIRMWARE> [--exec "CODE" | --stdio] [--max-cycles N]
             [--enum-cycles N] [--no-soft-reset] [--strict-decode]
+            [--core-threads on|off] [--core-window N]
             [--arch arm|riscv] [--psram SIZE]
 ```
 
@@ -180,6 +295,7 @@ rp2350 repl --file <FIRMWARE> [--exec "CODE" | --stdio] [--max-cycles N]
 | `--enum-cycles` | `100_000_000` | Budget before USB enumeration must finish / USB 枚举需在此预算内完成 |
 | `--no-soft-reset` | off | Skip the Ctrl-D soft reset on entry (ignored by `--stdio`) / 进入时跳过 Ctrl-D 软复位（`--stdio` 下忽略） |
 | `--strict-decode` | off | Halt on undefined instructions instead of delivering HardFault / 未定义指令停机，而不是投递 HardFault |
+| `--core-threads` / `--core-window` | `off` / `64` | Optional two-thread cores and their window; see “Optional two-thread cores” under `run` / 可选双核线程与其窗口，见 `run` 下的「可选双核线程」 |
 | `--arch` | from UF2 family | Override the core architecture / 覆盖核心架构（`riscv` 为别名） |
 | `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`） |
 
@@ -354,7 +470,8 @@ rp2350 play [--profile <FILE>] [--file <FIRMWARE>] [--fb <ADDR:WxH[:STRIDE]>]
             [--steps-per-frame N] [--frames N] [--buttons MASK]
             [--audio --audio-block N --audio-sm N] [--audio-rate HZ]
             [--audio-channels N] [--audio-capacity N] [--trace-steps N]
-            [--max-cycles N] [--arch arm|riscv] [--strict-decode] [--psram SIZE]
+            [--max-cycles N] [--arch arm|riscv] [--strict-decode]
+            [--core-threads on|off] [--core-window N] [--psram SIZE]
 ```
 
 There are **no example-specific defaults** in the crate. The firmware path, the
@@ -382,6 +499,7 @@ profile 文件或命令行；两者都没有时命令直接失败并指出缺失
 | `--trace-steps` | `0` | Leading steps of the first frame printed as `[trace]` lines / 第一帧开头打印的 `[trace]` 步数 |
 | `--max-cycles` | `u64::MAX` | Total instruction budget; `u64::MAX` = unlimited / 总指令预算，`u64::MAX` 表示不限制 |
 | `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions instead of HardFault / 架构覆盖 / 未定义指令停机，而不是投递 HardFault |
+| `--core-threads` / `--core-window` | `off` / `64` | Optional two-thread cores and their window; see “Optional two-thread cores” under `run` / 可选双核线程与其窗口，见 `run` 下的「可选双核线程」 |
 | `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`; a profile may set `psram = 8M` instead) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`；profile 也可用 `psram = 8M`） |
 
 #### Profile format / profile 格式
@@ -952,6 +1070,11 @@ impl PsramOptions {
 pub struct Machine { /* bus, bootrom, core, core1, peripherals, usb … */ }
 impl Machine {
     pub fn new(bytes: &[u8], options: &MachineOptions) -> Result<Self>;
+    pub fn new_with_core_threads(
+        bytes: &[u8],
+        options: &MachineOptions,
+        threads: CoreThreadOptions,
+    ) -> Result<Self>;
     pub fn step(&mut self) -> Result<CpuState>;   // both runnable cores
     pub fn step_cores(&mut self, core0: bool, core1: bool) -> Result<CpuState>;
     pub fn trace_step(&mut self, index: usize) -> Result<CpuState>;  // prints [trace]
@@ -959,6 +1082,8 @@ impl Machine {
     pub fn run_cycles(&mut self, cycles: u64);   // CdcLink cycle callback, both cores
     pub fn read_block(&mut self, addr: u32, len: usize) -> Vec<u8>;  // frame copies
     pub fn finalize(&mut self);                  // flush timebase + UART
+    // threading: core_threads_enabled, core_window, set_core_window,
+    // active_core_threads (0 outside a threaded batch)
     // diagnostics: image_description, core_description, boot_vectors, pc, sp,
     // steps, now_cycles, time_us, budget, halt_reason, usb, irqs,
     // dma_transfers, dma_state, hstx_words, hstx_state, pio_busy_mask,
@@ -966,9 +1091,11 @@ impl Machine {
     // sleep_fast_forward_steps,
     // pio_pc (test hook), core1_state, core1_pc, core1_sp, core1_launch_count,
     // core1_halt_reason, take_uart_output, take_notices, notices_pending,
-    // recent_steps, register, dump_memory
+    // recent_steps, register, registers, dump_memory
     // debugger: read_register, write_register, xpsr, write_xpsr, cpu_state
 }
+
+pub struct CoreThreadOptions { pub enabled: bool, pub window: u32 } // default off / 64
 
 pub struct RunOptions {
     pub file: PathBuf,
@@ -977,6 +1104,7 @@ pub struct RunOptions {
     pub trace_steps: usize,
     pub strict_decode: bool,
     pub sleep_fast_forward: Option<bool>, // None = env/default (`on`)
+    pub core_threads: CoreThreadOptions,  // `--core-threads` / `--core-window`
     pub psram: Option<PsramOptions>,
     pub dumps: Vec<MemoryDump>,       // --dump ADDR:LEN:PATH (repeatable)
 }

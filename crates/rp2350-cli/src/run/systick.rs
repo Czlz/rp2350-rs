@@ -64,7 +64,7 @@ pub(super) fn forward_systick_pending(
 /// 15 is a system exception, not external IRQ 15 (exception 31).
 /// 该行沿用与外设投递相同的 `[irq]` 前缀，前端可解析同一条流；它与
 /// `signal <n>` 区分开，因为异常 15 是系统异常，不是外部 IRQ 15（异常 31）。
-fn log_systick(irq_log: &mut IrqLog, pc: u32) {
+pub(super) fn log_systick(irq_log: &mut IrqLog, pc: u32) {
     if irq_log.lines.len() == IRQ_LOG_LIMIT {
         irq_log.lines.remove(0);
     }

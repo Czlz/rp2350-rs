@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use super::profile::{self, Profile};
 use super::{FrameSpec, PlayAudioConfig};
-use crate::run::{ArchArg, PsramOptions};
+use crate::run::{ArchArg, CoreThreadOptions, PsramOptions};
 
 /// Default sample rate of the audio sink when audio is enabled
 /// 启用音频时音频 sink 的默认采样率
@@ -83,6 +83,8 @@ pub struct PlayArgs {
     pub max_cycles: Option<u64>,
     /// Leading `[trace]` steps / 开头的 `[trace]` 步数
     pub trace_steps: Option<usize>,
+    /// Optional two-thread core executor / 可选双核线程执行器
+    pub core_threads: CoreThreadOptions,
     /// PSRAM window behind XIP chip select 1 / XIP 片选 1 后的 PSRAM 窗口
     pub psram: Option<PsramOptions>,
 }
@@ -111,6 +113,8 @@ pub struct PlayOptions {
     pub max_cycles: u64,
     /// Leading `[trace]` steps / 开头的 `[trace]` 步数
     pub trace_steps: usize,
+    /// Optional two-thread core executor / 可选双核线程执行器
+    pub core_threads: CoreThreadOptions,
     /// PSRAM window behind XIP chip select 1, or `None` to leave it unmapped
     /// XIP 片选 1 后的 PSRAM 窗口；`None` 表示保持未映射
     pub psram: Option<PsramOptions>,
@@ -163,6 +167,7 @@ pub fn resolve(args: &PlayArgs) -> Result<PlayOptions, String> {
         // No PSRAM by default: `0x1100_0000` keeps reporting NoDevice exactly as
         // it did before this option existed.
         psram: args.psram.or(profile.psram),
+        core_threads: args.core_threads,
     })
 }
 

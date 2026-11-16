@@ -53,6 +53,31 @@ impl Machine {
     // are exactly the overhead this optimization removes.
     #[allow(clippy::too_many_lines)]
     pub fn run_steps(&mut self, max_steps: u64) -> Result<CpuState> {
+        // 线程化模式把两个核交给独立工作线程，并用固定窗口协调外设；默认路径
+        // 保持逐字节不变。RISC-V 与缺少 core1 的映像回退到单线程路径。
+        // The threaded mode hands both cores to worker threads and coordinates
+        // peripherals on fixed windows; the default path stays byte-identical.
+        // RISC-V and images without core1 fall back to the single-threaded path.
+        if self.core_threads && matches!(self.core, CoreHandle::Arm(_)) && self.core1.is_some() {
+            return self.run_steps_threaded(max_steps);
+        }
+        self.run_steps_serial(max_steps)
+    }
+
+    /// Single-threaded batched stepping path (the deterministic default)
+    /// 单线程批量步进路径（确定性默认路径）
+    ///
+    /// # Errors
+    /// Propagates bus errors raised while dispatching a core-0 boot ROM trap,
+    /// exactly like [`Machine::step`]. Core-1 faults are recorded in
+    /// [`Machine::core1_halt_reason`] and never abort core 0.
+    /// 与 [`Machine::step`] 一样传播 core0 boot ROM 陷阱分发期间的总线错误。
+    /// core1 故障记录在 [`Machine::core1_halt_reason`]，绝不影响 core0。
+    // 热循环必须保持为单个函数：拆分引入的调用边界正是本项优化要消除的开销。
+    // The hot loop must stay one function: the call boundaries a split would add
+    // are exactly the overhead this optimization removes.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn run_steps_serial(&mut self, max_steps: u64) -> Result<CpuState> {
         if self.halt.is_some() {
             return Ok(CpuState::Halted);
         }

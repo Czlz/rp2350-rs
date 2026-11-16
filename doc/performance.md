@@ -1092,3 +1092,157 @@ SHA-256 也相同（`23CC9CAA…0D6CD6`），说明快进没有改变任何客�
 steps/time_us/PC/寄存器/SRAM/SysTick/TIMER/DMA/HSTX/`[irq]` 日志/回溯环形缓冲/宿主
 通知，覆盖单核睡、双核睡、另一核运行、DMA/PIO 活动、睡眠中改频、睡眠中置位中断、
 阻塞 FIFO 读与关闭开关。
+
+---
+
+## 12. MT-2b TIMER 无锁快照 / Lock-free TIMER snapshot（2026-11-16）
+
+MT-1 显示 core0 每步 0.46 次总线访问、其中 50 % 是 TIMER0 读（300 M 步共
+17 187 549 次）。本轮把这些读从「时基互斥锁 + 设备锁」改为共享原子快照，并顺带把
+`IrqAssert` 与中断泵的 TIMER 路径改为无锁。实现与一致性证明见
+[`threading-plan.md`](threading-plan.md) §10 与
+[`crates/rp2350-periph.md`](crates/rp2350-periph.md)「Lock-free counter snapshot」。
+MT-1 showed 0.46 bus accesses per core-0 step with 50 % TIMER0 reads (17 187 549
+per 300 M steps). This round serves them from a shared atomic snapshot and makes
+`IrqAssert` plus the timer side of the interrupt pump lock-free; see
+[`threading-plan.md`](threading-plan.md) §10 for the design and consistency
+proof.
+
+### 12.1 微基准 / Microbenchmark
+
+临时 example（交付前删除），单线程、252 MHz、20 M 次读、release，取两次最小值：
+
+| 路径 / Path | ns/读 |
+|---|---|
+| 旧路径 `timebase.lock().timer_us()` | **8.44 – 9.65** |
+| `Timer0::read32(TIMELR)`（快照） | **0.73 – 0.91** |
+| `Timer0::read32(TIMERAWL)` | 1.06 – 1.29 |
+| `TIMELR`+`TIMEHR` 成对 | 0.91 – 1.36 |
+
+单次读节省约 **8 ns**；300 M 步的 17.19 M 次读约 **0.14 s**，中断泵（每 64 步一次、
+原本每次约 20 次锁）再省 **0.1–0.2 s**。
+
+### 12.2 端到端 / End to end
+
+同一 emerald UF2、同机交错运行 7 轮（`run --max-cycles 300000000 --trace-steps 0`），
+报告进程 CPU 时间（对并行会话负载不敏感）与墙钟：
+
+| 指标 / Metric | 基线 / Before | 本任务 / After | 变化 |
+|---|---|---|---|
+| 300 M CPU 最小值 | 11.563 s | **11.094 s** | **−4.1 %** |
+| 300 M CPU 中位数 | 11.859 s | **11.297 s** | **−4.7 %** |
+| 300 M 墙钟最小值 | 12.113 s | 12.124 s | ±0（噪声） |
+| 300 M 墙钟中位数 | 13.294 s | **12.171 s** | −8.4 % |
+| 50 M 墙钟（纯睡眠快进） | 1.009–1.016 s | 1.021–1.033 s | 无变化 |
+
+- 300 M 墙钟样本在并行任务负载下跨度很大（基线单轮 15.508 s、最好 12.113 s）；
+  本任务把「与 `mp` 无关的锁」去掉后样本更集中（10 次中 8 次在 12.12–12.17 s）。
+  因此以 CPU 时间为主口径。
+- 收益小于 MT-1 的理想估计：225 M 步是睡眠快进（约 0.06 s），剩下的 75 M 步主要
+  花在 ARM 解释器；本轮只移除 core0 忙等读与中断泵的锁。
+- 微基准与整跑收益同向（读路径 8–10×、整跑 4–5 % CPU），没有用近似时钟或降低
+  alarm 精度换速度。
+
+### 12.3 计数器一致性 / Counter identity
+
+emerald 300 M 与基线**逐字段相同**：`time_us=1 798 617`、`dma=2 199 378 busy=0x0009`、
+`hstx words=5 401 204 underruns=0 fifo=8`、`sleep core0 steps=224 994 790 wakes=6`、
+`core1 Running pc=0x1000035C sp=0x2003D680 launches=1`、8 条 `[irq]`、
+final PC `0x1000B3AC`。
+
+### 12.4 剩余 / Remaining
+
+`MmioRouter` 的每设备互斥锁仍在（`rp2350-core` 所有权），客户机轮询在设备内只剩一次
+原子加载；线程化总线的无锁 `SharedRegion` 入口留给 MT-3。详见
+[`threading-plan.md`](threading-plan.md) §10.6。
+
+---
+
+## 13. MT-3b 可选双核线程（交互口径，2026-11-16）
+
+本节数据来自 `--core-threads on`。**默认 `off` 口径不变**：`doc/performance.md` 前文
+所有数字仍是单线程路径；本节的加速比只用同一台机器、同一 UF2、同一轮的
+`off` 运行作分母，且 `on` 模式不是位可复现的（窗口内顺序由宿主调度决定）。
+The numbers below are for `--core-threads on`. The default `off` numbers
+earlier in this file are unchanged; the speedups here use the same-host,
+same-image `off` run of the same round as the denominator, and `on` mode is not
+bit-reproducible (intra-window order follows the host scheduler).
+
+### 13.1 口径 / Method
+
+```powershell
+target\release\rp2350-cli.exe run --file "<emerald.uf2>" --max-cycles 300000000 `
+    --trace-steps 0 [--core-threads on --core-window N]
+```
+
+- phase 1 = 225 M–300 M（双核活跃段），phase 0 = 0–225 M（MT-3a 睡眠快进）。
+- 多轮测量取墙钟最小值；同轮交替跑 `off`/`on`，避免宿主负载漂移。绝对墙钟受
+  并行会话负载影响很大，**同轮比值**比绝对值更可靠。
+- 每次 `on` 运行都检查 `time_us`/`dma`/`hstx`/睡眠计数与 `off` 的差异，以及
+  `[irq]`/最终 PC；差异只在报告里注明，不用作通过条件（窗口内交错允许不同）。
+- Multiple runs per case, minimum wall clock; `off` and `on` alternate in the
+  same round. Absolute wall clock is very sensitive to concurrent host load;
+  the same-round ratio is the reliable metric. Every `on` run compares
+  `time_us`/`dma`/`hstx`/sleep counters with `off`; differences are reported,
+  not used as a pass condition.
+
+### 13.2 emerald 300 M / window sweep
+
+| 窗口 | 墙钟 | vs `off` | `time_us` | `dma` | `hstx words / underruns` | `sleep core0` |
+|---|---|---|---|---|---|---|
+| `off` | 9.35 s | 1.00× | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| 32 | 5.56 s | 1.68× | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| **64（默认）** | **5.15 s** | **1.82×** | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| 128 | **4.51 s** | **2.07×** | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| 256 | 4.16 s | 2.25× | 1 798 617 | 1 665 719 | 4 101 338 / 187 678 | 224 994 790 |
+
+- **窗口 64**：所有客户机计数器与 `off` 逐字段一致（`dma`、`hstx`、`time_us`、
+  睡眠步数）；最终 PC 与 core1 PC 因窗口相位不同而不同（允许）。8 条 `[irq]`
+  保留。
+- **窗口 32**：屏障/协调次数翻倍，但仍快于 `off`；计数器仍一致。
+- **窗口 128**：更快且 emerald 计数器仍一致；跨核事件延迟与泵送合并翻倍。
+- **窗口 256**：HSTX 开始欠载（`underruns=187 678`），因此不作为默认/推荐值。
+- **phase 1 单独**：`off` 约 7.4 s，`on`(64) 约 4.2 s → **≈1.8×**；整跑 1.82×。
+  phase 0 由 MT-3a 快进覆盖，`on` 与 `off` 都在 0.1 s 量级，不计入双核收益。
+- 墙钟受并行会话负载影响：另一轮同机交替 `off` 11.30 s / `on`(64) 5.66 s
+  （**2.00×**），因此 1.82× 是较保守的同轮值。
+
+### 13.3 解释 / Interpretation
+
+- 启动阶段和 core1 尚未启动时没有并行收益，执行器留在串行批量路径（含睡眠快进）；
+  只有双核都活跃才启动两条核线程。这避免了「每 10 000 步启动一次线程」的开销。
+- 边界工作与下一个窗口**重叠**：完成窗口的 DMA/PIO/HSTX/时基/中断/事件处理在下一
+  窗口执行期间运行，因此不计入核执行关键路径；代价是边界命令晚两个窗口生效。
+  实测协调线程等待 5.6 s、边界工作 1.5 s，重叠后总时间仍约等于等待时间。
+- 窗口同步使用缓存行隔离的原子自旋（`spin_loop` + 有界 `yield_now`），
+  而不是 `std::sync::Barrier`：后者在 64 步窗口下每步停泊/唤醒，曾退化到 66 s 级。
+- 共享总线按 MT-2a 形态：10 bank SRAM、Flash 免锁、其它区域每区域一把锁；
+  PPB 写按核捕获回放，SIO 访问持视图锁。
+- The executor stays serial during boot / before core1 launches (including the
+  MT-3a sleep fast-forward) and only starts the two workers when both cores are
+  live. A completed window's boundary work (DMA/PIO/HSTX/timebase/IRQ/events)
+  overlaps the **next** window, keeping it off the core critical path; boundary
+  commands then take effect two windows later. Window handshakes use
+  cache-line-padded atomic spins with a bounded `yield_now`, not
+  `std::sync::Barrier` (the latter regressed a 300 M run to ~66 s at 64-step
+  windows). The shared bus keeps MT-2a's shape: 10 SRAM banks, lock-free Flash,
+  one mutex per other region; PPB writes are captured per core and SIO accesses
+  take the view lock.
+
+### 13.4 固件 / Firmware（on 模式）
+
+| 固件 | 命令 | 结果 |
+|---|---|---|
+| FV-2 Arm MicroPython | `repl --file … --exec "print(6 * 7)" --core-threads on` | `[repl] stdout: 42`，steps=2 179 500，simulated=14 530 µs |
+
+FV-1/FV-2/FV-3 默认模式均 `42`；连续 10 次 `on` 300 M 无崩溃/挂起。
+FV-1/FV-2/FV-3 pass with `42` in the default mode; ten consecutive `on` 300 M
+runs completed without a crash or hang.
+
+### 13.5 剩余 / Remaining
+
+1. `MmioRouter`/APB/SIO 在 `on` 模式仍是每区域一把 `LockedRegion` 锁；把
+   `BootPeripherals` 的路由器直接注册为 `SharedRegion` 是后续优化。
+2. 窗口 >64 会合并 64 步泵送，HSTX 可能欠载；需要严格节拍时用默认 64。
+3. GDB 监视点是线程局部的，`on` 模式不支持；调试请用 `off`。
+

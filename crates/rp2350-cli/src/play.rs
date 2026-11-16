@@ -50,8 +50,7 @@ use anyhow::{Context, Result};
 use rp2350_periph::pio::{PIO_BLOCKS, PIO_SM_COUNT};
 use rp2350_periph::{AudioSink, AudioTap};
 
-use crate::run::{Machine, MachineOptions, SYSTEM_RESET_MESSAGE};
-
+use crate::run::{CoreThreadOptions, Machine, MachineOptions, SYSTEM_RESET_MESSAGE};
 /// Worker thread name / worker 线程名
 const WORKER_NAME: &str = "rp2350-play";
 
@@ -231,6 +230,23 @@ impl PlaySession {
         options: MachineOptions,
         config: PlayConfig,
     ) -> Result<Self, String> {
+        Self::start_with_core_threads(image, options, CoreThreadOptions::default(), config)
+    }
+
+    /// Boot a machine with an optional two-thread core executor
+    /// 用可选的双核线程执行器启动机器
+    ///
+    /// `threads.enabled = false` is identical to [`Self::start`].
+    /// `threads.enabled = false` 与 [`Self::start`] 完全一致。
+    ///
+    /// # Errors
+    /// See [`Self::start`]. / 见 [`Self::start`]。
+    pub fn start_with_core_threads(
+        image: Vec<u8>,
+        options: MachineOptions,
+        threads: CoreThreadOptions,
+        config: PlayConfig,
+    ) -> Result<Self, String> {
         if config.steps_per_frame == 0 {
             return Err("steps_per_frame must be greater than zero / 每帧步数必须大于 0".into());
         }
@@ -296,8 +312,8 @@ impl PlaySession {
                 .name(WORKER_NAME.to_owned())
                 .spawn(move || {
                     run_worker(
-                        &image, &options, config, &buttons, &stop, &latest, &replaced, &stats,
-                        &running, audio, &ready_tx,
+                        &image, &options, threads, config, &buttons, &stop, &latest, &replaced,
+                        &stats, &running, audio, &ready_tx,
                     );
                 })
                 .map_err(|error| format!("cannot spawn play worker / 无法创建 worker: {error}"))?
@@ -516,6 +532,7 @@ fn step_frame(
 fn run_worker(
     image: &[u8],
     options: &MachineOptions,
+    threads: CoreThreadOptions,
     config: PlayConfig,
     buttons: &AtomicU16,
     stop: &AtomicBool,
@@ -536,7 +553,7 @@ fn run_worker(
     }
     let _guard = RunningGuard(running);
 
-    let mut machine = match Machine::new(image, options) {
+    let mut machine = match Machine::new_with_core_threads(image, options, threads) {
         Ok(machine) => machine,
         Err(error) => {
             let _ = ready.send(Err(format!(
@@ -730,8 +747,9 @@ pub fn run(args: &PlayArgs) -> Result<()> {
         audio: options.audio,
         trace_steps: options.trace_steps,
     };
-    let session = PlaySession::start(image, machine_options, config)
-        .map_err(|message| anyhow::anyhow!(message))?;
+    let session =
+        PlaySession::start_with_core_threads(image, machine_options, options.core_threads, config)
+            .map_err(|message| anyhow::anyhow!(message))?;
     session.set_buttons(0);
 
     let mut printed = 0u64;

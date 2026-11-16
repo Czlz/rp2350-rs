@@ -230,6 +230,33 @@ fn headless_session_publishes_two_frames_and_shuts_down() {
 }
 
 #[test]
+fn headless_session_runs_with_the_threaded_core_executor() {
+    // 线程化开关与 PlaySession 的生命周期兼容：worker 自己构造 Machine，批次内
+    // 启动核线程并在帧边界 join；shutdown 后播放 worker 与核线程都已退出。
+    // The threaded switch is compatible with PlaySession's lifecycle: the worker
+    // builds the Machine itself, starts core threads per batch and joins them at
+    // frame boundaries; after shutdown both the play worker and core threads are
+    // gone.
+    let config = PlayConfig {
+        max_frames: Some(2),
+        ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 200)
+    };
+    let threads = crate::run::CoreThreadOptions {
+        enabled: true,
+        window: 32,
+    };
+    let session =
+        PlaySession::start_with_core_threads(spin_uf2(), spin_options(u64::MAX), threads, config)
+            .expect("session");
+    let stats = wait_for(&session, |stats| stats.frames >= 2);
+    assert_eq!(stats.frames, 2);
+    assert_eq!(stats.halted, None);
+    let final_stats = session.shutdown();
+    assert_eq!(final_stats.frames, 2);
+    assert_eq!(final_stats.halted, None);
+}
+
+#[test]
 fn frame_indices_and_steps_are_monotonic() {
     let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 200);
     let session = PlaySession::start(spin_uf2(), spin_options(u64::MAX), config).expect("session");
@@ -649,6 +676,7 @@ fn play_options_forward_the_psram_size_to_the_machine() {
         strict_decode: false,
         max_cycles: 1000,
         trace_steps: 0,
+        core_threads: crate::run::CoreThreadOptions::default(),
         psram,
     };
     let mapped = machine_options(&options);

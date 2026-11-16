@@ -94,6 +94,14 @@ determinism. No JIT and no firmware-specific tuning.
 > 定序为 MT-2b。 / MT-2a delivered the shareable bus layer (no threads) in §7; the
 > migration and arbitration half of the original MT-2 is now MT-2b.
 >
+> **MT-2b（子项）已交付**：TIMER0/1 计数读取改为共享无锁原子快照（含 alarm 门控与
+> 原子中断掩码），见 §10。区域迁移（bootrom/usb/usb-host/periph → `SharedRegion`）
+> 与 CLI 的 `SharedBus` 组装仍是 MT-2b 的剩余部分。
+> / **MT-2b (subtask) delivered**: lock-free atomic snapshots for the TIMER0/1
+> counter reads (with the alarm gate and an atomic IRQ mask), see §10. Region
+> migration (bootrom/usb/usb-host/periph → `SharedRegion`) and the CLI's
+> `SharedBus` assembly remain.
+>
 > **MT-5 已交付**：每设备插件线程 + 固定延迟邮箱，默认仍为同步路径，见 §8。
 > / MT-5 delivered the per-device plugin thread with a fixed-latency mailbox;
 > the synchronous path stays the default (see §8).
@@ -773,4 +781,243 @@ uncommitted change.
 2. 长时间运行（soak）与真实重插件（如 uart-terminal）的线程化吞吐未测。
 3. 无法终止卡死线程 → 分离 + 泄漏库句柄；若需要硬隔离必须进程外执行。
 4. 工作线程 panic 隔离仅覆盖 Rust 展开；`panic = "abort"` / 跨 `extern "C"` 不支持。
+
+---
+
+## 10. MT-2b（子项）：TIMER 读取走无锁原子快照（2026-11-16）
+
+## 10. MT-2b (subtask): lock-free TIMER reads (2026-11-16)
+
+MT-1 实测 core0 每步 **0.46 次总线访问**，其中 **50 % 是 TIMER0 读**（300 M 步共
+**17 187 549** 次 MMIO 读，几乎全在 `0x400B0024/0x400B0028` 的忙等循环里）。旧路径
+每次读都要经过 `MmioRouter` 设备锁 + TIMER 块的**时基互斥锁**。本节记录把这部分
+读取改为无锁原子快照的实现、一致性证明、测试与实测。**本轮不引入线程**，也不改变
+任何客户机可见时序。
+MT-1 measured **0.46 bus accesses per core-0 step**, **50 % of them TIMER0 reads**
+(**17 187 549** MMIO reads per 300 M steps, almost all in the
+`0x400B0024`/`0x400B0028` polling loop). Each read took the `MmioRouter` device
+mutex plus the TIMER block's **timebase mutex**. This section records the
+lock-free snapshot that replaces the latter, its consistency proof, tests and
+measurements. **No thread is introduced** and no guest-visible timing changes.
+
+### 10.1 交付内容 / Delivered
+
+| 项 / Item | 实现 / Implementation |
+|---|---|
+| 无锁镜像 | `timer_snapshot::TimerSnapshot`：`AtomicU64 now_us` + 每块 `AtomicU32 next_deadline / alarm_hits / ints` |
+| 发布方 | `Timebase::advance` / `push_ref_cycles` 在持有时基锁时以 `Release` 发布 `reference.time_us()`（执行周期、TICKS `CYCLES` 推入、时钟停止分支、`ADVANCE_INTERVAL` 批量边界） |
+| 读路径 | `TIMELR`/`TIMEHR`/`TIMERAWL`/`TIMERAWH` 各一次 `Acquire` 加载；不取时基锁、不取块寄存器锁 |
+| alarm 门控 | 块在既有采样点重算 `next_deadline`（最先到期的已武装截止值）与 `ints`；`refresh()` 无到期项时只读原子量、只写电平变化的线 |
+| 中断泵 | `IrqAssert` 由 `Arc<Mutex<u64>>` 改为 `Arc<AtomicU64>`（`fetch_or`/`fetch_and`/load），发布线与轮询掩码均无锁 |
+| 公有句柄 | `Timer0::snapshot()` / `Timer1::snapshot()`、`alarm_hits()`；`TimerSnapshot::now_us()` / `timer0_alarm_hits()` / `timer1_alarm_hits()` |
+
+### 10.2 快照更新点与一致性 / Update points and consistency
+
+`Timebase` 是 `clk_ref` 域唯一权威积分器，其两个变更入口就是全部更新点：
+`advance(cycles, …)`（客户机周期，含驱动每 `ADVANCE_INTERVAL = 10 000` 步的批量
+推进，MT-3a 睡眠快进也在该边界结算）与 `push_ref_cycles`（TICKS 的 `CYCLES` 写入）。
+两者都在**仍持有时基互斥锁**时发布，因此：
+
+- 单线程下「快照读」与「加锁读 `Timebase::timer_us()`」在任意时刻**逐位相同**；
+- 并发下读者最多看到写入前的上一发布值，而加锁读者在同一窗口会阻塞——不存在
+  「快照落后一个已完成的 `advance`」的状态；
+- 计数为 64 位，`TIMELR`/`TIMEHR` 仍是**独立采样**（与旧实现一致，分两次读可能跨
+  1 µs 刻度）；没有近似时钟，也没有降低 alarm 精度。
+
+alarm 仍只在既有采样点（`refresh`、`read32(ARMED/INTR/INTS)`、寄存器写）比较：
+`next_deadline` 选择 `now - deadline` 的回绕有符号差最大者，与 `reached()` 的判定
+顺序一致；时间前进时所有差值同步平移，因此该截止值在下次武装写入/采样触发前始终
+最先到期——门控 `reached(next_deadline, now)` 与「任一已武装 alarm 到期」严格等价。
+到期后 `sample()` 照旧锁存 `INTR`、清 `ARMED`，触发时刻与旧实现逐拍相同。
+
+### 10.3 与设备锁的关系（重要）/ Relation to the device lock
+
+`MmioRouter` 的每设备互斥锁属于 `rp2350-core`，不在本任务白名单内，**仍然存在**。
+本轮移除的是 TIMER 内部的两类锁：时基锁（每次读一次）与寄存器锁（每次中断泵
+若干次）。宿主侧可以完全绕过总线读取 `timer().snapshot().now_us()`；客户机轮询在
+设备内部只剩一次原子加载。把 TIMER 窗口接成真正的无锁 `SharedRegion`（线程化总线
+上也不取路由器设备锁）属于 MT-2b 的剩余迁移工作，见 §10.6。
+
+### 10.4 测试 / Tests
+
+新增 **17** 个测试（`cargo test -p rp2350-periph` 452 → **469**）：
+
+| 测试 / Test | 断言 / Property |
+|---|---|
+| `timer_snapshot::tests::a_new_snapshot_is_the_power_on_state` | 全零 = 上电状态 |
+| `...::publishing_a_counter_value_is_visible_to_every_reader` | 64 位发布可见、两半正确 |
+| `...::alarm_bits_are_per_block_and_acknowledged_by_value` | 每块独立、按值确认/清除 |
+| `...::derived_state_is_kept_per_block` | `next_deadline`/`ints` 按块独立 |
+| `clock_time::...::every_reference_advance_republishes_the_exact_counter` | 周期推进 / TICKS 推入 / 10 000 步批量边界后快照 == 加锁值 |
+| `clock_time::...::a_stopped_clock_republishes_the_unchanged_counter` | 停钟不清零 |
+| `irq::tests::concurrent_assertions_are_never_lost` | 4 线程并发断言不丢位 |
+| `timer_tests::the_snapshot_matches_locked_reads_at_random_instants` | 256 次随机推进，四别名与加锁路径逐位一致 |
+| `timer_tests::the_snapshot_follows_batched_and_ticks_driven_boundaries` | 64 个 10 000 步边界 + TICKS 推入 |
+| `timer_tests::timerawh_aliases_timehr_and_timerawl_aliases_timelr` | 别名高低半字同源 |
+| `timer_tests::snapshot_alarm_hits_follow_arming_firing_and_acknowledgement` | 武装/命中/确认/解除武装后的「已命中」位 |
+| `timer_tests::timer1_shares_the_counter_but_keeps_its_own_alarm_hits` | 共享计数、独立 alarm |
+| `timer_tests::the_refresh_gate_samples_only_when_a_deadline_is_due` | 无到期项 1 000 次刷新 0 次慢路径采样；到期恰好 1 次 |
+| `timer_tests::an_alarm_armed_in_the_past_fires_on_the_write` | 过期截止值写入即命中 |
+| `timer_tests::reset_clears_the_snapshot_alarm_state` | 复位清快照 alarm 状态 |
+| `timer_tests::the_sixty_four_bit_counter_wraps_through_the_high_word` | 越过 2^32 µs 的高字/低字 |
+| `timer_tests::concurrent_timer_reads_never_take_the_timebase_lock` | 主线程持有时间基锁时两线程各读 10 万次（10 s 超时） |
+
+### 10.5 性能 / Performance
+
+**微基准（临时 example，交付前已删除；单线程、252 MHz、20 M 次，取两次最小值）**：
+
+| 路径 / Path | ns/读 |
+|---|---|
+| 旧路径：`timebase.lock().timer_us()` | **8.44 – 9.65** |
+| 新路径：`Timer0::read32(TIMELR)`（快照） | **0.73 – 0.91** |
+| `Timer0::read32(TIMERAWL)` | 1.06 – 1.29 |
+| `TIMELR` + `TIMEHR` 成对读 | 0.91 – 1.36 |
+
+即单次 TIMER 读由约 8.4–9.7 ns 降到约 0.7–1.3 ns（**≈8 ns/读**）。按 300 M 步
+17.19 M 次读计算约省 **0.14 s**；中断泵（每 64 步一次，原本每次约 20 次锁）再省
+约 **0.1–0.2 s**。
+
+**端到端（emerald，release，同机交替，7 轮）**：
+
+| 指标 / Metric | 基线 / Before | 本任务 / After | 变化 |
+|---|---|---|---|
+| 300 M CPU 时间最小值 | 11.563 s | **11.094 s** | **−4.1 %** |
+| 300 M CPU 时间中位数 | 11.859 s | **11.297 s** | **−4.7 %** |
+| 300 M 墙钟最小值 | 12.113 s | 12.124 s | ±0（噪声） |
+| 300 M 墙钟中位数 | 13.294 s | **12.171 s** | −8.4 %（宿主负载） |
+| 50 M 墙钟（纯睡眠快进） | 1.009–1.016 s | 1.021–1.033 s | 无变化（该窗口不执行 TIMER 读） |
+
+墙钟最小值受并行会话负载影响很大（基线单轮曾到 15.5 s）；CPU 时间是更稳定的口径。
+收益小于 MT-1 的乐观估计，因为 300 M 中 225 M 是睡眠快进（0.06 s），剩余 75 M 步的
+宿主成本主要在 ARM 解释器；本轮收益集中在 core0 的 17 M 次忙等读与中断泵。
+
+### 10.6 剩余与对 MT-3 的注意事项 / Remaining and notes for MT-3
+
+1. **路由器设备锁仍在**：`MmioRouter` 的每设备 `Mutex<MmioRegion>` 由 `rp2350-core`
+   持有；线程化总线若要真正无锁读 TIMER，需要在 `SharedRegion` 层为只读寄存器加
+   快照入口（建议直接复用 `TimerSnapshot`，不要复制第二份计数）。
+2. **`Timebase` 不再 `Copy`**：它持有 `Arc<TimerSnapshot>`（克隆共享快照）。
+   `Timebase::new` 不再是 `const fn`；工作区内没有 `const` 用法。
+3. **alarm 门控是派生状态**：若以后增加「暂停/恢复 TIMER」（`PAUSE`/`DBGPAUSE`）语义，
+   必须在暂停时清空 `next_deadline` 或冻结快照，否则门控会按墙钟时间提前命中。
+4. **采样点不可省**：`next_deadline` 只在武装写入、采样触发与复位时重算；新增任何
+   修改 `ALARM`/`ARMED` 的路径都必须调用块的 `publish_derived()`。
+5. **通用性**：实现只依赖 `clk_ref` 域积分器与寄存器语义，与固件无关；除 emerald 外，
+   FV-1/2/3 的 REPL 路径（MicroPython/CircuitPython 的 TIMER 使用）已复跑。
+
+---
+
+## 11. MT-3b 交付记录：可选双核线程执行器（2026-11-16）
+
+## 11. MT-3b delivery: optional two-thread core executor (2026-11-16)
+
+本节记录 MT-3b：把 core0/core1 放进两条宿主线程、由调用方线程按固定窗口协调外设的
+**可选**模式。默认路径仍是 MT-3a 的确定性单线程批量步进，逐字节不变；`on` 模式只为
+交互吞吐，**不是位可复现的**。
+This section records MT-3b: an **opt-in** mode that runs core0/core1 on two host
+threads while the caller's thread coordinates peripherals on fixed windows.
+The default path is still MT-3a's deterministic single-threaded batch step and
+stays byte-identical; `on` mode exists for interactive throughput and is **not
+bit-reproducible**.
+
+### 11.1 交付内容 / Delivered
+
+| 项 / Item | 实现 / Implementation |
+|---|---|
+| 开关 | `--core-threads on|off`（默认 `off`）、`--core-window N`（默认 64，范围 1..=4096），`run`/`repl`/`play` 均可用 |
+| 线程化执行器 | `run/threads.rs` + `run/threads/worker.rs`：每个 `run_steps`/`run_cycles` 批次用 `std::thread::scope` 启动两条核线程，批次结束前 join |
+| 共享总线 | `run/bus.rs` `MachineBus::{Exclusive,Shared}`；`on` 模式在 `SharedBus` 上组装（10 bank SRAM、Flash 免锁、其它区域 `LockedRegion`） |
+| 协调线程 | DMA/PIO/HSTX/TIMER/SysTick/IRQ/SIO/SEV 只在窗口边界处理；同一条 `pump_dma`/`pump_pio`/`advance_timebase` 代码 |
+| 跨核语义 | PPB 写按核捕获并回放到写入核；SIO 访问持专用视图锁再 `select_core`；IRQ/事件/SEV 在窗口末投递 |
+| 睡眠 | 只有单核可运行/双核全睡时走串行批量路径（含 MT-3a 睡眠快进）；双核活跃才启线程 |
+| 生命周期 | 每批次启动/停止；`reboot` 保留模式与窗口；`Machine::active_core_threads()` 批次外为 0（按机器隔离） |
+| 测试 | `run/threads_tests.rs` 13 项 + 1 项 ignored 吞吐探针；CLI lib 169 / bin 88 |
+
+### 11.2 窗口模型与确定性边界 / Window model and determinism
+
+- 窗口边界由机器步数固定：`--core-window N` 个机器步，且不跨 10 000 步时基边界。
+  窗口内两核自由推进；边界处等待两条工作线程并结算该窗口，然后立即启动下一窗口，
+  而该窗口的边界工作（DMA/PIO/HSTX/时基/握手/中断/事件）在下一窗口执行期间与核
+  执行重叠。设备与共享总线是线程安全的；边界命令在两个窗口后生效。
+- 跨核事件（SIO FIFO/自旋锁/门铃/SEV/IRQ）延迟 ≤ 两个窗口；默认 64 步在 252 MHz
+  下约 0.5 µs 模拟时间。
+- 内存访问**窗口内**的顺序由宿主调度决定 → `on` 模式不是位可复现；默认 `off` 仍是。
+- 所有数据访问经 `SharedBus`：SRAM 10 bank 锁、Flash 免锁、其它区域每区域一把锁；
+  PPB 写有跨核互斥，SIO 视图有专用锁。没有 `unsafe`，没有数据竞争。
+- GDB 监视点状态是线程局部的：`on` 模式不支持监视点，调试请用 `off`。
+
+Window boundaries are fixed by machine steps (never crossing the 10 000-step
+timebase boundary). Inside a window both cores run freely; at the boundary the
+caller waits for both workers and performs the same boundary work as the serial
+path. Cross-core events are delivered at most one window late (64 steps ≈
+0.25 µs at 252 MHz). The order of memory accesses **inside** a window depends
+on the host scheduler, so `on` mode is not bit-reproducible; the default `off`
+path remains deterministic. All memory accesses go through `SharedBus` (10 SRAM
+bank locks, lock-free Flash, one lock per other region), PPB writes have a
+cross-core mutex and SIO accesses take a dedicated view lock. There is no
+`unsafe` and no data race. GDB watchpoints are thread-local, so `on` mode does
+not support them; debug with `off`.
+
+### 11.3 性能（emerald 300 M，release，同机） / Performance
+
+| 窗口 / Window | 墙钟 / Wall | vs `off` | time_us | dma | hstx words / underruns | sleep core0 |
+|---|---|---|---|---|---|---|
+| `off`（基线） | 9.35 s | 1.00× | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| 32 | 5.56 s | 1.68× | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| **64（默认）** | **5.15 s** | **1.82×** | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| 128 | 4.51 s | 2.07× | 1 798 617 | 2 199 378 | 5 401 204 / 0 | 224 994 790 |
+| 256 | 4.16 s | 2.25× | 1 798 617 | 1 665 719 | 4 101 338 / 187 678 | 224 994 790 |
+
+- 窗口 64 的客户机计数器与 `off` **逐字段一致**（`time_us`、`dma`、`hstx`、
+  睡眠步数；最终 PC 与 core1 PC 因窗口相位不同而不同，允许）。这证明窗口化没有
+  跳过指令或周期。
+- 窗口 128 更快且 emerald 计数器仍一致；窗口 256 开始让 HSTX 欠载（187 678 次
+  underrun），因此默认 64、交互可选 128。
+- phase 1（225–300 M）单独对比：`off` 约 7.4 s，`on`（64）约 4.2 s，**≈1.8×**；
+  整跑 1.82×。启动阶段（0–225 M）由 MT-3a 快进覆盖，`on` 与 `off` 都在 0.1 s 量级。
+- 32 步窗口因屏障/协调次数翻倍而略慢，但仍快于 `off`；64 是本机最稳的默认值。
+- 墙钟受并行会话负载影响较大：另一轮同机交替测得 `off` 11.30 s / `on`(64) 5.66 s
+  （**2.00×**），因此本轮报告的 1.82× 是较保守的同轮值。
+
+### 11.4 正确性与测试 / Correctness and tests
+
+| 测试 / Test | 断言 / Property |
+|---|---|
+| `off_is_the_default_and_byte_identical_between_runs` | 默认 off；两次运行的寄存器/SRAM 路径一致 |
+| `a_single_core_counter_matches_between_off_and_on` | 单核计数器 off/on 步数、PC、寄存器一致 |
+| `sram_snapshots_match_between_off_and_on_for_a_single_core_program` | 单核程序的 4 KiB SRAM 快照 off/on 逐字节一致 |
+| `window_sizes_32_64_128_agree_on_a_single_core_program` | 32/64/128 窗口结果一致 |
+| `worker_threads_are_joined_after_every_run` | 10 次运行后 `active_core_threads()==0` |
+| `reboot_preserves_the_threaded_mode_and_restarts_the_clock` | reboot 保留模式/窗口并归零步数 |
+| `a_guest_bus_fault_halts_the_threaded_machine` | 客户机总线故障在 on 模式正确停机 |
+| `window_changes_are_clamped_to_the_supported_range` | 窗口 1..=4096 钳制 |
+| `a_wfi_loop_is_fast_forwarded_on_the_threaded_path` | 双核睡眠仍走 MT-3a 快进 |
+| `threaded_cores_complete_a_sio_fifo_handshake` | 双核 FIFO 42→43 握手在窗口内完成 |
+| `threaded_cores_serialise_a_shared_counter_with_sio_spinlocks` | 200×2 自旋锁自增无丢失 |
+| `the_off_path_serialises_the_same_spinlock_counter` | 同一程序 off 路径 400 |
+| `threaded_mode_latches_a_guest_system_reset_request` | AIRCR.SYSRESETREQ 正确锁存 |
+| `dual_core_counter_throughput`（ignored） | 纯双核 SRAM 存储循环的窗口扫描探针 |
+| `play::tests::headless_session_runs_with_the_threaded_core_executor` | `PlaySession` 在线程化模式下发布 2 帧并干净关闭 |
+
+### 11.5 固件 / Firmware
+
+- FV-2（Arm MicroPython）`repl --exec "print(6 * 7)" --core-threads on` →
+  `[repl] stdout: 42`（steps=2 179 500，simulated=14 530 µs）。
+- FV-1/FV-2/FV-3 默认（`off`）均复跑 `42`；`off` 的 emerald 300 M 计数器与
+  MT-3a 基线逐字段一致。
+- 连续 10 次 `--core-threads on` 300 M 运行无崩溃/挂起（每批次线程 join，
+  批次外线程数为 0）。
+
+### 11.6 剩余卡点 / Remaining
+
+1. **窗口内非确定性**：这是交互模式的显式取舍；需要可复现时使用默认 `off`。
+2. **APB/SIO 仍是 `LockedRegion`**：`MmioRouter` 已经实现 `SharedRegion`，但
+   `BootPeripherals::mount` 不暴露路由器句柄；把它直接注册为共享区域可进一步
+   降低 MMIO 锁争用（TIMER 的 `TimerSnapshot` 已在 §10 降低了内部锁成本）。
+3. **窗口 >64 合并泵送**：`--core-window 128/256` 会降低 DMA/HSTX 服务频率；
+   需要严格 64 步泵送时保持默认 64。
+4. **GDB 监视点**与 `on` 不兼容（线程局部监视状态）；`step_cores`/`trace_step`
+   在 on 模式下仍走串行路径，保持调试语义。
+5. **RISC-V** 仍是单核模型，`--core-threads on` 对其退化为串行执行。
+
 

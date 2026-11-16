@@ -67,6 +67,16 @@ enum Commands {
         #[arg(long, value_name = "on|off", value_parser = run::parse_sleep_fast_forward)]
         sleep_fast_forward: Option<bool>,
 
+        /// Run core0/core1 on host threads (`on`/`off`, default off)
+        /// 在宿主线程上运行 core0/core1（`on`/`off`，默认关闭）
+        #[arg(long, value_name = "on|off", value_parser = run::parse_core_threads)]
+        core_threads: Option<bool>,
+
+        /// Machine steps between cross-core synchronisations (default 64)
+        /// 跨核同步之间的机器步数（默认 64）
+        #[arg(long, value_name = "N", default_value_t = 64, value_parser = run::parse_core_window)]
+        core_window: u32,
+
         /// Dump memory when the run stops: ADDR:LEN:PATH (repeatable)
         /// 停止时导出内存：ADDR:LEN:PATH（可重复）
         #[arg(long = "dump", value_name = "ADDR:LEN:PATH", value_parser = run::MemoryDump::parse)]
@@ -118,6 +128,16 @@ enum Commands {
         /// 遇到未定义指令时停机而不是跳过
         #[arg(long)]
         strict_decode: bool,
+
+        /// Run core0/core1 on host threads (`on`/`off`, default off)
+        /// 在宿主线程上运行 core0/core1（`on`/`off`，默认关闭）
+        #[arg(long, value_name = "on|off", value_parser = run::parse_core_threads)]
+        core_threads: Option<bool>,
+
+        /// Machine steps between cross-core synchronisations (default 64)
+        /// 跨核同步之间的机器步数（默认 64）
+        #[arg(long, value_name = "N", default_value_t = 64, value_parser = run::parse_core_window)]
+        core_window: u32,
 
         /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
         /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
@@ -245,6 +265,16 @@ enum Commands {
         #[arg(long)]
         strict_decode: bool,
 
+        /// Run core0/core1 on host threads (`on`/`off`, default off)
+        /// 在宿主线程上运行 core0/core1（`on`/`off`，默认关闭）
+        #[arg(long, value_name = "on|off", value_parser = run::parse_core_threads)]
+        core_threads: Option<bool>,
+
+        /// Machine steps between cross-core synchronisations (default 64)
+        /// 跨核同步之间的机器步数（默认 64）
+        #[arg(long, value_name = "N", default_value_t = 64, value_parser = run::parse_core_window)]
+        core_window: u32,
+
         /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
         /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
         #[arg(long, value_name = "SIZE", value_parser = run::PsramOptions::parse)]
@@ -335,6 +365,8 @@ fn main() {
             trace_steps,
             strict_decode,
             sleep_fast_forward,
+            core_threads,
+            core_window,
             dump,
             psram,
         } => {
@@ -345,6 +377,10 @@ fn main() {
                 trace_steps,
                 strict_decode,
                 sleep_fast_forward,
+                core_threads: run::CoreThreadOptions {
+                    enabled: core_threads.unwrap_or(false),
+                    window: core_window,
+                },
                 psram,
                 dumps: dump,
             };
@@ -359,6 +395,8 @@ fn main() {
             enum_cycles,
             no_soft_reset,
             strict_decode,
+            core_threads,
+            core_window,
             psram,
         } => {
             let options = repl::ReplOptions {
@@ -370,6 +408,10 @@ fn main() {
                 enum_cycles,
                 soft_reset: !no_soft_reset,
                 strict_decode,
+                core_threads: run::CoreThreadOptions {
+                    enabled: core_threads.unwrap_or(false),
+                    window: core_window,
+                },
                 psram,
             };
             finish(repl::run(&options), "repl failed / REPL 失败");
@@ -415,6 +457,8 @@ fn main() {
             max_cycles,
             arch,
             strict_decode,
+            core_threads,
+            core_window,
             psram,
         } => {
             let args = play::PlayArgs {
@@ -434,6 +478,10 @@ fn main() {
                 strict_decode,
                 max_cycles,
                 trace_steps,
+                core_threads: run::CoreThreadOptions {
+                    enabled: core_threads.unwrap_or(false),
+                    window: core_window,
+                },
                 psram,
             };
             finish(play::run(&args), "play failed / 播放失败");
@@ -713,6 +761,57 @@ mod tests {
         assert!(
             parse(&["run", "--file", "fw.uf2", "--sleep-fast-forward", "maybe"]).is_err(),
             "unknown spellings are rejected"
+        );
+    }
+
+    #[test]
+    fn run_parses_the_core_thread_switches() {
+        // `--core-threads on|off` 与 `--core-window N`，缺省分别为 off 与 64。
+        // `--core-threads on|off` and `--core-window N`; defaults are off and 64.
+        let cli = parse(&["run", "--file", "fw.uf2", "--core-threads", "on"]).expect("parse run");
+        let Commands::Run {
+            core_threads,
+            core_window,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(core_threads, Some(true));
+        assert_eq!(core_window, 64);
+
+        let cli = parse(&[
+            "repl",
+            "--file",
+            "fw.uf2",
+            "--core-threads",
+            "off",
+            "--core-window",
+            "128",
+        ])
+        .expect("parse repl");
+        let Commands::Repl {
+            core_threads,
+            core_window,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the repl subcommand");
+        };
+        assert_eq!(core_threads, Some(false));
+        assert_eq!(core_window, 128);
+
+        assert!(
+            parse(&["run", "--file", "fw.uf2", "--core-threads", "maybe"]).is_err(),
+            "unknown spellings are rejected"
+        );
+        assert!(
+            parse(&["run", "--file", "fw.uf2", "--core-window", "0"]).is_err(),
+            "zero window is rejected"
+        );
+        assert!(
+            parse(&["run", "--file", "fw.uf2", "--core-window", "4097"]).is_err(),
+            "over-large window is rejected"
         );
     }
 

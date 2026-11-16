@@ -576,8 +576,8 @@ fn sram_top_is_mapped_for_exception_stack_frames() {
     use rp2350_core::bus::AddressBus;
 
     let elf = infinite_loop_elf();
-    let machine = Machine::new(&elf, &MachineOptions::default()).expect("machine");
-    let mut bus = machine.bus;
+    let mut machine = Machine::new(&elf, &MachineOptions::default()).expect("machine");
+    let bus = machine.bus.exclusive_mut().expect("exclusive bus");
     let top = SRAM_BASE + SRAM_SIZE as u32;
     for addr in [top - 0x108, top - 0x20, top - 4] {
         let region = bus
@@ -625,7 +625,7 @@ fn uf2_family_selects_the_cpu_architecture() {
     // RISC-V family must auto-select Hazard3; the explicit override wins.
     // RISC-V family 必须自动选择 Hazard3；显式覆盖优先。
     let riscv = uf2_block(0xE48B_FF5A, FLASH_XIP_BASE, &[0u8; 4]);
-    let mut bus = SimpleBus::new();
+    let mut bus = crate::run::bus::MachineBus::new(false);
     bus.register_region(Box::new(RamRegion::new("flash", FLASH_XIP_BASE, 0x1000)))
         .expect("flash region");
     let (arch, entry, description) = load_image(&riscv, &mut bus, None).expect("load");

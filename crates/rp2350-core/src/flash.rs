@@ -56,9 +56,9 @@ static CONTENT_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Current flash content generation / 当前 Flash 内容世代号
 ///
 /// The `Acquire` load pairs with the `Release` bump in
-/// [`bump_content_generation`]: everything the host wrote before publishing a
+/// `bump_content_generation`: everything the host wrote before publishing a
 /// generation is visible to a reader that observes that generation.
-/// `Acquire` 加载与 [`bump_content_generation`] 的 `Release` 递增配对：宿主在发布
+/// `Acquire` 加载与 `bump_content_generation` 的 `Release` 递增配对：宿主在发布
 /// 世代之前写入的所有内容，对观察到该世代的读者可见。
 #[must_use]
 pub fn content_generation() -> u32 {

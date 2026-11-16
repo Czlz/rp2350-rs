@@ -13,6 +13,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -21,12 +22,14 @@ use rp2350_bootrom::Rp2350Bootrom;
 use rp2350_core::types::CpuId;
 use rp2350_core::{
     AddressBus, FLASH_XIP_BASE, FLASH_XIP_NOCACHE_BASE, FirmwareImage, FlashRegion, RamRegion,
-    SimpleBus, Uf2Arch, Uf2Image, XipMaintenanceRegion,
+    Uf2Arch, Uf2Image, XipMaintenanceRegion,
 };
 use rp2350_cpu::{CpuCore, CpuState};
 use rp2350_periph::{BootPeripherals, Core1Launch, psram::mount_psram};
 use rp2350_riscv::Hazard3Core;
 use rp2350_usb::{Controller, USBCTRL_IRQ};
+
+use self::bus::MachineBus;
 
 /// SRAM base address / SRAM 基地址
 const SRAM_BASE: u32 = 0x2000_0000;
@@ -176,6 +179,8 @@ pub struct RunOptions {
     /// Explicit sleep fast-forward switch (`None` = environment default)
     /// 显式睡眠快进开关（`None` 表示按环境变量默认）
     pub sleep_fast_forward: Option<bool>,
+    /// Optional two-thread core executor / 可选双核线程执行器
+    pub core_threads: CoreThreadOptions,
     /// PSRAM window to mount behind XIP chip select 1 / 在 XIP 片选 1 后挂载的 PSRAM 窗口
     pub psram: Option<PsramOptions>,
     /// Memory ranges written to disk after the run / 运行结束后写入磁盘的内存区间
@@ -349,6 +354,45 @@ pub fn parse_sleep_fast_forward(value: &str) -> Result<bool, String> {
     }
 }
 
+/// Parse `on`/`off` (also `true`/`false`, `1`/`0`) for `--core-threads`
+/// 为 `--core-threads` 解析 `on`/`off`（也接受 `true`/`false`、`1`/`0`）
+///
+/// # Errors
+/// Returns a message naming the accepted spellings.
+/// 返回列出可接受写法的错误消息。
+pub fn parse_core_threads(value: &str) -> Result<bool, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") || value == "1" {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("false")
+        || value == "0"
+    {
+        Ok(false)
+    } else {
+        Err(format!(
+            "bad core-threads switch `{value}` (expected on|off) / \
+             核线程开关非法，应为 on|off"
+        ))
+    }
+}
+
+/// Parse the cross-core window size `--core-window`
+/// 解析跨核窗口大小 `--core-window`
+///
+/// # Errors
+/// Returns a message when the value is not an integer in `1..=4096`.
+/// 值不是 `1..=4096` 内的整数时返回错误消息。
+pub fn parse_core_window(value: &str) -> Result<u32, String> {
+    match value.trim().parse::<u32>() {
+        Ok(window) if (1..=4096).contains(&window) => Ok(window),
+        _ => Err(format!(
+            "bad core-window `{value}` (expected 1..=4096) / \
+             核窗口大小非法，应为 1..=4096"
+        )),
+    }
+}
+
 /// Construction options shared by `run`, `repl`, `play` and `gdb`
 /// `run`、`repl`、`play` 与 `gdb` 共用的机器构造选项
 #[derive(Debug, Clone, Copy)]
@@ -371,6 +415,33 @@ impl Default for MachineOptions {
             max_cycles: DEFAULT_RUN_MAX_CYCLES,
             strict_decode: false,
             psram: None,
+        }
+    }
+}
+
+/// Optional two-thread core executor settings / 可选双核线程执行器设置
+///
+/// `enabled = false` is the default and reproduces the historical
+/// single-threaded interleaving byte for byte. `enabled = true` runs core0 and
+/// core1 on separate host threads; see `run/threads.rs` for the window model
+/// and the determinism boundary.
+/// `enabled = false` 是默认值，逐字节复现历史的单线程交错。`enabled = true` 让
+/// core0 与 core1 运行在独立宿主线程上；窗口模型与确定性边界见
+/// `run/threads.rs`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreThreadOptions {
+    /// Whether to use the threaded core executor / 是否使用线程化核执行器
+    pub enabled: bool,
+    /// Machine steps per cross-core window (default 64)
+    /// 每个跨核窗口的机器步数（默认 64）
+    pub window: u32,
+}
+
+impl Default for CoreThreadOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window: 64,
         }
     }
 }
@@ -616,6 +687,7 @@ impl CpuCore for CoreHandle {
 /// The `[tail]` and fault traces only need the last [`TAIL_TRACE_STEPS`] pairs.
 /// A fixed array turns the per-step record into two stores plus an index bump and
 /// removes the `VecDeque` capacity branch and modulo.
+#[derive(Clone, Copy)]
 struct RecentSteps {
     /// Stored pairs, oldest overwritten first / 存储的条目，最旧的先被覆盖
     items: [(u64, u32); TAIL_TRACE_STEPS],
@@ -666,9 +738,9 @@ impl RecentSteps {
 /// 回调驱动同一个对象，因此客户机与 USB 主机桥共享同一条时间线。
 pub struct Machine {
     /// Address bus with flash, SRAM and peripherals / 含 Flash、SRAM 与外设的地址总线
-    pub bus: SimpleBus,
+    pub bus: MachineBus,
     /// Synthetic boot ROM and trap dispatcher / 合成 boot ROM 与陷阱分发器
-    bootrom: Rp2350Bootrom,
+    bootrom: Arc<Rp2350Bootrom>,
     /// CPU core / CPU 核心
     core: CoreHandle,
     /// Cortex-M33 core 1, released through the SIO FIFO launch protocol
@@ -772,33 +844,85 @@ pub struct Machine {
     /// Latched `AIRCR.SYSRESETREQ` not yet taken by the frontend
     /// 尚未被前端取走的 `AIRCR.SYSRESETREQ` 锁存
     system_reset_pending: bool,
+    /// Whether the two-thread core executor is active / 双核线程执行器是否启用
+    ///
+    /// Fixed at construction: switching it requires rebuilding the bus (the
+    /// regions live either in a `SimpleBus` or in a `SharedBus`). `reboot`
+    /// preserves the setting.
+    /// 构造时固定：切换需要重建总线（区域要么位于 `SimpleBus`，要么位于
+    /// `SharedBus`）。`reboot` 会保留该设置。
+    core_threads: bool,
+    /// Machine steps per cross-core window / 每个跨核窗口的机器步数
+    core_window: u32,
+    /// Serialises SIO register accesses and `Sio::select_core` across workers
+    /// 在工作线程间串行化 SIO 寄存器访问与 `Sio::select_core`
+    sio_view_lock: Arc<Mutex<()>>,
+    /// Serialises PPB read-modify-write and replay capture across workers
+    /// 在工作线程间串行化 PPB 读-改-写与回放捕获
+    ppb_lock: Arc<Mutex<()>>,
+    /// Number of core worker threads belonging to this machine
+    /// 属于本机器的核工作线程数
+    core_worker_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Machine {
     /// Build the bus, load firmware and boot the selected core
     /// 构建总线、加载固件并启动所选核心
     ///
+    /// This is the deterministic single-threaded path. Use
+    /// [`Self::new_with_core_threads`] for the opt-in threaded executor.
+    /// 这是确定性单线程路径。可选线程化执行器请使用
+    /// [`Self::new_with_core_threads`]。
+    ///
     /// # Errors
     /// Returns an error when the firmware cannot be parsed or loaded, when a
     /// bus region cannot be registered, or when the core fails to boot.
     /// 固件无法解析或加载、总线区域注册失败，或核心启动失败时返回错误。
     pub fn new(bytes: &[u8], options: &MachineOptions) -> Result<Self> {
-        let mut bus = SimpleBus::new();
+        Self::new_with_core_threads(bytes, options, CoreThreadOptions::default())
+    }
+
+    /// Build the machine with an optional two-thread core executor
+    /// 用可选的双核线程执行器构建机器
+    ///
+    /// `threads.enabled = true` builds the region topology on a `SharedBus`
+    /// (10-bank SRAM, lock-free Flash, one lock per other region) so the two
+    /// core workers can access it concurrently. The threaded executor is only
+    /// available for Arm images; RISC-V keeps the single-threaded stepping path
+    /// even when the flag is on.
+    /// `threads.enabled = true` 在 `SharedBus` 上构建区域拓扑（10 bank SRAM、
+    /// 免锁 Flash、其余区域每区域一把锁），使两个核工作线程可以并发访问。线程化
+    /// 执行器仅适用于 Arm 映像；即使开关为 on，RISC-V 仍走单线程步进路径。
+    ///
+    /// # Errors
+    /// Returns the same boot/registration errors as [`Self::new`].
+    /// 返回与 [`Self::new`] 相同的启动/注册错误。
+    pub fn new_with_core_threads(
+        bytes: &[u8],
+        options: &MachineOptions,
+        threads: CoreThreadOptions,
+    ) -> Result<Self> {
+        let mut bus = MachineBus::new(threads.enabled);
         // 0x0000_0000..0x0000_7FFF 是独立的 boot ROM 地址区，与 Flash XIP 无关。
         // 这里挂载合成镜像与宿主陷阱桩，启动向量改为从 Flash XIP 基地址读取。
         // 0x0000_0000..0x0000_7FFF is the boot ROM window, separate from flash XIP.
         // Mount the synthetic image with host trap stubs here; boot vectors are now
         // read from the flash XIP base instead.
         let flash = FlashRegion::rp2350_xip();
-        let bootrom = Rp2350Bootrom::new(flash.handle());
+        let bootrom = Arc::new(Rp2350Bootrom::new(flash.handle()));
         bootrom.mount(&mut bus)?;
         // XIP 在缓存窗口 0x1000_0000 与非缓存别名 0x1400_0000 暴露同一份 Flash，
         // 两个区域共享底层存储。
         // XIP exposes the same flash through the cached window at 0x1000_0000 and
         // the non-cached alias at 0x1400_0000; both regions share one backing store.
         let flash_nocache = flash.alias("flash-xip-nocache", FLASH_XIP_NOCACHE_BASE);
-        bus.register_region(Box::new(flash))?;
-        bus.register_region(Box::new(flash_nocache))?;
+        // Flash 与 SRAM 自身已有共享访问路径，注册为真正的 `SharedRegion`；
+        // 其它区域在共享模式下由 `MachineBus` 包成每区域一把锁的 `LockedRegion`。
+        // Flash and SRAM already have their own shared access paths, so they are
+        // registered as real `SharedRegion`s; other regions are wrapped in a
+        // per-region `LockedRegion` in shared mode.
+        bus.register_dual(flash)?;
+        bus.register_dual(flash_nocache)?;
         // 0x1800_0000..0x1C00_0000 是 XIP 维护窗口，写入即请求缓存维护，数据被丢弃。
         // Flash 辅助代码用它清理 XIP SRAM 的缓存行；本模拟器没有缓存模型，
         // 因此这里只吸收写入、读出 0，而不是让它落到 NoDevice。
@@ -807,7 +931,7 @@ impl Machine {
         // lines covering XIP SRAM; this emulator has no cache model, so the window
         // absorbs writes and reads as zero instead of hitting NoDevice.
         bus.register_region(Box::new(XipMaintenanceRegion::new("xip-maintenance")))?;
-        bus.register_region(Box::new(RamRegion::new("sram", SRAM_BASE, SRAM_SIZE)))?;
+        bus.register_dual(RamRegion::new("sram", SRAM_BASE, SRAM_SIZE))?;
         let peripherals = BootPeripherals::mount(&mut bus)?;
         // PSRAM 挂在 XIP 片选 1 的 `0x1100_0000`；未请求时不注册该区域，客户机
         // 访问保持 `NoDevice`。挂载顺序与 `BootPeripherals::mount` 无关（两者不
@@ -892,6 +1016,7 @@ impl Machine {
 
         let spin_base = core.pc();
         let clock_generation_seen = peripherals.clock_generation();
+        let core_threads = threads.enabled && matches!(core, CoreHandle::Arm(_)) && core1.is_some();
         Ok(Self {
             bus,
             bootrom,
@@ -943,6 +1068,11 @@ impl Machine {
             clock_generation_seen,
             both_sleeping_steps: 0,
             system_reset_pending: false,
+            core_threads,
+            core_window: threads.window.clamp(1, 4096),
+            sio_view_lock: Arc::new(Mutex::new(())),
+            ppb_lock: Arc::new(Mutex::new(())),
+            core_worker_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -1256,8 +1386,30 @@ impl Machine {
     /// Returns the same boot errors as [`Self::new`].
     /// 返回与 [`Self::new`] 相同的启动错误。
     pub fn reboot(&mut self, bytes: &[u8], options: &MachineOptions) -> Result<()> {
-        *self = Self::new(bytes, options)?;
+        let threads = CoreThreadOptions {
+            enabled: self.core_threads,
+            window: self.core_window,
+        };
+        *self = Self::new_with_core_threads(bytes, options, threads)?;
         Ok(())
+    }
+
+    /// Whether the two-thread core executor is active / 双核线程执行器是否启用
+    #[must_use]
+    pub fn core_threads_enabled(&self) -> bool {
+        self.core_threads
+    }
+
+    /// Machine steps per cross-core window / 每个跨核窗口的机器步数
+    #[must_use]
+    pub fn core_window(&self) -> u32 {
+        self.core_window
+    }
+
+    /// Change the cross-core window size (clamped to `1..=4096`)
+    /// 修改跨核窗口大小（限制在 `1..=4096`）
+    pub fn set_core_window(&mut self, window: u32) {
+        self.core_window = window.clamp(1, 4096);
     }
 
     /// Drain both cores' `AIRCR.SYSRESETREQ` latches into the machine flag
@@ -1465,6 +1617,17 @@ impl Machine {
     #[must_use]
     pub fn register(&self, index: u8) -> u32 {
         self.core.read_register(index)
+    }
+
+    /// Snapshot all 16 general-purpose registers (test/diagnostic hook)
+    /// 快照全部 16 个通用寄存器（测试与诊断接口）
+    #[must_use]
+    pub fn registers(&self) -> [u32; 16] {
+        let mut values = [0u32; 16];
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = self.core.read_register(index as u8);
+        }
+        values
     }
 
     /// Read a core register by index (0-15) / 按索引读取核心寄存器（0-15）
@@ -1901,6 +2064,19 @@ impl Machine {
         self.core1_launches = self.core1_launches.saturating_add(1);
     }
 
+    /// Release core 1 through the host path, for tests that need a running peer
+    /// 通过宿主路径释放 core1，供需要运行中对端的测试使用
+    ///
+    /// Production launch always goes through the SIO FIFO protocol. This hook
+    /// only skips the mailbox handshake so a synthetic test can place core 1 at
+    /// a known vector without reproducing the full launch stream.
+    /// 生产启动始终经 SIO FIFO 协议；本钩子只跳过信箱握手，使合成测试无需复现完整
+    /// 启动流即可把 core1 放到已知向量。
+    #[cfg(test)]
+    pub fn release_core1_for_test(&mut self, sp: u32, entry: u32, vtor: u32) {
+        self.boot_core1(Core1Launch { vtor, sp, entry });
+    }
+
     fn execute_core0_step(&mut self, trace: Option<usize>) -> Result<CpuState> {
         if self.halt.is_some() || self.budget_exhausted() {
             return Ok(CpuState::Halted);
@@ -2189,7 +2365,8 @@ impl Machine {
     /// `PIOx_TXy`/`PIOx_RXy` 的 `TREQ_SEL` 只会在所选 FIFO 有空间或有数据时推进。
     /// 空闲路径只做一次 `busy_mask` 探测，不访问总线与 PIO 块。
     fn pump_dma_batch(&mut self) {
-        if self.steps - self.dma_pumped < PUMP_INTERVAL {
+        let elapsed = self.steps - self.dma_pumped;
+        if elapsed < PUMP_INTERVAL {
             return;
         }
         // 先记节流点：即使当前空闲，下一次检查也推迟一整批，避免每步加锁。
@@ -2197,26 +2374,32 @@ impl Machine {
         // Record the throttle point first: even when idle, the next probe waits
         // a full batch instead of locking on every step. The real elapsed steps
         // are handed to the pacing timers, so pacing follows the live clk_sys.
-        let elapsed = self.steps - self.dma_pumped;
         self.dma_pumped = self.steps;
         // HSTX advances independently of DMA: drain the host queue every batch,
-        // advance the expander by one batch of cycles and publish its FIFO-room
-        // DREQ before arbitration.
-        // HSTX 独立于 DMA 推进：每批排空宿主队列、推进一个批次周期，并在仲裁前
-        // 发布 FIFO 空间 DREQ。
-        self.peripherals.hstx_mut().advance(PUMP_INTERVAL);
+        // advance the expander by the elapsed cycles and publish its FIFO-room
+        // DREQ before arbitration. A window larger than `PUMP_INTERVAL` advances
+        // by its real width, so total expander time is unchanged.
+        // HSTX 独立于 DMA 推进：每批排空宿主队列、按真实经过周期推进扩展器，并在
+        // 仲裁前发布 FIFO 空间 DREQ。大于 `PUMP_INTERVAL` 的窗口按真实宽度推进，
+        // 因此扩展器总时间不变。
+        self.peripherals.hstx_mut().advance(elapsed);
         let drained = self.peripherals.hstx_mut().take_output_count();
         self.hstx_words = self.hstx_words.saturating_add(drained);
         self.peripherals.sync_hstx_dreq();
         if self.peripherals.dma().busy_mask() == 0 {
             return;
         }
+        // 一个 64 步批次搬运 `DMA_PUMP_TRANSFERS` 个单元；更宽的窗口按比例放大，
+        // 使线程化窗口（32/64/128）保持相同的单位时间搬运率。
+        // One 64-step batch moves `DMA_PUMP_TRANSFERS` units; a wider window
+        // scales that budget so every threaded window size keeps the same
+        // units-per-time transfer rate.
+        let periods = (elapsed / PUMP_INTERVAL).max(1);
+        let units = DMA_PUMP_TRANSFERS.saturating_mul(periods);
         // bus 与外设是不同字段，可直接分开借用，无需 RefCell。
         // `bus` and the peripheral handle are distinct fields, so they borrow
         // separately without a RefCell.
-        let moved = self
-            .peripherals
-            .pump_dma(&mut self.bus, DMA_PUMP_TRANSFERS, elapsed);
+        let moved = self.peripherals.pump_dma(&mut self.bus, units, elapsed);
         self.dma_transfers = self.dma_transfers.saturating_add(moved);
     }
 
@@ -2361,7 +2544,6 @@ fn write_dumps(machine: &mut Machine, dumps: &[MemoryDump]) -> Result<()> {
     }
     Ok(())
 }
-
 /// Read `dump.length` bytes from the bus and write them to `dump.path`
 /// 从总线读取 `dump.length` 字节并写入 `dump.path`
 ///
@@ -2369,7 +2551,7 @@ fn write_dumps(machine: &mut Machine, dumps: &[MemoryDump]) -> Result<()> {
 /// caller is responsible for choosing a side-effect-free range.
 /// 读取走正常总线，因此 SRAM、Flash 与 MMIO 窗口都可用；调用方需选择无副作用的
 /// 区间。
-fn write_memory_dump(bus: &mut SimpleBus, dump: &MemoryDump) -> Result<()> {
+fn write_memory_dump(bus: &mut dyn AddressBus, dump: &MemoryDump) -> Result<()> {
     let mut bytes = Vec::with_capacity(dump.length as usize);
     let mut cycles = 0u64;
     for offset in 0..dump.length {
@@ -2508,7 +2690,7 @@ fn drain_notices(machine: &mut Machine, stdout: &mut dyn Write) -> Result<()> {
 /// 检测格式、加载映像并返回其架构与摘要
 fn load_image(
     bytes: &[u8],
-    bus: &mut SimpleBus,
+    bus: &mut dyn AddressBus,
     override_arch: Option<ArchArg>,
 ) -> Result<(ArchArg, Option<u32>, String)> {
     if bytes.starts_with(&UF2_MAGIC) {
@@ -2668,6 +2850,7 @@ fn log_irq(irq_log: &mut IrqLog, core: &str, irq: u16, pc: u32) {
 }
 
 mod batch;
+mod bus;
 mod fast_forward;
 #[cfg(test)]
 mod fast_forward_tests;
@@ -2685,3 +2868,6 @@ mod systick;
 mod systick_tests;
 #[cfg(test)]
 mod tests;
+mod threads;
+#[cfg(test)]
+mod threads_tests;
