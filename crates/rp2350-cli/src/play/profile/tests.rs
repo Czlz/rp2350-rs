@@ -20,6 +20,8 @@ audio_capacity = 48000
 arch = riscv
 strict_decode = true
 max_cycles = 0x1000
+core_threads = true
+core_window = 32
 psram = 8M
 ";
 
@@ -47,6 +49,8 @@ fn parses_every_supported_key() {
     assert_eq!(profile.strict_decode, Some(true));
     // `0x1000` 十六进制预算。 / Hex budget.
     assert_eq!(profile.max_cycles, Some(0x1000));
+    assert_eq!(profile.core_threads, Some(true));
+    assert_eq!(profile.core_window, Some(32));
     assert_eq!(
         profile.psram,
         Some(PsramOptions {
@@ -191,6 +195,35 @@ fn arch_accepts_arm_and_riscv_spellings() {
         Some(ArchArg::RiscV)
     );
     assert!(parse("arch = x86\n").is_err());
+}
+
+#[test]
+fn core_executor_keys_cover_the_full_window_range() {
+    // `core_threads` 只接受布尔值；`core_window` 与 `--core-window` 同一范围 1..=4096。
+    // `core_threads` only accepts booleans; `core_window` uses the same 1..=4096
+    // range as `--core-window`.
+    assert_eq!(
+        parse("core_threads = false\n").expect("bool").core_threads,
+        Some(false)
+    );
+    assert_eq!(
+        parse("core_window = 1\n").expect("min").core_window,
+        Some(1)
+    );
+    assert_eq!(
+        parse("core_window = 4096\n").expect("max").core_window,
+        Some(4096)
+    );
+    for (text, line) in [
+        ("core_window = 0\n", 1),
+        ("core_window = 4097\n", 1),
+        ("core_window = wide\n", 1),
+        ("core_threads = on\n", 1),
+    ] {
+        let error = parse(text).expect_err(text);
+        assert_eq!(error.line, line, "text={text}");
+        assert!(error.message.contains("core"), "{text}: {error}");
+    }
 }
 
 #[test]

@@ -241,6 +241,54 @@ fn zero_steps_per_frame_and_zero_audio_fields_are_rejected() {
 }
 
 #[test]
+fn core_executor_settings_come_from_the_profile_and_the_command_line_wins() {
+    // 核执行器：默认 off/64，profile 可设，命令行覆盖；窗口在合并阶段同样校验。
+    // Core executor: off/64 by default, settable from the profile, and the command
+    // line wins; the merge also validates the window range.
+    let path = write_profile(
+        "core",
+        "firmware = fw.uf2\nframe = 0x20000000:4x4\nsteps_per_frame = 100\n\
+         core_threads = true\ncore_window = 32\n",
+    );
+    let from_profile = resolve(&profile_args(&path)).expect("profile core");
+    assert!(from_profile.core_threads.enabled);
+    assert_eq!(from_profile.core_threads.window, 32);
+
+    let args = PlayArgs {
+        core_threads: Some(false),
+        core_window: Some(128),
+        ..profile_args(&path)
+    };
+    let from_cli = resolve(&args).expect("cli core");
+    assert!(!from_cli.core_threads.enabled);
+    assert_eq!(from_cli.core_threads.window, 128);
+    let _ = std::fs::remove_file(path);
+
+    let defaults = resolve(&PlayArgs {
+        file: Some(PathBuf::from("fw.uf2")),
+        frame: Some(FrameSpec::new(0x2000_0000, 4, 4)),
+        steps_per_frame: Some(100),
+        ..PlayArgs::default()
+    })
+    .expect("defaults");
+    assert!(!defaults.core_threads.enabled);
+    assert_eq!(defaults.core_threads.window, DEFAULT_CORE_WINDOW);
+
+    let bad = PlayArgs {
+        core_window: Some(0),
+        ..PlayArgs::default()
+    };
+    let error = resolve(&PlayArgs {
+        file: Some(PathBuf::from("fw.uf2")),
+        frame: Some(FrameSpec::new(0x2000_0000, 4, 4)),
+        steps_per_frame: Some(100),
+        ..bad
+    })
+    .expect_err("zero window");
+    assert!(error.contains("core window"), "{error}");
+}
+
+#[test]
 fn a_missing_profile_file_is_reported() {
     let path = std::env::temp_dir().join("rp2350-play-does-not-exist.conf");
     let error = resolve(&profile_args(&path)).expect_err("missing profile");

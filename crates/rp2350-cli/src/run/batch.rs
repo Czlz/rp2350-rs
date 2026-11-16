@@ -53,6 +53,14 @@ impl Machine {
     // are exactly the overhead this optimization removes.
     #[allow(clippy::too_many_lines)]
     pub fn run_steps(&mut self, max_steps: u64) -> Result<CpuState> {
+        // 宿主输入轮询的相位按调用重置：前端每帧调用一次时，掩码与停止标志的
+        // 采样点因此相对帧起点固定，与旧的逐切片调用完全一致。
+        // The host-input poll phase restarts with every call, so a frontend that
+        // calls `run_steps` once per frame keeps the sampling points fixed
+        // relative to the frame start, exactly like the old slice-by-slice path.
+        if let Some(input) = self.host_input.as_mut() {
+            input.next = self.steps.saturating_add(input.interval);
+        }
         // 线程化模式把两个核交给独立工作线程，并用固定窗口协调外设；默认路径
         // 保持逐字节不变。RISC-V 与缺少 core1 的映像回退到单线程路径。
         // The threaded mode hands both cores to worker threads and coordinates
@@ -102,6 +110,12 @@ impl Machine {
         let mut spin_steps = self.spin_steps;
         let mut spin_activity = self.spin_activity;
         let mut core1_live = core1_running(self);
+        // 已安装宿主输入时，下一个轮询步号是硬边界：切片绝不跨过它，掩码与停止
+        // 标志才能落在与旧逐切片路径相同的步号上。
+        // With host input installed the next poll step is a hard boundary: a slice
+        // never crosses it, so the mask and stop flag land on exactly the same
+        // step numbers as the old slice-by-slice path.
+        let mut next_poll = self.host_input.as_ref().map(|input| input.next);
 
         while steps < end {
             // 睡眠快进：全部可运行核都在睡且没有可触发事件时，直接跳到下一个时基
@@ -113,7 +127,8 @@ impl Machine {
             // the normal loop execute that boundary step itself. A runnable core,
             // a pending interrupt or in-flight DMA/PIO/HSTX/ADC activity makes the
             // guard return `None` and falls back to the step-by-step path.
-            if let Some(landing) = self.sleep_fast_forward_skip(steps, end) {
+            let fast_end = next_poll.map_or(end, |poll| end.min(poll));
+            if let Some(landing) = self.sleep_fast_forward_skip(steps, fast_end) {
                 steps = landing;
                 continue;
             }
@@ -126,11 +141,13 @@ impl Machine {
             let until_dma = (self.dma_pumped + PUMP_INTERVAL).saturating_sub(steps);
             let until_pio = (self.pio_pumped + PUMP_INTERVAL).saturating_sub(steps);
             let until_time = (self.advanced + ADVANCE_INTERVAL).saturating_sub(steps);
+            let until_poll = next_poll.map_or(u64::MAX, |poll| poll.saturating_sub(steps).max(1));
             let chunk = (end - steps)
                 .min(until_pump.max(1))
                 .min(until_dma.max(1))
                 .min(until_pio.max(1))
-                .min(until_time.max(1));
+                .min(until_time.max(1))
+                .min(until_poll);
 
             let mut retired = 0u64;
             while retired < chunk {
@@ -347,6 +364,20 @@ impl Machine {
             }
 
             self.steps = steps;
+            // 宿主输入轮询：按键掩码与停止标志按绝对步号采样，因此帧内延迟仍是
+            // 一个轮询间隔。宿主停止不是客户机故障，不锁存停机原因。
+            // Host input poll: the button mask and stop flag are sampled on absolute
+            // step numbers, keeping the in-frame latency at one poll interval. A
+            // host stop is not a guest fault and never latches a halt reason.
+            if next_poll.is_some_and(|poll| steps >= poll) {
+                if !self.poll_host_input() {
+                    self.spin_base = spin_base;
+                    self.spin_steps = spin_steps;
+                    self.spin_activity = spin_activity;
+                    return Ok(CpuState::Halted);
+                }
+                next_poll = self.host_input.as_ref().map(|input| input.next);
+            }
         }
 
         self.steps = steps;

@@ -13,6 +13,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -446,6 +447,32 @@ impl Default for CoreThreadOptions {
     }
 }
 
+/// Optional host input polled by `run_steps` at fixed step boundaries
+/// 由 `run_steps` 在固定步边界轮询的可选宿主输入
+///
+/// A frontend that needs input latency far below one frame (the `play` worker)
+/// installs this instead of splitting the frame into many small `run_steps`
+/// calls. Polling keeps the exact step cadence — the action is applied after
+/// every `interval` machine steps, counted from the start of each `run_steps`
+/// call — while the whole frame stays one threaded batch.
+/// 需要远低于一帧的输入延迟的前端（`play` worker）安装本结构，而不是把一帧拆成
+/// 许多小的 `run_steps` 调用。轮询保持精确的步节奏——动作在每 `interval` 个机器步
+/// 之后生效，从每次 `run_steps` 调用的起点起算——同时整帧仍是一个线程化批次。
+#[derive(Debug)]
+struct HostInput {
+    /// Pins driven from the mask / 掩码驱动的引脚
+    pins: u16,
+    /// Button mask shared with the host thread (set = pressed = low)
+    /// 与宿主线程共享的按键掩码（置位 = 按下 = 低电平）
+    buttons: Arc<AtomicU16>,
+    /// Stop request shared with the host thread / 与宿主线程共享的停止请求
+    stop: Arc<AtomicBool>,
+    /// Machine steps between two polls / 两次轮询之间的机器步数
+    interval: u64,
+    /// Absolute step number of the next poll / 下一次轮询的绝对步号
+    next: u64,
+}
+
 /// Architecture-tagged CPU handle owned by [`Machine`]
 /// [`Machine`] 持有的带架构标记的 CPU 句柄
 ///
@@ -854,6 +881,9 @@ pub struct Machine {
     core_threads: bool,
     /// Machine steps per cross-core window / 每个跨核窗口的机器步数
     core_window: u32,
+    /// Host input polled at fixed step boundaries, if a frontend installed it
+    /// 在固定步边界轮询的宿主输入（前端安装时才有）
+    host_input: Option<HostInput>,
     /// Serialises SIO register accesses and `Sio::select_core` across workers
     /// 在工作线程间串行化 SIO 寄存器访问与 `Sio::select_core`
     sio_view_lock: Arc<Mutex<()>>,
@@ -1070,6 +1100,7 @@ impl Machine {
             system_reset_pending: false,
             core_threads,
             core_window: threads.window.clamp(1, 4096),
+            host_input: None,
             sio_view_lock: Arc::new(Mutex::new(())),
             ppb_lock: Arc::new(Mutex::new(())),
             core_worker_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1410,6 +1441,82 @@ impl Machine {
     /// 修改跨核窗口大小（限制在 `1..=4096`）
     pub fn set_core_window(&mut self, window: u32) {
         self.core_window = window.clamp(1, 4096);
+    }
+
+    /// Install host input that [`Self::run_steps`] polls every `interval` steps
+    /// 安装 [`Self::run_steps`] 每 `interval` 步轮询一次的宿主输入
+    ///
+    /// `pins` selects the pads driven from the shared button mask (bit `n` =
+    /// GP`n`, set = pressed = low); `stop` aborts the batch at the next poll.
+    /// The poll phase restarts with every `run_steps` call, so a frontend that
+    /// calls it once per frame keeps a frame-relative sampling cadence. Polling
+    /// changes **only** when the host action is applied: every guest step is
+    /// still executed exactly as before.
+    /// `pins` 选择由共享按键掩码驱动的 pad（位 `n` = GP`n`，置位 = 按下 = 低电平）；
+    /// `stop` 让批次在下一次轮询处中止。轮询相位在每次 `run_steps` 调用时重置，因此
+    /// 每帧调用一次的前端保持「相对帧起点」的采样节奏。轮询**只**改变宿主动作的生效
+    /// 时刻：每个客户机步仍照原样执行。
+    pub fn set_host_input(
+        &mut self,
+        pins: u16,
+        buttons: Arc<AtomicU16>,
+        stop: Arc<AtomicBool>,
+        interval: u64,
+    ) {
+        self.host_input = Some(HostInput {
+            pins,
+            buttons,
+            stop,
+            interval: interval.max(1),
+            next: self.steps.saturating_add(interval.max(1)),
+        });
+    }
+
+    /// Remove the host input installed by [`Self::set_host_input`]
+    /// 移除 [`Self::set_host_input`] 安装的宿主输入
+    pub fn clear_host_input(&mut self) {
+        self.host_input = None;
+    }
+
+    /// Poll the host input: drive the pads and report whether to keep running
+    /// 轮询宿主输入：驱动 pad，并报告是否继续运行
+    ///
+    /// Returns `true` when no input is installed or no stop was requested, so
+    /// the default path is a single `Option` check. A `false` result means the
+    /// host asked the machine to stop; the step loop returns
+    /// [`CpuState::Halted`] without latching a halt reason, because a host stop
+    /// is not a guest fault.
+    /// 未安装输入或未请求停止时返回 `true`，因此默认路径只有一次 `Option` 检查。
+    /// 返回 `false` 表示宿主请求停止；步进循环返回 [`CpuState::Halted`] 但不锁存
+    /// 停机原因，因为宿主停止不是客户机故障。
+    pub(crate) fn poll_host_input(&mut self) -> bool {
+        let Some(input) = self.host_input.as_mut() else {
+            return true;
+        };
+        let mask = input.buttons.load(Ordering::Relaxed);
+        let pins = input.pins;
+        input.next = self.steps.saturating_add(input.interval);
+        for pin in 0..u16::BITS {
+            let bit = 1u16 << pin;
+            if pins & bit != 0 {
+                // 按下 = 低电平：固件为按键启用了内部上拉。
+                // Pressed = low: the firmware enables pull-ups on the buttons.
+                self.peripherals
+                    .pads()
+                    .set_external_pin(pin, mask & bit == 0);
+            }
+        }
+        !self
+            .host_input
+            .as_ref()
+            .is_some_and(|input| input.stop.load(Ordering::Relaxed))
+    }
+
+    /// Absolute step number of the next host poll, if one is installed
+    /// 下一次宿主轮询的绝对步号（未安装时为 `None`）
+    #[must_use]
+    pub fn next_host_poll(&self) -> Option<u64> {
+        self.host_input.as_ref().map(|input| input.next)
     }
 
     /// Drain both cores' `AIRCR.SYSRESETREQ` latches into the machine flag

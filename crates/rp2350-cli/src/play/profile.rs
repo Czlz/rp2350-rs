@@ -31,6 +31,8 @@
 //! arch = arm
 //! strict_decode = false
 //! max_cycles = 0
+//! core_threads = false
+//! core_window = 64
 //! psram = 8M
 //! ```
 
@@ -101,6 +103,10 @@ pub struct Profile {
     pub strict_decode: Option<bool>,
     /// Total instruction budget / 总指令预算
     pub max_cycles: Option<u64>,
+    /// Optional two-thread core executor / 可选双核线程执行器
+    pub core_threads: Option<bool>,
+    /// Machine steps per cross-core window / 每个跨核窗口的机器步数
+    pub core_window: Option<u32>,
     /// PSRAM window behind XIP chip select 1 / XIP 片选 1 后的 PSRAM 窗口
     pub psram: Option<PsramOptions>,
 }
@@ -187,6 +193,13 @@ fn assign(profile: &mut Profile, key: &str, value: &str, line: usize) -> Result<
         "arch" => profile.arch = Some(parse_arch(value, line)?),
         "strict_decode" => profile.strict_decode = Some(parse_bool(value, key, line)?),
         "max_cycles" => profile.max_cycles = Some(parse_u64(value, key, line)?),
+        "core_threads" => profile.core_threads = Some(parse_bool(value, key, line)?),
+        "core_window" => {
+            profile.core_window = Some(
+                crate::run::parse_core_window(value)
+                    .map_err(|message| ProfileError::new(line, message))?,
+            );
+        }
         "psram" => {
             profile.psram = Some(PsramOptions::parse(value).map_err(|reason| {
                 ProfileError::new(

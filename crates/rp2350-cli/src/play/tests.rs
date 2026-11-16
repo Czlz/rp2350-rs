@@ -554,8 +554,8 @@ fn step_frame_applies_the_current_button_mask() {
         button_pins: 1 << 3,
         ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 32)
     };
-    let stop = AtomicBool::new(false);
-    let buttons = AtomicU16::new(1 << 3);
+    let stop = Arc::new(AtomicBool::new(false));
+    let buttons = Arc::new(AtomicU16::new(1 << 3));
     let mut trace_left = 0;
     assert_eq!(
         step_frame(&mut machine, &config, &stop, &buttons, &mut trace_left),
@@ -574,8 +574,8 @@ fn step_frame_reports_a_system_reset_and_stops() {
     // diagnostic and the worker stops via `halted`; it never reboots.
     let mut machine = Machine::new(&aircr_uf2(), &spin_options(u64::MAX)).expect("machine");
     let config = PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 64);
-    let stop = AtomicBool::new(false);
-    let buttons = AtomicU16::new(0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let buttons = Arc::new(AtomicU16::new(0));
     let mut trace_left = 0;
     let reason = step_frame(&mut machine, &config, &stop, &buttons, &mut trace_left);
     assert_eq!(reason.as_deref(), Some(SYSTEM_RESET_MESSAGE));
@@ -596,7 +596,7 @@ fn buttons_are_resampled_inside_a_frame() {
         button_pins: 1 << 4,
         ..PlayConfig::new(FrameSpec::new(SRAM_BASE + 0x1000, 4, 4), 400_000)
     };
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
     let buttons = Arc::new(AtomicU16::new(0));
     let mut trace_left = 0;
 

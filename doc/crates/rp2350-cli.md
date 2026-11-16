@@ -499,7 +499,7 @@ profile 文件或命令行；两者都没有时命令直接失败并指出缺失
 | `--trace-steps` | `0` | Leading steps of the first frame printed as `[trace]` lines / 第一帧开头打印的 `[trace]` 步数 |
 | `--max-cycles` | `u64::MAX` | Total instruction budget; `u64::MAX` = unlimited / 总指令预算，`u64::MAX` 表示不限制 |
 | `--arch` / `--strict-decode` | as `run` | Architecture override / halt on undefined instructions instead of HardFault / 架构覆盖 / 未定义指令停机，而不是投递 HardFault |
-| `--core-threads` / `--core-window` | `off` / `64` | Optional two-thread cores and their window; see “Optional two-thread cores” under `run` / 可选双核线程与其窗口，见 `run` 下的「可选双核线程」 |
+| `--core-threads` / `--core-window` | `off` / profile or `64` | Optional two-thread cores and their window (profile keys `core_threads` / `core_window`); see “Optional two-thread cores” under `run` and “Batched frame stepping” below / 可选双核线程与其窗口（profile 键 `core_threads` / `core_window`），见 `run` 下的「可选双核线程」与下面的「批量帧步进」 |
 | `--psram` | off (unmapped) | Mount the PSRAM window at `0x1100_0000` (same syntax as `run`; a profile may set `psram = 8M` instead) / 在 `0x1100_0000` 挂载 PSRAM 窗口（语法同 `run`；profile 也可用 `psram = 8M`） |
 
 #### Profile format / profile 格式
@@ -526,6 +526,8 @@ separates), LF and CRLF both parse, and unknown keys, duplicate keys, missing
 | `strict_decode` | `true` / `false` |
 | `max_cycles` | Total instruction budget / 总指令预算 |
 | `psram` | PSRAM window size at `0x1100_0000` (`8M`, `1024K`, `8388608`); absent = unmapped / `0x1100_0000` 处 PSRAM 窗口大小；缺省表示不挂载 |
+| `core_threads` | `true` / `false`; two-thread core executor (default `false` = deterministic) / 双核线程执行器（默认 `false`，确定性） |
+| `core_window` | `1`..=`4096`; machine steps per cross-core window (default `64`) / 每个跨核窗口的机器步数（默认 `64`） |
 
 Precedence is **command line > profile > built-in generic default**. A profile
 may set `audio = true` and still take `--audio-rate` from the command line; an
@@ -533,6 +535,58 @@ may set `audio = true` and still take `--audio-rate` from the command line; an
 resolution time.
 优先级为**命令行 > profile > 内置通用默认值**。profile 可以设置 `audio = true`
 而由命令行提供 `--audio-rate`；若两处都没有块/状态机，解析阶段直接报错。
+
+#### Batched frame stepping / 批量帧步进
+
+Each frame is **one** `Machine::run_steps(steps_per_frame)` call (the `[trace]`
+prefix of the first frame still runs one `trace_step` at a time so the lines
+match `run --trace-steps`). Splitting a frame into 4096-step calls used to pay
+two host-thread spawns per slice, which is why the threaded executor could not
+help `play`; one batch per frame lets it amortise the worker handshake over the
+whole frame.
+每帧是**一个** `Machine::run_steps(steps_per_frame)` 调用（第一帧的 `[trace]` 前缀
+仍逐条 `trace_step`，使输出与 `run --trace-steps` 相同）。过去一帧被拆成 4096 步的
+调用，每个切片都要启动两条宿主线程，线程化执行器因此帮不到 `play`；现在每帧一个
+批次，工作线程握手成本摊薄到整帧。
+
+Frame semantics are unchanged: the worker still advances exactly
+`steps_per_frame` machine steps, publishes one frame, samples the buttons every
+4096 steps and stops within ≤4096 steps of a host request. The sampling moved
+into the machine: `Machine::set_host_input(pins, buttons, stop, interval)` makes
+`run_steps` poll the mask and the stop flag on absolute step numbers — a hard
+chunk/window boundary in both the serial and the threaded path — so a poll lands
+on the same step as the old slice start. A host stop returns `CpuState::Halted`
+**without** latching a halt reason (`play` reports it as a normal stop, never as
+`halted`). Only the first frame with `--trace-steps > 0` shifts its in-batch
+sampling points by the trace length.
+帧语义不变：worker 仍精确推进 `steps_per_frame` 步、发布一帧、每 4096 步采样按键，
+并在宿主请求后 ≤4096 步内停止。采样点移入机器：`Machine::set_host_input(pins,
+buttons, stop, interval)` 让 `run_steps` 在绝对步号上轮询掩码与停止标志——串行与
+线程化路径都把该步号当作硬切片/窗口边界——因此轮询点与旧的切片起点完全相同。宿主
+停止返回 `CpuState::Halted` 但**不**锁存停机原因（`play` 把它当作正常停止，绝不记为
+`halted`）。只有设置了 `--trace-steps > 0` 的第一帧，其批内采样点会因 trace 长度而
+平移。
+
+The default `--core-threads off` path stays deterministic and byte-identical to
+the old slicing; `on` runs core0/core1 on two host threads and is explicitly not
+bit-reproducible inside a window (see “Optional two-thread cores” under `run`).
+默认 `--core-threads off` 路径保持确定性，并与旧切片逐字节一致；`on` 让 core0/core1
+运行在两条宿主线程上，窗口内显式不可位复现（见 `run` 下的「可选双核线程」）。
+
+Measured on `emerald.uf2` + `example/gba/profile.conf`, `--frames 130`, same
+machine, quiet host, back-to-back: **off 41.7 s vs on 20.9 s (2.00×)**; the last
+ten frames report **off 1.74–3.30 fps / 7.3–13.8 M steps/s** and **on 3.55–6.53
+fps / 14.9–27.4 M steps/s**. Both runs retire exactly 546 M steps
+(130 × 4.2 M). `on` is not bit-reproducible, so its per-frame spread varies
+between runs; across repeated off/on pairs the wall-clock ratio ranged from
+1.5× to 2.2× depending on where the host scheduler placed the two per-batch
+worker threads (2.00× and 2.03× on quiet back-to-back pairs).
+在 `emerald.uf2` + `example/gba/profile.conf`、`--frames 130`、同一台机器、宿主空闲
+且背靠背运行：**off 41.7 s，on 20.9 s（2.00×）**；最后十帧为 **off 1.74–3.30 fps /
+7.3–13.8 M steps/s**、**on 3.55–6.53 fps / 14.9–27.4 M steps/s**。两次运行都恰好执行
+546 M 步（130 × 4.2 M）。`on` 不可位复现，单帧区间随运行变化；重复的 off/on 成对测量
+墙钟比为 1.5–2.2×，取决于宿主调度把每批两条工作线程放到哪里（空闲背靠背时为
+2.00× 与 2.03×）。
 
 The subcommand boots the firmware on a worker thread, advances it by
 `--steps-per-frame` steps per frame, copies the guest frame buffer and prints
@@ -557,11 +611,16 @@ reset requested (AIRCR.SYSRESETREQ)` in `[play] summary`. This keeps the window,
 input state and audio tap owned by the host instead of silently resetting the
 image under the player.
 
-Measured on `emerald.uf2` with `example/gba/profile.conf`
-(`--profile example/gba/profile.conf --frames 20`): **11.7–12.5 fps /
-29.3–31.2 M steps/s** (two runs), 20 frames in 1.6–1.7 s wall clock. Before the
-round-4 batched stepping and the word-wise `read_block` the same command
-measured 8.26 fps.
+Measured on `emerald.uf2` with `example/gba/profile.conf` (4.2 M steps per
+frame): `--frames 130` reports **off 1.74–3.30 fps / 7.3–13.8 M steps/s** and
+`--core-threads on` **3.55–6.53 fps / 14.9–27.4 M steps/s** on the last ten
+frames (**41.7 s vs 20.9 s** for the whole run, 2.00×). The wide per-frame range
+is the 1-second rolling window catching one or two frames, not a step-rate
+change. See “Batched frame stepping” above.
+在 `emerald.uf2` + `example/gba/profile.conf`（每帧 4.2 M 步）实测：`--frames 130`
+的最后十帧为 **off 1.74–3.30 fps / 7.3–13.8 M steps/s**、`--core-threads on`
+**3.55–6.53 fps / 14.9–27.4 M steps/s**（整跑 **41.7 s vs 20.9 s**，2.00×）。单帧
+区间较宽是 1 秒滚动窗口只覆盖 1–2 帧造成的，不是步进速率变化。详见上文「批量帧步进」。
 该子命令在 worker 线程上启动固件，每帧推进 `--steps-per-frame` 步，拷贝客户机
 帧缓冲并为每帧打印一行。`--frames N` 跑满 N 帧后以状态码 0 退出；不带该参数时
 运行到机器停机或进程被杀。帧缓冲读不全（窗口未映射）时只打印一次
@@ -570,9 +629,6 @@ measured 8.26 fps.
 `system reset requested (AIRCR.SYSRESETREQ)` 停止，worker 发布已到达的帧，会话以
 `[play] summary` 中的 `halted=system reset requested (AIRCR.SYSRESETREQ)` 结束。
 窗口、输入状态与音频 tap 始终由宿主掌控，不会在玩家不知情时重置映像。
-`emerald.uf2` + `example/gba/profile.conf` 实测：**11.7–12.5 fps /
-29.3–31.2 M steps/s**（两次运行），20 帧约 1.6–1.7 秒墙钟。第四轮批量步进与按字
-`read_block` 之前，同一命令为 8.26 fps。
 
 #### Frame format and button semantics / 帧格式与按键语义
 
@@ -608,22 +664,25 @@ measured 8.26 fps.
   until the 60 fps boundary; a slower frame runs at full speed (no sleep).
   一帧耗时小于 1/60 秒时 worker 睡到 60 fps 边界；更慢的帧全速运行（不 sleep）。
 
-#### Why ~12 fps / 为什么只有约 12 fps
+#### Why only ~3 fps / 为什么只有约 3 fps
 
-The measured throughput is ~29–31 M steps/s while one game frame needs ~2.5 M
-steps (dual core + software PPU), so a frame takes ~85 ms → ~12 fps. Playability
-needs 30 fps (≥75 M steps/s) or 60 fps (≥150 M steps/s); closing that gap is the
-P0 performance track in `doc/playability-plan.md` (interpreter hot paths, JIT or
-frame-parallel evaluation). The play worker deliberately adds almost no
-per-step work: after round 4 a frame costs one `read_block` (76.8 KB, copied with
-32-bit bus reads) and one RGB565 conversion, both far below one frame of
-emulation.
-实测吞吐约 29–31 M steps/s，而一个游戏帧约需 2.5 M 步（双核 + 软件 PPU），因此
-一帧约 85 ms → 约 12 fps。可玩需要 30 fps（≥75 M steps/s）或 60 fps
-（≥150 M steps/s），差距由 `doc/playability-plan.md` 的 P0 性能线负责（解释器
-热路径、JIT 或帧级并行）。play worker 刻意几乎不增加每步开销：第四轮之后每帧仅
-一次 `read_block`（76.8 KB，按 32 位总线读拷贝）与一次 RGB565 转换，都远低于
-一帧仿真成本。
+On the real game segment emerald needs 4.2 M machine steps per 16.67 ms frame
+(252 MHz overclock), and the deterministic single-threaded path retires roughly
+7–14 M steps/s there, so a frame takes 300–700 ms. `--core-threads on` roughly
+doubles that (15–27 M steps/s, ~2×), which is the biggest single lever available
+without a JIT. Playability still needs 30 fps (≥75 M steps/s) or 60 fps
+(≥150 M steps/s); closing that gap stays on the P0 performance track in
+`doc/playability-plan.md` (interpreter hot paths, JIT or frame-parallel
+evaluation). The play worker deliberately adds almost no per-step work: a frame
+costs one `read_block` (76.8 KB, copied with 32-bit bus reads), one RGB565
+conversion and the in-batch input polls, all far below one frame of emulation.
+真实游戏段中 emerald 每 16.67 ms 帧需要 4.2 M 机器步（252 MHz 超频），而确定性单线程
+路径在该段约 7–14 M 步/秒，因此一帧需要 300–700 ms。`--core-threads on` 大约翻倍
+（15–27 M 步/秒，≈2×），是不做 JIT 时最大的单项杠杆。可玩仍需 30 fps
+（≥75 M 步/秒）或 60 fps（≥150 M 步/秒），差距由 `doc/playability-plan.md` 的 P0
+性能线负责（解释器热路径、JIT 或帧级并行）。play worker 刻意几乎不增加每步开销：
+每帧一次 `read_block`（76.8 KB，按 32 位总线读拷贝）、一次 RGB565 转换与批内输入
+轮询，都远低于一帧仿真成本。
 
 ### `gdb` — GDB remote debug server / GDB 远程调试服务器
 
@@ -1079,6 +1138,15 @@ impl Machine {
     pub fn step_cores(&mut self, core0: bool, core1: bool) -> Result<CpuState>;
     pub fn trace_step(&mut self, index: usize) -> Result<CpuState>;  // prints [trace]
     pub fn run_steps(&mut self, max_steps: u64) -> Result<CpuState>; // batched stepping
+    pub fn set_host_input(                 // in-batch input polling for play
+        &mut self,
+        pins: u16,
+        buttons: Arc<AtomicU16>,
+        stop: Arc<AtomicBool>,
+        interval: u64,
+    );
+    pub fn clear_host_input(&mut self);
+    pub fn next_host_poll(&self) -> Option<u64>;  // absolute step of the next poll
     pub fn run_cycles(&mut self, cycles: u64);   // CdcLink cycle callback, both cores
     pub fn read_block(&mut self, addr: u32, len: usize) -> Vec<u8>;  // frame copies
     pub fn finalize(&mut self);                  // flush timebase + UART
@@ -1192,11 +1260,19 @@ pub struct PlayStats {
 pub struct PlaySession { /* worker handle */ }
 impl PlaySession {
     pub fn start(image: Vec<u8>, options: MachineOptions, config: PlayConfig)
-        -> Result<Self, String>;   // Err on out-of-range audio block/SM
+        -> Result<Self, String>;   // deterministic single-threaded cores
+    pub fn start_with_core_threads(
+        image: Vec<u8>,
+        options: MachineOptions,
+        threads: CoreThreadOptions,
+        config: PlayConfig,
+    ) -> Result<Self, String>;     // Err on out-of-range audio block/SM
     pub fn latest_frame(&self) -> Option<Arc<Frame>>;
     pub fn set_buttons(&self, mask: u16);
     pub fn buttons(&self) -> u16;
     pub fn button_pins(&self) -> u16;
+    pub fn core_threads_enabled(&self) -> bool;  // read back from the machine
+    pub fn core_window(&self) -> u32;            // read back (clamped) window
     pub fn stats(&self) -> PlayStats;
     pub fn replaced_frames(&self) -> u64;
     pub fn is_running(&self) -> bool;

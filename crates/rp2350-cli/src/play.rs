@@ -31,6 +31,8 @@
     clippy::cast_sign_loss
 )]
 
+#[cfg(test)]
+mod batch_tests;
 mod frame;
 pub mod options;
 pub mod profile;
@@ -191,6 +193,10 @@ pub struct PlaySession {
     buttons: Arc<AtomicU16>,
     /// Pins the worker actually drives / worker 实际驱动的引脚
     button_pins: u16,
+    /// Effective two-thread executor state / 实际生效的双核线程执行器状态
+    core_threads: bool,
+    /// Effective cross-core window / 实际生效的跨核窗口
+    core_window: u32,
     /// Newest published frame / 最新发布的帧
     latest: Arc<Mutex<Option<SharedFrame>>>,
     /// Frames replaced before a consumer took them / 未被取走即被替换的帧数
@@ -319,9 +325,11 @@ impl PlaySession {
                 .map_err(|error| format!("cannot spawn play worker / 无法创建 worker: {error}"))?
         };
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok((core_threads, core_window))) => Ok(Self {
                 buttons,
                 button_pins: config.button_pins,
+                core_threads,
+                core_window,
                 latest,
                 replaced,
                 stop,
@@ -364,6 +372,25 @@ impl PlaySession {
     #[must_use]
     pub fn button_pins(&self) -> u16 {
         self.button_pins
+    }
+
+    /// Whether the worker's machine uses the two-thread core executor
+    /// worker 的机器是否使用双核线程执行器
+    ///
+    /// This is the setting the machine actually accepted, read back through the
+    /// startup channel: `false` when the frontend did not request it, and also
+    /// for RISC-V images or images without a core 1, which always step serially.
+    /// 这是机器实际接受的设置，经启动通道回读：前端未请求时为 `false`，RISC-V
+    /// 映像或没有 core1 的映像也一样（它们始终走串行路径）。
+    #[must_use]
+    pub fn core_threads_enabled(&self) -> bool {
+        self.core_threads
+    }
+
+    /// Machine steps per cross-core window / 每个跨核窗口的机器步数
+    #[must_use]
+    pub fn core_window(&self) -> u32 {
+        self.core_window
     }
 
     /// Statistics snapshot / 统计快照
@@ -448,82 +475,115 @@ pub(crate) fn apply_buttons(machine: &Machine, mask: u16, button_pins: u16) {
 /// Execute one frame's step budget and report an early stop reason
 /// 执行一帧的步数预算，并返回提前停止的原因
 ///
-/// Returns `None` when the budget was consumed normally. `trace_left` counts the
-/// `[trace]` steps still owed to the first frame.
-/// The frame is executed in [`STOP_POLL_STEPS`] slices: the stop flag **and the
-/// button mask** are re-read at every slice, so input latency is one slice of
-/// guest time instead of one whole frame.
-/// 预算正常耗尽时返回 `None`。`trace_left` 是第一帧尚未打印的 `[trace]` 步数。
-/// 一帧按 [`STOP_POLL_STEPS`] 步切片执行：每个切片重新读取停止标志**与按键掩码**，
-/// 因此输入延迟是一个切片的客户机时间，而不是一整帧。
+/// Returns `None` when the budget was consumed normally or the host asked the
+/// worker to stop. `trace_left` counts the `[trace]` steps still owed to the
+/// first frame.
+/// The frame is advanced with **one** [`Machine::run_steps`] batch, and the
+/// machine itself polls the button mask and the stop flag every
+/// [`STOP_POLL_STEPS`] steps, so the input cadence and the ≤4096-step stop
+/// latency are unchanged while the threaded executor gets a batch long enough
+/// to pay for its worker handshake.
+/// 预算正常耗尽或宿主请求停止时返回 `None`。`trace_left` 是第一帧尚未打印的
+/// `[trace]` 步数。
+/// 一帧用**一个** [`Machine::run_steps`] 批次推进，由机器自身每 [`STOP_POLL_STEPS`]
+/// 步轮询按键掩码与停止标志，因此输入节奏与 ≤4096 步的停止延迟不变，而线程化
+/// 执行器拿到足够长的批次来摊薄工作线程握手成本。
 fn step_frame(
     machine: &mut Machine,
     config: &PlayConfig,
-    stop: &AtomicBool,
-    buttons: &AtomicU16,
+    stop: &Arc<AtomicBool>,
+    buttons: &Arc<AtomicU16>,
     trace_left: &mut usize,
 ) -> Option<String> {
+    // 安装宿主输入：`run_steps` 在每 STOP_POLL_STEPS 步的绝对步号上采样。
+    // Install host input: `run_steps` samples it on absolute step numbers every
+    // STOP_POLL_STEPS steps.
+    machine.set_host_input(
+        config.button_pins,
+        Arc::clone(buttons),
+        Arc::clone(stop),
+        STOP_POLL_STEPS,
+    );
+    // 帧起点仍按旧路径写一次掩码：第一次批内轮询要等到 4096 步之后。
+    // The frame start still drives the mask like the old path; the first in-batch
+    // poll only happens after 4096 steps.
+    apply_buttons(machine, buttons.load(Ordering::Relaxed), config.button_pins);
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
     let mut stepped = 0u64;
-    while stepped < config.steps_per_frame {
-        if stepped % STOP_POLL_STEPS == 0 {
-            apply_buttons(machine, buttons.load(Ordering::Relaxed), config.button_pins);
-            if stop.load(Ordering::Relaxed) {
-                return None;
-            }
-            if machine.budget_exhausted() {
-                return Some(BUDGET_REASON.to_owned());
-            }
-            if let Some(reason) = machine.halt_reason() {
-                return Some(reason.to_owned());
-            }
-            // 复位请求：`play` 的策略是报告并停止 worker，不自动重启。
-            // A reset request makes `play` report and stop the worker; it never
-            // reboots automatically.
-            if machine.take_system_reset_request() {
-                return Some(SYSTEM_RESET_MESSAGE.to_owned());
-            }
-        }
-        let slice = (config.steps_per_frame - stepped).min(STOP_POLL_STEPS);
-        if *trace_left > 0 {
-            // 前 `trace_steps` 步必须逐步执行，才能打印与 `run --trace-steps`
-            // 相同的 `[trace]` 行。
-            // The leading `trace_steps` must be stepped one by one so the
-            // `[trace]` lines match `run --trace-steps` exactly.
-            let mut done = 0u64;
-            while done < slice && *trace_left > 0 {
-                *trace_left -= 1;
-                let index = config.trace_steps - *trace_left - 1;
-                let outcome = machine.trace_step(index);
-                for line in machine.take_notices() {
-                    println!("{line}");
+    if *trace_left > 0 {
+        // 前 `trace_steps` 步必须逐步执行，才能打印与 `run --trace-steps`
+        // 相同的 `[trace]` 行；其余步仍走一个批量 `run_steps`。
+        // The leading `trace_steps` must be stepped one by one so the `[trace]`
+        // lines match `run --trace-steps` exactly; the rest still uses one batch.
+        while stepped < config.steps_per_frame && *trace_left > 0 {
+            if stepped % STOP_POLL_STEPS == 0 {
+                apply_buttons(machine, buttons.load(Ordering::Relaxed), config.button_pins);
+                if stop.load(Ordering::Relaxed) {
+                    return None;
                 }
-                if let Err(error) = outcome {
-                    return Some(error.to_string());
+                if machine.budget_exhausted() {
+                    return Some(BUDGET_REASON.to_owned());
                 }
-                done += 1;
-            }
-            stepped += done;
-            let rest = slice - done;
-            if rest > 0 {
-                if let Err(error) = machine.run_steps(rest) {
-                    return Some(error.to_string());
+                if let Some(reason) = machine.halt_reason() {
+                    return Some(reason.to_owned());
                 }
-                stepped += rest;
+                if machine.take_system_reset_request() {
+                    return Some(SYSTEM_RESET_MESSAGE.to_owned());
+                }
             }
-        } else {
-            if let Err(error) = machine.run_steps(slice) {
-                return Some(error.to_string());
+            *trace_left -= 1;
+            let index = config.trace_steps - *trace_left - 1;
+            match trace_one(machine, index) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(error) => return Some(error),
             }
-            stepped += slice;
-        }
-        // 切片内部发生的复位请求必须在同一帧内发现，不能等到下一帧边界。
-        // A reset requested inside the slice must be caught within this frame,
-        // not at the next frame boundary.
-        if machine.take_system_reset_request() {
-            return Some(SYSTEM_RESET_MESSAGE.to_owned());
+            stepped += 1;
         }
     }
+    let remaining = config.steps_per_frame - stepped;
+    if remaining > 0 {
+        if let Err(error) = machine.run_steps(remaining) {
+            return Some(error.to_string());
+        }
+    }
+    // 顺序必须与旧的逐切片路径一致：停止 → 预算 → 停机 → 复位请求。
+    // The order must match the old slice-by-slice path: stop, budget, halt, reset.
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    if machine.budget_exhausted() {
+        return Some(BUDGET_REASON.to_owned());
+    }
+    if let Some(reason) = machine.halt_reason() {
+        return Some(reason.to_owned());
+    }
+    // 复位请求可能在批次内部锁存：`run_steps` 会立即停止推进，这里在帧内报告。
+    // A reset request can be latched inside the batch: `run_steps` stops advancing
+    // immediately and the frame reports it here.
+    if machine.take_system_reset_request() {
+        return Some(SYSTEM_RESET_MESSAGE.to_owned());
+    }
     None
+}
+
+/// Execute one `[trace]` step and return the lines it produced
+/// 执行一个 `[trace]` 步并返回它产生的行
+///
+/// The worker prints the returned lines; keeping the execution and the printing
+/// separate lets tests assert the trace text without capturing stdout.
+/// worker 负责打印返回的行；把执行与打印分开，测试因此无需捕获 stdout 即可断言
+/// 轨迹文本。
+fn trace_one(machine: &mut Machine, index: usize) -> Result<Vec<String>, String> {
+    let outcome = machine.trace_step(index);
+    let lines = machine.take_notices();
+    outcome.map_err(|error| error.to_string())?;
+    Ok(lines)
 }
 
 /// Worker body: boot, loop over frames, publish, then finalize
@@ -534,14 +594,14 @@ fn run_worker(
     options: &MachineOptions,
     threads: CoreThreadOptions,
     config: PlayConfig,
-    buttons: &AtomicU16,
-    stop: &AtomicBool,
+    buttons: &Arc<AtomicU16>,
+    stop: &Arc<AtomicBool>,
     latest: &Mutex<Option<SharedFrame>>,
     replaced: &AtomicU64,
     stats_slot: &Mutex<PlayStats>,
     running: &AtomicBool,
     audio: Option<AudioTap>,
-    ready: &Sender<Result<(), String>>,
+    ready: &Sender<Result<(bool, u32), String>>,
 ) {
     // 线程退出（含提前 return）时清除运行标志，宿主据此结束轮询。
     // Clearing the running flag on every exit path lets the host stop polling.
@@ -581,12 +641,17 @@ fn run_worker(
             return;
         }
     }
-    if ready.send(Ok(())).is_err() {
+    // 把机器实际生效的核执行器设置回读给宿主：`enabled` 只在 Arm 映像且存在
+    // core1 时被机器接受，窗口也会被钳制到 1..=4096。
+    // Read the machine's effective core-executor settings back to the host:
+    // `enabled` is only accepted for Arm images with a core1, and the window is
+    // clamped to 1..=4096.
+    let core_executor = (machine.core_threads_enabled(), machine.core_window());
+    if ready.send(Ok(core_executor)).is_err() {
         // 宿主已放弃会话（channel 关闭），不必继续跑机器。
         // The host dropped the session (channel closed); do not keep stepping.
         return;
     }
-
     let started = Instant::now();
     let mut window = RateWindow::new(started);
     let mut stats = PlayStats::default();

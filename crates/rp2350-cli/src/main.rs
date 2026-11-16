@@ -265,15 +265,18 @@ enum Commands {
         #[arg(long)]
         strict_decode: bool,
 
-        /// Run core0/core1 on host threads (`on`/`off`, default off)
-        /// 在宿主线程上运行 core0/core1（`on`/`off`，默认关闭）
+        /// Run core0/core1 on host threads (`on`/`off`, default off, or the
+        /// profile's `core_threads`)
+        /// 在宿主线程上运行 core0/core1（`on`/`off`，默认关闭，或取 profile 的
+        /// `core_threads`）
         #[arg(long, value_name = "on|off", value_parser = run::parse_core_threads)]
         core_threads: Option<bool>,
 
-        /// Machine steps between cross-core synchronisations (default 64)
-        /// 跨核同步之间的机器步数（默认 64）
-        #[arg(long, value_name = "N", default_value_t = 64, value_parser = run::parse_core_window)]
-        core_window: u32,
+        /// Machine steps between cross-core synchronisations (default 64, or the
+        /// profile's `core_window`)
+        /// 跨核同步之间的机器步数（默认 64，或 profile 的 `core_window`）
+        #[arg(long, value_name = "N", value_parser = run::parse_core_window)]
+        core_window: Option<u32>,
 
         /// PSRAM window behind XIP chip select 1: bytes or K/M (`8M`, `8192K`)
         /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
@@ -478,10 +481,8 @@ fn main() {
                 strict_decode,
                 max_cycles,
                 trace_steps,
-                core_threads: run::CoreThreadOptions {
-                    enabled: core_threads.unwrap_or(false),
-                    window: core_window,
-                },
+                core_threads,
+                core_window,
                 psram,
             };
             finish(play::run(&args), "play failed / 播放失败");
@@ -813,6 +814,43 @@ mod tests {
             parse(&["run", "--file", "fw.uf2", "--core-window", "4097"]).is_err(),
             "over-large window is rejected"
         );
+    }
+
+    #[test]
+    fn play_parses_the_core_thread_switches() {
+        // `play` 的 `--core-window` 没有 clap 默认值：未给出时由 profile 决定，
+        // 仍未给出才落到 64。窗口范围与 `run` 共用同一个校验器。
+        // `play`'s `--core-window` has no clap default: the profile decides when the
+        // flag is absent, and 64 is the last resort. The range check is shared with
+        // `run`.
+        let cli =
+            parse(&["play", "--core-threads", "on", "--core-window", "32"]).expect("parse play");
+        let Commands::Play {
+            core_threads,
+            core_window,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the play subcommand");
+        };
+        assert_eq!(core_threads, Some(true));
+        assert_eq!(core_window, Some(32));
+
+        let cli = parse(&["play"]).expect("parse bare play");
+        let Commands::Play {
+            core_threads,
+            core_window,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the play subcommand");
+        };
+        assert_eq!(core_threads, None);
+        assert_eq!(core_window, None);
+
+        assert!(parse(&["play", "--core-threads", "maybe"]).is_err());
+        assert!(parse(&["play", "--core-window", "0"]).is_err());
+        assert!(parse(&["play", "--core-window", "4097"]).is_err());
     }
 
     #[test]

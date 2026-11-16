@@ -42,6 +42,15 @@ pub const DEFAULT_MAX_CYCLES: u64 = u64::MAX;
 /// 第一帧默认打印的 `[trace]` 步数
 pub const DEFAULT_TRACE_STEPS: usize = 0;
 
+/// Default number of machine steps between cross-core synchronisations
+/// 跨核同步之间的默认机器步数
+///
+/// Matches `run`/`repl`'s `--core-window` default. A profile or the command line
+/// overrides it; `0` and values above 4096 are rejected.
+/// 与 `run`/`repl` 的 `--core-window` 默认值一致。profile 或命令行可覆盖；`0`
+/// 与大于 4096 的值会被拒绝。
+pub const DEFAULT_CORE_WINDOW: u32 = 64;
+
 /// Raw `play` arguments as parsed from the command line
 /// 从命令行解析出的原始 `play` 参数
 ///
@@ -83,8 +92,12 @@ pub struct PlayArgs {
     pub max_cycles: Option<u64>,
     /// Leading `[trace]` steps / 开头的 `[trace]` 步数
     pub trace_steps: Option<usize>,
-    /// Optional two-thread core executor / 可选双核线程执行器
-    pub core_threads: CoreThreadOptions,
+    /// Two-thread core executor switch from the command line (`None` = profile)
+    /// 命令行给出的双核线程开关（`None` 表示取 profile 值）
+    pub core_threads: Option<bool>,
+    /// Cross-core window from the command line (`None` = profile)
+    /// 命令行给出的跨核窗口（`None` 表示取 profile 值）
+    pub core_window: Option<u32>,
     /// PSRAM window behind XIP chip select 1 / XIP 片选 1 后的 PSRAM 窗口
     pub psram: Option<PsramOptions>,
 }
@@ -147,6 +160,21 @@ pub fn resolve(args: &PlayArgs) -> Result<PlayOptions, String> {
     if steps_per_frame == 0 {
         return Err("steps per frame must be greater than zero / 每帧步数必须大于 0".to_owned());
     }
+    // 跨核窗口按 `--core-window` 的同一范围校验：命令行已由 clap 校验，profile
+    // 也在解析时校验，这里兜住直接构造 `PlayArgs` 的调用方。
+    // The cross-core window uses the same range as `--core-window`: clap checks
+    // the command line and the profile parser checks the file, so this guards
+    // callers that build `PlayArgs` directly.
+    let core_window = args
+        .core_window
+        .or(profile.core_window)
+        .unwrap_or(DEFAULT_CORE_WINDOW);
+    if !(1..=4096).contains(&core_window) {
+        return Err(format!(
+            "bad core window {core_window} (expected 1..=4096) / \
+             核窗口大小非法，应为 1..=4096"
+        ));
+    }
     Ok(PlayOptions {
         file,
         frame,
@@ -167,7 +195,15 @@ pub fn resolve(args: &PlayArgs) -> Result<PlayOptions, String> {
         // No PSRAM by default: `0x1100_0000` keeps reporting NoDevice exactly as
         // it did before this option existed.
         psram: args.psram.or(profile.psram),
-        core_threads: args.core_threads,
+        // 核执行器：命令行 > profile > 默认（off / 64）。默认 off 保持确定性，
+        // on 是交互提速模式，窗口内访问顺序由宿主调度决定。
+        // Core executor: command line > profile > default (off / 64). The default
+        // off stays deterministic; on is the interactive mode whose intra-window
+        // access order is decided by the host scheduler.
+        core_threads: CoreThreadOptions {
+            enabled: args.core_threads.or(profile.core_threads).unwrap_or(false),
+            window: core_window,
+        },
     })
 }
 

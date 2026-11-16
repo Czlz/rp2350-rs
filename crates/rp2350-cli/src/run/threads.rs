@@ -312,9 +312,17 @@ impl Machine {
                 .saturating_add(ADVANCE_INTERVAL)
                 .saturating_sub(self.steps)
                 .max(1);
+            // 宿主输入的下一个轮询步号同样是窗口硬边界：窗口绝不跨过它，否则
+            // 按键/停止采样点会与串行路径不同。
+            // The next host-input poll step is a hard window boundary too: a window
+            // never crosses it, so mask/stop sampling matches the serial path.
+            let until_poll = self.host_input.as_ref().map_or(u64::MAX, |input| {
+                input.next.saturating_sub(self.steps).max(1)
+            });
             let chunk = (end - self.steps)
                 .min(until_time)
                 .min(u64::from(self.core_window.max(1)))
+                .min(until_poll)
                 .max(1);
             let base = self.steps;
             let iteration = std::time::Instant::now();
@@ -354,6 +362,19 @@ impl Machine {
                 report0.state == CpuState::Sleeping && report1.state == CpuState::Sleeping,
                 report0.retired > 0 || report1.retired > 0,
             );
+            // 窗口结束时两个工作线程都在等下一 phase，外设此刻无并发访问，因此
+            // 可以安全地把按键掩码写到 pad 并检查停止请求。宿主停止不锁存 halt。
+            // Both workers wait for the next phase at the window end, so no
+            // peripheral is accessed concurrently: it is safe to drive the pads from
+            // the mask and check the stop request. A host stop never latches a halt.
+            if self
+                .host_input
+                .as_ref()
+                .is_some_and(|input| self.steps >= input.next)
+                && !self.poll_host_input()
+            {
+                return BatchOutcome::Halted;
+            }
             if report0.reset_requested || report1.reset_requested {
                 self.system_reset_pending = true;
             }
