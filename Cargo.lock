@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-arm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
@@ -3418,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-audio"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cpal",
  "parking_lot",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-bootrom"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rp2350-core",
  "rp2350-cpu",
@@ -3435,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3449,16 +3449,18 @@ dependencies = [
  "rp2350-gdb",
  "rp2350-mcp",
  "rp2350-periph",
+ "rp2350-plugin",
  "rp2350-riscv",
  "rp2350-usb",
  "rp2350-usb-host",
  "rp2350-virt-periph",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "rp2350-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
@@ -3471,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-cpu"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitflags 2.13.2",
  "rp2350-core",
@@ -3481,7 +3483,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-egui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "eframe",
@@ -3504,7 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-ffi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libloading",
  "log",
@@ -3513,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-gdb"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "log",
@@ -3526,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-led-plugin"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rp2350-core",
  "rp2350-plugin",
@@ -3536,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-mcp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "log",
@@ -3552,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-periph"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
@@ -3565,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-plugin"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3574,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-riscv"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rp2350-core",
  "rp2350-cpu",
@@ -3582,7 +3584,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-uart-terminal"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rp2350-core",
  "rp2350-plugin",
@@ -3592,7 +3594,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-usb"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "parking_lot",
  "rp2350-core",
@@ -3601,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-usb-host"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rp2350-core",
  "rp2350-usb",
@@ -3609,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-virt-periph"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "egui 0.37.0",
  "log",

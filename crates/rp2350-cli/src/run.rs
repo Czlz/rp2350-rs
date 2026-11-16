@@ -893,6 +893,9 @@ pub struct Machine {
     /// Number of core worker threads belonging to this machine
     /// 属于本机器的核工作线程数
     core_worker_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Virtual device plugins driven at the 64-step pump boundary, if configured
+    /// 若已配置，则在 64 步泵送边界驱动的虚拟设备插件
+    plugins: Option<plugins::PluginRuntime>,
 }
 
 impl Machine {
@@ -1044,10 +1047,10 @@ impl Machine {
             }
         };
 
-        let spin_base = core.pc();
-        let clock_generation_seen = peripherals.clock_generation();
+        let (spin_base, clock_generation_seen) = (core.pc(), peripherals.clock_generation());
         let core_threads = threads.enabled && matches!(core, CoreHandle::Arm(_)) && core1.is_some();
         Ok(Self {
+            plugins: plugin_runtime(&peripherals)?,
             bus,
             bootrom,
             core,
@@ -2454,6 +2457,53 @@ impl Machine {
         ));
     }
 
+    /// Commit one plugin epoch at the shared 64-step pump boundary
+    /// 在共享的 64 步泵送边界提交一个插件 epoch
+    ///
+    /// A no-op unless plugins were configured, so the default path only pays one
+    /// `Option` check per 64 retired steps.
+    /// 未配置插件时为空操作，因此默认路径每 64 个退役步只付一次 `Option` 判断。
+    fn pump_plugins(&mut self) {
+        if let Some(plugins) = self.plugins.as_mut() {
+            let clock = plugins::HostClock::capture(&self.peripherals);
+            plugins.drive(self.steps, clock);
+        }
+    }
+
+    /// `[plugins]` status lines of the configured device runtime
+    /// 已配置设备运行时的 `[plugins]` 状态行
+    ///
+    /// Returns an empty vector when no plugin was configured, so `run`'s output
+    /// stays byte-identical on the default path.
+    /// 未配置插件时返回空向量，因此默认路径下 `run` 的输出逐字节不变。
+    #[must_use]
+    pub fn plugin_status_lines(&mut self) -> Vec<String> {
+        self.plugins
+            .as_mut()
+            .map_or_else(Vec::new, plugins::PluginRuntime::status_lines)
+    }
+
+    /// Install a plugin runtime for tests / 测试用安装插件运行时
+    #[cfg(test)]
+    pub(crate) fn install_plugins_for_test(&mut self, plugins: plugins::PluginRuntime) {
+        self.plugins = Some(plugins);
+    }
+
+    /// Committed plugin epochs, if plugins are configured / 已提交的插件 epoch 数
+    #[cfg(test)]
+    pub(crate) fn plugin_epochs_for_test(&self) -> Option<u64> {
+        self.plugins.as_ref().map(|plugins| plugins.epochs)
+    }
+
+    /// Drive plugins with an explicit step count (test hook) / 以显式步数驱动插件
+    #[cfg(test)]
+    pub(crate) fn drive_plugins_for_test(&mut self, steps: u64) -> bool {
+        let clock = plugins::HostClock::capture(&self.peripherals);
+        self.plugins
+            .as_mut()
+            .is_some_and(|plugins| plugins.drive(steps, clock))
+    }
+
     /// Run one throttled DMA batch before interrupt delivery
     /// 在中断投递前执行一个受节流的 DMA 批次
     ///
@@ -2482,6 +2532,11 @@ impl Machine {
         // a full batch instead of locking on every step. The real elapsed steps
         // are handed to the pacing timers, so pacing follows the live clk_sys.
         self.dma_pumped = self.steps;
+        // 虚拟设备插件与 DMA/PIO/中断共用这个 64 步边界：每窗口只提交一个
+        // epoch，未配置插件时只是一次 `Option` 判断。
+        // Virtual device plugins share this 64-step boundary: one epoch per
+        // window, and an unconfigured machine pays a single `Option` check.
+        self.pump_plugins();
         // HSTX advances independently of DMA: drain the host queue every batch,
         // advance the expander by the elapsed cycles and publish its FIFO-room
         // DREQ before arbitration. A window larger than `PUMP_INTERVAL` advances
@@ -2563,6 +2618,23 @@ impl Machine {
     }
 }
 
+/// Build the plugin runtime for a freshly constructed machine
+/// 为新构造的机器建立插件运行时
+///
+/// Reads the thread-local configuration installed by
+/// [`run_with_plugins`]; `None` when plugins are not configured.
+/// 读取 [`run_with_plugins`] 安装的线程局部配置；未配置插件时为 `None`。
+///
+/// # Errors
+///
+/// Propagates plugin directory, load and wiring failures.
+/// 传播插件目录、加载与接线错误。
+fn plugin_runtime(peripherals: &BootPeripherals) -> Result<Option<plugins::PluginRuntime>> {
+    let clock = plugins::HostClock::capture(peripherals);
+    plugins::runtime_from_active(peripherals.pads(), clock)
+        .context("plugin setup failed / 插件初始化失败")
+}
+
 /// Build the bus, load firmware and execute until halt or budget exhaustion
 /// 构建总线、加载固件并执行到停机或预算耗尽
 ///
@@ -2571,6 +2643,27 @@ impl Machine {
 /// bus region cannot be registered, or when the core fails to boot.
 /// 固件无法读取、解析或加载，总线区域注册失败，或核心启动失败时返回错误。
 pub fn run(options: &RunOptions) -> Result<()> {
+    run_with_plugins(options, &plugins::PluginOptions::default())
+}
+
+/// Build the machine, execute it, and drive the configured device plugins
+/// 构建机器、执行固件并驱动已配置的设备插件
+///
+/// The plugin configuration is installed for the duration of the call (including
+/// the reboot path), so every machine built here owns its own
+/// [`plugins::PluginRuntime`]. Without an active configuration no manager is
+/// constructed and the output is identical to [`run`].
+/// 插件配置在调用期间（含重启路径）保持生效，因此这里构造的每台机器都拥有自己的
+/// [`plugins::PluginRuntime`]。未启用配置时不构造管理器，输出与 [`run`] 相同。
+///
+/// # Errors
+///
+/// Returns the same errors as [`run`] plus plugin scan/load/wiring failures.
+/// 返回与 [`run`] 相同的错误，外加插件扫描/加载/接线失败。
+pub fn run_with_plugins(
+    options: &RunOptions,
+    plugin_options: &plugins::PluginOptions,
+) -> Result<()> {
     let bytes = std::fs::read(&options.file).with_context(|| {
         format!(
             "cannot read firmware / 无法读取固件: {}",
@@ -2578,8 +2671,11 @@ pub fn run(options: &RunOptions) -> Result<()> {
         )
     })?;
 
+    plugins::install(plugin_options);
     let mut stdout = std::io::stdout();
-    reset::execute(&bytes, options, &mut stdout)?;
+    let result = reset::execute(&bytes, options, &mut stdout);
+    plugins::clear();
+    result?;
     stdout.flush()?;
     Ok(())
 }
@@ -2638,6 +2734,12 @@ fn print_post_mortem(machine: &mut Machine, stdout: &mut impl Write) -> Result<(
         if !uart.ends_with(b"\n") {
             writeln!(stdout)?;
         }
+    }
+    // 插件状态是本任务新增的宿主诊断；未配置插件时为空，输出不变。
+    // Plugin status is the new host diagnostic of this task; it is empty when
+    // no plugin was configured, so the default output is unchanged.
+    for line in machine.plugin_status_lines() {
+        writeln!(stdout, "{line}")?;
     }
     Ok(())
 }
@@ -2961,6 +3063,7 @@ mod bus;
 mod fast_forward;
 #[cfg(test)]
 mod fast_forward_tests;
+pub mod plugins;
 #[cfg(test)]
 mod psram_tests;
 mod reset;

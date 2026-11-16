@@ -31,7 +31,24 @@ py example/gba/tools/fb2png.py fb.bin fb.png 3
 py example/gba/tools/hold_stdin.py 600 | rp2350-cli.exe repl --file emerald.uf2 --stdio --max-cycles 0
 ```
 
-期望的 `run` 诊断（正常状态）：
+## 截图 / Screenshot
+
+1.2 G 步时由 `g_fb` 导出的真实游戏帧（240×160 RGB565，38 400 个像素非零、22 种颜色）：
+
+![emerald frame at 1.2 G steps](doc/emerald-frame-1.2g.png)
+
+生成命令：
+
+```bash
+rp2350-cli run --file emerald.uf2 --max-cycles 1200000000 --trace-steps 0 \
+    --dump 0x20063DF4:0x12C00:fb.bin
+py example/gba/tools/fb2png.py fb.bin emerald-frame-1.2g.png 3
+```
+
+同一次运行的诊断：`dma=28752246`、`hstx words=70514080 underruns=0`、
+`core1 state=Running`、`final PC=0x1000B3A8`。
+
+## 期望的 `run` 诊断（正常状态）
 
 ```text
 [run] dma=<millions> busy=0x0009
@@ -158,6 +175,7 @@ GUI 按键（画面获焦后生效）：
 | 文件 | 内容 |
 |------|------|
 | [doc/gba-bringup-report.md](doc/gba-bringup-report.md) | 启动验证报告：缺陷根因、修复、验收数据、已知限制 |
+| [doc/emerald-frame-1.2g.png](doc/emerald-frame-1.2g.png) | 1.2 G 步时由 `g_fb` 导出的游戏帧（README 截图） |
 | [doc/gba-frame-gamefreak.png](doc/gba-frame-gamefreak.png) | 1.2G 步时 HSTX 扫描输出的游戏帧 |
 | [tools/fb2png.py](tools/fb2png.py) | 把 `--dump` 的 RGB565 帧缓冲转成放大 PNG（仅标准库） |
 | [tools/hold_stdin.py](tools/hold_stdin.py) | 保持 `repl --stdio` 的 stdin 打开，直到固件打印日志 |

@@ -10,18 +10,19 @@
 | Item | Detail |
 |------|--------|
 | **Chip** | RP2350 (Raspberry Pi Pico 2) |
-| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU（单精度算术/比较/转换、FPCCR 惰性压栈）+ NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP 并行 SIMD/饱和指令（core1 常驻 WFE，`DualCoreM33` 脚手架已落地） |
+| **ARM** | Cortex-M33：Thumb-16/32 + FPv5-SP FPU（单精度算术/比较/转换、FPCCR 惰性压栈）+ NVIC/异常/SysTick + GPIO/DCP 协处理器 + DSP/SIMD/饱和指令；真实双核 core0+core1（SIO/PSM/每核 PPB 与中断路由） |
 | **RISC-V** | Hazard3 RV32IMAC + C（已实现，CLI `--arch riscv` 可用） |
 | **USB** | 设备控制器模型 + 主机桥 + raw REPL：真实 MicroPython UF2 → 官方 `run-perfbench.py` 全链路可跑（Arm/RISC-V 各 24/24） |
-| **PIO** | 3 blocks × 4 SMs：寄存器块 + 状态机执行（9 类指令、autopush/autopull、wrap、stall）+ 引脚/side-set/delay/CLKDIV/FIFO join + 共享句柄/IRQ 路由/主循环 tick；DMA 握手/FUNCSEL 待补 |
-| **DMA** | 16 通道模型 + 控制块 + AL 触发 + byte/half/word + RING/CHAIN_TO/DREQ/IRQ + CLI `Machine` 泵送 |
-| **HSTX** | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS 命令、宿主 drain/scanline、下溢 IRQ；完整 DVI/TMDS 时序待补 |
-| **GUI** | egui 0.37 (eframe + wgpu) — 寄存器面板 + DMA/HSTX/PIO 只读外设面板（Virtual Electronics Lab 规划中） |
-| **Debug** | GDB RSP：协议层 + TCP 服务 + CLI `gdb` 接线（R0–R15/XPSR、内存、断点、resume、`Z2` 写监视点、`target.xml`）；读/访问监视点与多核 vCont 规划中 |
-| **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权 |
-| **Plugins** | libloading + abi_stable — 目录扫描 + `DeviceManager::reload` + CLI `list-devices`/`wire`/`--reload`/`--watch`；LED 与 UART Terminal 插件已就绪 |
-| **Platform** | Windows / Linux / macOS / Web (WASM planned) |
-| **Performance** | Target 200+ MCPS (single core, release build) |
+| **PIO** | 3 blocks × 4 SMs：9 类指令、autopush/autopull、wrap、stall、FIFO join、引脚/side-set/delay/CLKDIV、共享句柄、IRQ 路由、DMA DREQ 门控、`FUNCSEL` 功能选择 |
+| **DMA** | 16 通道 + 控制块 + AL 触发 + byte/half/word + RING/CHAIN_TO/DREQ/IRQ + sniffer（CRC/XOR/SUM）+ `BUSCTRL` 性能计数器 + CLI `Machine` 泵送（64 步批量仲裁） |
+| **HSTX** | APB 控制 + AHB FIFO、8 字 FIFO/WOF、RAW/TMDS 命令、像素时钟节拍、宿主 drain/scanline、下溢 IRQ；无 TMDS 10 位编码/DVI 位时序 |
+| **GUI** | egui 0.37 (eframe + wgpu) — PlayView（画面/键盘/音频/线程开关）+ 虚拟实验室连线画布 + 寄存器/DMA/HSTX/PIO 面板 |
+| **Audio** | I2S 采样捕获（`AudioSink`/`AudioTap`）+ `rp2350-audio` 宿主后端（`cpal` 可选，null 降级） |
+| **Debug** | GDB RSP：协议层 + TCP 服务 + CLI `gdb`（R0–R15/XPSR、内存、断点、resume、`Z2`/`Z3`/`Z4` 监视点、双核 `vCont`、`target.xml`）；线程化执行器模式下不支持监视点 |
+| **MCP** | JSON-RPC 方法层 + HTTP 传输（`POST /mcp`、`GET /health`）+ CLI `mcp-serve` + Bearer 鉴权（无 TLS） |
+| **Plugins** | libloading + abi_stable — 目录扫描、热重载（`--reload`/`--watch`）、线程化执行器、`run --plugin-dir/--wire/--plugin-threads` 挂接；LED 与 UART Terminal 插件 |
+| **Platform** | Windows / Linux / macOS 原生；Web (WASM) 不属于 V1（见 `v1-scope.md`） |
+| **Performance** | 默认确定性 ≈5–8.5 M 步/秒（按工作负载窗口，见 [`performance.md`](performance.md)）；`--core-threads on` 约 1.8–2.0×（非位可复现） |
 | **Repository** | [github.com/Czlz/rp2350-rs](https://github.com/Czlz/rp2350-rs) |
 | **Live Demo** | [czlz.github.io/rp2350-rs](https://czlz.github.io/rp2350-rs/) |
 
@@ -47,12 +48,13 @@ rp2350-rs/
 │   ├── rp2350-periph/            # built-in silicon peripherals — Stage-4 boot stubs (Peripheral trait)
 │   ├── rp2350-usb/               # USB device controller model (DPRAM, endpoint handshake, IRQ14)
 │   ├── rp2350-usb-host/          # host-side bridge: enumeration, CDC, raw REPL, perfbench
+│   ├── rp2350-audio/             # host audio backend (cpal optional, null fallback)
 │   ├── rp2350-virt-periph/       # Virtual Device Manager (DevicePlugin, PluginLoader, WiringTable, DeviceManager)
 │   ├── rp2350-plugin/            # plugin base trait (RpPlugin, PluginContext, PluginMetadata, ABI)
 │   ├── rp2350-ffi/               # FFI safety wrapper (SafeLibrary — libloading RAII)
 │   ├── rp2350-gdb/               # GDB RSP: protocol layer, TCP server, target adapters
-│   ├── rp2350-egui/              # egui GUI (register panels; Virtual Lab planned)
-│   ├── rp2350-cli/               # CLI: run/repl/perfbench/gdb/list-devices/wire/mcp-serve
+│   ├── rp2350-egui/              # egui GUI: PlayView, Virtual Lab canvas, peripheral panels
+│   ├── rp2350-cli/               # CLI: run / repl / play / perfbench / gdb / devices / mcp-serve
 │   └── rp2350-mcp/               # MCP Server: JSON-RPC methods + HTTP transport
 ├── plugins/                      # ★ all virtual devices as independent plugins
 │   ├── led/                      # first-party: LED
@@ -110,9 +112,13 @@ cargo doc --no-deps --document-private-items
 | Document | Description |
 |----------|-------------|
 | [architecture.md](architecture.md) | Architecture design, trait system, data flow |
+| [v1-scope.md](v1-scope.md) | V1 范围/精度声明：包含与不包含、已知近似、确定性与线程模式、验证矩阵 |
+| [images/README.md](images/README.md) | 截图资源与逐条复现命令（真实固件 REPL、GUI、游戏帧） |
 | [implementation-plan.md](implementation-plan.md) | V1 release plan (work packages + firmware gates) |
-| [handoff.md](handoff.md) | V1 scope, remaining work, acceptance commands, known limits |
 | [lessons.md](lessons.md) | Lessons learned and engineering pitfalls |
+| [playability-plan.md](playability-plan.md) | emerald 可玩性：吞吐、帧率、音频欠载与已知限制 |
+| [threading-plan.md](threading-plan.md) | 双核线程执行器设计、测量与限制 |
+| [performance.md](performance.md) | 按工作负载窗口的性能测量与优化记录 |
 | [perfbench-report.md](perfbench-report.md) | Official `run-perfbench.py` results on both MicroPython firmware images |
 | [example/](../example/README.md) | **示例项目**：GBA 等真实固件的运行说明、引脚/外设配置与验证报告（`example/<name>/doc/`）|
 | [usb-device-model.md](usb-device-model.md) | USB device controller model + host bridge design |

@@ -207,7 +207,7 @@ back out on the `RX` line at the configured baud rate.
 | `data_bits` | integer | `8` | Data bits per frame, `5..=8` / 每帧数据位 |
 | `stop_bits` | integer | `1` | Stop bits per frame, `1..=2` / 每帧停止位 |
 | `rx_line` | boolean | `true` | Idle (mark) level of the `RX` line / `RX` 空闲电平 |
-| `clock_hz` | integer | `150000000` | Cycles per second used to derive bit timing / 由周期换算位时间的时钟频率 |
+| `clock_hz` | integer | `150000000` | Sampling clock of the wired pads; `run` injects the live `clk_peri` / 接线 pad 的采样时钟，`run` 注入实时 `clk_peri` |
 
 ```jsonc
 // apply_config example / apply_config 示例
@@ -233,7 +233,10 @@ system clock.
 `bit_cycles = clock_hz / baud`。接收端在位**中心**采样（观察到起始边沿后
 1.5 · bit_cycles，之后每 `bit_cycles` 一次），一次 `tick()` 可跨过多个采样点；
 采用绝对周期可避免主机分块推进产生漂移。默认 150 MHz 时钟下 115200 波特率的
-一位为 1302 周期；调整 `clock_hz` 可匹配其它系统时钟。
+一位为 1302 周期；调整 `clock_hz` 可匹配其它系统时钟。`run` 会在构造时与每次时钟树
+世代变化后自动注入实时 `clk_peri`，因此接真实机器时无需手动设置。
+`run` injects the live `clk_peri` at construction and after every clock-tree
+generation change, so attaching to a real machine needs no manual override.
 
 A frame whose stop bit does not match the idle level is dropped and counted in
 `framing_errors`. 停止位不等于空闲电平的帧会被丢弃并计入 `framing_errors`。
@@ -511,11 +514,63 @@ libraries that fail to load are logged with `log::warn!` and skipped.
 
 > **One-shot / 一次性**：these subcommands exit immediately after printing, so
 > the devices, `SafeLibrary` handles and wiring are released at process exit.
-> There is no wiring persistence and no emulator attach yet.
+> Wiring is not persisted between invocations.
 > 这些子命令打印后立即退出，设备、`SafeLibrary` 句柄与接线在进程结束时释放；
-> 目前没有接线持久化，也不会挂接模拟器运行。
+> 接线不会在两次调用之间持久化。
 
-**B. Programmatic API / 程序化 API**
+**B. Attached to a running machine (`run`) / 挂接真实运行（`run`）**
+
+```bash
+cargo build --release -p rp2350-led-plugin -p rp2350-uart-terminal
+rp2350-cli run --file firmware.uf2 --max-cycles 20000000 \
+    --plugin-dir target/release \
+    --wire com.rp2350-rs.led:0:25 \
+    --plugin-threads
+# [plugins] devices=2 epochs=5170 threads=2 degraded=0
+# [plugins] state: {"com.rp2350-rs.led":{"on":false,...}, ...}
+```
+
+- Plugins are stepped once per 64-step pump window: epoch = `steps / 64`, and the
+  elapsed steps of the window are handed to the plugin as `cycles`.
+  每个 64 步泵送窗口步进一次：`epoch = steps / 64`，窗口内实际经过的步数作为
+  `cycles` 传入。
+- Inline mode (default) runs devices on the simulation thread; `--plugin-threads`
+  moves each device to its own worker with the fixed `DEFAULT_LATENCY_TICKS`
+  publish delay. Both modes use `DeviceManager::step_gpio`, so pin snapshots are
+  comparable; only the threaded mode is not bit-reproducible.
+  内联模式（默认）在模拟线程执行设备；`--plugin-threads` 把每个设备放到独立工作
+  线程并使用固定的 `DEFAULT_LATENCY_TICKS` 发布延迟。两种模式都走
+  `DeviceManager::step_gpio`，引脚快照可直接对照；只有线程模式非位可复现。
+- **Host clock injection / 宿主时钟注入**：when plugins are active, `run` applies
+  one universal payload to every loaded device —
+  `{"clock_hz": <clk_peri>, "sys_clock_hz": <clk_sys>}` — once at construction,
+  then again at the first 64-step pump boundary whose clock-tree generation
+  differs from the last injected one. `clock_hz` is the clock of the pads a
+  device samples (`clk_peri`, the UART/PIO peripheral clock), **not** `clk_sys`;
+  `sys_clock_hz` is informational for devices that pace work against the core
+  clock. Unknown keys are ignored, a device that rejects the payload is logged
+  via `log::warn!` and never fails the run, and an unchanged generation is never
+  resent (threaded devices pay no mailbox round trip per epoch). `[plugins]
+  clock:` reports the last injected values and the injection count.
+  启用插件时，`run` 向每个已加载设备应用同一份载荷
+  `{"clock_hz": <clk_peri>, "sys_clock_hz": <clk_sys>}`：构造时一次，之后在第一个
+  时钟树世代与上次注入不同的 64 步泵送边界再注入。`clock_hz` 是设备采样 pad 的
+  时钟（`clk_peri`，UART/PIO 外设时钟），**不是** `clk_sys`；`sys_clock_hz` 供需要
+  按核心时钟配速的设备参考。未知键被忽略，拒绝载荷的设备只经 `log::warn!` 记录、
+  绝不让 `run` 失败；世代未变绝不重发（线程化设备不会每 epoch 付一次邮箱往返）。
+  `[plugins] clock:` 报告最近注入值与注入次数。
+- Without `--plugin-dir`/`--wire` no `DeviceManager` is constructed and the
+  output is byte-identical to the pre-plugin path.
+  不传 `--plugin-dir`/`--wire` 时不构造 `DeviceManager`，输出与未接入插件前逐字节一致。
+- **Limits / 限制**：only `run` is wired today (`repl`/`play` are not), and a
+  device that keeps its own frequency model must still treat `clock_hz` as
+  `clk_peri` rather than `clk_sys`. Runtime retunes are forwarded at the next
+  pump boundary, so the first ≤64 steps after a clock write may still use the
+  previous rate. 目前只有 `run` 已接线（`repl`/`play` 未接线）；自行维护频率模型的
+  设备仍须把 `clock_hz` 当作 `clk_peri` 而不是 `clk_sys`。运行时改频在下一个泵送
+  边界转发，因此改频后的最初 ≤64 步仍可能使用旧频率。
+
+**C. Programmatic API / 程序化 API**
 
 ```rust
 let mut dm = DeviceManager::new();                       // 默认搜索路径 "plugins"

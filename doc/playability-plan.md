@@ -1,6 +1,7 @@
 # 可玩性状态 / Playability status
 
-> V1 总计划见 [`handoff.md`](handoff.md)；性能与多线程证据见
+> V1 范围与发布计划见 [`v1-scope.md`](v1-scope.md)、[`implementation-plan.md`](implementation-plan.md)；
+> 性能与多线程证据见
 > [`performance.md`](performance.md)、[`threading-plan.md`](threading-plan.md)。
 > 示例固件与引脚/按键表见 [`../example/gba/README.md`](../example/gba/README.md)。
 > 本文件只保留**当前状态与限制**，不再维护已完成任务清单。

@@ -53,28 +53,9 @@ jobs:
       - name: Doc
         run: cargo doc --no-deps --document-private-items
 
-  # ── WASM Check ──
-  wasm-check:
-    name: WASM Check
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/
-            ~/.cargo/git/
-            target/
-          key: wasm-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: wasm-cargo-
-
-      - name: Check WASM
-        run: cargo check --target wasm32-unknown-unknown --all-features
+  # ── WASM Check (out of V1 scope) ──
+  # The V1 release ships native binaries only: the GUI depends on host-only
+  # crates (tokio full / libloading / filesystem firmware loading), so the
+  # `wasm32-unknown-unknown` target is not part of the V1 matrix.
+  # V1 只发布原生产物：GUI 依赖宿主专用 crate（tokio full / libloading /
+  # 文件系统固件加载），因此 `wasm32-unknown-unknown` 不在 V1 验证矩阵内。

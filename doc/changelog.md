@@ -5,14 +5,13 @@
 
 ---
 
-## [Unreleased]
+## [1.0.0] — 2026-11-16
 
-### Changed / 变更
-- `rp2350-arm`: `check_pending_exceptions` now also honours `FAULTMASK` and `BASEPRI` (the same gate decides whether a sleep wake-up enters an interrupt); `CpuCore::step` on a sleeping core advances `SysTick`/`total_cycles` instead of returning immediately; `StepResult::Sleep` became `Sleep(SleepKind)` and `SEV`/`SEVL` report `SendEvent { local }`
-- `rp2350-riscv`: `wfi` is a real wait instead of a `NOP`; `signal_interrupt` no longer forces `CpuState::Running` (the step's own wake rule decides), and a retryable load stall never enters a guest trap
-- `rp2350-cli`: `run_steps`/`step_cores` treat `CpuState::Sleeping` as a normal, time-advancing step (only `Halted`/`Faulted`/`Reset` stop the machine), the executed-PC ring skips sleep steps, and `core1_running` includes a sleeping core 1 so it can be woken
+> V1 发布口径见 [`v1-scope.md`](v1-scope.md)：包含/不包含项、已知近似、确定性与线程模式差异。
 
 ### Added / 新增
+- `doc/images`: real-run screenshot assets + reproduction commands — Arm/RISC-V MicroPython and CircuitPython raw-REPL sessions, the Virtual Lab GUI, and the 1.2 G-step emerald frame (`example/gba/doc/emerald-frame-1.2g.png`); README now opens with a showcase section built from these captures.
+- `rp2350-cli`: plugin host wiring for `run` — `--plugin-dir`, repeatable `--wire DEVICE:PORT:GPIO` and `--plugin-threads`; devices are driven once per 64-step pump window (`epoch = steps / 64`, elapsed steps passed as `cycles`), inline on the simulation thread or on per-device workers with the fixed publish latency, and `[plugins] devices=… epochs=… threads=…` plus the MCP state JSON are printed at exit. The host also injects one universal `{"clock_hz": <clk_peri>, "sys_clock_hz": <clk_sys>}` payload at construction and again whenever the clock-tree generation changes, so `uart-terminal` decodes at the live peripheral rate (48 MHz on the stock MicroPython image instead of its 150 MHz default). Without plugin flags no `DeviceManager` is built and the historical output is byte-identical; `Drop` reclaims worker threads on every exit and error path; 12 tests (driver/epoch/thread shutdown + clock injection with recording/rejecting mocks), incl. a 30-epoch inline/threaded pin-by-pin comparison and a 30× parallel run.
 - `rp2350-core` / `rp2350-periph` / `rp2350-arm` / `rp2350-riscv` / `rp2350-cli`: GAP-07 sleep semantics — `BusErrorKind::Stall` + `CoreError::is_stall()` + `MemoryRegion::read_would_stall`/`MmioDevice::stall_on_read32` (default "never stalls"), `SIO_FIFO_RD` blocking reads with datasheet `FIFO_ST` `VLD`/`RDY`/`WOF`/`ROE` + write-one-to-clear and a per-core `SIO_IRQ_FIFO = VLD|WOF|ROE`, an `Sio::event_generation()` counter, real `WFI`/`WFE`/`SEV`/`SEVL` with an event register and exception-event sources, blocked-load replay without guest-visible exceptions, `Machine` sleep scheduling (`[run] sleep core0 steps=… wakes=… core1 steps=… wakes=…` plus a one-shot `[run] sleep stall` diagnostic) and `Machine::sleep_counters`/`sleep_state`; 6 core + 11 periph + 14 arm + 7 riscv + 7 CLI tests
 - `rp2350-gdb` / `rp2350-cli`: read and access watchpoints — `Z3`/`Z4` RSP packets with `T05rwatch:`/`T05awatch:` stop replies, an installable SRAM read watch in `rp2350-core` (`watch::set_read_watch`/`check_read`/`take_read_hit` behind an `AtomicBool` fast gate) and `MachineTarget` hit ordering; `qRcmd` reaches `monitor reset`/`info`/`halt`; ~30 new tests plus a real `arm-none-eabi-gdb` `rwatch`/`awatch` smoke test
 - `rp2350-periph` / `rp2350-cli`: dual-core execution — real Cortex-M33 core1 (`SIO_CPUID` per-core views, `{0,0,1,vtor,sp,entry}` launch handshake, PSM `FRCE_OFF.PROC1` reset/release, per-core PPB replay and IRQ routing), `Machine` steps both cores and reports `[run] core1 state=…`; pokeemerald's `core1_render` now runs and drives HSTX + PPU
@@ -98,6 +97,9 @@
 - `plugins/uart-terminal`: second-party UART terminal plugin — `TX` (input) is sampled at the configured baud to decode start/data/stop bits LSB-first, `RX` (output) shifts bytes out with the same bit timing; `baud`/`data_bits`/`stop_bits`/`rx_line`/`clock_hz` configuration, framing-error accounting and a state snapshot (11 tests)
 
 ### Changed / 变更
+- `rp2350-arm`: `check_pending_exceptions` now also honours `FAULTMASK` and `BASEPRI` (the same gate decides whether a sleep wake-up enters an interrupt); `CpuCore::step` on a sleeping core advances `SysTick`/`total_cycles` instead of returning immediately; `StepResult::Sleep` became `Sleep(SleepKind)` and `SEV`/`SEVL` report `SendEvent { local }`
+- `rp2350-riscv`: `wfi` is a real wait instead of a `NOP`; `signal_interrupt` no longer forces `CpuState::Running` (the step's own wake rule decides), and a retryable load stall never enters a guest trap
+- `rp2350-cli`: `run_steps`/`step_cores` treat `CpuState::Sleeping` as a normal, time-advancing step (only `Halted`/`Faulted`/`Reset` stop the machine), the executed-PC ring skips sleep steps, and `core1_running` includes a sleeping core 1 so it can be woken
 - 文档结构：**示例项目专用内容迁出主 `doc/`**。`gba-bringup-report.md` 与游戏帧截图移到 `example/gba/doc/`，示例的固件信息、运行命令、引脚表、外设/插件依赖移到 `example/gba/README.md`，帧缓冲转 PNG 工具移到 `example/gba/tools/fb2png.py`；`.trae/rules/project.md` 新增「示例项目目录（example/，强制）」规则，主 `doc/` 只保留跨示例的通用文档并用相对路径链接
 - `doc/implementation-plan.md`：P1 进度表同步 —— PIO（DMA DREQ）、DMA（`TRANS_COUNT` 重载、3 通道环）、HSTX（像素时钟节拍、`DREQ_HSTX`）、ARM ISA（`MSPLIM`/`PSPLIM`、折半/双乘/宽乘）、双核（真实 core1 执行）状态更新；验收主线增加 GBA 示例链接
 - `doc/changelog.md`：更新「Planned」列表（双核/HSTX/egui 画布/DSP/GDB 已完成，改为 PIO FUNCSEL、WFI/WFE 调度、PSRAM XIP、MCP TLS、多核 GDB `vCont`、TMDS 串行化）
@@ -105,7 +107,7 @@
 ### Fixed / 修复
 - `rp2350-periph`: TIMER interrupt registers were at the RP2040-era offsets (`0x38/0x3C/0x40/0x44` instead of `0x3C/0x40/0x44/0x48`), `INTF` was treated as write-one-to-clear instead of a force mask, alarms never auto-disarmed and there was no `TIMER1`; all four are fixed, `INTS = (INTR | INTF) & INTE` drives the four lines and `TIMER1` at `0x400B_8000` shares the microsecond timebase with independent alarms/IRQs
 - `rp2350-arm`: `enter_exception` never wrote `xPSR[8:0]` (IPSR), so `MRS IPSR` returned 0 and pico-sdk's `alarm_pool_irq_handler` selected the wrong timer/alarm and crashed with `Bus error 0x00757C08`; the exception number is now latched on entry
-- **Reverted**: the `WFI`/`WFE`/`SEV` sleep semantics from `9a6b088` (kept in history) are not in the current tree. The architecture side is implemented, but emerald's core-1 launch handshake stalls when core 0 sleeps in `multicore_fifo_pop_blocking` (the SIO FIFO read is non-blocking in the model) and the fast-forward needed to make long sleeps cheap also races the USB host bridge. Re-landing needs blocking `FIFO_RD`/FIFO-IRQ semantics first; see the Planned list.
+- **Re-landed**: the `WFI`/`WFE`/`SEV` sleep semantics reverted from `9a6b088` are implemented again in this release — blocking `SIO_FIFO_RD`, FIFO IRQ, `FIFO_ST` accounting and sleep scheduling landed first (see the GAP-07 entry above), so the core-1 launch handshake no longer stalls when core 0 sleeps. / `WFI`/`WFE`/`SEV` 睡眠语义已随阻塞 FIFO 与睡眠调度重新落地，见上方 GAP-07 条目。
 - `rp2350-periph`: SIO hardware spinlocks were missing and `SPINLOCK_ST` read `0xFFFF_FFFF` (all free, the opposite of the reset value); `SPINLOCK0..31` at `0x100 + 4n` now claim on read, release on write, share state across cores and report the real bitmap; `Sio::spinlock_state()` diagnostics, 11 tests
 - `rp2350-arm`: the exclusive monitor was a `thread_local!`, so both cores stepped on one host thread shared it and core0's `LDREX` could satisfy core1's `STREX`; the monitor now lives in `CortexM33Registers` (per core), `CLREX` (`0xF3BF_8F2F`) is implemented instead of decoding as undefined, and 9 tests cover cross-core isolation and size mismatches
 - `rp2350-core`: the non-cached XIP alias at `0x1400_0000` was unmapped, so firmware executing from the `XIP_NOCACHE_NOALLOC` window failed with `BusError::NoDevice`; it now reads the same flash bytes as the cached window
@@ -139,15 +141,15 @@
 - **FV-3 ✅（2026-11-14）**：`cargo run --release -p rp2350-cli -- repl --file adafruit-circuitpython-...uf2 --no-soft-reset --max-cycles 300000000 --exec "print(6 * 7)"` → `[repl] USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`、`[repl] banner`、`stdout: 42`（约 39.8M 步）。根因：16 位 `SXTB/SXTH/UXTB/UXTH` 误更新 APSR。
 - **FV-1 ✅（2026-11-14）**：`cargo run --release -p rp2350-cli -- repl --file RPI_PICO2-RISCV-...uf2 --exec "print(6 * 7)"` → `[repl] USB CDC configured: IN=0x82/64 OUT=0x02/64 interface=1`、`[repl] banner`、`stdout: 42`（2,659,500 步 / 17,730 µs）；`run --arch riscv --strict-decode --max-cycles 50000000` 无未定义指令。修复 Zcmp、Xh3irq 抢占/NOIRQ、CSR 窗口索引与 boot2 数据查找槽。
 
-### Planned / 计划中
-- PIO pin function select (`IO_BANK0` `GPIOx_FUNC`) so PIO/UART pins share the pad matrix
-- `WFI`/`WFE`/`SEV` sleep semantics (reverted from `9a6b088`): needs blocking `SIO_FIFO_RD`/FIFO-IRQ semantics so the core-1 launch handshake can sleep
-- HSTX TMDS serialiser and DVI bit timing; pixel-capture API for hosts
-- QSPI Flash XIP + PSRAM XIP
-- egui: wiring persistence and a device palette for the Virtual Lab
-- MCP TLS transport
-- GDB: multi-core `vCont` and target-side `monitor` extensions beyond reset/info/halt
-- `TIMER`/`TIMER1`: remaining RP2350 timer semantics beyond alarms (`PAUSE`/`DBGPAUSE`, `LOCKED`)
+### Planned / 已排期（不在 V1 范围）
+- HSTX TMDS 10 位编码与 DVI 位时序；宿主侧像素捕获 API
+- USB 全速位级时序、CRC 与位填充
+- MCP TLS 传输
+- 周期成本模型（当前 `steps == cycles`）、TrustZone/SAU、MPU 与 `MemManage`/`BusFault` 故障源
+- 存档/状态保存（`--save-state`/`--load-state`、GUI Save/Load）——V1 明确排除
+- `TIMER`/`TIMER1` 的 `PAUSE`/`DBGPAUSE`/`LOCKED` 语义
+- 实时 60 fps 游玩（在「不做 JIT」前提下不可达）
+- `SMLALxy`（`SMLALBB/BT/TB/TT`）与 `CP1-CP3`/`CP5-CP7` 协处理器建模
 
 ---
 

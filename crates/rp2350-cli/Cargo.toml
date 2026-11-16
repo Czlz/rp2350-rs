@@ -21,6 +21,7 @@ clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
 
 # Internal
 rp2350-core = { workspace = true }
@@ -35,3 +36,8 @@ rp2350-virt-periph = { workspace = true }
 rp2350-gdb = { workspace = true }
 rp2350-mcp = { workspace = true }
 rp2350-ffi = { workspace = true }
+
+[dev-dependencies]
+# 测试内的进程内 mock `DevicePlugin` 需要基础插件契约（不依赖已构建的 cdylib）。
+# In-process mock `DevicePlugin`s in tests need the base plugin contract.
+rp2350-plugin = { workspace = true }

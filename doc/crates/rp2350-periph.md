@@ -2384,14 +2384,14 @@ consuming anything when the queue is empty.
 ### Not modelled yet / 尚未建模
 
 `INTERP0/1`, the TMDS encoder (`TMDS_CTRL`/`TMDS_WDATA`/`TMDS_*POP*`),
-`PERI_NONSEC`, `RISCV_SOFTIRQ`, the RISC-V `MTIME*` block, and
-exclusive/`LDREX`/`STREX` monitors. The FIFO is 8 entries deep per direction with
-sticky `WOF`/`ROE`; the spinlocks are 32 bits wide because the RP2350 block
-exposes exactly `SPINLOCK0..31`.
+`PERI_NONSEC`, `RISCV_SOFTIRQ` and the RISC-V `MTIME*` block. The FIFO is 8
+entries deep per direction with sticky `WOF`/`ROE`; the spinlocks are 32 bits
+wide because the RP2350 block exposes exactly `SPINLOCK0..31`. The per-core
+`LDREX`/`STREX` exclusive monitor lives in `rp2350-arm`, not in SIO.
 `INTERP0/1`、TMDS 编码器（`TMDS_CTRL`/`TMDS_WDATA`/`TMDS_*POP*`）、
-`PERI_NONSEC`、`RISCV_SOFTIRQ`、RISC-V `MTIME*` 块，以及独占访问监视器均未
-建模。每方向 FIFO 深度 8，带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350
-该块只提供 `SPINLOCK0..31`。
+`PERI_NONSEC`、`RISCV_SOFTIRQ` 与 RISC-V `MTIME*` 块均未建模。每方向 FIFO
+深度 8，带粘滞 `WOF`/`ROE`；自旋锁为 32 位，因为 RP2350 该块只提供
+`SPINLOCK0..31`。每核 `LDREX`/`STREX` 独占监视器在 `rp2350-arm` 中，不在 SIO。
 
 ---
 

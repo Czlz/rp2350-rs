@@ -1,7 +1,8 @@
 # 经验教训 / Lessons learned
 
 本文件保留**仍然适用**的工程经验与踩坑记录，不再列举已解决的缺陷（那些已在 changelog 与
-crate 文档中）。下一会话请先读本文件，再读 [`handoff.md`](handoff.md)。
+crate 文档中）。下一会话请先读本文件，再读 [`implementation-plan.md`](implementation-plan.md)
+与 [`v1-scope.md`](v1-scope.md)。
 
 ## 1. 定位与语义
 

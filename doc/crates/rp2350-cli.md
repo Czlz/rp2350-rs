@@ -1920,18 +1920,19 @@ transfers happen because the machine pumps them, not because the guest writes
   旁打印 `[run] dma=… busy=…`。它只是宿主诊断：`repl --exec` 的 stdout 仍只
   承载客户机字节。
 - **Limitations / 限制**：no cycle-accurate arbitration or `HIGH_PRIORITY`
-  scheduling, no DREQ pacing-timer (`TREQ_SEL` `0x3B..=0x3E`) tick driving
-  and no HSTX DMA handshake. PIO DREQ gating is unit-granular inside a batch
-  but the batch itself is throttled to 64 steps, and PIO pin FUNCSEL routing is
-  not modelled, so a PIO+DMA stream is not cycle-exact. Every `Dma::run` unit
-  costs one bus read plus one bus write, but the instruction budget and
-  peripheral timebase only count CPU steps, so DMA traffic is not added to
-  `steps` or `time_us`.
-  不做周期精确仲裁或 `HIGH_PRIORITY` 调度，不驱动 DREQ 节拍定时器
-  （`TREQ_SEL` `0x3B..=0x3E`），也不建模 HSTX DMA 握手。PIO DREQ 门控在批次内
-  按单元生效，但批次本身按 64 步节流，且未建模 PIO 引脚的 FUNCSEL 路由，因此
-  PIO+DMA 数据流不是周期精确的。每个 `Dma::run` 单元消耗一次总线读加一次总线
-  写，但指令预算与外设时基只统计 CPU 步数，DMA 流量不计入 `steps` 或 `time_us`。
+  preemption — a batch is a 64-step round-robin, and DMA never stalls a CPU
+  access. PIO DREQ is sampled once per batch (unit-granular inside it), so a
+  PIO+DMA stream is not cycle-exact. Every `Dma::run` unit costs one bus read
+  plus one bus write, but the instruction budget and peripheral timebase only
+  count CPU steps, so DMA traffic is not added to `steps` or `time_us`.
+  Pacing timers (`TREQ_SEL` `0x3B..=0x3E`), HSTX `DREQ_HSTX`, PIO DREQ gating
+  and `IO_BANK0` FUNCSEL pad routing **are** modelled.
+  不做周期精确仲裁或 `HIGH_PRIORITY` 抢占：一个批次是 64 步轮转，DMA 也不会
+  让 CPU 访问 stall。PIO DREQ 每批采样一次（批内按单元生效），因此 PIO+DMA
+  数据流不是周期精确的。每个 `Dma::run` 单元消耗一次总线读加一次总线写，
+  但指令预算与外设时基只统计 CPU 步数，DMA 流量不计入 `steps` 或 `time_us`。
+  节拍定时器（`TREQ_SEL` `0x3B..=0x3E`）、HSTX `DREQ_HSTX`、PIO DREQ 门控与
+  `IO_BANK0` FUNCSEL 引脚路由**均已建模**。
 
 ### PIO pump / PIO 泵送
 

@@ -86,6 +86,21 @@ enum Commands {
         /// XIP 片选 1 后的 PSRAM 窗口：字节数或带 K/M 后缀（`8M`、`8192K`）
         #[arg(long, value_name = "SIZE", value_parser = run::PsramOptions::parse)]
         psram: Option<run::PsramOptions>,
+
+        /// Plugin directory scanned for virtual devices (default target/release)
+        /// 扫描虚拟设备插件的目录（默认 target/release）
+        #[arg(long = "plugin-dir", value_name = "DIR")]
+        plugin_dir: Option<PathBuf>,
+
+        /// Wire a device port to a GPIO pin: `DEVICE_ID:PORT:GPIO` (repeatable)
+        /// 将设备端口连接到 GPIO 引脚：`DEVICE_ID:PORT:GPIO`（可重复）
+        #[arg(long = "wire", value_name = "DEVICE_ID:PORT:GPIO", value_parser = run::plugins::WireSpec::parse)]
+        wire: Vec<run::plugins::WireSpec>,
+
+        /// Drive plugin devices on worker threads instead of inline
+        /// 用工作线程而非内联方式驱动插件设备
+        #[arg(long = "plugin-threads")]
+        plugin_threads: bool,
     },
 
     /// Open the USB CDC raw REPL of a booted firmware
@@ -372,6 +387,9 @@ fn main() {
             core_window,
             dump,
             psram,
+            plugin_dir,
+            wire,
+            plugin_threads,
         } => {
             let options = run::RunOptions {
                 file: file.into(),
@@ -387,7 +405,15 @@ fn main() {
                 psram,
                 dumps: dump,
             };
-            finish(run::run(&options), "run failed / 运行失败");
+            let plugin_options = run::plugins::PluginOptions {
+                plugin_dir,
+                wires: wire,
+                threads: plugin_threads,
+            };
+            finish(
+                run::run_with_plugins(&options, &plugin_options),
+                "run failed / 运行失败",
+            );
         }
         Commands::Repl {
             file,

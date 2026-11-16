@@ -1,4 +1,4 @@
-name: Release & Deploy
+name: Release
 
 on:
   push:
@@ -56,7 +56,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/rp2350${{ matrix.ext }} dist/
+          # Workspace binaries: CLI (headless) + GUI.
+          # 工作区二进制：CLI（无界面）与 GUI。
+          cp target/${{ matrix.target }}/release/rp2350-cli${{ matrix.ext }} dist/
+          cp target/${{ matrix.target }}/release/rp2350-egui${{ matrix.ext }} dist/
+          # First-party virtual device plugins ship next to the binaries so
+          # `--plugin-dir dist` works out of the box.
+          # 第一方虚拟设备插件与二进制同目录分发，`--plugin-dir dist` 即可使用。
+          cp target/${{ matrix.target }}/release/*led_plugin* dist/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/*uart_terminal* dist/ 2>/dev/null || true
+          ls -l dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -64,56 +73,17 @@ jobs:
           name: rp2350-rs-${{ matrix.target }}
           path: dist/
 
-  # ── WASM Build & Deploy to GitHub Pages ──
-  release-wasm:
-    name: WASM Build & GitHub Pages
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install trunk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: trunk
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/
-            ~/.cargo/git/
-            target/
-          key: wasm-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: wasm-release-
-
-      - name: Build WASM
-        run: trunk build --release
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rp2350-rs-wasm
-          path: dist/
-
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
-          cname: ""
+  # ── WASM Build & Deploy (out of V1 scope) ──
+  # Not part of V1: the GUI links host-only crates and the repository has no
+  # web entry point (`index.html`/`Trunk.toml`). Native artifacts only.
+  # 不属于 V1：GUI 链接宿主专用 crate，仓库也没有 web 入口
+  # （`index.html`/`Trunk.toml`）；只发布原生产物。
 
   # ── GitHub Release (on tag) ──
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [release-native, release-wasm]
+    needs: [release-native]
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
@@ -124,11 +94,19 @@ jobs:
         with:
           path: dist/
 
-      - name: Generate changelog
+      - name: Generate release notes
         id: changelog
         run: |
-          echo "## Changes" > CHANGES.md
-          git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo HEAD^)..HEAD >> CHANGES.md
+          {
+            echo "# rp2350-rs ${GITHUB_REF_NAME}"
+            echo
+            echo "V1 scope, precision statement and known limits are included below;"
+            echo "the same statement ships in \`doc/v1-scope.md\`."
+            echo
+            sed -n '/^## \[[0-9]/,$p' doc/changelog.md
+            echo
+            cat doc/v1-scope.md
+          } > CHANGES.md
           echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
           cat CHANGES.md >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
