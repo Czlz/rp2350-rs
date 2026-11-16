@@ -1,12 +1,13 @@
 //! PIO clock-divider behaviour tests / PIO 时钟分频行为测试
 //!
-//! Every host tick is one `clk_sys` cycle, so `SMx_CLKDIV` divides the system
-//! clock. These tests cover the two properties the timing model must have:
-//! the fractional divisor gates machine cycles, and writing `CLKDIV` restarts
-//! the divider so the new value takes effect on the next clock edge.
-//! 每个宿主 tick 是一个 `clk_sys` 周期，因此 `SMx_CLKDIV` 分频的是系统时钟。
-//! 这些测试覆盖时序模型的两个性质：小数分频正确门控机器周期，以及写入
-//! `CLKDIV` 会重启分频器，使新值在下一个时钟边沿生效。
+//! Every host tick argument is a `clk_sys` cycle, so `SMx_CLKDIV` divides the
+//! system clock. These tests cover the properties the timing model must have:
+//! the fractional divisor gates machine cycles without losing its remainder,
+//! writing `CLKDIV` changes the period immediately while keeping the phase, and
+//! `CTRL.CLKDIV_RESTART` is what discards the partial period.
+//! 宿主 tick 的参数是 `clk_sys` 周期，因此 `SMx_CLKDIV` 分频的是系统时钟。
+//! 这些测试覆盖时序模型必须满足的性质：小数分频正确门控机器周期且不丢余数、
+//! 写 `CLKDIV` 立即改变周期但保留相位、`CTRL.CLKDIV_RESTART` 才丢弃当前周期。
 
 use super::Pio;
 use super::regs::*;
@@ -45,7 +46,7 @@ fn a_fractional_divider_gates_machine_cycles() {
 }
 
 #[test]
-fn writing_clkdiv_restarts_the_divider_immediately() {
+fn writing_clkdiv_keeps_the_phase_and_uses_the_new_period_at_once() {
     let mut pio = rig();
     // 先走到 4.0 分频的第三拍（相位 768 / 1024），尚未退休。
     // Advance to the third edge of a 4.0 divider (phase 768 / 1024).
@@ -53,15 +54,25 @@ fn writing_clkdiv_restarts_the_divider_immediately() {
     assert!(!pio.step_sm(0));
     assert!(!pio.step_sm(0));
     assert!(!pio.step_sm(0));
-    // 改成 1.0：分频器立即重启，下一拍就退休，而不是补完旧相位。
-    // Change to 1.0: the divider restarts, so the next edge retires instead of
-    // finishing the old phase.
+    // 改成 1.0：新周期立即生效，下一拍就退休；相位余数不丢。
+    // Change to 1.0: the new period applies at once, so the next edge retires
+    // and the fractional remainder is not lost.
     assert!(pio.write32(SM0_CLKDIV, 1 << 16));
     assert!(pio.step_sm(0));
-    // 再改回 4.0 同样立即生效：第一拍不退休。
-    // Changing back to 4.0 is immediate too: the first edge does not retire.
+    // 再改回 4.0：从 0 重新累计，前三拍不退休。
+    // Changing back to 4.0 starts from phase 0: the first three edges do not
+    // retire.
     assert!(pio.write32(SM0_CLKDIV, 4 << 16));
     assert!(!pio.step_sm(0));
+    assert!(!pio.step_sm(0));
+    assert!(!pio.step_sm(0));
+    // 只有 `CTRL.CLKDIV_RESTART` 会丢弃当前周期。
+    // Only `CTRL.CLKDIV_RESTART` discards the current period.
+    assert!(pio.write32(CTRL, SM0_ENABLE | CLKDIV_RESTART));
+    assert!(!pio.step_sm(0), "the restart discards the partial period");
+    assert!(!pio.step_sm(0));
+    assert!(!pio.step_sm(0));
+    assert!(pio.step_sm(0), "a full period after the restart retires");
 }
 
 #[test]

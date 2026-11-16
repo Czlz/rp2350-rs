@@ -63,6 +63,10 @@ pub(super) const CLKDIV_MASK: u32 = 0xFFFF_FF00;
 /// `SMx_CLKDIV` reset value / `SMx_CLKDIV` 复位值
 pub(super) const CLKDIV_RESET: u32 = 0x0001_0000;
 
+/// One whole `clk_sys` cycle in `CLKDIV` fractional units (1/256)
+/// 一个完整 `clk_sys` 周期在 `CLKDIV` 小数单位（1/256）中的值
+pub(super) const CLKDIV_UNIT: u32 = 256;
+
 /// `SMx_EXECCTRL` writable mask; bit 31 (`EXEC_STALLED`) is read-only
 /// `SMx_EXECCTRL` 可写掩码；位 31（`EXEC_STALLED`）为只读
 pub(super) const EXECCTRL_WRITE_MASK: u32 = 0x7FFF_FFFF;
@@ -301,6 +305,17 @@ pub(super) struct StateMachine {
     pub(super) pending_irq_wait: Option<u8>,
     /// `CLKDIV` phase accumulator in 1/256 clock units / `CLKDIV` 相位累加器（1/256 时钟单位）
     pub(super) clock_phase: u32,
+    /// PIO clock edges this machine has been clocked with / 本状态机已收到的 PIO 时钟边沿数
+    ///
+    /// Counts clocked edges (including delay cycles and stalled retries), not
+    /// retired instructions. Host diagnostic only.
+    /// 统计真正时钟化的边沿（含延迟周期与阻塞重试），不是退休指令数；仅作宿主诊断。
+    pub(super) machine_cycles: u64,
+    /// Instructions retired by this machine / 本状态机已退休的指令数
+    ///
+    /// Injected `SMx_INSTR` executions are not counted: they bypass the clock.
+    /// 注入的 `SMx_INSTR` 执行不计入，因为它们绕过时钟。
+    pub(super) instructions_retired: u64,
     /// Delay cycles still to burn before the next instruction / 下条指令前的剩余延迟周期
     pub(super) delay_cycles: u8,
     /// TX FIFO / TX FIFO
@@ -328,6 +343,8 @@ impl StateMachine {
             osr_bits: 0,
             pending_irq_wait: None,
             clock_phase: 0,
+            machine_cycles: 0,
+            instructions_retired: 0,
             delay_cycles: 0,
             tx: Fifo::with_capacity(FIFO_DEPTH),
             rx: Fifo::with_capacity(FIFO_DEPTH),
@@ -338,10 +355,10 @@ impl StateMachine {
     /// 应用 `CTRL.SM_RESTART` 脉冲：复位 PC、移位计数与阻塞状态
     ///
     /// FIFO contents are preserved, as required by the datasheet. A restart also
-    /// resets the clock-divider phase and the remaining delay, as the hardware
-    /// restarts the machine's clock.
-    /// 按数据手册要求保留 FIFO 内容。重启同时复位分频器相位与剩余延迟，对应硬件
-    /// 重启状态机时钟的行为。
+    /// resets the clock-divider phase and the remaining delay, matching the SDK
+    /// contract that `pio_sm_restart` clears the divider counter.
+    /// 按数据手册要求保留 FIFO 内容。重启同时复位分频器相位与剩余延迟，对应 SDK
+    /// 文档中 `pio_sm_restart` 清除分频计数器的约定。
     pub(super) fn restart(&mut self) {
         self.pc = 0;
         self.isr = 0;
@@ -349,9 +366,19 @@ impl StateMachine {
         self.isr_bits = 0;
         self.osr_bits = 0;
         self.pending_irq_wait = None;
-        self.clock_phase = 0;
+        self.restart_divider();
         self.delay_cycles = 0;
         self.execctrl &= !EXECCTRL_EXEC_STALLED;
+    }
+
+    /// Restart the clock divider from phase 0 / 从相位 0 重启时钟分频器
+    ///
+    /// This is the hardware `CTRL.CLKDIV_RESTART` action: the current divider
+    /// period is discarded and the next machine cycle needs a full period.
+    /// 这是硬件 `CTRL.CLKDIV_RESTART` 的语义：丢弃当前分频周期，下一个机器周期
+    /// 需要等满一个完整周期。
+    pub(super) fn restart_divider(&mut self) {
+        self.clock_phase = 0;
     }
 
     /// `SHIFTCTRL.PUSH_THRESH`, where 0 encodes 32 / `SHIFTCTRL.PUSH_THRESH`，0 表示 32
@@ -522,20 +549,36 @@ impl StateMachine {
         (self.clkdiv >> 16) * 256 + ((self.clkdiv >> 8) & 0xFF)
     }
 
-    /// Advance the clock-divider phase, returning `true` when a machine cycle is due
-    /// 推进分频相位；本周期应产生一个机器周期时返回 `true`
+    /// Advance the free-running clock divider by one `clk_sys` cycle
+    /// 推进自由运行的分频器一个 `clk_sys` 周期
     ///
-    /// The datasheet encodes a divisor of `INT + FRAC/256` in 16.8 fixed point.
-    /// Divisors of 1.0 or below (including the invalid `INT = 0` case) tick on
-    /// every PIO clock so the model never deadlocks on a zero divisor.
-    /// 数据手册用 16.8 定点数表示 `INT + FRAC/256` 的分频比。分频比 ≤ 1.0（含非法的
-    /// `INT = 0`）时每个 PIO 时钟都推进，避免零分频让模型死锁。
-    pub(super) fn clock_tick(&mut self) -> bool {
+    /// Returns `true` when this cycle produces a machine cycle (an SM clock
+    /// edge). The datasheet encodes the divisor as `INT + FRAC/256` in 16.8
+    /// fixed point; the phase accumulator keeps the remaining 1/256 units, so
+    /// the long-run instruction rate is exactly `clk_sys / (INT + FRAC/256)`
+    /// with no per-batch truncation. Divisors of 1.0 or below (including the
+    /// invalid `INT = 0` case) clock every cycle so the model never deadlocks.
+    /// 本周期产生机器周期（状态机时钟边沿）时返回 `true`。数据手册用 16.8 定点数
+    /// 表示 `INT + FRAC/256`；相位累加器保留 1/256 单位的余数，因此长期指令速率
+    /// 精确等于 `clk_sys / (INT + FRAC/256)`，不会按批次截断。分频比 ≤ 1.0（含
+    /// 非法的 `INT = 0`）时每周期都推进，避免零分频让模型死锁。
+    ///
+    /// The divider free-runs: it keeps advancing while the state machine is
+    /// disabled, exactly like the hardware divider, so re-enabling a machine
+    /// does not restart the phase. Use [`StateMachine::restart_divider`] for
+    /// `CTRL.CLKDIV_RESTART` or [`StateMachine::restart`] for `SM_RESTART`.
+    /// 分频器自由运行：状态机被禁用期间仍继续推进（与硬件一致），因此重新使能
+    /// 不会重启相位。`CTRL.CLKDIV_RESTART` 用 [`StateMachine::restart_divider`]，
+    /// `SM_RESTART` 用 [`StateMachine::restart`]。
+    pub(super) fn advance_divider(&mut self) -> bool {
         let divisor = self.clkdiv_units();
-        if divisor <= 256 {
+        if divisor <= CLKDIV_UNIT {
+            // 分频比 ≤ 1：每周期一个机器周期，累加器无余数可保留。
+            // Divisor ≤ 1: one machine cycle per cycle, no remainder to keep.
+            self.clock_phase = 0;
             return true;
         }
-        self.clock_phase += 256;
+        self.clock_phase += CLKDIV_UNIT;
         if self.clock_phase < divisor {
             return false;
         }

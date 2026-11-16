@@ -33,7 +33,10 @@ impl Pio {
     pub fn rx_fifo_empty(&self, sm: usize) -> Option<bool>;
     pub fn rx_fifo_full(&self, sm: usize) -> Option<bool>;
     pub fn step_sm(&mut self, sm: usize) -> bool;
-    pub fn tick(&mut self, cycles: u64);
+    pub fn tick(&mut self, clk_sys_cycles: u64);
+    pub fn clk_sys_cycles(&self) -> u64;
+    pub fn machine_cycles(&self, sm: usize) -> Option<u64>;
+    pub fn instructions_retired(&self, sm: usize) -> Option<u64>;
     pub fn set_input_levels(&mut self, levels: u32);
     pub fn input_levels(&self) -> u32;
     pub fn set_input_level(&mut self, pin: u8, high: bool);
@@ -51,7 +54,10 @@ impl SharedPio {
     pub fn device(&self) -> Box<dyn MmioDevice>;
     pub fn with<R>(&self, f: impl FnOnce(&Pio) -> R) -> R;
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Pio) -> R) -> R;
-    pub fn tick(&self, cycles: u64);
+    pub fn tick(&self, clk_sys_cycles: u64);
+    pub fn clk_sys_cycles(&self) -> u64;
+    pub fn machine_cycles(&self, sm: usize) -> Option<u64>;
+    pub fn instructions_retired(&self, sm: usize) -> Option<u64>;
     pub fn sync_irqs(&self);
     pub fn irq_flags(&self) -> u32;
     pub fn enabled_mask(&self) -> u8;
@@ -126,21 +132,94 @@ inside `tick`, `IRQ_FORCE` writes, `IRQ` write-one-to-clear writes, and every
 `with_mut` 调用，因此清标志与释放线是同一次操作。直接使用 `Pio`（单元测试、
 独立挂载）没有中断路由；只有 `SharedPio` 会驱动共享 `IrqAssert`。
 
-### Tick semantics / tick 语义
+### Tick semantics and the clock model / tick 语义与时钟模型
 
-`SharedPio::tick(cycles)` models `cycles` PIO clock cycles and matches
-`Pio::tick`: each cycle gives every enabled machine one clock edge, `CLKDIV`
-gates the machine cycle, and a pending instruction delay is burned before the
-next fetch. The host decides the cycle budget; `rp2350-cli` hands one PIO cycle
-per retired guest instruction (see `doc/crates/rp2350-cli.md`). `Pio::tick`
-takes `&mut self` for standalone use, while the shared handle takes `&self`
-because the register file lives behind the mutex.
+`SharedPio::tick(clk_sys_cycles)` models elapsed **`clk_sys` cycles**, not PIO
+clock cycles, and matches `Pio::tick`. Each machine's `SMx_CLKDIV` divider turns
+`CLKDIV_INT + CLKDIV_FRAC/256` of those cycles into one PIO instruction cycle
+(a machine cycle), so the instruction rate is exactly `clk_sys / CLKDIV` and a
+32-bit word program that spends `N` instructions per word produces
+`clk_sys / (CLKDIV · N)` words per second. The argument is not a batch count:
+`rp2350-cli` hands `pump_pio_batch` the retired guest steps since the previous
+batch, which are `clk_sys` cycles in the CPU model (one retired instruction =
+one cycle, see below), so a 64-step batch advances 64 `clk_sys` cycles.
 
-`SharedPio::tick(cycles)` 建模 `cycles` 个 PIO 时钟周期，语义与 `Pio::tick`
-一致：每个周期给每台已使能状态机一个时钟边沿，`CLKDIV` 决定是否产生机器周期，
-待处理指令延迟在下次取指前消耗。周期预算由宿主决定；`rp2350-cli` 按每条退役的
-客户机指令给出一个 PIO 周期（见 `doc/crates/rp2350-cli.md`）。独立使用时
-`Pio::tick` 取 `&mut self`，共享句柄取 `&self`，因为寄存器文件位于互斥锁之后。
+`SharedPio::tick(clk_sys_cycles)` 建模经过的 **`clk_sys` 周期数**，不是 PIO 时钟
+周期数，语义与 `Pio::tick` 一致。每台状态机的 `SMx_CLKDIV` 分频器把这些周期中的
+`CLKDIV_INT + CLKDIV_FRAC/256` 个换成一个 PIO 指令周期（机器周期），因此指令速率
+精确等于 `clk_sys / CLKDIV`；一个每字消耗 `N` 条指令的 32 位字程序每秒产生
+`clk_sys / (CLKDIV · N)` 个字。参数不是批次计数：`rp2350-cli` 把上一批以来退役的
+客户机步数交给 `pump_pio_batch`，在 CPU 模型里就是 `clk_sys` 周期（一条退休指令 =
+一个周期，见下文），因此 64 步的批次推进 64 个 `clk_sys` 周期。
+
+| Property / 性质 | Rule / 规则 |
+|-----------------|-------------|
+| Instruction period / 指令周期 | `CLKDIV_INT + CLKDIV_FRAC/256` `clk_sys` cycles, 16.8 fixed point / `clk_sys` 周期，16.8 定点 |
+| Fractional remainder / 小数余数 | Kept in a per-machine accumulator in 1/256 units; batches never truncate it / 每机 1/256 单位累加器保留，批次不截断 |
+| Delay cycles / 延迟周期 | Burned as machine cycles *after* the divider, so a delay `D` costs `(1 + D)·CLKDIV` `clk_sys` / 在分频之后按机器周期消耗，延迟 `D` 占 `(1 + D)·CLKDIV` 个 `clk_sys` |
+| `CLKDIV` write / 写入 | Takes effect on the next `clk_sys` edge and **keeps** the phase accumulator (fractional remainder survives) / 下一个 `clk_sys` 边沿生效，且**保留**相位累加器（小数余数不丢） |
+| `CTRL.CLKDIV_RESTART` | Discards the current divider period; the next machine cycle needs a full period / 丢弃当前分频周期，下一个机器周期需等满一个周期 |
+| `CTRL.SM_RESTART` | Resets PC/shift counters/delay/stall and the divider phase (SDK contract) / 复位 PC、移位计数、延迟、阻塞状态与分频相位（SDK 约定） |
+| `SM_ENABLE` 0/1 | The divider free-runs while disabled; only an enabled machine executes. Enabling does **not** restart the phase — use `CLKDIV_RESTART` (the SDK's `pio_enable_sm_mask_in_sync`). A block with no enabled machine is not ticked by the shared handle's fast path, so its phase stays where the last accounted cycle left it / 禁用时分频器自由运行，只有使能机器执行指令；使能**不**重启相位，需要同步时用 `CLKDIV_RESTART`（SDK 的 `pio_enable_sm_mask_in_sync`）；块内没有任何使能机器时共享句柄走快速路径、不推进，相位停在上一次计入的周期 |
+| Divisor ≤ 1 / 分频 ≤ 1 | One machine cycle per `clk_sys` cycle; the invalid `INT = 0` case cannot deadlock the model / 每个 `clk_sys` 周期一个机器周期；非法的 `INT = 0` 不会让模型死锁 |
+| Host batch granularity / 宿主批次粒度 | A batch of `E` `clk_sys` cycles is delivered exactly once; no cycle is skipped or duplicated. The CLI batches every 64 steps / 一批 `E` 个 `clk_sys` 周期一次性交付，不跳过也不重复；CLI 每 64 步一批 |
+
+`clk_sys_cycles()`, `machine_cycles(sm)` and `instructions_retired(sm)` expose
+the measurements used by the timing tests: the long-run instruction count must
+be `clk_sys_cycles / CLKDIV` (within one machine cycle), and
+`instructions_retired / machine_cycles` is the measured divider ratio.
+`clk_sys_cycles()` 等接口暴露计时测试使用的量：长期指令数必须等于
+`clk_sys_cycles / CLKDIV`（误差 ≤ 一个机器周期），
+`instructions_retired / machine_cycles` 是实测分频比。
+
+Guest `CTRL`/`CLKDIV` writes take effect at the next **pump boundary** (the CLI
+pumps every 64 steps), so an enable or divider change can be observed up to
+`PUMP_INTERVAL` = 64 `clk_sys` cycles late; the whole preceding batch is never
+lost or duplicated at the boundary. Per-instruction register visibility (MMIO
+reads/writes) is unchanged.
+客户机对 `CTRL`/`CLKDIV` 的写入在下一个**泵送边界**生效（CLI 每 64 步泵送一次），
+因此使能或改分频最多晚 `PUMP_INTERVAL` = 64 个 `clk_sys` 周期被观察到；批次边界
+不会丢失或复制整批周期。逐指令的寄存器可见性（MMIO 读写）不变。
+
+#### Relation to the CPU cycle model / 与 CPU 周期模型的关系
+
+The CPU cores still account one retired instruction as one `clk_sys` cycle
+(`steps == cycles`), so the CLI's step count is the PIO `clk_sys` budget. That
+approximation is unchanged by this model and is documented in
+[`doc/performance.md`](../performance.md). PIO timing is **not** derived from
+retired-instruction counts inside the block: the block only consumes `clk_sys`
+cycles and divides them by `CLKDIV`.
+CPU 核仍按「一条退休指令 = 一个 `clk_sys` 周期」记账（`steps == cycles`），因此
+CLI 的步数就是 PIO 的 `clk_sys` 预算。该近似未因本模型改变，见
+[`doc/performance.md`](../performance.md)。PIO 计时**不**依赖块内的退休指令计数：
+块只消费 `clk_sys` 周期并按 `CLKDIV` 分频。
+
+#### Known timing vector / 已知计时向量
+
+A 32-bit serializer needs 64 PIO instructions per word (two `out` instructions
+per bit). At `clk_sys = 252 MHz` and a 13440 Hz word rate the firmware divisor
+is `252e6 / (13440 · 64) = 292.96875` (`INT = 292`, `FRAC = 248`,
+`SMx_CLKDIV = 0x0124_F800`). The tests in `pio/timing_tests.rs` run that exact
+vector: 1/128 s (1 968 750 `clk_sys` cycles) must retire 105 words, i.e.
+13440 words/s. The emerald guest reaches the same number: a 100 M-step window
+at 252 MHz advances PIO2 by exactly 100 000 000 `clk_sys` cycles and retires
+341 333 instructions (100 M / 292.96875), producing 5 334 words
+(13 441.7 words/s, 63.99 instructions/word).
+一个 32 位串行器每字需要 64 条 PIO 指令（每比特两条 `out`）。`clk_sys = 252 MHz`、
+13440 Hz 字速率时固件分频值为 `252e6 / (13440 · 64) = 292.96875`
+（`INT = 292`、`FRAC = 248`、`SMx_CLKDIV = 0x0124_F800`）。
+`pio/timing_tests.rs` 使用同一向量：1/128 秒（1 968 750 个 `clk_sys` 周期）必须
+产出 105 个字，即 13440 字/秒。emerald 客户机数据一致：252 MHz 下 1 亿步窗口让
+PIO2 正好推进 100 000 000 个 `clk_sys` 周期、退休 341 333 条指令
+（100 M / 292.96875），产出 5 334 个字（13 441.7 字/秒，63.99 指令/字）。
+
+> Wall-clock audio production is a different number: at ~15–25 M host steps/s the
+> guest runs ~6–10 % of real time, so the same stream yields only ~300–1000
+> words per wall-clock second. That is a host-throughput limit, not a PIO clock
+> error; see [`doc/performance.md`](../performance.md).
+> 墙钟音频产出是另一个量：宿主约 15–25 M 步/秒时客户机只跑到实时的 6–10 %，
+> 同一条流每秒只产出约 300–1000 个字。这是宿主吞吐限制，不是 PIO 时钟错误；
+> 见 [`doc/performance.md`](../performance.md)。
 
 ### Pin model / 引脚模型
 
@@ -335,42 +414,47 @@ FIFO；`Dma::busy_selects_dreq(first, last)` 是选择该粒度的探测接口�
 ### State-machine execution / 状态机执行
 
 `step_sm(sm)` advances one machine by exactly one PIO clock edge. Every edge
-first advances that machine's `CLKDIV` phase accumulator (1.0 or faster ticks
-every cycle), then burns one pending instruction-delay cycle if present. Only
-when both gates pass does the machine emit side-set and execute one
-instruction; `true` means an instruction retired, `false` means the edge was
-gated or spent on a delay. `step_sm` ignores `CTRL.SM_ENABLE` so tests can
-drive a single machine; `tick(cycles)` applies the same edge to every enabled
-machine.
+first advances that machine's free-running `CLKDIV` phase accumulator (1.0 or
+faster ticks every cycle), then burns one pending instruction-delay cycle if
+present. Only when both gates pass does the machine emit side-set and execute
+one instruction; `true` means an instruction retired, `false` means the edge was
+gated or spent on a delay. `step_sm` ignores `CTRL.SM_ENABLE` so tests can drive
+a single machine; `tick(clk_sys_cycles)` advances every machine's divider and
+executes the enabled ones.
 
 Delay cycles come from the bits of the delay/side-set field that are not
 allocated to side-set (`5 - SIDESET_COUNT`, or all five bits when
 `SIDESET_COUNT = 0`). After an instruction retires, its delay is burned before
 the next fetch, so an instruction with delay `N` occupies `N + 1` machine
-cycles.
+cycles, i.e. `(N + 1) · CLKDIV` `clk_sys` cycles.
 
-`step_sm(sm)` 让单台状态机推进恰好一个 PIO 时钟边沿。每个边沿先推进该机的
-`CLKDIV` 相位累加器（1.0 或更快时每个周期都推进），再在存在剩余延迟时消耗一个
+`step_sm(sm)` 让单台状态机推进恰好一个 PIO 时钟边沿。每个边沿先推进该机自由运行
+的 `CLKDIV` 相位累加器（1.0 或更快时每个周期都推进），再在存在剩余延迟时消耗一个
 延迟周期。两道门都通过后才会输出 side-set 并执行一条指令；返回 `true` 表示指令
 退休，返回 `false` 表示本边沿被分频拦住或用于消耗延迟。`step_sm` 忽略
-`CTRL.SM_ENABLE` 以便测试单台状态机；`tick(cycles)` 对每台已启用状态机施加同样
-的边沿。
+`CTRL.SM_ENABLE` 以便测试单台状态机；`tick(clk_sys_cycles)` 推进每台机器的分频器
+并只执行已使能的机器。
 
 延迟周期来自共享延迟/side-set 字段中未分配给 side-set 的位（`5 - SIDESET_COUNT`，
 `SIDESET_COUNT = 0` 时为全部 5 位）。指令退休后先消耗其延迟再取下一条，因此带
-延迟 `N` 的指令占用 `N + 1` 个机器周期。
+延迟 `N` 的指令占用 `N + 1` 个机器周期，即 `(N + 1) · CLKDIV` 个 `clk_sys`。
 
 `CLKDIV` is interpreted as `INT + FRAC/256` (16.8 fixed point). The model keeps
-a per-machine phase accumulator in 1/256 clock units and emits a machine cycle
-whenever it wraps. The reset value `0x0001_0000` is 1.0, so one PIO clock equals
-one instruction by default; `0x0002_0000` halves the rate and `0x0001_8000`
-gives 1.5. A divisor of 1.0 or below — including the invalid `INT = 0` — ticks
-every cycle so a zero divisor cannot deadlock the model.
+a per-machine phase accumulator in 1/256 `clk_sys` units and emits a machine
+cycle whenever it reaches the divisor, subtracting the divisor and therefore
+keeping the remainder. The reset value `0x0001_0000` is 1.0, so one `clk_sys`
+cycle equals one instruction by default; `0x0002_0000` halves the rate and
+`0x0001_8000` gives 1.5. A divisor of 1.0 or below — including the invalid
+`INT = 0` — ticks every cycle so a zero divisor cannot deadlock the model. A
+`CLKDIV` write changes the period at the next edge without resetting the
+accumulator; `CTRL.CLKDIV_RESTART` resets it.
 
-`CLKDIV` 按 `INT + FRAC/256`（16.8 定点）解释。模型为每台状态机维护 1/256 时钟
-单位的相位累加器，回绕时产生一个机器周期。复位值 `0x0001_0000` 为 1.0，因此
-默认一个 PIO 时钟对应一条指令；`0x0002_0000` 减半，`0x0001_8000` 为 1.5。
-分频比 ≤ 1.0（含非法的 `INT = 0`）时每周期都推进，避免零分频让模型死锁。
+`CLKDIV` 按 `INT + FRAC/256`（16.8 定点）解释。模型为每台状态机维护 1/256
+`clk_sys` 单位的相位累加器，达到分频值时产生一个机器周期并减去分频值，因此余数
+自然保留。复位值 `0x0001_0000` 为 1.0，因此默认一个 `clk_sys` 周期对应一条指令；
+`0x0002_0000` 减半，`0x0001_8000` 为 1.5。分频比 ≤ 1.0（含非法的 `INT = 0`）时
+每周期都推进，避免零分频让模型死锁。写 `CLKDIV` 在下一个边沿改变周期且不重置
+累加器；`CTRL.CLKDIV_RESTART` 才会重置相位。
 
 Side-set occupies the top `SIDESET_COUNT` bits of the shared field and is
 emitted at the start of the instruction to `SIDESET_BASE..`; with
@@ -1964,7 +2048,7 @@ consumers in the mounted machine share it:
 | TIMER0/1 | `clk_ref / TICK` | 1 µs counter, same µs at 150/252 MHz / 1 µs 计数 |
 | `SYST_CSR.CLKSOURCE=1` | `clk_sys` | countdown in processor cycles / 处理器周期 |
 | `SYST_CSR.CLKSOURCE=0` | `clk_ref / 2` | countdown in reference cycles / 参考周期 |
-| PIO state machines | `clk_sys / CLKDIV` | integer+fractional 16.8 divider, write restarts it / 16.8 分频，写即重启 |
+| PIO state machines | `clk_sys / CLKDIV` | 16.8 integer+fractional divider; `tick` counts `clk_sys` cycles, the phase keeps its remainder, `CLKDIV_RESTART` restarts it / 16.8 整数+小数分频；`tick` 按 `clk_sys` 周期计，相位保留余数，`CLKDIV_RESTART` 重启 |
 | HSTX pixels | `CLK_HSTX / CSR.CLKDIV` | `ceil(CLKDIV·clk_sys/clk_hstx)` cycles/pixel / 每像素周期 |
 | UART0 baud | `clk_peri` | `baud = clk_peri·4/(64·IBRD+FBRD)` |
 | ADC conversion | `clk_adc` | 96 `clk_adc` cycles → `ceil(96·clk_sys/clk_adc)` CPU cycles |

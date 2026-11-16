@@ -129,23 +129,54 @@ impl Pio {
         machine.step(instr, &mut bus)
     }
 
-    /// Advance every enabled state machine by `cycles` PIO clock cycles
-    /// 让所有已启用的状态机推进 `cycles` 个 PIO 时钟周期
+    /// Advance every state machine by `clk_sys_cycles` system-clock cycles
+    /// 让所有状态机推进 `clk_sys_cycles` 个系统时钟周期
     ///
-    /// Each cycle gives every enabled machine one clock edge. The machine's
-    /// `CLKDIV` accumulator decides whether it emits a machine cycle, and a
-    /// machine cycle first burns any pending instruction delay before fetching
-    /// one instruction. With the reset `CLKDIV` of 1.0 this stays one
-    /// instruction per cycle and machine.
-    /// 每个周期给所有已启用状态机一个时钟边沿。状态机的 `CLKDIV` 累加器决定是否
-    /// 产生机器周期，机器周期会先消耗待处理的指令延迟再取一条指令。复位值
-    /// `CLKDIV = 1.0` 下仍是每周期每状态机一条指令。
-    pub fn tick(&mut self, cycles: u64) {
-        for _ in 0..cycles {
-            for index in 0..SM_COUNT {
-                if self.enabled & (1 << index) != 0 {
-                    self.step_sm(index);
+    /// The argument is measured in `clk_sys` cycles, exactly like the retired
+    /// step count the CLI hands in (one retired instruction is one `clk_sys`
+    /// cycle in the CPU model). It is **not** a PIO clock count: each machine's
+    /// `CLKDIV` accumulator turns `INT + FRAC/256` of these cycles into one PIO
+    /// instruction, so the instruction rate is `clk_sys / CLKDIV`. Every
+    /// machine's divider free-runs (also while the machine is disabled); only
+    /// machines with `CTRL.SM_ENABLE` set execute. The phase accumulator keeps
+    /// its fractional remainder across batches, so no clock is lost or invented
+    /// at a batch boundary.
+    /// 参数以 `clk_sys` 周期计，与 CLI 交入的退休步数相同（CPU 模型中一条退休
+    /// 指令 = 一个 `clk_sys` 周期）。它**不是** PIO 时钟数：每台状态机的 `CLKDIV`
+    /// 累加器把这些周期中的 `INT + FRAC/256` 个换成一个 PIO 指令周期，因此指令速率
+    /// 为 `clk_sys / CLKDIV`。所有机器的分频器都自由运行（禁用期间也推进），只有
+    /// `CTRL.SM_ENABLE` 置位的机器执行指令。相位累加器跨批次保留小数余数，批次
+    /// 边界不会丢失或凭空产生时钟。
+    pub fn tick(&mut self, clk_sys_cycles: u64) {
+        self.clk_sys_cycles = self.clk_sys_cycles.saturating_add(clk_sys_cycles);
+        let Pio {
+            sm,
+            imem,
+            enabled,
+            irq,
+            fdebug,
+            input_levels,
+            output_levels,
+            output_enables,
+            ..
+        } = self;
+        for _ in 0..clk_sys_cycles {
+            for (index, machine) in sm.iter_mut().enumerate() {
+                // 分频器自由运行，禁用期间也推进；只有使能位真正执行指令。
+                // The divider free-runs even while disabled; only an enabled
+                // machine executes.
+                if !machine.advance_divider() || *enabled & (1 << index) == 0 {
+                    continue;
                 }
+                let instr = imem[usize::from(machine.pc)];
+                let mut bus = SmBus {
+                    irq: &mut *irq,
+                    fdebug: &mut *fdebug,
+                    input: *input_levels,
+                    output: &mut *output_levels,
+                    output_enable: &mut *output_enables,
+                };
+                machine.exec_clocked(instr, &mut bus);
             }
         }
     }
@@ -196,9 +227,22 @@ impl StateMachine {
     /// clock divider gated this machine or a delay cycle was burned.
     /// 边沿未退休指令时返回 `false`：要么被分频器拦住，要么消耗了一个延迟周期。
     pub(super) fn step(&mut self, instr: u16, bus: &mut SmBus<'_>) -> bool {
-        if !self.clock_tick() {
+        if !self.advance_divider() {
             return false;
         }
+        self.exec_clocked(instr, bus)
+    }
+
+    /// Execute one machine cycle that the clock divider has already granted
+    /// 执行一个分频器已经放行的机器周期
+    ///
+    /// The caller advances the divider first, so no `clk_sys` cycle is counted
+    /// twice. Pending instruction delay is burned before the next fetch; a
+    /// stalled instruction is retried on the next machine cycle.
+    /// 调用方先推进分频器，因此同一个 `clk_sys` 周期不会被重复计数。指令延迟在下次
+    /// 取指前消耗；阻塞的指令在下一个机器周期重试。
+    pub(super) fn exec_clocked(&mut self, instr: u16, bus: &mut SmBus<'_>) -> bool {
+        self.machine_cycles = self.machine_cycles.saturating_add(1);
         if self.delay_cycles > 0 {
             self.delay_cycles -= 1;
             return false;
@@ -213,12 +257,14 @@ impl StateMachine {
                 self.execctrl &= !EXECCTRL_EXEC_STALLED;
                 self.pc = self.next_pc();
                 self.delay_cycles = delay;
+                self.instructions_retired = self.instructions_retired.saturating_add(1);
                 true
             }
             Exec::Branch(target) => {
                 self.execctrl &= !EXECCTRL_EXEC_STALLED;
                 self.pc = target & 0x1F;
                 self.delay_cycles = delay;
+                self.instructions_retired = self.instructions_retired.saturating_add(1);
                 true
             }
         }

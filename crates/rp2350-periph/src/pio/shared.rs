@@ -173,28 +173,34 @@ impl SharedPio {
         result
     }
 
-    /// Advance every enabled state machine by `cycles` PIO clock cycles
-    /// 让所有已启用状态机推进 `cycles` 个 PIO 时钟周期
+    /// Advance every state machine by `clk_sys_cycles` system-clock cycles
+    /// 让所有状态机推进 `clk_sys_cycles` 个系统时钟周期
     ///
-    /// One PIO clock cycle is modelled per caller-supplied cycle; the API
-    /// matches [`Pio::tick`]. The routed input vector is resampled from the
-    /// shared pads before the batch and the driven outputs are published after
-    /// it, so `IO_BANK0.FUNCSEL` routing is applied once per host tick at batch
-    /// granularity. A block with `CTRL.SM_ENABLE = 0` returns after one
-    /// uncontended lock and does no per-machine work, and the interrupt lines
-    /// are only republished when the `IRQ` flags actually changed.
-    /// 每个调用方给出的周期对应一个 PIO 时钟周期，语义与 [`Pio::tick`] 一致。批次
-    /// 开始前从共享 pad 重采样路由输入，结束后发布驱动输出，因此
+    /// The argument is the number of `clk_sys` cycles that elapsed, *not* a PIO
+    /// clock count: each machine's `CLKDIV` divider turns
+    /// `INT + FRAC/256` of these cycles into one PIO instruction, so the
+    /// instruction rate is `clk_sys / CLKDIV` and the fractional remainder is
+    /// carried across batches. This is the same contract as [`Pio::tick`]. The
+    /// routed input vector is resampled from the shared pads before the batch
+    /// and the driven outputs are published after it, so `IO_BANK0.FUNCSEL`
+    /// routing is applied once per host tick at batch granularity. A block with
+    /// `CTRL.SM_ENABLE = 0` returns after one uncontended lock and does no
+    /// per-machine work, and the interrupt lines are only republished when the
+    /// `IRQ` flags actually changed.
+    /// 参数是经过的 `clk_sys` 周期数，**不是** PIO 时钟数：每台状态机的 `CLKDIV`
+    /// 分频器把这些周期中的 `INT + FRAC/256` 个换成一个 PIO 指令周期，因此指令
+    /// 速率为 `clk_sys / CLKDIV`，小数余数跨批次保留。语义与 [`Pio::tick`] 相同。
+    /// 批次开始前从共享 pad 重采样路由输入，结束后发布驱动输出，因此
     /// `IO_BANK0.FUNCSEL` 路由按宿主 tick 以批次粒度生效。`CTRL.SM_ENABLE = 0`
     /// 的块在一次无竞争加锁后即返回、不做任何状态机工作；只有 `IRQ` 标志真正变化
     /// 时才重新发布中断线。
-    pub fn tick(&self, cycles: u64) {
+    pub fn tick(&self, clk_sys_cycles: u64) {
         let mut pio = self.inner.lock();
         if pio.enabled == 0 {
             return;
         }
         pio.sample_inputs();
-        pio.tick(cycles);
+        pio.tick(clk_sys_cycles);
         pio.publish_outputs();
         publish(&self.irq, self.index, pio.irq);
     }
@@ -295,6 +301,32 @@ impl SharedPio {
     #[must_use]
     pub fn output_enables(&self) -> u32 {
         self.inner.lock().output_enables
+    }
+
+    /// `clk_sys` cycles handed to this block by [`SharedPio::tick`]
+    /// 通过 [`SharedPio::tick`] 交给本块的 `clk_sys` 周期数
+    #[must_use]
+    pub fn clk_sys_cycles(&self) -> u64 {
+        self.inner.lock().clk_sys_cycles()
+    }
+
+    /// PIO clock edges state machine `sm` has been clocked with
+    /// 状态机 `sm` 已收到的 PIO 时钟边沿数
+    ///
+    /// Returns `None` for `sm >= 4`; see [`Pio::machine_cycles`].
+    /// `sm >= 4` 时返回 `None`；详见 [`Pio::machine_cycles`]。
+    #[must_use]
+    pub fn machine_cycles(&self, sm: usize) -> Option<u64> {
+        self.inner.lock().machine_cycles(sm)
+    }
+
+    /// Instructions retired by state machine `sm` / 状态机 `sm` 已退休的指令数
+    ///
+    /// Returns `None` for `sm >= 4`; see [`Pio::instructions_retired`].
+    /// `sm >= 4` 时返回 `None`；详见 [`Pio::instructions_retired`]。
+    #[must_use]
+    pub fn instructions_retired(&self, sm: usize) -> Option<u64> {
+        self.inner.lock().instructions_retired(sm)
     }
 }
 

@@ -13,15 +13,17 @@ use super::regs::*;
 use super::*;
 
 #[test]
-fn xor_alias_updates_clkdiv_and_restarts_the_clock() {
+fn xor_alias_updates_clkdiv_and_keeps_the_divider_phase() {
     let mut pio = Pio::new(2);
     let clkdiv = SM0_CLKDIV + SM_STRIDE;
     assert!(pio.write32(clkdiv, 0x0001_0000));
     pio.sm[1].clock_phase = 7;
-    // `pio_sm_clkdiv_restart` uses hw_xor_bits on SMx_CLKDIV (alias +0x1000).
+    // 原子别名做读-改-写；`SMx_CLKDIV` 没有重启位，相位累加器照常保留。
+    // The atomic alias read-modify-writes; `SMx_CLKDIV` has no restart bit, so
+    // the phase accumulator keeps running.
     assert!(pio.write32(clkdiv + 0x1000, 0x8000_0000));
-    assert_eq!(pio.read32(clkdiv), Some(0x0001_0000));
-    assert_eq!(pio.sm[1].clock_phase, 0);
+    assert_eq!(pio.read32(clkdiv), Some(0x8001_0000));
+    assert_eq!(pio.sm[1].clock_phase, 7);
 }
 
 #[test]

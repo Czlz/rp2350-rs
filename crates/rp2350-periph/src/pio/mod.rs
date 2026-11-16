@@ -49,6 +49,8 @@ mod sm;
 mod sm_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timing_tests;
 
 use rp2350_core::mmio::{MmioDevice, MmioWindow};
 
@@ -72,9 +74,6 @@ pub const PIO_BLOCKS: usize = 3;
 /// PIO 寄存器窗口（含 SET/CLR/XOR 原子别名，共 16 KB）
 pub(super) const PIO_WINDOW_SIZE: usize = 0x4000;
 
-/// `SMx_CLKDIV` clock-restart stroke / `SMx_CLKDIV` 时钟重启脉冲位
-const CLKDIV_RESTART_BIT: u32 = 1 << 31;
-
 /// Number of state machines in one PIO block / 一个 PIO 块中的状态机数量
 pub const PIO_SM_COUNT: usize = regs::SM_COUNT;
 
@@ -89,7 +88,8 @@ pub const PIO_SM_COUNT: usize = regs::SM_COUNT;
 /// register files behind a shared handle.
 /// 该块通过 [`MmioDevice`] 暴露通用寄存器、指令存储与四个状态机寄存器窗口。
 /// 写 `SMx_INSTR` 会立即执行一条指令，`SMx_ADDR` 报告当前程序计数器。调用
-/// [`Pio::tick`]（或 [`Pio::step_sm`]）可按“每次一条指令”的方式驱动状态机。
+/// [`Pio::tick`]（按经过的 `clk_sys` 周期分频推进）或 [`Pio::step_sm`]（单台
+/// 状态机一个 PIO 时钟边沿）可驱动状态机。
 /// 需要在挂载到总线的同时继续驱动它的宿主应使用 [`SharedPio`]，它用共享句柄
 /// 持有其中一个寄存器文件。
 #[derive(Debug)]
@@ -127,6 +127,8 @@ pub struct Pio {
     /// `OUT PINDIRS`/`SET PINDIRS`/side-set 驱动的输出使能
     output_enables: u32,
     imem: [u16; IMEM_WORDS],
+    /// Total `clk_sys` cycles handed to this block by the host / 宿主交给本块的 `clk_sys` 周期总数
+    clk_sys_cycles: u64,
     sm: [StateMachine; SM_COUNT],
 }
 
@@ -154,6 +156,7 @@ impl Pio {
             output_levels: 0,
             output_enables: 0,
             imem: [0; IMEM_WORDS],
+            clk_sys_cycles: 0,
             sm: core::array::from_fn(|slot| StateMachine::new(slot as u8)),
         }
     }
@@ -265,15 +268,17 @@ impl Pio {
     fn write_sm(&mut self, index: usize, register: u32, value: u32) -> bool {
         match register {
             SM_CLKDIV => {
-                // Bit 31 is a self-clearing clock-restart stroke, not storage.
-                // Writing the divider itself also restarts the fractional
-                // accumulator, so a new CLKDIV takes effect on the next PIO
-                // clock edge instead of finishing the old period.
-                // 位 31 是自清零的时钟重启脉冲，不属于存储值。写入分频值本身也会
-                // 重启小数累加器，因此新的 CLKDIV 在下一个 PIO 时钟边沿立即生效，
-                // 而不是先走完旧周期。
-                self.sm[index].clock_phase = 0;
-                self.sm[index].clkdiv = value & CLKDIV_MASK & !CLKDIV_RESTART_BIT;
+                // `SMx_CLKDIV` is a plain 16.8 fixed-point divider
+                // (`INT` bits 31:16, `FRAC` bits 15:8); it has no restart bit.
+                // A write changes the period immediately but keeps the phase
+                // accumulator, so the fractional remainder of the running
+                // period is not lost. `CTRL.CLKDIV_RESTART` is the documented
+                // way to restart the phase.
+                // `SMx_CLKDIV` 是普通的 16.8 定点分频器（`INT` 位 31:16、
+                // `FRAC` 位 15:8），没有重启位。写入立即改变周期，但保留相位
+                // 累加器，因此运行中周期的分数余数不会丢失。重启相位应使用
+                // `CTRL.CLKDIV_RESTART`。
+                self.sm[index].clkdiv = value & CLKDIV_MASK;
             }
             SM_EXECCTRL => {
                 // EXEC_STALLED 为只读状态位，不受写入影响。
@@ -534,6 +539,41 @@ impl Pio {
     pub fn output_enables(&self) -> u32 {
         self.output_enables
     }
+
+    /// `clk_sys` cycles this block has been advanced with / 本块已推进的 `clk_sys` 周期数
+    ///
+    /// Counts the argument of every [`Pio::tick`] call. Dividing a state
+    /// machine's [`Pio::instructions_retired`] by this counter yields the
+    /// measured instruction rate, which should match
+    /// `1 / (CLKDIV_INT + CLKDIV_FRAC/256)`.
+    /// 统计每次 [`Pio::tick`] 的参数。用它除状态机的
+    /// [`Pio::instructions_retired`]，就得到实测指令速率，应等于
+    /// `1 / (CLKDIV_INT + CLKDIV_FRAC/256)`。
+    #[must_use]
+    pub fn clk_sys_cycles(&self) -> u64 {
+        self.clk_sys_cycles
+    }
+
+    /// PIO clock edges state machine `sm` has been clocked with
+    /// 状态机 `sm` 已收到的 PIO 时钟边沿数
+    ///
+    /// Includes edges spent on instruction delay and on stalled retries.
+    /// Returns `None` for `sm >= 4`.
+    /// 包含消耗在指令延迟与阻塞重试上的边沿。`sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn machine_cycles(&self, sm: usize) -> Option<u64> {
+        self.sm.get(sm).map(|machine| machine.machine_cycles)
+    }
+
+    /// Instructions retired by state machine `sm` / 状态机 `sm` 已退休的指令数
+    ///
+    /// Excludes `SMx_INSTR` injections, which bypass the clock. Returns `None`
+    /// for `sm >= 4`.
+    /// 不含绕过时钟的 `SMx_INSTR` 注入。`sm >= 4` 时返回 `None`。
+    #[must_use]
+    pub fn instructions_retired(&self, sm: usize) -> Option<u64> {
+        self.sm.get(sm).map(|machine| machine.instructions_retired)
+    }
 }
 
 impl MmioDevice for Pio {
@@ -619,7 +659,7 @@ impl MmioDevice for Pio {
                         self.sm[index].restart();
                     }
                     if value & (CLKDIV_RESTART << index) != 0 {
-                        self.sm[index].clock_phase = 0;
+                        self.sm[index].restart_divider();
                     }
                 }
                 true
