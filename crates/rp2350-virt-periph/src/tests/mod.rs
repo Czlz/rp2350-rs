@@ -84,16 +84,13 @@ pub(crate) fn build_fixture(tag: &str, body: &str) -> Option<PathBuf> {
 /// 断言每个接线条目都指向真实存在且同名的设备端口
 pub(crate) fn assert_wiring_consistent(manager: &crate::DeviceManager) {
     for entry in manager.wiring().all() {
-        let Some(plugin) = manager
-            .devices()
-            .find_map(|(id, plugin)| (id == &entry.device_id).then_some(plugin))
-        else {
+        let Some(ports) = manager.ports_of(&entry.device_id) else {
             panic!(
                 "wiring references missing device {} / 接线引用了不存在的设备",
                 entry.device_id
             );
         };
-        let Some(port) = plugin.ports().get(entry.port_index) else {
+        let Some(port) = ports.get(entry.port_index) else {
             panic!(
                 "device {} has no port {} / 设备 {} 没有端口 {}",
                 entry.device_id, entry.port_index, entry.device_id, entry.port_index
@@ -106,5 +103,8 @@ pub(crate) fn assert_wiring_consistent(manager: &crate::DeviceManager) {
     }
 }
 
+mod executor;
+mod executor_faults;
+mod fixtures;
 mod loader;
 mod reload;

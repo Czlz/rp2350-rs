@@ -15,14 +15,16 @@
     clippy::module_name_repetitions
 )]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rp2350_core::gpio::GpioPin;
 use rp2350_plugin::PluginContext;
 
-use super::device::DevicePlugin;
+use super::device::{DevicePlugin, DevicePort};
 use super::error::{ConfigError, DeviceError};
+use super::executor::{ExecutorConfig, PinSnapshot, PublishSchedule};
+use super::executor_device::DeviceHost;
 use super::loader::{LoadedPlugin, PluginLoader};
 use super::reload::{Fingerprint, scan_with_fingerprints};
 use super::wiring::WiringTable;
@@ -36,20 +38,44 @@ pub type DeviceId = String;
 /// during a hot reload. 对 crate 内可见，使 [`super::reload`] 模块能在热重载时
 /// 增删实例。
 pub(crate) struct ManagedDevice {
-    /// The device plugin / 设备插件
-    pub(crate) plugin: Box<dyn DevicePlugin>,
+    /// The device plugin host (inline or worker thread) / 设备插件宿主
+    pub(crate) host: DeviceHost,
     /// Source path if loaded from disk / 从磁盘加载时的源路径
     pub(crate) source_path: Option<PathBuf>,
     /// Library backing a dynamically loaded plugin / 动态加载插件背后的库
     ///
-    /// Declared after `plugin` so the plugin (and its vtable) drops first.
+    /// Declared after `host` so the plugin (and its vtable) drops first.
     /// Only kept alive for RAII: it is never read, dropping it unloads the DLL.
-    /// 声明在 `plugin` 之后，确保插件（及其 vtable）先于库被释放。
+    /// 声明在 `host` 之后，确保插件（及其 vtable）先于库被释放。
     /// 仅用于 RAII：不会被读取，释放它即卸载 DLL。
     #[allow(dead_code)]
     pub(crate) library: Option<rp2350_ffi::SafeLibrary>,
     /// Fingerprint recorded when the library was loaded / 加载库时记录的指纹
     pub(crate) fingerprint: Option<Fingerprint>,
+}
+
+impl ManagedDevice {
+    /// Build a managed device, threading it when `executor` is configured
+    /// 构造受管设备；`executor` 已配置时使用工作线程
+    pub(crate) fn new(
+        id: &DeviceId,
+        plugin: Box<dyn DevicePlugin>,
+        source_path: Option<PathBuf>,
+        library: Option<rp2350_ffi::SafeLibrary>,
+        fingerprint: Option<Fingerprint>,
+        executor: Option<ExecutorConfig>,
+    ) -> Self {
+        let host = match executor {
+            Some(config) => DeviceHost::threaded(id.clone(), plugin, Vec::new(), config),
+            None => DeviceHost::inline(plugin),
+        };
+        Self {
+            host,
+            source_path,
+            library,
+            fingerprint,
+        }
+    }
 }
 
 /// Error returned by [`DeviceManager::apply_config`]
@@ -63,19 +89,37 @@ pub enum ConfigApplyError {
     /// The plugin rejected the configuration / 插件拒绝了该配置
     #[error(transparent)]
     Invalid(#[from] ConfigError),
+
+    /// The plugin worker failed or is latched high-Z
+    /// 插件工作线程失败或已锁定为高阻
+    #[error(transparent)]
+    Executor(#[from] crate::executor::ExecutorError),
 }
 
 /// Device manager — the central hub for all virtual peripheral plugins
 /// 设备管理器 — 所有虚拟外设插件的中央枢纽
 pub struct DeviceManager {
     /// All registered devices keyed by ID / 所有已注册设备（按 ID 索引）
-    pub(crate) devices: HashMap<DeviceId, ManagedDevice>,
+    ///
+    /// `BTreeMap` keeps iteration deterministic (ID order), which the stepped
+    /// path relies on for reproducible output ordering.
+    /// `BTreeMap` 使迭代顺序确定（按 ID），步进路径依赖它获得可复现的输出顺序。
+    pub(crate) devices: BTreeMap<DeviceId, ManagedDevice>,
     /// Wiring table mapping (device, port) ↔ GPIO pin
     /// 接线表映射 (设备, 端口) ↔ GPIO 引脚
     pub(crate) wiring: WiringTable,
     /// Plugin loader for dynamic library scanning
     /// 用于动态库扫描的插件加载器
     pub(crate) loader: PluginLoader,
+    /// Executor configuration; `None` keeps the synchronous default
+    /// 执行器配置；`None` 保持同步默认路径
+    pub(crate) executor: Option<ExecutorConfig>,
+    /// Fixed-latency publish queue of the stepped path / 步进路径的固定延迟发布队列
+    pub(crate) schedule: PublishSchedule,
+    /// Last epoch accepted by [`DeviceManager::step`] / 步进接受的最后 epoch
+    pub(crate) last_step_epoch: Option<u64>,
+    /// Pins driven by at least one device output / 至少被一个设备输出驱动的引脚
+    pub(crate) driven_pins: PinSnapshot,
 }
 
 impl DeviceManager {
@@ -83,9 +127,13 @@ impl DeviceManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            devices: HashMap::new(),
+            devices: BTreeMap::new(),
             wiring: WiringTable::new(),
             loader: PluginLoader::default(),
+            executor: None,
+            schedule: PublishSchedule::new(super::executor::DEFAULT_LATENCY_TICKS),
+            last_step_epoch: None,
+            driven_pins: PinSnapshot::empty(),
         }
     }
 
@@ -100,14 +148,10 @@ impl DeviceManager {
             return Err(DeviceError::AlreadyExists(id));
         }
         self.devices.insert(
-            id,
-            ManagedDevice {
-                plugin: device,
-                source_path: None,
-                library: None,
-                fingerprint: None,
-            },
+            id.clone(),
+            ManagedDevice::new(&id, device, None, None, None, self.executor),
         );
+        self.refresh_bindings(&id);
         Ok(())
     }
 
@@ -142,14 +186,17 @@ impl DeviceManager {
         let path = path.as_ref();
         let LoadedPlugin { library, plugin } = self.loader.load_device(path)?;
         self.devices.insert(
-            id,
-            ManagedDevice {
+            id.clone(),
+            ManagedDevice::new(
+                &id,
                 plugin,
-                source_path: Some(path.to_path_buf()),
-                library: Some(library),
-                fingerprint: Fingerprint::read(path),
-            },
+                Some(path.to_path_buf()),
+                Some(library),
+                Fingerprint::read(path),
+                self.executor,
+            ),
         );
+        self.refresh_bindings(&id);
         Ok(())
     }
 
@@ -188,6 +235,14 @@ impl DeviceManager {
     }
 
     /// Remove a registered device / 移除已注册的设备
+    ///
+    /// In threaded mode the worker is stopped and joined before this returns
+    /// (bounded by the shutdown deadline), the plugin box is dropped, and the
+    /// wiring entries are removed. After the call, [`DeviceManager::thread_count`]
+    /// and the next [`DeviceManager::step`] never observe the device.
+    /// 线程化模式下本调用返回前会停止并 join 工作线程（受关闭期限约束）、释放插件
+    /// box 并移除接线条目；返回后 [`DeviceManager::thread_count`] 与下一次
+    /// [`DeviceManager::step`] 都不会再看到该设备。
     pub fn unregister(&mut self, id: &DeviceId) -> Result<(), DeviceError> {
         if self.drop_device_instance(id) {
             Ok(())
@@ -197,6 +252,10 @@ impl DeviceManager {
     }
 
     /// Wire a device port to a GPIO pin / 将设备端口连接到 GPIO 引脚
+    ///
+    /// In threaded mode the new binding is pushed to the device worker before the
+    /// call returns, so the next step already sees it.
+    /// 线程化模式下新绑定会在返回前推送到设备工作线程，下一次步进即生效。
     pub fn wire(
         &mut self,
         device_id: &str,
@@ -208,7 +267,7 @@ impl DeviceManager {
             .get(device_id)
             .ok_or_else(|| DeviceError::NotFound(device_id.to_string()))?;
 
-        let ports = device.plugin.ports();
+        let ports = device.host.ports();
         if port_index >= ports.len() {
             return Err(DeviceError::PortIndexOutOfBounds(port_index));
         }
@@ -216,6 +275,7 @@ impl DeviceManager {
         let port_name = ports[port_index].name.clone();
         self.wiring
             .wire(device_id, &port_name, port_index, gpio_pin);
+        self.refresh_bindings(device_id);
         Ok(())
     }
 
@@ -227,12 +287,18 @@ impl DeviceManager {
 
     /// Notify all devices about GPIO pin changes and sync output levels
     /// 通知所有设备 GPIO 引脚变化并同步输出电平
+    ///
+    /// This is the **synchronous** path and only touches inline devices. Devices
+    /// hosted on worker threads are skipped: drive them with
+    /// [`DeviceManager::step`], which keeps the fixed propagation delay.
+    /// 这是**同步**路径，只作用于内联设备。工作线程上的设备会被跳过：请用
+    /// [`DeviceManager::step`] 驱动它们，以保持固定传播延迟。
     pub fn sync_gpio(&mut self, gpio_pins: &mut [GpioPin]) {
         // Input → Device: read GPIO output level, feed into device input ports
         // Input → Device: 读取 GPIO 输出电平，馈入设备输入端口
         for entry in self.wiring.all() {
             if let Some(device) = self.devices.get_mut(&entry.device_id) {
-                let ports = device.plugin.ports();
+                let ports = device.host.ports();
                 if entry.port_index < ports.len()
                     && matches!(
                         ports[entry.port_index].direction,
@@ -240,8 +306,9 @@ impl DeviceManager {
                             | super::device::PortDirection::Bidirectional
                     )
                 {
-                    if let Some(pin) = gpio_pins.get_mut(entry.gpio_pin as usize) {
-                        device.plugin.on_gpio_change(entry.port_index, pin.level());
+                    if let Some(pin) = gpio_pins.get(entry.gpio_pin as usize) {
+                        let level = pin.level();
+                        device.host.notify_gpio(entry.port_index, level);
                     }
                 }
             }
@@ -250,8 +317,7 @@ impl DeviceManager {
         // Device → Output: read device output port level, write into GPIO pin
         // Device → Output: 读取设备输出端口电平，写入 GPIO 引脚
         for (device_id, managed) in &mut self.devices {
-            let ports = managed.plugin.ports();
-            let _snapshot = managed.plugin.state_snapshot();
+            let ports = managed.host.ports();
 
             // For each output port, check the wiring and update GPIO
             for (i, port) in ports.iter().enumerate() {
@@ -262,7 +328,9 @@ impl DeviceManager {
                 ) {
                     if let Some(gpio_pin) = self.wiring.find_by_device_port(device_id, i) {
                         if let Some(pin) = gpio_pins.get_mut(gpio_pin as usize) {
-                            pin.set_input(port.level);
+                            if let Some(level) = managed.host.output_level(i) {
+                                pin.set_input(level);
+                            }
                         }
                     }
                 }
@@ -271,25 +339,32 @@ impl DeviceManager {
     }
 
     /// Tick all devices / 推进所有设备的时钟
+    ///
+    /// Synchronous path only; worker-hosted devices are advanced by
+    /// [`DeviceManager::step`]. 仅同步路径；工作线程上的设备由
+    /// [`DeviceManager::step`] 推进。
     pub fn tick_all(&mut self, ctx: &mut dyn PluginContext, cycles: u64) {
         for managed in self.devices.values_mut() {
-            managed.plugin.tick(ctx, cycles);
+            managed.host.tick_inline(ctx, cycles);
         }
     }
 
     /// Shutdown all devices / 关闭所有设备
     pub fn shutdown_all(&mut self) {
         for managed in self.devices.values_mut() {
-            managed.plugin.shutdown();
+            managed.host.shutdown_in_place();
         }
     }
 
     /// Query all device states (MCP API) / 查询所有设备状态（MCP API）
+    ///
+    /// Takes `&mut self` because worker-hosted devices answer through their
+    /// mailbox. 工作线程上的设备通过邮箱应答，因此需要 `&mut self`。
     #[must_use]
-    pub fn mcp_query_all(&self) -> serde_json::Value {
+    pub fn mcp_query_all(&mut self) -> serde_json::Value {
         let mut states = serde_json::Map::new();
-        for (id, managed) in &self.devices {
-            states.insert(id.clone(), managed.plugin.state_snapshot());
+        for (id, managed) in &mut self.devices {
+            states.insert(id.clone(), managed.host.state_snapshot());
         }
         serde_json::Value::Object(states)
     }
@@ -297,10 +372,21 @@ impl DeviceManager {
     /// MCP API: query one device state; `None` when the ID is unknown
     /// MCP API：查询单个设备状态；ID 不存在时返回 `None`
     #[must_use]
-    pub fn mcp_query_device(&self, id: &str) -> Option<serde_json::Value> {
+    pub fn mcp_query_device(&mut self, id: &str) -> Option<serde_json::Value> {
         self.devices
-            .get(id)
-            .map(|managed| managed.plugin.state_snapshot())
+            .get_mut(id)
+            .map(|managed| managed.host.state_snapshot())
+    }
+
+    /// Port table of one device, `None` when the ID is unknown
+    /// 单个设备的端口表；ID 不存在时返回 `None`
+    ///
+    /// Works for inline and worker-hosted devices: the threaded host caches the
+    /// port table captured at registration / reload.
+    /// 内联与工作线程设备都可用：线程化宿主缓存注册/重载时捕获的端口表。
+    #[must_use]
+    pub fn ports_of(&self, id: &str) -> Option<&[DevicePort]> {
+        self.devices.get(id).map(|managed| managed.host.ports())
     }
 
     /// MCP API: list devices as `[{id, name, has_ui, tags, ports}]`, sorted by ID
@@ -315,9 +401,9 @@ impl DeviceManager {
             .devices
             .iter()
             .map(|(id, managed)| {
-                let metadata = managed.plugin.metadata();
+                let metadata = managed.host.metadata();
                 let ports: Vec<&str> = managed
-                    .plugin
+                    .host
                     .ports()
                     .iter()
                     .map(|port| port.name.as_str())
@@ -325,14 +411,15 @@ impl DeviceManager {
                 serde_json::json!({
                     "id": id,
                     "name": metadata.name,
-                    "has_ui": managed.plugin.has_ui(),
+                    "has_ui": managed.host.has_ui(),
                     "tags": metadata.tags,
                     "ports": ports,
                 })
             })
             .collect();
-        // HashMap 迭代顺序不稳定，按 ID 排序保证 MCP 输出可复现。
-        // HashMap iteration order is unstable; sort by ID for reproducible MCP output.
+        // `BTreeMap` 已按 ID 排序；显式排序使输出契约与容器实现无关。
+        // `BTreeMap` is already ID-ordered; sort explicitly so the contract does
+        // not depend on the container.
         entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         entries
     }
@@ -340,12 +427,17 @@ impl DeviceManager {
     /// MCP API: apply a JSON configuration to one device
     /// MCP API：向单个设备应用 JSON 配置
     ///
+    /// Threaded devices apply the configuration on their worker thread.
+    /// 线程化设备在工作线程上应用配置。
+    ///
     /// # Errors
     ///
-    /// Returns [`ConfigApplyError::DeviceNotFound`] for an unknown ID and
-    /// [`ConfigApplyError::Invalid`] when the plugin rejects the configuration.
+    /// Returns [`ConfigApplyError::DeviceNotFound`] for an unknown ID,
+    /// [`ConfigApplyError::Invalid`] when the plugin rejects the configuration,
+    /// and [`ConfigApplyError::Executor`] when a worker times out or is high-Z.
     /// 未知 ID 返回 [`ConfigApplyError::DeviceNotFound`]，插件拒绝配置时返回
-    /// [`ConfigApplyError::Invalid`]。
+    /// [`ConfigApplyError::Invalid`]，工作线程超时或已高阻时返回
+    /// [`ConfigApplyError::Executor`]。
     pub fn apply_config(
         &mut self,
         id: &str,
@@ -355,8 +447,7 @@ impl DeviceManager {
             .devices
             .get_mut(id)
             .ok_or_else(|| ConfigApplyError::DeviceNotFound(id.to_string()))?;
-        managed.plugin.apply_config(config)?;
-        Ok(())
+        managed.host.configure(id, config)
     }
 
     /// Get a reference to the plugin loader / 获取插件加载器引用
@@ -380,21 +471,6 @@ impl DeviceManager {
     #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.len()
-    }
-
-    /// Iterate over every registered device as `(id, plugin)`
-    /// 遍历所有已注册设备 `(id, plugin)`
-    ///
-    /// Iteration order is unspecified (`HashMap`); sort by ID when a stable
-    /// order is required. The iterator borrows the manager, so the host must not
-    /// call [`DeviceManager::reload`] concurrently (reload is synchronous and
-    /// unloads libraries).
-    /// 迭代顺序不确定（`HashMap`）；需要稳定顺序时请按 ID 排序。迭代器借用管理器，
-    /// 因此宿主不得并发调用 [`DeviceManager::reload`]（热重载是同步操作并会卸载库）。
-    pub fn devices(&self) -> impl Iterator<Item = (&DeviceId, &dyn DevicePlugin)> + '_ {
-        self.devices
-            .iter()
-            .map(|(id, managed)| (id, managed.plugin.as_ref()))
     }
 }
 
@@ -501,7 +577,7 @@ mod tests {
 
     #[test]
     fn mcp_query_empty() {
-        let dm = DeviceManager::new();
+        let mut dm = DeviceManager::new();
         let result = dm.mcp_query_all();
         assert_eq!(result.as_object().unwrap().len(), 0);
     }

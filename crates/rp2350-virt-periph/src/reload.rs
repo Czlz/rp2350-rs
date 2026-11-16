@@ -331,6 +331,7 @@ impl DeviceManager {
                             // 端口表不兼容时清空该设备的全部接线，保证 devices/wiring 一致。
                             // Drop every entry so devices and wiring stay consistent.
                             self.wiring.remove_device(&new_id);
+                            self.refresh_bindings(&new_id);
                             report.unwired.push((render_path(key), reason));
                         }
                     }
@@ -375,7 +376,7 @@ impl DeviceManager {
                 let Some(managed) = self.devices.get(id) else {
                     return Err("device vanished after reload / 重载后设备消失".to_string());
                 };
-                let ports = managed.plugin.ports();
+                let ports = managed.host.ports();
                 match ports.get(entry.port_index) {
                     Some(port) if port.name == entry.port_name => {}
                     Some(port) => {
@@ -401,6 +402,7 @@ impl DeviceManager {
             self.wiring
                 .wire(id, &entry.port_name, entry.port_index, entry.gpio_pin);
         }
+        self.refresh_bindings(id);
         Ok(())
     }
 
@@ -422,29 +424,47 @@ impl DeviceManager {
         }
         self.devices.insert(
             id.clone(),
-            ManagedDevice {
+            ManagedDevice::new(
+                &id,
                 plugin,
-                source_path: Some(path.to_path_buf()),
-                library: Some(library),
+                Some(path.to_path_buf()),
+                Some(library),
                 fingerprint,
-            },
+                self.executor,
+            ),
         );
+        self.refresh_bindings(&id);
         Ok(id)
     }
 
     /// Shut down and drop one device instance, then release its library
     /// 关闭并释放单个设备实例，随后释放其库
     ///
-    /// Returns `false` when the ID is unknown.
-    /// ID 不存在时返回 `false`。
+    /// Returns `false` when the ID is unknown. With a worker-hosted device the
+    /// worker is joined first and the plugin box is dropped before the library;
+    /// a worker that never answers is detached and its library is intentionally
+    /// kept mapped (Rust cannot kill the thread).
+    /// ID 不存在时返回 `false`。线程化设备先回收工作线程，并在库之前释放插件 box；
+    /// 永不响应的工作线程会被分离，其库被有意保持映射（Rust 无法终止线程）。
     pub(crate) fn drop_device_instance(&mut self, id: &DeviceId) -> bool {
         let Some(mut managed) = self.devices.remove(id) else {
             return false;
         };
-        managed.plugin.shutdown();
+        let outcome = managed.host.stop();
+        drop(outcome.plugin);
+        if outcome.detached {
+            if let Some(library) = managed.library.take() {
+                log::warn!(
+                    "plugin '{id}' thread did not stop; keeping its library mapped / \
+                     插件线程未停止，保留其库映射"
+                );
+                std::mem::forget(library);
+            }
+        }
         self.wiring.remove_device(id);
-        // ManagedDevice 字段按声明顺序析构：plugin 先于 library 释放。
-        // ManagedDevice fields drop in declaration order: plugin before library.
+        self.recompute_driven_pins();
+        // ManagedDevice 字段按声明顺序析构：host 先于 library 释放。
+        // ManagedDevice fields drop in declaration order: host before library.
         drop(managed);
         true
     }

@@ -5,12 +5,15 @@
 > 虚拟设备管理器：虚拟外设插件的生命周期、GPIO 接线、tick 调度与 MCP 状态查询。
 > **不包含**设备实现 —— 设备本体位于插件中。
 >
-> **Status**: 已实现 / implemented — `DeviceManager`（无参构造）、`register` /
-> `load_plugin` / `scan_and_load` / `reload` / `unregister` / `wire` / `sync_gpio` /
-> `tick_all` / `shutdown_all` / `mcp_query_all` / `mcp_query_device` /
-> `mcp_list_devices` / `apply_config` / `devices`、`PluginLoader`（目录扫描 +
-> ABI 校验 + 损坏输入诊断）、`ReloadReport`、`WiringTable`、`DevicePlugin`/`DevicePort`、
-> `ConfigSchema`。见文末“规划中”。
+> **Status**: 已实现 / implemented — `DeviceManager`（无参构造 / `with_latency` /
+> `with_executor`）、`register` / `load_plugin` / `scan_and_load` / `reload` /
+> `unregister` / `wire` / `sync_gpio` / `tick_all` / `shutdown_all` /
+> `step` / `step_gpio` / `shutdown_threads` / `mcp_query_all` /
+> `mcp_query_device` / `mcp_list_devices` / `ports_of` / `apply_config`、
+> `PluginLoader`（目录扫描 + ABI 校验 + 损坏输入诊断）、`ReloadReport`、
+> `WiringTable`、`DevicePlugin`/`DevicePort`、`ConfigSchema`、
+> `PinSnapshot`/`PortBinding`/`ExecutorConfig`/`PublishSchedule`/`DeviceExecutor`
+> 与固定延迟插件线程（MT-5）。见文末“规划中”。
 
 ---
 
@@ -25,6 +28,11 @@
 | `device` | `DevicePlugin` trait, `DevicePort`, `PortDirection` |
 | `config` | `ConfigSchema` — JSON config schema |
 | `error` | `DeviceError`, `ConfigError` |
+| `executor` | `PinSnapshot`, `PortBinding`, `ExecutorConfig`, `PublishSchedule`, `StepReport`, `ExecutorError` |
+| `executor_worker` | `Command`/`Response` mailbox, `WorkerContext`, worker loop (private side) |
+| `executor_host` | `DeviceExecutor` — per-device worker handle, timeout, panic latch |
+| `executor_device` | per-device inline/threaded host (`DeviceHost`) |
+| `executor_manager` | `DeviceManager::step` / `step_gpio` / `shutdown_threads` |
 
 ---
 
@@ -64,6 +72,12 @@ interface. Device logic must work when `render_ui()` is never called.
 `state_snapshot()` 来自 `RpPlugin`，是无头/MCP 模式的权威接口。设备逻辑必须在
 从不调用 `render_ui()` 的情况下正常工作。
 
+In threaded mode the same call is served by the device worker
+(`Command::QueryState`), and a degraded device answers with
+`{"error": "...", "degraded": true}`.
+线程化模式下该调用由设备工作线程服务（`Command::QueryState`）；已降级设备返回
+`{"error": "...", "degraded": true}`。
+
 ---
 
 ## `DeviceManager` / 设备管理器
@@ -71,11 +85,19 @@ interface. Device logic must work when `render_ui()` is never called.
 ```rust
 pub type DeviceId = String;
 
-pub struct DeviceManager { /* devices, wiring, loader */ }
+pub struct DeviceManager { /* devices, wiring, loader, executor, schedule */ }
 impl DeviceManager {
-    /// No arguments — devices are registered explicitly.
-    /// 无参数 —— 设备通过显式注册加入。
+    /// No arguments — devices are registered explicitly (synchronous default).
+    /// 无参数 —— 设备通过显式注册加入（同步默认路径）。
     pub fn new() -> Self;
+
+    /// Synchronous manager with a custom fixed propagation delay (epochs).
+    /// 同步管理器，可指定固定传播延迟（epoch）。
+    pub fn with_latency(latency_ticks: u64) -> Self;
+
+    /// Opt-in threading: every device gets its own worker thread.
+    /// 可选多线程：每台设备使用独立工作线程。
+    pub fn with_executor(config: ExecutorConfig) -> Self;
 
     /// Register an already-constructed plugin (in-process).
     /// 注册已构建的插件（进程内）。
@@ -126,23 +148,40 @@ impl DeviceManager {
     ///   设备输出端口电平 → GPIO 引脚输入（set_input）。
     pub fn sync_gpio(&mut self, gpio_pins: &mut [GpioPin]);
 
-    /// Tick all devices / 推进所有设备
+    /// Tick all devices (synchronous path only) / 推进所有设备（仅同步路径）
     pub fn tick_all(&mut self, ctx: &mut dyn PluginContext, cycles: u64);
 
     /// Shutdown all devices / 关闭所有设备
     pub fn shutdown_all(&mut self);
 
+    /// One fixed-delay epoch: dispatch to every device, collect outputs.
+    /// 固定延迟的一个 epoch：向所有设备派发并收集输出。
+    pub fn step(&mut self, epoch: u64, inputs: PinSnapshot, cycles: u64)
+        -> Result<StepReport, StepError>;
+
+    /// `step` plus GPIO sampling and masked write-back / `step` + GPIO 采样与掩码写回
+    pub fn step_gpio(&mut self, epoch: u64, pins: &mut [GpioPin], cycles: u64)
+        -> Result<StepReport, StepError>;
+
+    /// Stop and join every plugin worker (threaded mode only).
+    /// 停止并回收所有插件工作线程（仅线程化模式）。
+    pub fn shutdown_threads(&mut self) -> usize;
+
     /// MCP API: `{ "<id>": <state_snapshot()>, ... }` / MCP 查询所有设备状态
-    pub fn mcp_query_all(&self) -> serde_json::Value;
+    pub fn mcp_query_all(&mut self) -> serde_json::Value;
 
     /// MCP API: one device snapshot, `None` if unknown.
     /// MCP API：单个设备状态，未注册时返回 None。
-    pub fn mcp_query_device(&self, id: &str) -> Option<serde_json::Value>;
+    pub fn mcp_query_device(&mut self, id: &str) -> Option<serde_json::Value>;
 
     /// MCP API: `[{id, name, has_ui, tags, ports}]`, sorted by id.
     /// `ports` 按接线顺序（即 `wire` 使用的索引顺序）列出端口名。
     /// MCP API：设备清单（按 id 排序），`ports` 为接线顺序的端口名。
     pub fn mcp_list_devices(&self) -> Vec<serde_json::Value>;
+
+    /// Port table of one device (inline or worker-hosted).
+    /// 单个设备的端口表（内联或工作线程宿主）。
+    pub fn ports_of(&self, id: &str) -> Option<&[DevicePort]>;
 
     /// MCP API: apply JSON config through `DevicePlugin::apply_config`.
     /// MCP API：通过 apply_config 应用 JSON 配置。
@@ -153,12 +192,26 @@ impl DeviceManager {
     pub fn loader_mut(&mut self) -> &mut PluginLoader;
     pub fn has_devices(&self) -> bool;
     pub fn device_count(&self) -> usize;
-    /// Iterate `(id, plugin)` over every registered device (unordered).
-    /// 遍历所有已注册设备 `(id, plugin)`（顺序不确定）。
-    pub fn devices(&self) -> impl Iterator<Item = (&DeviceId, &dyn DevicePlugin)> + '_;
+
+    // Threaded-mode introspection / 线程化模式自检
+    pub fn executor_config(&self) -> Option<ExecutorConfig>;
+    pub fn latency_ticks(&self) -> u64;
+    pub fn thread_count(&self) -> usize;
+    pub fn degraded_devices(&self) -> Vec<DeviceId>;
+    pub fn degraded_reasons(&self) -> Vec<(DeviceId, String)>;
+    pub fn set_step_timeout(&mut self, id: &str, timeout: Duration) -> bool;
+    pub fn driven_pins(&self) -> PinSnapshot;
 }
 impl Default for DeviceManager { /* == Self::new() */ }
 ```
+
+> `mcp_query_all` / `mcp_query_device` take `&mut self` because worker-hosted
+> devices answer through their mailbox. `devices()` (an iterator over
+> `&dyn DevicePlugin`) no longer exists: worker-hosted plugins are owned by
+> their thread, so callers use `ports_of` / `mcp_list_devices` / `mcp_query_*`.
+> `mcp_query_all` / `mcp_query_device` 使用 `&mut self`，因为工作线程设备通过邮箱
+> 应答。`devices()`（返回 `&dyn DevicePlugin` 迭代器）已移除：工作线程独占插件，
+> 调用方改用 `ports_of` / `mcp_list_devices` / `mcp_query_*`。
 
 > There is no `new(plugin_dirs, headless)` constructor and no
 > `LoadedDevice{name, device_type}` / `PluginOrigin` type in the source. Devices
@@ -299,16 +352,164 @@ replaces its entry.
 ## GPIO Sync Flow / GPIO 同步流程
 
 ```
-Host step (每步一次):
+Synchronous path (default, unchanged):
   DeviceManager::sync_gpio(&mut [GpioPin])
     ├─ wiring.all() → for each entry with Input|Bidirectional port:
     │     device.on_gpio_change(port_index, gpio_pin.level())
     └─ for each device output|bidirectional port:
           wiring.find_by_device_port() → gpio_pin.set_input(port.level)
 
-Device tick (设备推进):
   DeviceManager::tick_all(ctx, cycles) → plugin.tick(ctx, cycles) per device
+
+Fixed-delay path (`step`, works in both modes):
+  DeviceManager::step(epoch, PinSnapshot, cycles)
+    ├─ PublishSchedule::take_effective(epoch)   # outputs produced at epoch-latency
+    ├─ phase 1: for every device (ID order):
+    │     inline  → on_gpio_change* → tick → collect outputs (immediately)
+    │     threaded→ Command::Step sent, no wait (workers run in parallel)
+    ├─ phase 2: collect threaded responses in ID order (per-device timeout)
+    ├─ combine per-device outputs with wired-OR
+    └─ PublishSchedule::publish(epoch, combined) # effective at epoch+latency
 ```
+
+\* Inputs are delivered to every wired input/bidirectional port on every step,
+with no merging, dropping or edge filtering.
+
+---
+
+## Threaded Executors / 线程化执行器（MT-5）
+
+### Switch / 开关
+
+- `DeviceManager::new()` — **synchronous default**, unchanged semantics, no
+  threads; `sync_gpio` / `tick_all` remain the legacy drive path.
+- `DeviceManager::with_executor(ExecutorConfig)` — each registered / loaded
+  device is moved to **its own** worker thread. `register`, `load_plugin`,
+  `scan_and_load`, `reload` and `unregister` all honour the mode.
+- `ExecutorConfig { latency_ticks, step_timeout }`: propagation delay in
+  simulation epochs (default 1 peripheral tick, clamped to ≥ 1) and the upper
+  bound of one mailbox round trip (default **5 s**, `DEFAULT_STEP_TIMEOUT`).
+  The timeout is a **stall bound**, not a scheduling knob: only a worker that
+  genuinely hangs may hit it. Tests that verify degradation pass a short
+  timeout explicitly (`ExecutorConfig::new(latency, Duration::from_millis(…))`);
+  a normal `cargo test` / concurrent build must never latch a healthy device.
+
+`DeviceManager::new()` 是**同步默认路径**（语义不变、无线程，`sync_gpio` /
+`tick_all` 保留）；`with_executor` 让每台设备运行在**各自**工作线程上，注册、加载、
+扫描、热重载、注销都遵循该模式。`ExecutorConfig` 指定传播延迟（仿真 epoch，默认 1
+个外设 tick，最小 1）与单次邮箱往返上限（默认 **5 s**，`DEFAULT_STEP_TIMEOUT`）。
+该超时是**卡死上限**而非调度参数：只有真正卡死的工作线程才应触发；需要验证降级的
+测试显式传入短超时（`ExecutorConfig::new(latency, Duration::from_millis(…))`）。
+正常 `cargo test` 或并行构建不得把健康设备误判为高阻。
+
+`set_step_timeout(id, timeout)` overrides the bound of **one** worker-hosted
+device (inline devices and unknown IDs return `false`), so a known-slow device
+can be tightened without giving every healthy device the same tiny budget. It
+takes effect on the next command; a device already high-Z stays high-Z until
+`reload`. `set_step_timeout(id, timeout)` 覆盖**单台**工作线程设备的卡死上限
+（内联设备与未知 ID 返回 `false`），可只收紧已知较慢的设备而不牵连健康设备；从
+下一条命令生效，已高阻的设备在 `reload` 前保持高阻。
+
+### Mailbox / 邮箱协议
+
+```rust
+pub enum Command {
+    Step { epoch: u64, inputs: PinSnapshot, cycles: u64 },
+    Configure { config: serde_json::Value },
+    Reload { plugin: Box<dyn DevicePlugin>, bindings: Vec<PortBinding> },
+    SetBindings { bindings: Vec<PortBinding> },
+    QueryState,
+    Shutdown,
+}
+pub enum Response {
+    Stepped { epoch: u64, outputs: PinSnapshot },
+    Ack,
+    Reloaded { previous: Box<dyn DevicePlugin> },
+    State { value: serde_json::Value },
+    Shutdown { plugin: Box<dyn DevicePlugin> },
+    Failed { epoch: Option<u64>, message: String },
+}
+```
+
+Every command is a request with exactly one response, so the host can bound the
+wait. The worker owns the plugin box: no host thread calls into a plugin while
+it runs on a worker. `WorkerContext` supplies `current_cycles() == epoch` and
+records (does not dispatch) `schedule_callback` requests.
+
+每条命令都是“一次请求、恰好一个响应”，宿主因此可以有界等待。工作线程独占插件
+box：插件在工作线程运行时，宿主线程不再调用它。`WorkerContext` 让
+`current_cycles()` 等于该 epoch，并**记录**（不派发）`schedule_callback`。
+
+### Delay semantics / 延迟语义
+
+- `epoch` input snapshot → device → outputs published at
+  `epoch + latency_ticks`; they appear in `StepReport::effective` and on GPIO at
+  that epoch. The delay lives in `PublishSchedule` on the simulation thread and
+  is counted in epochs, never in host time.
+- `StepReport.produced` holds **one entry per registered device**, in ID order.
+  A healthy device carries its output of the current epoch; a device that timed
+  out, panicked or was already stopped carries `PinSnapshot::empty` (high-Z:
+  it drives no pin) and is also listed in `StepReport.degraded`. A degraded
+  device therefore never disappears silently from the report, and `effective`
+  only ever contains the wired-OR of healthy, actively driven pins.
+  `StepReport.effective` holds the wired-OR of outputs that matured now. Skipped
+  epochs are released together (wired-OR), so no input is merged and no output
+  is lost.
+- Determinism: identical input sequences produce identical per-pin output
+  sequences on the synchronous and threaded paths (tests compare them at
+  latency 1 and 3).
+
+`epoch` 的输入快照 → 设备 → 输出在 `epoch + latency_ticks` 发布，并在该 epoch
+通过 `StepReport::effective` 与 GPIO 生效；延迟在模拟线程的 `PublishSchedule` 中
+以 epoch 计量，与宿主时间无关。`produced` 为**每台已注册设备**按 ID 顺序保留一个
+条目：健康设备携带当前 epoch 的输出；超时、panic 或已停止的设备携带
+`PinSnapshot::empty`（高阻：不驱动任何引脚），并同时列入 `degraded`。因此降级
+设备不会从报告里静默消失，`effective` 只包含健康设备实际驱动的引脚线或。跳过的
+epoch 会一起释放（线或），因此不合并输入、不丢失输出。确定性：同一输入序列在同步
+与线程化路径产生逐 pin 相同的输出序列（测试在延迟 1 与 3 下对照）。
+
+### Failure handling / 失败降级
+
+| Situation / 情况 | Behaviour / 行为 |
+|------------------|------------------|
+| Worker exceeds `step_timeout` (default **5 s**, `DEFAULT_STEP_TIMEOUT`) | device latched **high-Z**, listed in `StepReport::degraded` and kept in `produced` with an empty (no-drive) snapshot, stable diagnostic line; simulation continues / 设备锁定为**高阻**，列入 `degraded` 并在 `produced` 中保留空（不驱动）快照，诊断行稳定，仿真继续 |
+| Plugin panics in `tick` / `apply_config` / `state_snapshot` | caught per command, worker poisoned, device high-Z; other devices unaffected / 按命令捕获，线程中毒、设备高阻，其它设备不受影响 |
+| Plugin panics in `shutdown` | ignored, the plugin box is still returned / 忽略，仍交还插件 box |
+| `shutdown_threads` / manager drop | sends `Shutdown`, joins with a bounded deadline, drops the plugin **before** the library / 发送 `Shutdown`，限期 join，插件先于库释放 |
+| Worker never answers / 工作线程永不响应 | detached (`DeviceExecutor::is_detached`), library handle intentionally leaked so the vtable stays mapped / 分离，库句柄有意泄漏以保持 vtable 映射 |
+
+The default five-second bound is a **stall detector**: parallel `cargo test`,
+concurrent builds or a busy host may delay a worker by tens of milliseconds but
+must never latch a healthy device high-Z. Degradation tests opt into a short
+timeout explicitly. A high-Z device keeps its `produced` entry with an empty
+snapshot, so `produced` always has one entry per registered device and callers
+can tell "no output" (0 bits) from "device missing".
+默认 5 秒上限是**卡死检测**：并行 `cargo test`、并发构建或繁忙宿主可能让工作线程
+延迟数十毫秒，但绝不能把健康设备误锁为高阻。降级测试显式选择短超时。高阻设备在
+`produced` 中保留空快照，因此 `produced` 始终为每台已注册设备保留一个条目，调用方
+能区分「无输出（0 位）」与「设备缺失」。
+
+`catch_unwind` only covers Rust-level unwinding. A `panic = "abort"` plugin, or
+an unwind crossing a foreign (`extern "C"`) frame, aborts the process and cannot
+be isolated — this is the pre-existing cdylib limitation.
+`catch_unwind` 只覆盖 Rust 级展开；`panic = "abort"` 的插件，或展开穿过外部
+（`extern "C"`）帧时仍会终止进程 —— 这是既有的 cdylib 限制。
+
+Diagnostics / 诊断：`thread_count()`、`degraded_devices()`、
+`degraded_reasons()`（每次查询内容一致）、`DeviceExecutor::timeouts()`。
+
+### Reload / unregister in threaded mode / 线程化模式下的重载与注销
+
+`reload` remains synchronous: the old worker is stopped and joined, the plugin
+box is dropped, then the library is unloaded and the replacement loaded and
+spawned on a fresh worker. Binding tables are rebuilt after `wire` / reload, so
+wiring stays consistent. `unregister` stops and joins exactly one worker before
+returning; afterwards `thread_count()` is immediately accurate, the wiring entry
+is gone, and the next `step` never dispatches to the removed device.
+`reload` 仍是同步操作：先停止并 join 旧工作线程、释放插件 box，再卸载旧库、加载
+新库并在新线程上启动；`wire` / 重载后重建绑定表，接线保持一致。`unregister`
+在返回前停止并 join 恰好一个工作线程；返回后 `thread_count()` 立即准确、接线条目
+已移除，下一次 `step` 不会再向该设备派发。
 
 ---
 
@@ -327,13 +528,17 @@ pub enum ConfigError { MissingField(String), InvalidType { field, expected, actu
 pub enum ConfigApplyError {
     DeviceNotFound(String),                  // manager-level: unknown id / 未知设备
     Invalid(ConfigError),                    // plugin rejected config / 插件拒绝配置
+    Executor(ExecutorError),                 // worker timeout / high-Z / 工作线程超时或高阻
 }
 ```
 
 `apply_config` 由 `DeviceManager` 负责查找设备（`DeviceNotFound`），再调用
-`DevicePlugin::apply_config` 并把 `ConfigError` 包装为 `Invalid`。
+`DevicePlugin::apply_config` 并把 `ConfigError` 包装为 `Invalid`（内联路径）或
+经邮箱返回 `Executor`（线程化路径）。
 `apply_config` resolves the device in the manager (`DeviceNotFound`) and then
-delegates to `DevicePlugin::apply_config`, wrapping `ConfigError` as `Invalid`.
+delegates to `DevicePlugin::apply_config`, wrapping `ConfigError` as `Invalid`
+on the inline path, or reporting `Executor` through the mailbox on the threaded
+path.
 
 ---
 
@@ -425,13 +630,13 @@ panics and always returns a `ReloadReport`.
 | Library still invalid / 库仍然损坏 | unchanged / 不变 | unchanged / 不变 | `failed` (retried every pass) / 每次重试 |
 
 Consistency invariant / 一致性不变量：after every `reload`, each entry returned by
-`wiring().all()` points at an existing device returned by `devices()`, with
+`wiring().all()` points at an existing device reported by `ports_of()`, with
 `port_index < ports().len()` and a matching `port_name`. Entries are only
 re-applied after that check succeeds; otherwise the whole device wiring is
 dropped and reported in `unwired`.
-每次 `reload` 后，`wiring().all()` 的每个条目都指向 `devices()` 中真实存在的设备，
-满足 `port_index < ports().len()` 且 `port_name` 一致；只有校验通过才会重新应用，
-否则清除该设备的全部接线并记录到 `unwired`。
+每次 `reload` 后，`wiring().all()` 的每个条目都指向 `ports_of()` 中真实存在的
+设备，满足 `port_index < ports().len()` 且 `port_name` 一致；只有校验通过才会
+重新应用，否则清除该设备的全部接线并记录到 `unwired`。
 
 Devices registered in-process (`register`) or whose source path is outside `dir`
 are never touched. Devices are always shut down **before** their library is
@@ -487,23 +692,51 @@ unloaded (mandatory on Windows, where loaded DLLs are locked).
   with `failed` rather than crashing.
   Windows 上已加载 DLL 被系统锁定：在其被加载时删除/替换需要先卸载，`reload`
   已这样做；外部进程若仍持有该文件，重载会归类为 `failed` 而不是崩溃。
+- **Threads cannot be killed.** A plugin that never returns from `tick` leaves a
+  detached worker behind; `DeviceExecutor::is_detached()` reports it and the
+  library handle is intentionally leaked so the plugin vtable stays mapped. Do
+  not unload such a library manually. **线程无法被终止。** 永不从 `tick` 返回的
+  插件会留下已分离的工作线程；`is_detached()` 报告该状态，库句柄被有意泄漏以保持
+  插件 vtable 映射，请勿手动卸载该库。
+- **Threaded mode assumes plugins are `Send`.** `RpPlugin` already requires
+  `Send + Sync`, so a plugin that compiles for the synchronous path also compiles
+  for the threaded one; a plugin that keeps thread-local state must copy it into
+  the worker explicitly. **线程化模式假定插件为 `Send`。** `RpPlugin` 已要求
+  `Send + Sync`，因此能用于同步路径的插件也能用于线程化路径；依赖线程局部状态的
+  插件必须自行把状态复制到工作线程。
+- `sync_gpio` / `tick_all` are synchronous-path APIs: worker-hosted devices are
+  skipped. Use `step` / `step_gpio` in threaded mode.
+  `sync_gpio` / `tick_all` 属于同步路径：工作线程设备会被跳过；线程化模式请用
+  `step` / `step_gpio`。
 
 ---
 
 ## Usage Example / 使用示例
 
 ```rust
-use rp2350_virt_periph::{DeviceManager, DevicePort};
+use rp2350_virt_periph::{DeviceManager, DevicePort, ExecutorConfig, PinSnapshot};
 
 let mut dm = DeviceManager::new();
 dm.register("led-1".into(), Box::new(LedPlugin::new()))?;
 dm.wire("led-1", 0, 25)?;                      // port 0 → GPIO 25
 
-dm.sync_gpio(&mut chip.gpio_pins);             // every simulation step
+dm.sync_gpio(&mut chip.gpio_pins);             // every simulation step (sync path)
 dm.tick_all(&mut ctx, cycles);
 
 let states = dm.mcp_query_all();               // {"led-1": {"level": true}}
 dm.unregister("led-1")?;                       // shutdown + unwire
+
+// Threaded mode: same wiring, fixed one-epoch propagation delay.
+let mut dm = DeviceManager::with_executor(ExecutorConfig::default());
+dm.register("led-1".into(), Box::new(LedPlugin::new()))?;
+dm.wire("led-1", 0, 25)?;
+let mut pins = chip.gpio_pins.clone();
+let mut inputs = PinSnapshot::empty();
+inputs.set(25, true);
+let report = dm.step_gpio(0, &mut pins, 1)?;   // effective at epoch 1
+assert_eq!(report.degraded, Vec::<String>::new());
+let states = dm.mcp_query_device("led-1");
+dm.shutdown_threads();                         // join every worker
 ```
 
 ---
@@ -522,3 +755,11 @@ dm.unregister("led-1")?;                       // shutdown + unwire
 - ⬜ `mcp-serve` 子命令仍为桩（`mcp_query_all` / `mcp_query_device` /
   `mcp_list_devices` 已可用于未来的 MCP 服务器）。
   `mcp-serve` remains a stub; the MCP query API is ready for a future server.
+- ⬜ 宿主接线（Host wiring）：`rp2350-cli` 与 `rp2350-egui` 尚未启用
+  `DeviceManager::with_executor`（MT-5 的白名单不含这两个 crate），因此
+  `--plugin-threads` 开关与虚拟实验室的“多设备并行”接入仍待后续任务；线程化模式目前
+  仅由 crate API 与 19 项测试覆盖。
+  Neither `rp2350-cli` nor `rp2350-egui` enables `DeviceManager::with_executor`
+  yet (MT-5's file whitelist excludes both crates), so a `--plugin-threads` flag
+  and the virtual-lab multi-device hookup remain a follow-up task; the threaded
+  mode is currently exercised through the crate API and 19 tests.

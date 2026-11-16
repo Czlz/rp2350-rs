@@ -481,7 +481,11 @@ fn reload_keeps_device_and_wiring_tables_consistent() {
     assert_eq!(report.rewired.len(), 1, "{report:?}");
     assert_eq!(report.failed.len(), 1, "{report:?}");
 
-    let mut ids: Vec<String> = dm.devices().map(|(id, _)| id.clone()).collect();
+    let mut ids: Vec<String> = dm
+        .mcp_list_devices()
+        .iter()
+        .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+        .collect();
     ids.sort();
     assert_eq!(ids, vec!["com.rp2350-rs.led", "reload.stub"]);
     assert_wiring_consistent(&dm);

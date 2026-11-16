@@ -150,4 +150,12 @@ UART、ADC/RTC 与 DMA pacing 已跟随实时时钟树。**1 秒模拟时间在 
   `cargo tree -p rp2350-egui --depth 1` 含 `rp2350-cli`，
   `cargo tree -p rp2350-cli --depth 1` 不含 `rp2350-egui`。
 - **音频**：`cpal` 在无声卡/CI 环境会失败；插件必须可选、可静默。
+- **设备插件线程（MT-5）**：`rp2350-virt-periph` 已支持每设备插件线程（`with_executor`，
+  固定 epoch 延迟、超时/panic 高阻降级），默认仍是同步路径；emerald 示例不加载设备
+  插件，因此该改动**不影响**本计划的帧率/音频数据。线程化宿主接线（CLI 开关、虚拟
+  实验室多设备并行）是后续任务，详见 `doc/threading-plan.md` §8。
+  Device plugin threads (MT-5) are opt-in and the emerald example loads no device
+  plugins, so this work does not change the frame-rate or audio numbers here; host
+  wiring (CLI flag, virtual-lab multi-device parallelism) is a follow-up (see
+  `doc/threading-plan.md` §8).
 - **示例耦合**：帧缓冲地址与按钮引脚属于示例配置，必须放 `example/gba/`，不写死进模拟器。

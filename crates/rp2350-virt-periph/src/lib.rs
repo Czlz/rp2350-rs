@@ -13,6 +13,11 @@
 pub mod config;
 pub mod device;
 pub mod error;
+pub mod executor;
+mod executor_device;
+mod executor_host;
+mod executor_manager;
+mod executor_worker;
 pub mod loader;
 pub mod manager;
 pub mod reload;
@@ -22,9 +27,15 @@ pub mod wiring;
 mod tests;
 
 pub use config::ConfigSchema;
-pub use device::{DevicePlugin, DevicePort};
+pub use device::{DevicePlugin, DevicePort, PortDirection};
 pub use error::DeviceError;
+pub use executor::{
+    DEFAULT_LATENCY_TICKS, DEFAULT_STEP_TIMEOUT, ExecutorConfig, ExecutorError, PIN_SNAPSHOT_PINS,
+    PinSnapshot, PortBinding, PublishSchedule, StepError, StepReport,
+};
+pub use executor_host::DeviceExecutor;
+pub use executor_worker::{Command, Response, WorkerContext};
 pub use loader::{LoadedPlugin, PluginLoader};
-pub use manager::DeviceManager;
+pub use manager::{ConfigApplyError, DeviceManager};
 pub use reload::{Fingerprint, ReloadReport, normalize_path, scan_with_fingerprints};
 pub use wiring::{WiringEntry, WiringTable};
