@@ -104,6 +104,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Remove previous release for this tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Re-running a tag must not accumulate stale assets.
+          # 重新发布同一标签时先删除旧 Release，避免残留过期附件。
+          gh release delete "$GITHUB_REF_NAME" --yes --cleanup-tag=false || true
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
