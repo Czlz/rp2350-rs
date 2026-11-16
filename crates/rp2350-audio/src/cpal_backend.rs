@@ -17,27 +17,59 @@ use cpal::{FromSample, SampleFormat, SizedSample, SupportedStreamConfig};
 use crate::AudioFormat;
 use crate::pipeline::{Resampler, Shared};
 
+/// A started stream plus the probe detail shown by the host
+/// 已启动的流以及宿主展示的探测详情
+pub(crate) struct OpenedStream {
+    /// Live output stream; dropping it stops playback
+    /// 活动的输出流；丢弃即停止播放
+    pub(crate) stream: cpal::Stream,
+    /// Device name and selected stream format / 设备名与选定的流格式
+    pub(crate) detail: String,
+}
+
 /// Open and start a default output stream for `format`
 /// 为 `format` 打开并启动默认输出流
 ///
-/// Returns `None` when the host has no usable default output device.
-/// 宿主无可用默认输出设备时返回 `None`。
-pub(crate) fn open(format: AudioFormat, shared: &Arc<Shared>) -> Option<cpal::Stream> {
+/// Returns the reason when the host has no usable default output device or no
+/// supported configuration, so the null backend can explain itself instead of
+/// silently pretending to play.
+/// 宿主无可用默认输出设备或没有受支持配置时返回原因，使 null 后端能解释自己，
+/// 而不是静默地假装在播放。
+pub(crate) fn open(format: AudioFormat, shared: &Arc<Shared>) -> Result<OpenedStream, String> {
     let host = cpal::default_host();
-    let device = host.default_output_device()?;
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| "no default output device / 没有默认输出设备".to_owned())?;
+    let device_name = device.to_string();
     let channels = u16::from(format.channels.max(1));
     let rate = format.rate_hz.max(1);
     let config = select_config(&device, channels, rate)?;
-    let stream = match config.sample_format() {
+    let sample_format = config.sample_format();
+    let stream = match sample_format {
         SampleFormat::F32 => build::<f32>(&device, &config, format, shared),
         SampleFormat::I16 => build::<i16>(&device, &config, format, shared),
-        _ => return None,
+        other => {
+            return Err(format!(
+                "device {device_name:?} has no f32/i16 output config (best was {other:?}) / \
+                 设备没有 f32/i16 输出配置（最佳为 {other:?}）"
+            ));
+        }
     }
-    .ok()?;
+    .map_err(|error| {
+        format!("cannot build output stream on {device_name:?}: {error} / 无法在设备上建流")
+    })?;
     // 流创建成功后必须显式播放，否则部分后端保持暂停状态。
     // A created stream stays paused on some backends until `play` succeeds.
-    stream.play().ok()?;
-    Some(stream)
+    stream.play().map_err(|error| {
+        format!("cannot start output stream on {device_name:?}: {error} / 无法启动输出流")
+    })?;
+    let detail = format!(
+        "device={device_name:?} stream={}Hz/{}ch/{:?}",
+        config.sample_rate(),
+        config.channels(),
+        sample_format
+    );
+    Ok(OpenedStream { stream, detail })
 }
 
 /// Pick the supported config closest to the requested rate and channel count
@@ -51,12 +83,21 @@ pub(crate) fn open(format: AudioFormat, shared: &Arc<Shared>) -> Option<cpal::St
 /// 策略（详见 `doc/crates/rp2350-audio.md`）：只考虑声道数与 tap 相同的范围；
 /// 覆盖 `rate` 的范围直接使用（不重采样）；否则取最近边界最接近 `rate` 的范围，
 /// 差值由最近邻重采样消除；并列时优先 `f32`，其次 `i16`。
-fn select_config(device: &cpal::Device, channels: u16, rate: u32) -> Option<SupportedStreamConfig> {
+fn select_config(
+    device: &cpal::Device,
+    channels: u16,
+    rate: u32,
+) -> Result<SupportedStreamConfig, String> {
     let mut best: Option<(u32, u8, SupportedStreamConfig)> = None;
-    for range in device.supported_output_configs().ok()? {
+    let mut saw_channel = false;
+    let ranges = device
+        .supported_output_configs()
+        .map_err(|error| format!("cannot query output configs: {error} / 无法查询输出配置"))?;
+    for range in ranges {
         if range.channels() != channels {
             continue;
         }
+        saw_channel = true;
         let rank = format_rank(range.sample_format());
         if rank == 0 {
             continue;
@@ -76,7 +117,19 @@ fn select_config(device: &cpal::Device, channels: u16, rate: u32) -> Option<Supp
             best = Some((distance, rank, config));
         }
     }
-    best.map(|(_, _, config)| config)
+    best.map(|(_, _, config)| config).ok_or_else(|| {
+        if saw_channel {
+            format!(
+                "no f32/i16 config for {channels} channels at {rate} Hz / \
+                 没有 {channels} 声道 {rate} Hz 的 f32/i16 配置"
+            )
+        } else {
+            format!(
+                "device exposes no {channels}-channel output config / \
+                 设备没有 {channels} 声道输出配置"
+            )
+        }
+    })
 }
 
 /// Preference rank of a sample format, `0` meaning unsupported

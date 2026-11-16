@@ -222,6 +222,14 @@ pub(crate) struct Shared {
     pub(crate) running: AtomicBool,
     /// Number of starved playback intervals / 缺样本的播放区间数量
     pub(crate) underruns: AtomicU64,
+    /// Interleaved samples actually removed from the source
+    /// 实际从来源取走的交替样本数
+    pub(crate) pulled: AtomicU64,
+    /// Latest cumulative `SampleSource::dropped` value / 来源累计丢样的最新值
+    pub(crate) source_dropped: AtomicU64,
+    /// Backend probe result (device/config or the null-backend reason)
+    /// 后端探测结果（设备/配置，或 null 后端原因）
+    backend_detail: Mutex<Option<String>>,
     backend: AtomicU8,
 }
 
@@ -235,6 +243,9 @@ impl Shared {
             stop: AtomicBool::new(false),
             running: AtomicBool::new(true),
             underruns: AtomicU64::new(0),
+            pulled: AtomicU64::new(0),
+            source_dropped: AtomicU64::new(0),
+            backend_detail: Mutex::new(None),
             backend: AtomicU8::new(BACKEND_PENDING),
         }
     }
@@ -252,6 +263,26 @@ impl Shared {
     /// Count one starved playback interval / 记一次缺样本的播放区间
     pub(crate) fn note_underrun(&self) {
         self.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how many samples the worker just pulled / 记录工作线程刚取走的样本数
+    pub(crate) fn note_pulled(&self, samples: usize) {
+        self.pulled.fetch_add(samples as u64, Ordering::Relaxed);
+    }
+
+    /// Publish the source's cumulative drop counter / 发布来源的累计丢样计数
+    pub(crate) fn note_source_dropped(&self, dropped: u64) {
+        self.source_dropped.store(dropped, Ordering::Relaxed);
+    }
+
+    /// Publish the backend probe result / 发布后端探测结果
+    pub(crate) fn set_backend_detail(&self, detail: Option<String>) {
+        *self.backend_detail.lock() = detail;
+    }
+
+    /// Clone the backend probe result / 克隆后端探测结果
+    pub(crate) fn backend_detail(&self) -> Option<String> {
+        self.backend_detail.lock().clone()
     }
 
     /// Publish the selected backend / 发布已选定的后端

@@ -9,7 +9,8 @@ use rp2350_periph::{AudioSink, AudioTap};
 
 #[cfg(feature = "playback")]
 use crate::pipeline::SampleQueue;
-use crate::{AudioFormat, AudioOutput, SampleSource};
+use crate::pipeline::Shared;
+use crate::{AudioFormat, AudioOutput, AudioReport, SampleSource};
 
 const RATE: u32 = 13_440;
 const CHANNELS: u8 = 2;
@@ -278,4 +279,162 @@ fn resampler_duplicates_frames_when_upsampling() {
     let starved = resampler.fill(&mut empty, &mut silence);
     assert!(starved > 0);
     assert_eq!(silence, [0, 0, 0, 0]);
+}
+
+#[test]
+fn report_tracks_pulled_samples_and_frames() {
+    let output = AudioOutput::start(
+        ConstantSource {
+            remaining: usize::MAX,
+        },
+        4_096,
+    );
+    assert!(
+        wait_until(|| output.tap_samples() > 32, Duration::from_secs(2)),
+        "the worker must pull samples"
+    );
+    let report = output.report();
+    assert_eq!(report.backend, output.backend());
+    assert_eq!(report.rate_hz, RATE);
+    assert_eq!(report.channels, CHANNELS);
+    assert_eq!(report.frames(), report.tap_samples / u64::from(CHANNELS));
+    assert!(report.elapsed > Duration::ZERO);
+    assert!(report.queued <= 4_096, "queued={}", report.queued);
+    output.shutdown();
+}
+
+#[test]
+fn production_rate_uses_the_window_delta() {
+    let earlier = AudioReport {
+        backend: "cpal",
+        rate_hz: RATE,
+        channels: CHANNELS,
+        tap_samples: 0,
+        tap_dropped: 0,
+        queue_dropped: 0,
+        underruns: 0,
+        queued: 0,
+        elapsed: Duration::from_secs(5),
+    };
+    // 448 frames/s over 10 s = 4480 frames = 8960 interleaved samples.
+    // 10 秒内 448 帧/秒 = 4480 帧 = 8960 个交替样本。
+    let later = AudioReport {
+        tap_samples: 8_960,
+        elapsed: Duration::from_secs(15),
+        ..earlier
+    };
+    let window = later.frames_per_second_since(&earlier);
+    assert!((window - 448.0).abs() < 0.001, "window={window}");
+    // 累计口径是 4480 帧 / 15 s ≈ 298.67 fps，故意与窗口值不同。
+    // The cumulative value is 4480 frames / 15 s ≈ 298.67 fps, deliberately
+    // different from the window value.
+    assert!((later.frames_per_second() - 298.666_666_666_666_7).abs() < 0.001);
+    assert!(later.slower_than_real_time(1.0));
+    assert!(!later.slower_than_real_time(20_000.0));
+
+    let zero_window = earlier.frames_per_second_since(&earlier);
+    assert!(
+        zero_window.abs() < f64::EPSILON,
+        "zero-length window={zero_window}"
+    );
+}
+
+#[test]
+fn null_tick_counts_underruns_and_never_replays() {
+    let shared = Shared::new(1_024);
+    shared.push(&[7, 8, 9]);
+    assert!(!crate::null_tick(&shared, 6), "short fill is an underrun");
+    assert_eq!(
+        shared.underruns.load(Ordering::Relaxed),
+        1,
+        "one short tick"
+    );
+    assert_eq!(shared.queue.lock().len(), 0, "the queue is consumed");
+
+    // 再次取样本仍然静音：不会循环播放刚才的 7/8/9。
+    // Polling again stays silent: the old 7/8/9 samples are never replayed.
+    assert!(!crate::null_tick(&shared, 6));
+    assert_eq!(shared.underruns.load(Ordering::Relaxed), 2);
+    assert_eq!(shared.queue.lock().len(), 0);
+
+    shared.push(&[1, 2, 3, 4, 5, 6]);
+    assert!(crate::null_tick(&shared, 6), "a full batch is not starved");
+    assert_eq!(
+        shared.underruns.load(Ordering::Relaxed),
+        2,
+        "a full batch must not count"
+    );
+}
+
+#[cfg(feature = "playback")]
+#[test]
+fn starvation_emits_silence_instead_of_looping_the_last_frame() {
+    let mut queue = SampleQueue::new(16);
+    queue.push(&[111, 222, 333, 444]);
+    let mut resampler = crate::pipeline::Resampler::new(2, 4, 2);
+    let mut out = [0_i16; 12];
+    let missing = resampler.fill(&mut queue, &mut out);
+    assert!(missing >= 1, "the source must run dry");
+    assert_eq!(&out[..8], &[111, 222, 111, 222, 333, 444, 333, 444]);
+    // 源只有两帧：之后必须是静音，而不是 333/444 无限循环。
+    // Only two source frames exist; the rest must be silence, not a loop of
+    // 333/444.
+    assert_eq!(&out[8..], &[0; 4], "out={out:?}");
+}
+
+#[test]
+fn source_dropped_counter_is_reported() {
+    let tap = tap_with(4);
+    for _ in 0..4 {
+        tap.push_word(0x0002_0001);
+    }
+    assert_eq!(tap.dropped(), 4, "capacity 4 keeps the last frame");
+    let output = AudioOutput::start(tap.clone(), 1_024);
+    assert!(
+        wait_until(|| output.source_dropped() >= 4, Duration::from_secs(2)),
+        "the worker must publish the source drop counter"
+    );
+    let report = output.report();
+    assert_eq!(report.tap_dropped, tap.dropped());
+    assert!(report.dropped() >= 4);
+    output.shutdown();
+}
+
+#[test]
+fn backend_detail_explains_the_selected_backend() {
+    let output = AudioOutput::start(ConstantSource { remaining: 0 }, 128);
+    let detail = output
+        .backend_detail()
+        .expect("every backend publishes its probe detail");
+    assert_ne!(detail, "");
+    if output.backend() == "cpal" {
+        assert!(detail.starts_with("device="), "detail={detail}");
+        assert!(detail.contains("stream="), "detail={detail}");
+    } else {
+        // null 后端必须给出原因（无设备 / 无配置 / 未编译 playback）。
+        // The null backend must explain itself (no device/config/feature).
+        assert!(
+            detail.contains("device") || detail.contains("config") || detail.contains("playback"),
+            "detail={detail}"
+        );
+    }
+    output.shutdown();
+}
+
+#[test]
+fn report_with_zero_elapsed_is_not_a_division_by_zero() {
+    let report = AudioReport {
+        backend: "null",
+        rate_hz: RATE,
+        channels: CHANNELS,
+        tap_samples: 0,
+        tap_dropped: 0,
+        queue_dropped: 0,
+        underruns: 0,
+        queued: 0,
+        elapsed: Duration::ZERO,
+    };
+    assert!(report.frames_per_second().abs() < f64::EPSILON);
+    assert_eq!(report.dropped(), 0);
+    assert_eq!(report.frames(), 0);
 }

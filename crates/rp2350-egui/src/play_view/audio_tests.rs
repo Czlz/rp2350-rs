@@ -12,10 +12,32 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rp2350_audio::{AudioFormat, SampleSource};
+use rp2350_audio::{AudioFormat, AudioReport, SampleSource};
 
 use super::tests::{FakeShared, temp_firmware, view_with_fake};
 use super::*;
+
+/// Build a synthetic report for formatting tests / 为格式化测试构造合成快照
+fn report(
+    backend: &'static str,
+    tap_samples: u64,
+    tap_dropped: u64,
+    queue_dropped: u64,
+    underruns: u64,
+    elapsed: Duration,
+) -> AudioReport {
+    AudioReport {
+        backend,
+        rate_hz: 13_440,
+        channels: 2,
+        tap_samples,
+        tap_dropped,
+        queue_dropped,
+        underruns,
+        queued: 0,
+        elapsed,
+    }
+}
 
 /// Silent sample source that reports when the worker released it
 /// 报告工作线程何时释放自己的静音样本来源
@@ -179,6 +201,116 @@ fn dropping_a_view_with_audio_joins_the_worker() {
     assert!(
         released.load(Ordering::Relaxed),
         "Drop must join the audio worker"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn audio_status_line_reports_all_counters() {
+    // 1 s of 48 kHz stereo production is healthy; drops are still reported.
+    // 1 秒 48 kHz 立体声生产是健康的；丢样仍然要显示。
+    let mut healthy = report("cpal", 96_000, 3, 4, 0, Duration::from_secs(1));
+    healthy.rate_hz = 48_000;
+    let line = format_audio_report(Some(&healthy), None);
+    assert!(
+        line.starts_with("audio=cpal tap_samples=96000 dropped=7 underruns=0"),
+        "line={line}"
+    );
+    assert!(line.contains("produced=48000/s"), "line={line}");
+    assert!(line.contains("need=48000/s"), "line={line}");
+    assert!(!line.contains("slower than real time"), "line={line}");
+
+    let off = format_audio_report(None, None);
+    assert_eq!(off, "audio=off underruns=0 tap_samples=0 dropped=0");
+    for field in ["audio=", "tap_samples=", "dropped=", "underruns="] {
+        assert!(off.contains(field), "off={off}");
+    }
+}
+
+#[test]
+fn slow_production_shows_the_realtime_notice() {
+    // 448 frames/s for 5 s on a 13 440 Hz source: the emerald case.
+    // 13 440 Hz 来源上 5 秒只有 448 帧/秒：即 emerald 的现状。
+    let starved = report("cpal", 4_480, 0, 0, 500, Duration::from_secs(5));
+    let line = format_audio_report(Some(&starved), None);
+    assert!(line.contains("produced=448/s"), "line={line}");
+    assert!(line.contains("need=13440/s"), "line={line}");
+    assert!(
+        line.contains(
+            "audio: emulation slower than real time (underruns=500, produced=448/s, need=13440/s)"
+        ),
+        "line={line}"
+    );
+    // 明确不伪造声音：同一行仍报告真实的 underrun 数。
+    // No fake audio: the same line still reports the real underrun count.
+    assert!(line.contains("underruns=500"), "line={line}");
+}
+
+#[test]
+fn audio_diagnostic_has_the_stable_fields() {
+    let starved = report("null", 4_480, 2, 5, 500, Duration::from_secs(5));
+    let line = format_audio_diagnostic(&starved, 448.0);
+    assert!(
+        line.starts_with(
+            "[rp2350-egui] audio backend=null tap_samples=4480 dropped=7 underruns=500"
+        ),
+        "line={line}"
+    );
+    assert!(line.contains("produced=448/s"), "line={line}");
+    assert!(line.contains("need=13440/s"), "line={line}");
+    assert!(line.contains("elapsed_s=5.0"), "line={line}");
+
+    // 空 tap 必须提示接线检查，而不是只报 produced=0。
+    // An empty tap must point at the wiring instead of only reporting 0.
+    let empty = report("cpal", 0, 0, 0, 500, Duration::from_secs(5));
+    let hint = format_audio_diagnostic(&empty, 0.0);
+    assert!(hint.contains("tap_samples=0"), "hint={hint}");
+    assert!(hint.contains("audio_block/audio_sm"), "hint={hint}");
+    assert!(hint.contains("audio init"), "hint={hint}");
+}
+
+#[test]
+fn first_sample_line_reports_when_capture_starts() {
+    let first = report("cpal", 896, 0, 0, 0, Duration::from_secs(48));
+    let line = format_audio_first_sample(&first);
+    assert!(
+        line.starts_with("[rp2350-egui] audio first-sample backend=cpal tap_samples=896"),
+        "line={line}"
+    );
+    assert!(line.contains("elapsed_s=48.0"), "line={line}");
+    assert!(line.contains("need=13440/s"), "line={line}");
+}
+
+#[test]
+fn live_output_report_feeds_the_status_line() {
+    let (mut view, path, _released) = start_with_audio(true, "audio-report");
+    let report = view
+        .audio_report()
+        .expect("host output must publish a report");
+    assert_eq!(report.backend, view.audio_backend().expect("backend"));
+    assert_eq!(report.rate_hz, 48_000);
+    assert_eq!(report.channels, 2);
+    assert!(report.elapsed > Duration::ZERO);
+    let line = view.audio_status_line();
+    for field in [
+        "audio=",
+        "tap_samples=",
+        "dropped=",
+        "underruns=",
+        "produced=",
+        "need=",
+    ] {
+        assert!(line.contains(field), "line={line}");
+    }
+    view.stop();
+    assert_eq!(
+        view.audio_status_line(),
+        "audio=off underruns=0 tap_samples=0 dropped=0"
+    );
+    assert!(view.audio_report().is_none());
+    assert_eq!(
+        view.audio_reported, 0,
+        "a new session restarts the diagnostics"
     );
     let _ = std::fs::remove_file(path);
 }

@@ -475,6 +475,15 @@ DMA  run  →  bus write PIO TXF  ─┴→ Pio::push_tx(sm, word) → AudioTap 
 - `BootPeripherals::audio_tap()` returns a clone of the most recently installed
   handle; clones share one sink, so a playback plugin can drain it concurrently.
 - Resetting a PIO block keeps the tap wiring but clears the captured samples.
+- The DMA must actually reach `push_tx`: `pump_dma` refreshes PIO DREQs per
+  unit, and a full HSTX FIFO only caps the HSTX channel (its DREQ is
+  deasserted). It must **not** zero the whole batch budget, otherwise the
+  PIO-paced I2S DMA never transfers and the tap stays empty even though the
+  picture and the playback backend are healthy.
+- 复位 PIO 块保留 tap 接线但清空已捕获样本。
+- DMA 必须真正到达 `push_tx`：`pump_dma` 逐单元刷新 PIO DREQ，HSTX FIFO 满时只
+  限制 HSTX 通道（其 DREQ 去断言），**不得**把整批预算置零；否则 PIO 节拍的 I2S
+  DMA 永远不传输，画面与播放后端都正常时 tap 仍为空。
 - 每个块只捕获一个状态机；`BootPeripherals::mount` **不**自动安装 tap，
   未安装时压入路径只做一次 `Option` 判断；复位保留接线并清空已捕获样本。
 
@@ -1218,11 +1227,19 @@ while the TX FIFO has room.
   `dma.run` marks it busy, and using the busy flag here let a batch run with a
   stale DREQ level, overfilling the FIFO, dropping a word (`WOF`) and
   desynchronising the HSTX command/data phase.
+  The cap applies only while `DREQ_HSTX` is **asserted** (FIFO not full). A full
+  HSTX FIFO deasserts its request, so the channel cannot consume the budget; if
+  the host still treated it as paced it would set the budget to zero and skip
+  every other channel. That starvation blocked the I2S TX DMA (`PIO2_TX0`,
+  selector 16), whose tap therefore stayed empty while the picture was fine.
   `pump_dma` 用两条节拍规则避免批次冲垮 FIFO：忙碌的 PIO 节拍通道逐单元执行；
   只要有已使能通道选中 `DREQ_HSTX`(52)，批次预算就被限制为 `Hstx::fifo_room()`。
   `enabled_selects_dreq` 有意忽略 `BUSY`：通道在 `dma.run` 置 busy 之前就已使能，
   若用 busy 判定，整批会用陈旧 DREQ 电平执行、灌满 FIFO、丢字（`WOF`）并让 HSTX
-  命令/数据相位失步。
+  命令/数据相位失步。该上限只在 `DREQ_HSTX` **断言**（FIFO 未满）时生效：FIFO 满
+  会去断言请求，该通道无法消费预算；若宿主仍按「有节拍」处理，就会把预算置零并
+  跳过其它通道。这种饥饿会阻塞 I2S TX DMA（`PIO2_TX0`，选择器 16），使画面正常
+  但音频 tap 永远为空。
 
 `pump_dma` also advances the pacing timers at the start of every call with
 `Dma::advance(64)` (the fixed `DMA_PUMP_CYCLES` budget), so `TIMER0..3` queue

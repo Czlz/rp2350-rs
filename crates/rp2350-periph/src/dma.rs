@@ -796,17 +796,22 @@ impl Dma {
         })
     }
 
-    /// Whether any enabled channel selects a DREQ in `first..=last`
-    /// 是否有任一已使能通道选择了 `first..=last` 范围内的 DREQ
+    /// Whether any enabled channel selects an **asserted** DREQ in `first..=last`
+    /// 是否有任一已使能且其 DREQ **当前断言**的通道选择了 `first..=last`
     ///
     /// The host uses this to pick the DREQ refresh granularity. Unlike
     /// [`Self::busy_selects_dreq`] it ignores `BUSY`, which matters at the
     /// moment a channel is triggered: a channel that is enabled but not yet
     /// marked busy must still be resynchronised per unit, otherwise a whole
     /// batch runs with a stale DREQ level and overruns a small FIFO (HSTX).
+    /// A selector whose DREQ is currently deasserted cannot transfer, so it
+    /// must not cap a shared budget either: a full HSTX FIFO must not starve an
+    /// unrelated PIO-paced channel (for example the I2S TX DMA).
     /// 宿主据此选择 DREQ 刷新粒度。与 [`Self::busy_selects_dreq`] 不同，它忽略
     /// `BUSY`，这在通道刚被触发的瞬间很关键：已使能但尚未置 busy 的通道仍必须
     /// 逐单元重新同步，否则整批会用陈旧的 DREQ 电平执行并冲垮小 FIFO（HSTX）。
+    /// 当前 DREQ 去断言的通道无法传输，因此也不能限制共享预算：HSTX FIFO 满时
+    /// 不得饿死无关的 PIO 节拍通道（例如 I2S TX DMA）。
     ///
     /// The permanent request is never reported.
     /// 永久请求不计入。
@@ -818,7 +823,14 @@ impl Dma {
                 return false;
             }
             let selector = ((channel.ctrl & CTRL_TREQ_SEL_MASK) >> CTRL_TREQ_SEL_SHIFT) as u8;
-            selector != TREQ_PERMANENT && selector >= first && selector <= last
+            selector != TREQ_PERMANENT
+                && selector >= first
+                && selector <= last
+                && state
+                    .dreq
+                    .get(usize::from(selector))
+                    .copied()
+                    .unwrap_or(false)
         })
     }
 
@@ -1132,5 +1144,38 @@ fn apply_bswap(ctrl: u32, value: u32, data_size: u8) -> u32 {
         0 => value,
         1 => u32::from((value as u16).swap_bytes()),
         _ => value.swap_bytes(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::irq::IrqAssert;
+
+    /// A deasserted request must not cap the shared DMA budget
+    /// 去断言的请求不得限制共享 DMA 预算
+    ///
+    /// The I2S audio DMA is paced by PIO2 TX0; when the HSTX FIFO is full its
+    /// DREQ is deasserted. Treating that disabled channel as "paced" made the
+    /// host set a zero budget and skip every other channel, so the audio tap
+    /// never received a word.
+    /// I2S 音频 DMA 由 PIO2 TX0 节拍；HSTX FIFO 满时其 DREQ 去断言。把该无法传输的
+    /// 通道当作「需要节拍」会让宿主给出零预算并跳过其它通道，导致音频 tap 一个字
+    /// 都收不到。
+    #[test]
+    fn enabled_selects_dreq_requires_an_asserted_request() {
+        let dma = Dma::new(IrqAssert::new());
+        {
+            let mut state = dma.state.lock();
+            state.channels[0].ctrl = CTRL_EN | (u32::from(52u8) << CTRL_TREQ_SEL_SHIFT);
+        }
+        assert!(dma.enabled_selects_dreq(52, 52), "reset DREQ is asserted");
+        dma.set_dreq(52, false);
+        assert!(
+            !dma.enabled_selects_dreq(52, 52),
+            "a deasserted HSTX request must not cap the budget"
+        );
+        dma.set_dreq(52, true);
+        assert!(dma.enabled_selects_dreq(52, 52));
     }
 }

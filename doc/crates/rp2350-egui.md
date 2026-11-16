@@ -570,6 +570,24 @@ the mask is not written. Mapping is pure (`KeyState`, `mask_from_keys`).
 `audio = false`（不捕获）时 worker 完全不碰 PIO FIFO，`audio_source()` 返回
 `None`，状态栏保持 `audio=off underruns=0`。
 
+启动宿主输出后会向 stderr 打一行探测结果，随后在启动后 **5 s、15 s** 各打一条稳定
+诊断行（`[rp2350-egui] audio backend=<cpal|null> tap_samples=<n> dropped=<n>
+underruns=<n> produced=<n>/s need=<rate>/s elapsed_s=<..>`）。`produced` 是相对上一条
+诊断的 `tap_samples` 增量 / 墙钟增量 / 声道数，因此慢启动或客户机停摆不会被累计
+平均值掩盖；`backend_detail` 打印设备名与选定流格式，null 后端则打印原因
+（无设备/无配置/未编译 `playback`）与排查提示。tap 首次交付样本时另外打印一行
+`[rp2350-egui] audio first-sample …`：慢速客户机可能几分钟后才到达音频初始化，
+该行把这一刻变为可观察证据。
+
+**实时率不足时保持静音，不伪造声音。** 播放端按 `rate_hz` 消费，客户机只有在
+≥ 实时吞吐时才能供上样本；供不上时 `rp2350-audio` 用静音填充并累加 `underruns`，
+绝不循环旧样本。状态行会显示
+`audio: emulation slower than real time (underruns=…, produced=…/s, need=…/s)`；
+这是需要提升模拟吞吐（多线程/性能）的信号，见
+[`doc/playability-plan.md`](../playability-plan.md) 的 P2。tap 能否收到样本还取决于
+`rp2350-periph` 的 DMA 节拍：HSTX FIFO 满时不得把整批预算置零，否则 PIO2 TX0 的
+I2S DMA 会被饿死（见 [`rp2350-periph.md`](rp2350-periph.md) 的 HSTX 节拍规则）。
+
 启用真实声卡输出（`cpal`）需要 feature 转发；本 crate 默认**不**打开它：
 
 ```bash
@@ -597,6 +615,28 @@ opt-in through `--features audio-playback`; without the feature or without a
 device the null backend consumes samples silently, `start()` still succeeds, the
 status bar shows `audio=null` and the one-time notice
 `无声卡，静默运行 / no sound card, silent` is appended to the status line.
+
+A probe line is written to stderr when the host output starts, followed by stable
+diagnostics at **5 s and 15 s**:
+`[rp2350-egui] audio backend=<cpal|null> tap_samples=<n> dropped=<n>
+underruns=<n> produced=<n>/s need=<rate>/s elapsed_s=<..>`. `produced` is the
+`tap_samples` delta divided by the wall-clock delta and the channel count, so a
+slow boot or a stalled guest cannot hide behind the cumulative average. The
+probe line names the device and selected stream (`cpal`) or the fallback reason
+and a hint (no device/config, feature off). When the tap delivers its first
+sample, an extra `[rp2350-egui] audio first-sample …` line makes that transition
+observable: a slow guest may take minutes to reach audio initialisation.
+
+**Insufficient real-time throughput stays silent; sound is never faked.** The
+playback side consumes at `rate_hz`, so the guest must be at least real time to
+keep up; when it is not, `rp2350-audio` fills with silence and counts
+`underruns`, never looping stale samples. The status line then shows
+`audio: emulation slower than real time (underruns=…, produced=…/s, need=…/s)`,
+which points at emulation throughput (multi-threading/performance) in
+[`doc/playability-plan.md`](../playability-plan.md) P2. Whether the tap receives
+samples also depends on the `rp2350-periph` DMA pacing: a full HSTX FIFO must
+not zero the whole batch budget, otherwise the PIO2 TX0 I2S DMA starves (see the
+HSTX pacing rules in [`rp2350-periph.md`](rp2350-periph.md)).
 
 ### Reset / 复位
 
@@ -654,15 +694,31 @@ lost and nothing can resume from the reset point.
 ```
 frame=<index> steps=<..> fps=<..> steps/s=<..> replaced=<..> · running|stopped
 buttons / 按键: A|Right
-audio=<backend> underruns=<n>
+audio=<backend> tap_samples=<n> dropped=<n> underruns=<n> produced=<n>/s need=<n>/s
 ```
 
-`audio=` 是宿主输出后端（`cpal` / `null`），无输出时为 `audio=off underruns=0`；
-`underruns` 每帧从输出线程重读，持续增长说明客户机产样本慢于播放节奏。
+`audio=` 是宿主输出后端（`cpal` / `null`），无输出时为
+`audio=off underruns=0 tap_samples=0 dropped=0`。`tap_samples` 是从 tap 实际取走的
+**交替**样本数，`dropped` 是 tap 溢出与内部队列丢样之和，`underruns` 每帧从输出线程
+重读；`produced` 是 `tap_samples / 声道数 / 墙钟秒`，`need` 是来源采样率
+（emerald 为 13440/s）。`produced` 明显低于 `need` 时行尾追加
+` · audio: emulation slower than real time (underruns=…, produced=…/s, need=…/s)`；
+此时没有声音是**预期**的：播放端只补静音并计数，不循环旧样本。
 
 `halted` 存在时追加 ` · halted / 停机: <原因>`（例如指令预算耗尽、非法指令）。
 `replaced` 是「未被 GUI 取走即被替换」的帧数；它持续增长说明 UI 或渲染跟不上 worker
 （当前 worker 约 8 fps）。
+
+The `audio=` field names the host backend (`cpal` / `null`); with no output the
+line is `audio=off underruns=0 tap_samples=0 dropped=0`. `tap_samples` counts
+**interleaved** samples pulled from the tap, `dropped` is the tap overflow plus
+the internal queue drops, and `underruns` is re-read from the output thread every
+frame. `produced` is `tap_samples / channels / wall seconds` and `need` is the
+source rate (13440/s for emerald). When `produced` is clearly below `need` the
+line ends with
+` · audio: emulation slower than real time (underruns=…, produced=…/s, need=…/s)`;
+the silence is then **expected**: the playback side inserts silence and counts
+underruns, never looping stale samples.
 
 ### 帧率说明 / Frame rate
 
@@ -745,8 +801,12 @@ but slow. See the P0 rows of the playability plan for the way forward.
 - **宿主音频**（`play_view/audio.rs`）：勾选音频且有 tap 时创建 `AudioOutput` 且
   `backend()` ∈ {`cpal`, `null`}、`playing() == true`；未勾选时不创建输出且
   `underruns() == 0`；`stop()` 在 2 s 内 join 音频线程（来源的 drop 标志置位）、
-  输出句柄清空；`format_audio` 的 `audio=<backend> underruns=<n>` / `audio=off`
-  格式；null 后端提示只追加一次（`cpal` 不提示）；`Drop` 同样 join 音频线程。
+  输出句柄清空；状态行包含 `backend/tap_samples/dropped/underruns/produced/need`
+  六项，无输出为 `audio=off underruns=0 tap_samples=0 dropped=0`；`produced` 低于
+  `need` 时出现 `audio: emulation slower than real time (underruns=…, produced=…/s,
+  need=…/s)`；5 s/15 s stderr 诊断行前四个字段固定，tap 首次有样本时另有
+  `first-sample` 行；null 后端提示只追加一次（`cpal` 不提示）；`Drop` 同样 join
+  音频线程；`stop()` 清空实时速率状态。
 
 `play_view/params_tests.rs`（字段与 profile，`#[cfg(test)] mod params_tests`）：
 

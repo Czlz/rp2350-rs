@@ -71,21 +71,28 @@ mod reset_tests;
 mod tests;
 pub mod types;
 
-pub use audio::{AUDIO_CAPACITY, AUDIO_NULL, SILENT_NOTICE, format_audio};
+pub use audio::{
+    AUDIO_CAPACITY, AUDIO_DIAGNOSTIC_TIMES, AUDIO_NULL, SILENT_NOTICE, SLOW_TOLERANCE_FPS,
+    format_audio, format_audio_diagnostic, format_audio_first_sample, format_audio_report,
+};
 pub use cli_source::{CliPlaySource, CliPlayStarter};
 pub use fields::{PlayFields, PlayInputs, format_frame};
 pub use types::{
     AudioRequest, PlayFrame, PlayRequest, PlaySource, PlayStarter, PlayStats, format_stats,
 };
 
+use std::time::Duration;
+
 use egui::{
     Align2, Color32, ColorImage, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Vec2, pos2, vec2,
 };
-use rp2350_audio::AudioOutput;
+use rp2350_audio::{AudioOutput, AudioReport};
 
-/// Height reserved for the three-line status bar / 三行状态栏保留的高度
-const STATUS_HEIGHT: f32 = 64.0;
+/// Height reserved for the three-line status bar; the audio line may wrap once
+/// when it carries the slow-emulation notice
+/// 三行状态栏保留的高度；音频行带「慢于实时」提示时可能换行一次
+const STATUS_HEIGHT: f32 = 80.0;
 
 /// Screen background behind the guest picture / 客户机画面背后的底色
 const BACKDROP: Color32 = Color32::from_rgb(0x12, 0x14, 0x18);
@@ -346,6 +353,18 @@ pub struct PlayView {
     audio_output: Option<AudioOutput>,
     /// Whether the silent-backend notice was already appended / 静默后端提示是否已追加
     audio_notice_shown: bool,
+    /// Number of 5 s/15 s audio diagnostics already written
+    /// 已写出的 5 秒/15 秒音频诊断条数
+    audio_reported: usize,
+    /// Whether the first captured audio sample was already logged
+    /// 首个音频样本是否已记录
+    audio_first_sample_reported: bool,
+    /// Snapshot used to compute the next production-rate window
+    /// 用于计算下一次生产速率窗口的快照
+    audio_previous: Option<AudioReport>,
+    /// Most recent production rate shown by the status line
+    /// 状态行显示的最近生产帧率
+    audio_produced_fps: Option<f64>,
     /// Toolbar status of the last action / 最近一次操作的状态
     status: String,
     /// Current button mask / 当前按键掩码
@@ -371,6 +390,10 @@ impl Default for PlayView {
             fields: PlayFields::default(),
             audio_output: None,
             audio_notice_shown: false,
+            audio_reported: 0,
+            audio_first_sample_reported: false,
+            audio_previous: None,
+            audio_produced_fps: None,
             status: "idle / 空闲".to_owned(),
             buttons: 0,
             focus_hint: true,
@@ -495,6 +518,27 @@ impl PlayView {
         };
         let output = audio::start(source);
         self.note_silent_backend(output.backend());
+        // 探测结果（设备/流，或 null 原因）只打印一次，便于脚本取证。
+        // Print the probe result (device/stream or the null reason) once for
+        // scriptable evidence.
+        if let Some(detail) = output.backend_detail() {
+            if output.backend() == AUDIO_NULL {
+                eprintln!(
+                    "[rp2350-egui] audio probe backend={} {detail} hint=\"check the default \
+                     output device and audio_channels/audio_rate\"",
+                    output.backend()
+                );
+            } else {
+                eprintln!(
+                    "[rp2350-egui] audio probe backend={} {detail}",
+                    output.backend()
+                );
+            }
+        }
+        self.audio_reported = 0;
+        self.audio_first_sample_reported = false;
+        self.audio_previous = None;
+        self.audio_produced_fps = None;
         self.audio_output = Some(output);
     }
 
@@ -507,6 +551,10 @@ impl PlayView {
         if let Some(output) = self.audio_output.take() {
             output.shutdown();
         }
+        self.audio_reported = 0;
+        self.audio_first_sample_reported = false;
+        self.audio_previous = None;
+        self.audio_produced_fps = None;
     }
 
     /// Append the silent-backend notice to the toolbar status at most once
@@ -580,6 +628,11 @@ impl PlayView {
     /// Render the tab: toolbar, picture, keyboard and status bar
     /// 渲染标签页：工具栏、画面、键盘与状态栏
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        // 画面与音频计数都是实时数据：按 100 ms 周期请求重绘，避免只在输入事件时刷新。
+        // The picture and audio counters are live data: repaint every 100 ms
+        // instead of only on input events.
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        self.pump_audio_diagnostics();
         self.toolbar(ui);
         ui.separator();
         self.pump(ui.ctx());
@@ -779,7 +832,7 @@ impl PlayView {
         ui.monospace(format!("buttons / 按键: {}", describe_mask(self.buttons)));
         // 音频行每帧重读输出线程的计数：欠载数实时增长，无需缓存。
         // Reread the output counters every frame so underruns stay live.
-        ui.monospace(format_audio(self.audio_backend(), self.audio_underruns()));
+        ui.monospace(self.audio_status_line());
     }
 }
 
