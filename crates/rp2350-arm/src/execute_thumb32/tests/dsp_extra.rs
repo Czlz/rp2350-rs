@@ -1,4 +1,4 @@
-﻿//! Second wave of DSP tests: halving lanes, dual multiply-accumulate, wide
+//! Second wave of DSP tests: halving lanes, dual multiply-accumulate, wide
 //! multiply, `SMMLS` and the accumulating packed byte extends
 //! 第二批 DSP 测试：折半通道、双乘累加、宽乘法、`SMMLS` 与累加式打包字节扩展
 //!

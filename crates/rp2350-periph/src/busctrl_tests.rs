@@ -1,4 +1,4 @@
-﻿//! BUSCTRL tests: priority hints, performance counters, fabric accounting
+//! BUSCTRL tests: priority hints, performance counters, fabric accounting
 //! BUSCTRL 测试：优先级提示、性能计数器与总线矩阵记账
 //!
 //! The counter tests drive [`BusPerf`] directly where the exact event stream

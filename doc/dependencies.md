@@ -1,120 +1,77 @@
 # Third-Party Dependencies / 第三方依赖清单
 
-> **Version**: 3.0 | **Date**: 2026-11-08
+> **Version**: 4.0 | **Date**: 2026-11-16
 
----
+统一在 `[workspace.dependencies]` 声明，子 crate 用 `{ workspace = true }` 引用。
 
-## Core Dependencies / 核心依赖
+## Core / 核心
 
-| Crate | Version | Usage | Why |
-|-------|---------|-------|-----|
-| `thiserror` | 2.x | Library error types | `#[derive(Error)]` macro, zero-cost |
-| `anyhow` | 1.x | CLI error handling | `context()` chain, fast prototyping |
-| `log` | 0.4 | Facade logging | Universal log macros |
-| `env_logger` | 0.11 | Log output | Environment-configurable output |
-| `tracing` | 0.1 | Structured logging | Span, event, subscriber for egui |
-| `tracing-subscriber` | 0.3 | Log formatting | Layered subscriber for egui integration |
+| Crate | Version | Usage |
+|-------|---------|-------|
+| `thiserror` | 2.x | 库错误类型（`#[derive(Error)]`） |
+| `anyhow` | 1.x | CLI 错误上下文 |
+| `log` / `env_logger` | 0.4 / 0.11 | 日志门面与输出 |
+| `tracing` / `tracing-subscriber` | 0.1 / 0.3 | 结构化日志（GUI 集成） |
 
-## Concurrency & Data / 并发与数据结构
+## Concurrency & Data / 并发与数据
 
-| Crate | Version | Usage | Why |
-|-------|---------|-------|-----|
-| `parking_lot` | 0.12 | Synchronization | Faster Mutex/RwLock than std |
-| `tokio` | 1.x (full) | GDB server async | TCP accept, connection multiplexing |
-| `serde` | 1.x | Serialization | Config, plugin metadata, state save |
-| `serde_json` | 1.x | JSON ser/de | Plugin descriptor format |
-| `bytemuck` | 1.x | Zero-copy casting | `Pod`/`Zeroable` for register arrays |
-| `smallvec` | 1.x | Small vectors | Stack-allocated for tiny collections |
-| `bitflags` | 2.x | Bitfield enums | Register flag definitions |
-| `uuid` | 1.x | Unique IDs | Plugin instance IDs |
+| Crate | Version | Usage |
+|-------|---------|-------|
+| `parking_lot` | 0.12 | 互斥锁/RwLock |
+| `tokio` | 1.x | GDB / MCP 服务异步运行时 |
+| `serde` / `serde_json` | 1.x | 插件配置、状态快照、MCP |
+| `bytemuck` | 1.x | 寄存器数组零拷贝 |
+| `smallvec` | 1.x | 小集合栈分配 |
+| `bitflags` | 2.x | 寄存器位定义 |
+| `uuid` | 1.x | 设备实例 ID |
 
 ## Firmware Loading / 固件加载
 
 | Crate | Version | Usage |
 |-------|---------|-------|
-| `elf` | 0.7 | ELF file parsing |
-| `ihex` | 3.x | Intel HEX parsing |
+| `elf` | 0.7 | ELF 解析 |
 
-## ★ egui GUI / 图形界面
+> UF2 由仓库内部 `rp2350-core::uf2` 解析，不使用第三方 crate；Intel HEX 解析不在
+> V1 范围（无调用方，相关 workspace 条目已删除）。
+
+## GUI / 图形界面
 
 | Crate | Version | Usage |
 |-------|---------|-------|
-| `eframe` | 0.37 | egui framework (native + wasm runner) |
-| `egui` | 0.37 | Immediate mode GUI core |
-| `egui-wgpu` | 0.37 | wgpu render backend |
-| `egui-winit` | 0.37 | winit window integration |
-| `egui_plot` | 0.37 | Plot widgets (PIO timing) |
-| `winit` | 0.30 | Windowing abstraction |
-| `wgpu` | 24.x | GPU rendering (cross-platform native) |
-| `image` | 0.25 | HSTX screenshot → PNG |
-
-### egui Version Policy / egui 版本策略
-
-All egui-family crates use the latest stable release. Version is specified in `[workspace.dependencies]` for unified management.
-所有 egui 系列 crate 使用最新稳定版。版本在 `[workspace.dependencies]` 中统一管理。
-
-```toml
-[workspace.dependencies]
-egui = "0.37"
-eframe = "0.37"
-egui-wgpu = "0.37"
-egui-winit = "0.37"
-egui_plot = "0.37"
-```
+| `eframe` / `egui` | 0.37 | 应用框架与即时模式 GUI |
+| `egui-wgpu` / `wgpu` | 0.37 / 24.x | wgpu 渲染后端 |
+| `egui-winit` / `winit` | 0.37 / 0.30 | 窗口与事件 |
+| `egui_plot` | 0.37 | 曲线/时序图 |
 
 ## Plugin FFI / 插件 FFI
 
 | Crate | Version | Usage |
 |-------|---------|-------|
-| `libloading` | 0.8 | Dynamic library loading (dlopen/LoadLibrary) |
-| `abi_stable` | 0.12 | Stable ABI for cross-version plugin compat |
+| `libloading` | 0.8 | 动态库加载（`LoadLibrary`/`dlopen`） |
+
+插件 ABI 由 `rp2350-plugin` 自定义 `extern "C"` 符号 + 版本号校验实现，
+**不使用** `abi_stable`（该 workspace 条目已删除）。
+
+## Audio / 音频
+
+| Crate | Version | Feature | Usage |
+|-------|---------|---------|-------|
+| `cpal` | 0.18 | `playback` | 宿主声卡输出；未启用时使用 null 后端 |
 
 ## Build & CLI / 构建与命令行
 
 | Crate | Version | Usage |
 |-------|---------|-------|
-| `clap` | 4.x (derive) | CLI argument parsing |
-| `chrono` | 0.4 | Timestamps (changelog, trace) |
+| `clap` | 4.x (derive) | CLI 参数解析 |
 
-## ★ WASM / Web Assembly / Web 发布
+## WebAssembly
 
-| Crate | Version | Usage |
-|-------|---------|-------|
-| `wasm-bindgen` | 0.2 | Rust ↔ JS interop for wasm target |
-| `wasm-bindgen-futures` | 0.4 | Async runtime bridge for wasm |
-| `web-sys` | 0.3 | Browser DOM APIs (canvas, events, localStorage) |
-| `console_error_panic_hook` | 0.1 | Rust panic → browser console |
-| `js-sys` | 0.3 | JavaScript type bindings |
-| `wee_alloc` | 0.4 | WASM-optimized allocator (~1KB) |
+**不属于 V1。** GUI 依赖 `tokio full`、`libloading` 与文件系统固件加载等宿主专用
+crate，仓库也没有 `index.html`/`Trunk.toml` web 入口；V1 只发布原生二进制。
+原先预留的 `wasm-bindgen`/`web-sys`/`js-sys`/`wee_alloc` 等未使用依赖已从
+`[workspace.dependencies]` 删除。
 
-### WASM Build Tool / Web 构建工具
-
-| Tool | Usage |
-|------|-------|
-| `trunk` | WASM bundler (index.html + wasm + JS glue) |
-| `wasm-pack` | WASM npm package builder (optional, for publishing) |
-| `wasm-opt` | WASM binary optimizer (binaryen) |
-
-### Plugin ABI in WASM / Web 中的插件 ABI
-
-In WASM builds, dynamic `.dll`/`.so` loading is NOT available (no `dlopen`). Virtual devices are compiled as **static crate dependencies** instead, selected via cargo features:
-WASM 构建中无法使用动态 `.dll`/`.so` 加载（无 `dlopen`）。虚拟设备改为**静态 crate 依赖**，通过 cargo feature 选择。
-
-```toml
-# Cargo.toml
-[features]
-default = ["plugin-led", "plugin-tfcard", "plugin-uart"]
-plugin-led = ["rp2350-plugin-led"]
-plugin-tfcard = ["rp2350-plugin-tfcard"]
-plugin-uart = ["rp2350-plugin-uart-terminal"]
-wasm = ["eframe/wasm_bindgen", "egui-wgpu/webgl"]
-```
-
----
-
-## Dynamic Library Loading Notes / 动态库加载说明
-
-### Platform-specific paths
+## Dynamic Library Loading / 动态库加载
 
 | Platform | Extension | Default search |
 |----------|-----------|----------------|
@@ -122,7 +79,7 @@ wasm = ["eframe/wasm_bindgen", "egui-wgpu/webgl"]
 | Linux | `.so` | `plugins/`, `LD_LIBRARY_PATH` |
 | macOS | `.dylib` | `plugins/`, `DYLD_LIBRARY_PATH` |
 
-### Required exported symbols
+导出的 ABI 符号（由 `rp2350-plugin` 定义）：
 
 ```
 rp2350_plugin_version        → fn() -> u32  (ABI version = 1)
@@ -130,13 +87,5 @@ rp2350_plugin_is_device      → fn() -> u32  (1 = DevicePlugin)
 rp2350_device_plugin_create  → fn() -> *mut dyn DevicePlugin
 ```
 
-### FFI Safety
-
-All `libloading` calls are wrapped in `SafeLibrary` (RAII wrapper in `rp2350-ffi`).
-所有 `libloading` 调用均封装在 `SafeLibrary`（RAII 包装，位于 `rp2350-ffi`）。
-
-No `#[link]` attribute is used — all dynamic loading is runtime via `libloading`.
-不使用 `#[link]` 属性 —— 所有动态加载通过 `libloading` 运行时完成。
-
-`--release + lto = "fat" + codegen-units = 1` for static linking of all internal crates.
-发布构建使用 `--release + lto = "fat" + codegen-units = 1` 进行所有内部 crate 的静态链接。
+所有 `libloading` 调用封装在 `rp2350-ffi` 的 `SafeLibrary`（RAII）；不使用 `#[link]`。
+发布构建使用 `--release` + `lto = "fat"` + `codegen-units = 1`。

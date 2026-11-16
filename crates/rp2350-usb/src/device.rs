@@ -349,9 +349,12 @@ impl UsbCore {
 
     fn buff_cpu_should_handle(&self) -> u32 {
         let mut mask = 0u32;
-        for ep in 0..16 {
+        // 端点下标决定 BUFF_STATUS 的位位置，逐端点迭代顺序不变。
+        // The endpoint index determines the BUFF_STATUS bit position; iterating
+        // the slots keeps the same order.
+        for (ep, slots) in self.next_high.iter().enumerate() {
             for dir in [Direction::In, Direction::Out] {
-                if self.next_high[ep][dir.index()] {
+                if slots[dir.index()] {
                     mask |= regs::buff_status_bit(ep, dir);
                 }
             }

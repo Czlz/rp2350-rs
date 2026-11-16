@@ -7,7 +7,7 @@
 - `doc/` — 该示例的验证报告、性能数据、截图；
 - `tools/` — 示例专用脚本。
 
-规则见 `.trae/rules/project.md` 的「示例项目目录（example/，强制）」：示例专用内容
+规则见 [`AGENTS.md`](../AGENTS.md) 的「示例项目目录（example/，强制）」：示例专用内容
 不放主 `doc/`，主 `doc/` 只保留跨示例的通用文档并链接到此处。
 This directory holds examples that drive **real firmware** with this emulator.
 Each example has its own directory with a `README.md` (target firmware, run

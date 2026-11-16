@@ -24,7 +24,6 @@
 | **Platform** | Windows / Linux / macOS 原生；Web (WASM) 不属于 V1（见 `v1-scope.md`） |
 | **Performance** | 默认确定性 ≈5–8.5 M 步/秒（按工作负载窗口，见 [`performance.md`](performance.md)）；`--core-threads on` 约 1.8–2.0×（非位可复现） |
 | **Repository** | [github.com/Czlz/rp2350-rs](https://github.com/Czlz/rp2350-rs) |
-| **Live Demo** | [czlz.github.io/rp2350-rs](https://czlz.github.io/rp2350-rs/) |
 
 ### Reference / 参考基准
 
@@ -116,6 +115,7 @@ cargo doc --no-deps --document-private-items
 | [images/README.md](images/README.md) | 截图资源与逐条复现命令（真实固件 REPL、GUI、游戏帧） |
 | [implementation-plan.md](implementation-plan.md) | V1 release plan (work packages + firmware gates) |
 | [lessons.md](lessons.md) | Lessons learned and engineering pitfalls |
+| [firmware-verification.md](firmware-verification.md) | FV-1/2/3 固件门禁、诊断手册与子任务拆分模板 |
 | [playability-plan.md](playability-plan.md) | emerald 可玩性：吞吐、帧率、音频欠载与已知限制 |
 | [threading-plan.md](threading-plan.md) | 双核线程执行器设计、测量与限制 |
 | [performance.md](performance.md) | 按工作负载窗口的性能测量与优化记录 |

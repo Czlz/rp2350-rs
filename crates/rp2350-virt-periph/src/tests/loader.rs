@@ -198,13 +198,17 @@ fn load_device_rejects_null_factory() {
     let Some(path) = build_fixture(
         "null-factory",
         r#"
+// 工厂返回 fat-pointer 的空值：与 `DeviceCreateFn` 的 `*mut dyn Trait` 返回
+// 约定一致，避免调用约定不匹配导致的未定义行为。
+// The factory returns a null fat pointer so the calling convention matches
+// `DeviceCreateFn` (`*mut dyn Trait`) instead of a thin `*mut c_void`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rp2350_plugin_version() -> u32 { 1 }
 #[unsafe(no_mangle)]
 pub extern "C" fn rp2350_plugin_is_device() -> u32 { 1 }
 #[unsafe(no_mangle)]
-pub extern "C" fn rp2350_device_plugin_create() -> *mut core::ffi::c_void {
-    core::ptr::null_mut()
+pub extern "C" fn rp2350_device_plugin_create() -> *mut dyn core::any::Any {
+    core::ptr::null_mut::<()>() as *mut dyn core::any::Any
 }
 "#,
     ) else {

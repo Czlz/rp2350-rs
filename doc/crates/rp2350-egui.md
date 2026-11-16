@@ -77,11 +77,6 @@ split keeps both files under the project's 500-code-line cap.
 画布拆分：`canvas.rs` 保存纯数据模型与几何（无需画笔即可单元测试），
 `canvas_view.rs` 提供 `CanvasState::show` 与绘制逻辑。拆分保证两个文件都符合
 项目单文件 500 行代码上限。
-
-Planned target layout (Phase 3, not yet created / 规划中的目标结构，尚未创建):
-    panels/{hstx_view, memory, pio_view, gpio_view, terminal, debugger}.rs
-    canvas/{chip_view, pin_widget, device_widget, drag_drop}.rs
-    theme.rs, icons.rs
 ```
 
 ---
@@ -177,10 +172,10 @@ stepping in the background because the session lives in its own thread.
 `PlayView`（worker、纹理、工具栏文本）由 `EmuApp` 持有，来回切换不会丢失。正在
 运行的游玩 worker 会继续在后台推进，因为会话位于自己的线程中。
 
-**目标设计 / Target design（规划中 / planned，Phase 3）**：扩展为
-`chip: Arc<Mutex<RP2350Chip>>` + `gdb_server` 句柄 + `plugin_host` + 左侧外设/
-插件面板、右侧寄存器/HSTX 面板、底部 UART 终端与状态栏，以及
-`render_menu()` / `tick_simulator(multiplier)` 执行控制。
+**当前布局 / Current layout**：`EmuApp` 持有 `CanvasState` 与 `PlayView`，
+外设面板在 `panels.rs`（快照类型/格式化）与 `app.rs`（渲染）中，没有额外的
+`panels/` 或 `canvas/` 子模块目录。`EmuApp` 不直接持有 `RP2350Chip`：真实机器
+运行在 `PlaySession` 的 worker 线程里。
 
 ---
 

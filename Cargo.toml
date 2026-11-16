@@ -45,7 +45,6 @@ smallvec = "1"
 bitflags = "2"
 uuid = { version = "1", features = ["v4"] }
 elf = "0.7"
-ihex = "3"
 eframe = "0.37"
 egui = "0.37"
 egui-wgpu = "0.37"
@@ -53,17 +52,8 @@ egui-winit = "0.37"
 egui_plot = "0.37"
 winit = "0.30"
 wgpu = "24"
-image = "0.25"
 libloading = "0.8"
-abi_stable = "0.12"
 clap = { version = "4", features = ["derive"] }
-chrono = "0.4"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = "0.3"
-console_error_panic_hook = "0.1"
-js-sys = "0.3"
-wee_alloc = "0.4"
 
 rp2350-core = { path = "crates/rp2350-core" }
 rp2350-cpu = { path = "crates/rp2350-cpu" }
@@ -81,8 +71,6 @@ rp2350-gdb = { path = "crates/rp2350-gdb" }
 rp2350-egui = { path = "crates/rp2350-egui" }
 rp2350-cli = { path = "crates/rp2350-cli" }
 rp2350-mcp = { path = "crates/rp2350-mcp" }
-rp2350-led-plugin = { path = "plugins/led" }
-rp2350-uart-terminal = { path = "plugins/uart-terminal" }
 
 [profile.release]
 opt-level = 3

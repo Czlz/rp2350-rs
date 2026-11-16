@@ -421,8 +421,10 @@ impl Nvic {
         }
         // 数字越小优先级越高。/
         // A numerically smaller priority wins.
-        for priority in 0..PRIORITY_LEVELS {
-            let bucket = &self.priority_mask[priority];
+        // 分桶数组顺序即优先级从高到低，迭代顺序与原下标顺序一致。
+        // The bucket array is ordered highest-priority first, so iteration order
+        // matches the previous index order.
+        for bucket in &self.priority_mask {
             for (group, bits) in candidates.iter().enumerate() {
                 let hit = *bits & bucket[group];
                 if hit != 0 {

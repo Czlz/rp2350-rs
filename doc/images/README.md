@@ -48,4 +48,4 @@ py example\gba\tools\fb2png.py fb.bin emerald-frame-1.2g.png 3
 - 终端渲染不使用第三方库；GUI 截图是窗口的屏幕捕获（Play 页由 GPU 纹理绘制，屏幕捕获
   可能为黑，因此这里选虚拟实验室画布）。
 - 固件不随仓库分发，路径与校验值见 [`../../example/gba/README.md`](../../example/gba/README.md)
-  与 `.opencode/skills/firmware-verification/SKILL.md`。
+  与 [`../firmware-verification.md`](../firmware-verification.md)。

@@ -2,10 +2,10 @@
 //!
 //! The mode is part of the host request, not of the guest: it is fixed when a
 //! session starts and cannot change while the worker runs. Keeping the widgets
-//! and the guarded setters here leaves [`PlayView`](super::PlayView) room for the
+//! and the guarded setters here leaves [`PlayView`] room for the
 //! rest of the toolbar and keeps this file inside the project's line budget.
 //! 该模式属于宿主请求而不是客户机：会话启动时固定，worker 运行期间不能改变。把
-//! 控件与带锁的 setter 放在这里，既给 [`PlayView`](super::PlayView) 的其余工具栏
+//! 控件与带锁的 setter 放在这里，既给 [`PlayView`] 的其余工具栏
 //! 留出空间，也让本文件保持在项目的行数预算内。
 
 use super::PlayView;

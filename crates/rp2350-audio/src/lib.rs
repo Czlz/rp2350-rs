@@ -79,7 +79,7 @@ pub const TICK: Duration = Duration::from_millis(5);
 
 /// Upper bound for the backend probe that runs during [`AudioOutput::start`]
 /// [`AudioOutput::start`] 期间后端探测的等待上限
-const INIT_TIMEOUT: Duration = Duration::from_millis(1000);
+const INIT_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Sample rate and channel count of a stream / 流的采样率与声道数
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

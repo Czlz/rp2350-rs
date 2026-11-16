@@ -141,7 +141,7 @@ GUI 按键（画面获焦后生效）：
   并正确推进时间」作为目标，帧率见 `doc/performance.md`。
 - 固件是**忙等**实现的（SDK 的 `tight_loop_contents()` 是空函数），双核大量时间花在
   互相等待的短循环上。这只说明**本示例**不走睡眠路径；模拟器仍必须实现
-  `WFI`/`WFE`/`SEV` 与阻塞式 FIFO（见 `.trae/rules/project.md` 的「通用性与指令精确」）。
+  `WFI`/`WFE`/`SEV` 与阻塞式 FIFO（见 [`AGENTS.md`](../AGENTS.md) 的「通用性与指令精确」）。
 - 音频采样率：固件 I2S 为 13440 Hz 立体声（PIO2 + DMA）；`rp2350-audio` 播放时按
   tap 的元数据与设备支持的采样率做最近邻重采样。
 
@@ -175,7 +175,6 @@ GUI 按键（画面获焦后生效）：
 | 文件 | 内容 |
 |------|------|
 | [doc/gba-bringup-report.md](doc/gba-bringup-report.md) | 启动验证报告：缺陷根因、修复、验收数据、已知限制 |
-| [doc/emerald-frame-1.2g.png](doc/emerald-frame-1.2g.png) | 1.2 G 步时由 `g_fb` 导出的游戏帧（README 截图） |
-| [doc/gba-frame-gamefreak.png](doc/gba-frame-gamefreak.png) | 1.2G 步时 HSTX 扫描输出的游戏帧 |
+| [doc/emerald-frame-1.2g.png](doc/emerald-frame-1.2g.png) | 1.2 G 步时由 `g_fb` 导出的游戏帧（README 截图，经 HSTX 扫描同一缓冲） |
 | [tools/fb2png.py](tools/fb2png.py) | 把 `--dump` 的 RGB565 帧缓冲转成放大 PNG（仅标准库） |
 | [tools/hold_stdin.py](tools/hold_stdin.py) | 保持 `repl --stdio` 的 stdin 打开，直到固件打印日志 |

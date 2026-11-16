@@ -1,4 +1,4 @@
-﻿//! Shared Thumb-16 executors used by both the decoder and the decode cache
+//! Shared Thumb-16 executors used by both the decoder and the decode cache
 //! 译码器与译码缓存共用的 Thumb-16 执行器
 //!
 //! The bodies below are the hot arms of [`super::execute_thumb16`]. They live

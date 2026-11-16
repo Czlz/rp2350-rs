@@ -654,12 +654,14 @@ impl MmioDevice for Pio {
                 // Restart/clock-restart bits are self-clearing strokes; SM_ENABLE is
                 // retained, and SM_RESTART/CLKDIV_RESTART are applied below.
                 self.enabled = (value & SM_ENABLE_MASK) as u8;
-                for index in 0..SM_COUNT {
+                // 状态机位序固定为 SM0..SM3，逐位对应一个状态机。
+                // The bit order is fixed to SM0..SM3, one bit per state machine.
+                for (index, sm) in self.sm.iter_mut().enumerate() {
                     if value & (SM_RESTART << index) != 0 {
-                        self.sm[index].restart();
+                        sm.restart();
                     }
                     if value & (CLKDIV_RESTART << index) != 0 {
-                        self.sm[index].restart_divider();
+                        sm.restart_divider();
                     }
                 }
                 true

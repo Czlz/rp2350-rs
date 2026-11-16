@@ -97,14 +97,18 @@
 - `plugins/uart-terminal`: second-party UART terminal plugin — `TX` (input) is sampled at the configured baud to decode start/data/stop bits LSB-first, `RX` (output) shifts bytes out with the same bit timing; `baud`/`data_bits`/`stop_bits`/`rx_line`/`clock_hz` configuration, framing-error accounting and a state snapshot (11 tests)
 
 ### Changed / 变更
+- 仓库卫生：`.trae/`、`.opencode/` 等本地 agent/IDE 目录不再随仓库发布（规则迁移到根 `AGENTS.md`，固件验证手册迁移到 `doc/firmware-verification.md`）；删除重复的示例截图与空目录，README/示例文档同步更新。
 - `rp2350-arm`: `check_pending_exceptions` now also honours `FAULTMASK` and `BASEPRI` (the same gate decides whether a sleep wake-up enters an interrupt); `CpuCore::step` on a sleeping core advances `SysTick`/`total_cycles` instead of returning immediately; `StepResult::Sleep` became `Sleep(SleepKind)` and `SEV`/`SEVL` report `SendEvent { local }`
 - `rp2350-riscv`: `wfi` is a real wait instead of a `NOP`; `signal_interrupt` no longer forces `CpuState::Running` (the step's own wake rule decides), and a retryable load stall never enters a guest trap
 - `rp2350-cli`: `run_steps`/`step_cores` treat `CpuState::Sleeping` as a normal, time-advancing step (only `Halted`/`Faulted`/`Reset` stop the machine), the executed-PC ring skips sleep steps, and `core1_running` includes a sleeping core 1 so it can be woken
-- 文档结构：**示例项目专用内容迁出主 `doc/`**。`gba-bringup-report.md` 与游戏帧截图移到 `example/gba/doc/`，示例的固件信息、运行命令、引脚表、外设/插件依赖移到 `example/gba/README.md`，帧缓冲转 PNG 工具移到 `example/gba/tools/fb2png.py`；`.trae/rules/project.md` 新增「示例项目目录（example/，强制）」规则，主 `doc/` 只保留跨示例的通用文档并用相对路径链接
+- 文档结构：**示例项目专用内容迁出主 `doc/`**。`gba-bringup-report.md` 与游戏帧截图移到 `example/gba/doc/`，示例的固件信息、运行命令、引脚表、外设/插件依赖移到 `example/gba/README.md`，帧缓冲转 PNG 工具移到 `example/gba/tools/fb2png.py`；`AGENTS.md` 新增「示例项目目录（example/，强制）」规则，主 `doc/` 只保留跨示例的通用文档并用相对路径链接
 - `doc/implementation-plan.md`：P1 进度表同步 —— PIO（DMA DREQ）、DMA（`TRANS_COUNT` 重载、3 通道环）、HSTX（像素时钟节拍、`DREQ_HSTX`）、ARM ISA（`MSPLIM`/`PSPLIM`、折半/双乘/宽乘）、双核（真实 core1 执行）状态更新；验收主线增加 GBA 示例链接
 - `doc/changelog.md`：更新「Planned」列表（双核/HSTX/egui 画布/DSP/GDB 已完成，改为 PIO FUNCSEL、WFI/WFE 调度、PSRAM XIP、MCP TLS、多核 GDB `vCont`、TMDS 串行化）
 
 ### Fixed / 修复
+- CI: rustc/clippy 1.100 的 `needless_range_loop` 命中 4 处（DMA `CHAN_ABORT`、PIO `CTRL`、NVIC 优先级扫描、USB `BUFF_STATUS`），改为固定数组 `iter()`/`iter_mut().enumerate()`，位序与扫描顺序不变；全 workspace `-D warnings -W clippy::pedantic` 重新通过。
+- `rp2350-audio`: 后端探测等待从 1 s 放宽到 5 s，修复并行测试/慢声卡枚举时 `backend_detail()` 在 `start()` 返回后仍为 `None` 的偶发失败。
+- `rp2350-virt-periph` 测试夹具：`rp2350_device_plugin_create` 改为返回 fat-pointer 空值（与 `DeviceCreateFn` 的 `*mut dyn Trait` ABI 一致），修复 Rust 1.100 下 `load_device_rejects_null_factory` 的 `STATUS_ACCESS_VIOLATION`。
 - `rp2350-periph`: TIMER interrupt registers were at the RP2040-era offsets (`0x38/0x3C/0x40/0x44` instead of `0x3C/0x40/0x44/0x48`), `INTF` was treated as write-one-to-clear instead of a force mask, alarms never auto-disarmed and there was no `TIMER1`; all four are fixed, `INTS = (INTR | INTF) & INTE` drives the four lines and `TIMER1` at `0x400B_8000` shares the microsecond timebase with independent alarms/IRQs
 - `rp2350-arm`: `enter_exception` never wrote `xPSR[8:0]` (IPSR), so `MRS IPSR` returned 0 and pico-sdk's `alarm_pool_irq_handler` selected the wrong timer/alarm and crashed with `Bus error 0x00757C08`; the exception number is now latched on entry
 - **Re-landed**: the `WFI`/`WFE`/`SEV` sleep semantics reverted from `9a6b088` are implemented again in this release — blocking `SIO_FIFO_RD`, FIFO IRQ, `FIFO_ST` accounting and sleep scheduling landed first (see the GAP-07 entry above), so the core-1 launch handshake no longer stalls when core 0 sleeps. / `WFI`/`WFE`/`SEV` 睡眠语义已随阻塞 FIFO 与睡眠调度重新落地，见上方 GAP-07 条目。

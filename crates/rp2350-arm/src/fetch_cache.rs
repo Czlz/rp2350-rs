@@ -1,4 +1,4 @@
-﻿//! Instruction-fetch cache for the read-only flash XIP windows
+//! Instruction-fetch cache for the read-only flash XIP windows
 //! 只读 Flash XIP 窗口的取指缓存
 //!
 //! Every instruction fetch otherwise resolves an address through the dynamic

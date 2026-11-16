@@ -257,9 +257,11 @@ impl MmioDevice for Dma {
                     true
                 }
                 GLOBAL_CHAN_ABORT => {
-                    for index in 0..CHANNELS {
+                    // 逐通道按位清除 busy：位序与通道下标严格一一对应。
+                    // Clear busy per channel; the bit order maps 1:1 to channel index.
+                    for (index, channel) in state.channels.iter_mut().enumerate() {
                         if value & (1u32 << index) != 0 {
-                            state.channels[index].busy = false;
+                            channel.busy = false;
                         }
                     }
                     true

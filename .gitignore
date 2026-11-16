@@ -28,12 +28,11 @@ plugins/**/*.dylib
 # Handoff files (temporary, session-specific)
 /HANDOFF.md
 
-# Trae workspace documents (session-specific design plans, not shipped)
-# Project rules are shipped so agents and humans read the same contract.
-.trae/*
-!.trae/rules/
-.trae/rules/*
-!.trae/rules/project.md
+# Agent / IDE workspace configuration (local only, never published)
+# 智能体/IDE 工作区配置（仅本地，不发布）
+.trae/
+.opencode/
+.screenshots/
 
 # Cargo lock for libraries (keep for workspace root)
 # Cargo.lock — committed for workspace root only

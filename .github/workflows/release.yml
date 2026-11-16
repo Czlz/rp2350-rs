@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Needed by softprops/action-gh-release (default GITHUB_TOKEN is read-only).
+# 创建 Release 需要写权限（默认 GITHUB_TOKEN 只读）。
+permissions:
+  contents: write
+
 jobs:
   # ── Native Release Builds ──
   release-native:

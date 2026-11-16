@@ -199,6 +199,7 @@ Full design documents in `doc/`:
 - [USB Device Model](doc/usb-device-model.md) — USB device controller and host bridge design
 - [Plugin Guide](doc/plugins.md) — how to create virtual device plugins
 - [Lessons Learned](doc/lessons.md) — engineering pitfalls (measurement, concurrency, release hygiene)
+- [Firmware Verification](doc/firmware-verification.md) — FV-1/2/3 gates, diagnosis playbook, subtask template
 - [Changelog](doc/changelog.md) — version history
 - [API Reference](doc/crates/) — per-crate public API documentation
 

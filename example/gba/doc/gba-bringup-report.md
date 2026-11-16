@@ -198,11 +198,11 @@ pixels=38400 nonzero=38396 unique=32
 
 (Image: `fb_1200m.png` — game frame at 1.2 G steps. / 图片：1.2 G 步时的游戏帧。)
 
-![Game Freak logo rendered by the emulated PPU and scanned out over HSTX](gba-frame-gamefreak.png)
+![Game Freak logo rendered by the emulated PPU and scanned out over HSTX](emerald-frame-1.2g.png)
 
-*`example/gba/doc/gba-frame-gamefreak.png` — the frame the HSTX ring is scanning out after
+*`example/gba/doc/emerald-frame-1.2g.png` — the frame the HSTX ring is scanning out after
 1.2 G steps, captured with `run --dump 0x20063DF4:0x12C00:fb.bin`.*
-*`example/gba/doc/gba-frame-gamefreak.png` —— 1.2 G 步时 HSTX 环扫描输出的帧，用
+*`example/gba/doc/emerald-frame-1.2g.png` —— 1.2 G 步时 HSTX 环扫描输出的帧，用
 `run --dump 0x20063DF4:0x12C00:fb.bin` 抓取。*
 
 ### Regression gates / 回归门禁
