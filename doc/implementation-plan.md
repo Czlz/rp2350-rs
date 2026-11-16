@@ -31,7 +31,7 @@
 | R3 | V1 精度/限制声明（`doc/v1-scope.md`，含 release notes 素材） | 主会话 | ✅ 完成（README/doc 索引/release notes 引用；CLI/GUI 内置链接列 V1 后） |
 | R4 | 稳定性：3 OS CI、30 次并行、2 G/30 min soak、线程模式长跑 | 主会话 | 🟡 本地全部完成；3 OS CI 需推送后确认 |
 | R5 | 存档/状态保存 | — | ❌ V1 明确排除（见 `v1-scope.md` §3.8） |
-| R6 | 打 `v1.0.0` 标签并触发 release workflow | 主会话 | ⬜ 待执行 |
+| R6 | 打 `v1.0.0` 标签并触发 release workflow | 主会话 | ✅ 已发布（Release #6：4 原生目标 + 16 个附件） |
 
 顺序：R1 → R2 → R3 → R4 → R6（R5 排除）。
 
@@ -68,8 +68,9 @@
 
 ### R6 发布动作
 
-- [ ] 打 `v1.0.0` 标签，触发 release workflow（4 个原生目标二进制 + 第一方插件；无 WASM/Pages）
-- [ ] Release notes 使用 `v1-scope.md` 的范围声明 + `changelog.md` 的 `[1.0.0]` 条目
+- [x] 打 `v1.0.0` 标签，触发 release workflow（4 个原生目标二进制 + 第一方插件；无 WASM/Pages）
+- [x] Release notes 使用 `v1-scope.md` 的范围声明 + `changelog.md` 的 `[1.0.0]` 条目
+- [x] 历史清理：`.opencode/`、`.trae/` 已从全部提交中移除并强制推送（186 个提交）
 
 ## 3. 固件验证清单（V1 门禁）
 
