@@ -13,7 +13,7 @@
 
 ## Features / 特性
 
-> 状态标注 / Status: ✅ 已实现 implemented · 🚧 部分 partial · ⏳ 规划 planned（阶段计划见 [implementation-plan](doc/implementation-plan.md) 与 [reference-gap-analysis](doc/reference-gap-analysis.md)）
+> 状态标记 / Status: ✅ 已实现 implemented · 🚧 部分 partial · ⏳ 规划 planned（V1 范围与发布计划见 [handoff](doc/handoff.md) 与 [implementation-plan](doc/implementation-plan.md)）。
 
 - ✅ **ARM Cortex-M33** — Thumb-16/32 解码器、FPv5-SP FPU（单精度算术/比较/转换/VSEL/VRINT、FPCCR 惰性压栈）、NVIC/异常/SysTick、GPIO(CP0)/DCP(CP4) 协处理器、DSP 并行 SIMD（SADD/SSUB/UADD/USUB、SXTB16/UXTB16、USAD8/USADA8、QADD/QSUB/SSAT/USAT、SEL）
 - ✅ **RISC-V Hazard3** — RV32IMAC + C 压缩指令、machine CSRs、Xh3irq 外部中断、picobin 启动
@@ -130,8 +130,8 @@ rp2350-rs/
 
 Full design documents in `doc/`:
 - [Architecture](doc/architecture.md) — trait system, data flow, address space
-- [Implementation Plan](doc/implementation-plan.md) — phased tasks with milestones
-- [Reference Gap Analysis](doc/reference-gap-analysis.md) — 验收主线（Stages 0–6）：真实 MicroPython UF2 → USB CDC → perfbench
+- [V1 Release Plan](doc/implementation-plan.md) — work packages, firmware gates and release checklist
+- [Handoff / V1 scope](doc/handoff.md) — 验收主线（Stages 0–6）：真实 MicroPython UF2 → USB CDC → perfbench
 - [perfbench Report](doc/perfbench-report.md) — official `run-perfbench.py` results on the Arm and RISC-V MicroPython images
 - [GBA Example](example/gba/README.md) — running `emerald.uf2` (pokeemerald-rp2350) with core 1, HSTX scanout and a real game picture (all examples: [example/README.md](example/README.md))
 - [USB Device Model](doc/usb-device-model.md) — USB 设备控制器与主机桥设计

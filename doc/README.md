@@ -110,8 +110,9 @@ cargo doc --no-deps --document-private-items
 | Document | Description |
 |----------|-------------|
 | [architecture.md](architecture.md) | Architecture design, trait system, data flow |
-| [implementation-plan.md](implementation-plan.md) | Phased implementation plan with milestones |
-| [reference-gap-analysis.md](reference-gap-analysis.md) | Upstream gap analysis, UF2/RISC-V/RP2040/USB plan |
+| [implementation-plan.md](implementation-plan.md) | V1 release plan (work packages + firmware gates) |
+| [handoff.md](handoff.md) | V1 scope, remaining work, acceptance commands, known limits |
+| [lessons.md](lessons.md) | Lessons learned and engineering pitfalls |
 | [perfbench-report.md](perfbench-report.md) | Official `run-perfbench.py` results on both MicroPython firmware images |
 | [example/](../example/README.md) | **示例项目**：GBA 等真实固件的运行说明、引脚/外设配置与验证报告（`example/<name>/doc/`）|
 | [usb-device-model.md](usb-device-model.md) | USB device controller model + host bridge design |

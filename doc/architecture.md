@@ -363,7 +363,7 @@ CLK_RTC: RP2350 无该分频器，RTC 直接使用 LPOSC
   `clk_ref` 域（`TIMELR`/`TIMERAWH`，1 µs 节拍），并接收
   `ClockTree::generation()`。SysTick、ADC、POWMAN RTC、UART 与 HSTX 都持有共享
   时钟树/时基；PIO 的一个宿主 tick 是一个 `clk_sys` 周期，`CLKDIV`（16.8 定点）
-  在其上分频，写入 `SMx_CLKDIV` 立即重启分频器；DMA pacing 按真实经过周期记账。
+  在其上分频，写入 `SMx_CLKDIV` 保留分频器相位；`CLKDIV_RESTART` 只重启分频器，`SM_RESTART` 复位 PC/移位/延迟/阻塞/相位；DMA pacing 按真实经过周期记账。
 - 消费者与时钟对照见 [`crates/rp2350-periph.md`](crates/rp2350-periph.md) 的
   「Unified time base and consumers」表。SysTick 的唯一真相源是外设侧
   `SysTickCounter`：`SYST_CSR`/`SYST_RVR`/`SYST_CVR`、`COUNTFLAG`、实时时钟源与
